@@ -18,14 +18,17 @@ pub struct LiveSession {
 #[derive(Debug)]
 enum Inner {
     Model(crate::backend::live::Session),
-    /// The store's own reader is opened at the first batch.
-    Durable {
-        reader: Reader,
-        opts: SessionOptions,
-        pending: Vec<(LiveId, Query, LiveOptions)>,
-        session: Option<crate::durable::read::live::Session>,
-        last_id: u64,
-    },
+    Durable(Box<Durable>),
+}
+
+/// The store's own reader is opened at the first batch, so reads opened before it wait here.
+#[derive(Debug)]
+struct Durable {
+    reader: Reader,
+    opts: SessionOptions,
+    pending: Vec<(LiveId, Query, LiveOptions)>,
+    session: Option<crate::durable::read::live::Session>,
+    last_id: u64,
 }
 
 impl LiveSession {
@@ -33,13 +36,13 @@ impl LiveSession {
         opts.check()?;
         let inner = match &reader.inner {
             ReaderInner::Model(s) => Inner::Model(crate::backend::live::Session::new(s.clone())),
-            _ => Inner::Durable {
+            _ => Inner::Durable(Box::new(Durable {
                 reader: reader.clone(),
                 opts,
                 pending: Vec::new(),
                 session: None,
                 last_id: 0,
-            },
+            })),
         };
         Ok(LiveSession { inner })
     }
@@ -49,18 +52,13 @@ impl LiveSession {
     pub fn open(&mut self, query: Query, options: LiveOptions) -> Result<LiveId, QueryError> {
         match &mut self.inner {
             Inner::Model(s) => s.open(query),
-            Inner::Durable {
-                session,
-                pending,
-                last_id,
-                ..
-            } => {
+            Inner::Durable(d) => {
                 check(&query)?;
-                *last_id += 1;
-                let id = LiveId(*last_id);
-                match session {
+                d.last_id += 1;
+                let id = LiveId(d.last_id);
+                match &mut d.session {
                     Some(s) => s.open(id, query, options),
-                    None => pending.push((id, query, options)),
+                    None => d.pending.push((id, query, options)),
                 }
                 Ok(id)
             }
@@ -71,14 +69,14 @@ impl LiveSession {
     pub fn cancel(&mut self, id: LiveId) -> bool {
         match &mut self.inner {
             Inner::Model(s) => s.cancel(id),
-            Inner::Durable {
-                session: Some(s), ..
-            } => s.cancel(id),
-            Inner::Durable { pending, .. } => {
-                let n = pending.len();
-                pending.retain(|(k, ..)| *k != id);
-                pending.len() != n
-            }
+            Inner::Durable(d) => match &mut d.session {
+                Some(s) => s.cancel(id),
+                None => {
+                    let n = d.pending.len();
+                    d.pending.retain(|(k, ..)| *k != id);
+                    d.pending.len() != n
+                }
+            },
         }
     }
 
@@ -89,23 +87,17 @@ impl LiveSession {
     pub fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError> {
         match &mut self.inner {
             Inner::Model(s) => s.next(timeout),
-            Inner::Durable {
-                reader,
-                opts,
-                pending,
-                session,
-                ..
-            } => {
-                if session.is_none() {
-                    let r = reader.durable().expect("a durable reader")?;
+            Inner::Durable(d) => {
+                if d.session.is_none() {
+                    let r = d.reader.durable().expect("a durable reader")?;
                     let mut s =
-                        crate::durable::read::live::Session::new(r, reader.progress(), *opts);
-                    for (id, q, o) in pending.drain(..) {
+                        crate::durable::read::live::Session::new(r, d.reader.progress(), d.opts);
+                    for (id, q, o) in d.pending.drain(..) {
                         s.open(id, q, o);
                     }
-                    *session = Some(s);
+                    d.session = Some(s);
                 }
-                session.as_mut().expect("opened above").next(timeout)
+                d.session.as_mut().expect("opened above").next(timeout)
             }
         }
     }

@@ -242,7 +242,7 @@ pub enum LiveEvent {
         /// The series.
         series: SeriesId,
         /// What the store knew about it at the cut.
-        info: SeriesInfo,
+        info: Box<SeriesInfo>,
         /// Its place among the selected series.
         index: usize,
         /// Its share of the result.

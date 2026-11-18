@@ -189,7 +189,7 @@ fn tail_while_writing_timed() {
     empty_polls(
         "the writer's process, Tail",
         &store.reader(),
-        &[tail.clone()],
+        std::slice::from_ref(&tail),
     );
     empty_polls(
         "the writer's process, Tail and Latest of 400 series",

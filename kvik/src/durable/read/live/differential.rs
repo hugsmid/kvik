@@ -335,7 +335,9 @@ fn static_at_cut(reader: &Reader, s: &Watched, moved: bool) -> Result<(), TestCa
 }
 
 /// What consumers hold as both backends agree on it: positions and staleness set aside (Q-16).
-fn plain(held: &BTreeMap<LiveId, Held>) -> Vec<(LiveId, Option<Vec<(SeriesId, Live)>>, Vec<Fact>)> {
+type Plain = Vec<(LiveId, Option<Vec<(SeriesId, Live)>>, Vec<Fact>)>;
+
+fn plain(held: &BTreeMap<LiveId, Held>) -> Plain {
     let fact = |mut f: Fact| {
         f.position = Position::ORIGIN;
         f

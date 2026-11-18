@@ -678,7 +678,7 @@ fn latest_read(
             l.shown.insert(*id, live.clone());
             out.push(LiveEvent::Joined {
                 series: *id,
-                info,
+                info: Box::new(info),
                 index,
                 part: crate::read::Part::Live(live),
             });

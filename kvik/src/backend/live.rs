@@ -120,7 +120,7 @@ impl Session {
                                 match old.iter().find(|(o, _)| o == k) {
                                     None => mine.push(LiveEvent::Joined {
                                         series: *k,
-                                        info: s.series(SeriesKey::Id(*k))?,
+                                        info: Box::new(s.series(SeriesKey::Id(*k))?),
                                         index,
                                         part: Part::Live(live.clone()),
                                     }),
