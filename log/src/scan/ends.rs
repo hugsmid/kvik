@@ -160,7 +160,7 @@ impl Ends {
                 _ => BLOCK_HEADER_LEN as u64 + len.next_multiple_of(8) <= MAX_BATCH_DATA,
             }
         });
-        let header = plausible.then(|| reads.peek(p, limit)).flatten();
+        let header = plausible.then(|| reads.peek_ahead(p, limit)).flatten();
         let Some(h) = header else {
             return NONE;
         };

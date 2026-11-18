@@ -134,6 +134,7 @@ impl Valid {
         }
     }
 
+    #[inline]
     fn index(&self, p: u64) -> Option<usize> {
         (p.is_multiple_of(8) && p >= self.base && (p - self.base) / 8 <= self.mask)
             .then_some(((p >> 3) & self.mask) as usize)
@@ -145,6 +146,7 @@ impl Valid {
         }
     }
 
+    #[inline]
     pub(crate) fn holds(&self, p: u64) -> bool {
         self.index(p)
             .is_some_and(|i| self.bits[i / 64] & (1 << (i % 64)) != 0)
@@ -235,28 +237,65 @@ impl<'a> Reads<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self, offset: u64, limit: u64) -> Option<BlockHeader> {
         self.peek_raw(offset, limit).map(|(h, _)| h)
     }
 
+    #[inline]
     pub(crate) fn peek_raw(
         &mut self,
         offset: u64,
         limit: u64,
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.headers += 1;
-        self.recent_at(offset, limit).or_else(|| {
-            self.checksums += 1;
-            let found = peek_raw(self.bytes, offset, limit)?;
-            self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
-            if let Some(v) = &mut self.valid {
-                v.mark(offset);
-            }
-            Some(found)
-        })
+        match self.recent_at(offset, limit) {
+            Some(found) => Some(found),
+            None => self.checksum_header(offset, limit),
+        }
     }
 
-    /// A header read again: one of the last two, or one the chain ends found valid, taken without its checksum.
+    /// [`Reads::peek`] for the chain ends, which read each start once: a header found valid before, else checksummed
+    /// and remembered.
+    #[inline]
+    pub(crate) fn peek_ahead(&mut self, offset: u64, limit: u64) -> Option<BlockHeader> {
+        self.headers += 1;
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
+        if self.valid.as_ref().is_some_and(|v| v.holds(offset)) {
+            let raw = slice(self.bytes, offset, BLOCK_HEADER_LEN as u64)?;
+            return Some(BlockHeader {
+                block_type: raw[0],
+                flags: raw[1],
+                body_len: u32_at(raw, 4),
+                body_crc32c: u32_at(raw, 8),
+            });
+        }
+        self.checksums += 1;
+        let (h, _) = peek_raw(self.bytes, offset, limit)?;
+        if let Some(v) = &mut self.valid {
+            v.mark(offset);
+        }
+        Some(h)
+    }
+
+    fn checksum_header(
+        &mut self,
+        offset: u64,
+        limit: u64,
+    ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
+        self.checksums += 1;
+        let found = peek_raw(self.bytes, offset, limit)?;
+        self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
+        if let Some(v) = &mut self.valid {
+            v.mark(offset);
+        }
+        Some(found)
+    }
+
+    /// A header read again: one of the last two, or one found valid since damage, taken without its checksum.
+    #[inline]
     fn recent_at(&self, offset: u64, limit: u64) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
             return None;
