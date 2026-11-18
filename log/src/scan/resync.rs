@@ -165,6 +165,7 @@ impl Chains {
     /// from the prefix table (Q-110), or from the verdicts of a boundary read that walked its chain (`walks`, Q-873).
     /// Once failed reads in a window have checked [`super::FAILED_READ_BUDGET`] bytes of body, the rest of the window
     /// is not read (Q-110).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resync<'a>(
         &mut self,
         reads: &mut Reads<'a>,
