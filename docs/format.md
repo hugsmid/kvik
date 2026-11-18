@@ -840,12 +840,14 @@ its own prefix, which the engine never sees.
 <sid>/log/<generation:8 hex>-<file_id:16 hex>.kvl    a sealed log segment, under its local name
 <sid>/manifest/<generation:8 hex>/<epoch:16 hex>     one manifest record
 <sid>/claims/<generation:8 hex>                      a generation claim marker
+<sid>/uploaded/<generation:8 hex>/<sequence:16 hex>  a last-uploaded marker (Q-614)
 <sid>/probe                                          the conditional-write probe
 <sid>/files/<kind:2 hex>/<generation:8 hex>-<file_id:16 hex>   a file of any other kind (A.1)
 <sid>/probe/<nonce:32 hex>                           a checksum probe; stored only by a bucket that is refused (Q-213)
 ```
   A log segment (kind 1) is only under `log/`; `files/01/` names nothing. A listing of
-  `<sid>/manifest/<generation>/` returns a generation's records in epoch order. Generation 0 has no claim marker; it
+  `<sid>/manifest/<generation>/` returns a generation's records in epoch order, and one of
+  `<sid>/uploaded/<generation>/` its last-uploaded markers in sequence order. Generation 0 has no claim marker; it
   counts as claimed (`spec.md` §8 Generations). A reader ignores a key under `<sid>/` that this table does not name,
   and a key that does not start with a store id (32 lower-case hex digits and `/`). A restore finds the store id by
   listing from the first key: none is `NoStore`, more than one `SeveralStores`; `attach_backup` refuses a bucket
@@ -866,6 +868,30 @@ its own prefix, which the engine never sees.
   key, and a claim is read by whether its key exists (`stat`, Q-163), so the marker holds no store id or version. The nonce makes
   each attempt's marker unique (Q-161). A marker is written once; a restore that restarts before its restore record claims the next generation and never puts a
   marker again.
+- **Last-uploaded marker** (Q-614; an envelope; the version 1 plaintext is 60 bytes exactly): 0 magic ASCII `KVKM`; 4
+  version `u16` (1); 6 reserved (2); 8 generation `u32`, that of its key; 12 reserved (4); 16 sequence `u64`, that
+  of its key, from 1; 24 `epoch` `u64`, the last record of the generation uploaded when it was put; 32 `open` `u64`,
+  the first record of the latest manifest uploaded (the latest rebuild record without field 100, or with none the
+  first record uploaded); 40 `read_first` and 48 `read_last` `u64`, the first and last record a restore of the
+  records uploaded reads (`spec.md` §8 Generations, Q-108), both 0 when it reads none; 56 `marker_crc32c` over bytes
+  0..56. Magic and version keep their offsets in every version; a later version may change the rest, its length
+  included. Checks, in this order: magic; version (another is a version refusal, whatever the length); length;
+  checksum; reserved bytes zero; sequence at least 1; `1 ≤ open ≤ epoch`; the read range both 0, or
+  `1 ≤ read_first ≤ read_last ≤ epoch` with `read_first = open` or `read_last < open`; generation and sequence those
+  of its key. Objects are never
+  overwritten, so a generation's markers are a series with no gap in their sequences, and the latest is the one
+  that counts: a reader lists `<sid>/uploaded/<generation>/` and asks `stat` for the sequences after the highest
+  listed, doubling the step and then halving back, so a listing that lags hides no marker. A marker is put after
+  each record of its generation has been put and before any later object, never before: by the upload driver at
+  its next step, and by a full restore after its restore record (sequence 1). A put that meets another marker's
+  content under its key takes the next sequence. At its first step the upload driver reads the latest marker, the
+  records listed above it and those `stat` reports within 8 epochs after the highest it knows (as a restore asks,
+  Q-612), checks that their uploaded forms chain from the marker's epoch (a break whose predecessor `stat` reports
+  is a lagging listing: the step is retried), and puts a marker at once if they are ahead of it (a restart between a
+  record and its marker, a latest marker that cannot be read, a bucket written before markers). A latest marker of a
+  version it does not read stops its uploads (`UploadError::MarkerVersion`): an earlier version is never put after
+  a later one. A restore checks the latest marker that opens and decodes, passing over and reporting those after it
+  that do not, but never one of a later version (`spec.md` §8 Generations, `api.md` Restore).
 - **Probe** (Q-162). The conditional-write probe at `<sid>/probe` is an envelope whose plaintext is never read. A
   checksum probe at `<sid>/probe/<nonce>` is unsealed: the 19 ASCII bytes `kvik checksum probe` (Q-340).
   `attach_backup`, and a restore before it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to

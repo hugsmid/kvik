@@ -4,6 +4,7 @@
 //! - [`keys`]: the only place an object key is built or parsed.
 //! - [`port`]: the manifest as the upload driver sees it.
 //! - [`upload`]: the upload driver, a step function the store runs on its own thread.
+//! - [`marker`]: the last-uploaded marker a restore checks the records it reads against.
 //! - [`plan`]: what a restore installs, from the records it read.
 //! - [`restore`]: the restore driver.
 //! - [`uploaded`]: the uploaded form of a manifest record and the chain of epochs it names.
@@ -25,6 +26,7 @@ pub mod envelope;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 pub mod keys;
+pub mod marker;
 pub mod plan;
 pub mod port;
 pub mod restore;

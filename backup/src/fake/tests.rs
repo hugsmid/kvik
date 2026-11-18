@@ -294,6 +294,8 @@ fn scripted_restore_replays_then_is_done() {
         record: record(),
         resumed: false,
         unnamed: Vec::new(),
+        marker_fallback: None,
+        earlier_state: None,
     };
     let mut d = ScriptedRestore {
         prepared: [Ok(prepared.clone())].into(),

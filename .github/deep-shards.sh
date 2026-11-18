@@ -74,6 +74,7 @@ backup-upload   backup upload_histories
 backup-plan     backup restore_plan
 backup-restore  backup restore_properties
 backup-chain    backup restore_chain_properties
+backup-marker   backup marker
 export-layout   export layout
 log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::

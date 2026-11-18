@@ -81,8 +81,9 @@ fn the_copy_verified_record_comes_after_its_upload_and_before_the_records_that_n
     assert_eq!(copy_epoch, 3);
     assert!(put(&keys.file(&f)) < copy);
     assert!(copy < put(&keys.record(0, 2)));
-    assert!(put(&keys.record(0, 2)) < put(&keys.record(0, 3)));
-    assert_eq!(ev.last(), Some(&Event::Put(keys.record(0, 3))));
+    assert!(put(&keys.record(0, 2)) < put(&keys.marker(0, 2)));
+    assert!(put(&keys.marker(0, 2)) < put(&keys.record(0, 3)));
+    assert_eq!(ev.last(), Some(&Event::Put(keys.marker(0, 3))));
     assert!(ev.contains(&Event::Append(4, Body::Empty)));
     assert_eq!(h.puts_of(&keys.record(0, 4)), 0);
     h.check_done();
@@ -634,6 +635,9 @@ fn backed_up_through_waits_for_the_copy_verified_record_to_go_up() {
     }
     assert_eq!(h.puts_of(&keys.record(0, 3)), 0);
     assert_eq!(d.progress().backed_up_through, None);
+    assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+    assert_eq!(h.puts_of(&keys.marker(0, 2)), 1);
+    assert_eq!(h.puts_of(&keys.record(0, 3)), 0);
     assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
     assert_eq!(h.puts_of(&keys.record(0, 3)), 1);
     assert_eq!(d.progress().backed_up_through, Some((0, 10)));

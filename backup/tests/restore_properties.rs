@@ -55,7 +55,7 @@ proptest! {
         }
         assert_installed(&fs, &src, &gone);
         prop_assert_eq!(manifest(&fs).1.len(), gone.len());
-        prop_assert_eq!(sink.inner.puts(), if drill { 0 } else { 3 });
+        prop_assert_eq!(sink.inner.puts(), if drill { 0 } else { 4 });
         prop_assert_eq!(p.record.drill, drill);
     }
 

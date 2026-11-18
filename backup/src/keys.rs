@@ -9,6 +9,7 @@
 //! <store_id>/files/<kind:2 hex>/<generation:8 hex>-<file_id:16 hex>   any other kind
 //! <store_id>/manifest/<generation:8 hex>/<epoch:16 hex>
 //! <store_id>/claims/<generation:8 hex>
+//! <store_id>/uploaded/<generation:8 hex>/<sequence:16 hex>         a last-uploaded marker (Q-614)
 //! ```
 
 use std::fmt::Write as _;
@@ -37,6 +38,13 @@ pub enum ObjectName {
     },
     /// A generation's claim marker.
     Claim(u32),
+    /// A last-uploaded marker (Q-614).
+    Marker {
+        /// The generation whose records it names.
+        generation: u32,
+        /// Its sequence number, from 1.
+        sequence: u64,
+    },
     /// The attach probe.
     Probe,
     /// A checksum probe, with its nonce (Q-213).
@@ -115,6 +123,16 @@ impl Keys {
         format!("{}manifest/{generation:08x}/", self.root)
     }
 
+    /// A last-uploaded marker's key (format A.17; Q-614).
+    pub fn marker(&self, generation: u32, sequence: u64) -> String {
+        format!("{}{sequence:016x}", self.markers_prefix(generation))
+    }
+
+    /// The prefix of a generation's last-uploaded markers; a listing returns them in sequence order.
+    pub fn markers_prefix(&self, generation: u32) -> String {
+        format!("{}uploaded/{generation:08x}/", self.root)
+    }
+
     /// What `key` names, if it is one of this store's keys.
     pub fn parse(&self, key: &str) -> Option<ObjectName> {
         let rest = key.strip_prefix(self.root.as_str())?;
@@ -155,6 +173,13 @@ impl Keys {
                 })
             }
             "claims" => Some(ObjectName::Claim(hex(rest, 8)? as u32)),
+            "uploaded" => {
+                let (g, n) = rest.split_once('/')?;
+                Some(ObjectName::Marker {
+                    generation: hex(g, 8)? as u32,
+                    sequence: hex(n, 16)?,
+                })
+            }
             "probe" => Some(ObjectName::ChecksumProbe(bytes16(rest)?)),
             _ => None,
         }
@@ -270,6 +295,12 @@ mod tests {
             k.record(1, 0x10),
             format!("{ROOT}manifest/00000001/0000000000000010")
         );
+        assert_eq!(
+            k.marker(2, 0x11),
+            format!("{ROOT}uploaded/00000002/0000000000000011")
+        );
+        assert!(k.marker(2, 0x11).starts_with(&k.markers_prefix(2)));
+        assert!(!k.marker(2, 0x11).starts_with(&k.markers_prefix(1)));
         assert!(k.record(1, 0x10).starts_with(&k.records_prefix(1)));
         assert!(!k.record(1, 0x10).starts_with(&k.records_prefix(0)));
     }
@@ -313,6 +344,13 @@ mod tests {
             (k.file(&desc(0xfe, 0, 1)), file(0xfe, 0, 1)),
             (k.claim(u32::MAX), ObjectName::Claim(u32::MAX)),
             (
+                k.marker(u32::MAX, u64::MAX),
+                ObjectName::Marker {
+                    generation: u32::MAX,
+                    sequence: u64::MAX,
+                },
+            ),
+            (
                 k.record(5, u64::MAX),
                 ObjectName::Record {
                     generation: 5,
@@ -342,6 +380,9 @@ mod tests {
             format!("{ROOT}manifest/00000001/0000000000000010/x"),
             format!("{ROOT}claims/0000000g"),
             format!("{ROOT}claims/+0000003"),
+            format!("{ROOT}uploaded/00000001/11"),
+            format!("{ROOT}uploaded/00000001"),
+            format!("{ROOT}uploaded/00000001/000000000000001A"),
             format!("{ROOT}other/x"),
             format!("{ROOT}probe/0123456789ABCDEF00010203040506ff"),
             format!("{ROOT}probe/0123456789abcdef00010203040506f"),

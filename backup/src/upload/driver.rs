@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use super::{BackupDriver, Progress, Refused, Step, UploadConfig, UploadError};
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{Keys, ObjectName};
+use crate::marker::Summary;
 use crate::port::ManifestPort;
 use crate::uploaded::{UploadedRecord, opens_manifest};
 use crate::{DriverFuture, LocalStore};
@@ -37,7 +38,7 @@ pub struct Uploader<S, E, M> {
     manifest: M,
     cfg: UploadConfig,
     store_done: bool,
-    cursor: Option<Cursor>,
+    pub(super) cursor: Option<Cursor>,
     sizes: BTreeMap<FileRef, u64>,
     attempt: u32,
     awaiting: Option<Awaiting>,
@@ -48,7 +49,7 @@ pub struct Uploader<S, E, M> {
 
 /// Where the record uploads stand: read from the bucket at the first step, then kept (Q-282).
 #[derive(Debug)]
-struct Cursor {
+pub(super) struct Cursor {
     /// The highest epoch uploaded; every record at or below it is in the bucket.
     uploaded: u64,
     /// The highest epoch read from the manifest.
@@ -57,6 +58,12 @@ struct Cursor {
     pending: VecDeque<UploadedRecord>,
     /// The epoch of each file's copy-verified record written since the last rebuild record.
     copied_at: BTreeMap<FileRef, u64>,
+    /// The records of this generation in the bucket, as this driver knows them (Q-614).
+    pub(super) summary: Summary,
+    /// What the latest marker this driver knows of names; a marker is due while it is behind `summary`.
+    pub(super) marked: Summary,
+    /// The sequence the next marker tries first.
+    pub(super) next_marker: u64,
 }
 
 /// An object `put` but not yet reported by the bucket (Q-284).
@@ -74,13 +81,13 @@ pub(super) enum Stop {
     Fail(UploadError),
 }
 
-type Out<T> = Result<T, Stop>;
+pub(super) type Out<T> = Result<T, Stop>;
 
 pub(super) fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
 
-fn sink_stop(e: SinkError) -> Stop {
+pub(super) fn sink_stop(e: SinkError) -> Stop {
     if e.is_transient() {
         Stop::Retry(e)
     } else {
@@ -89,7 +96,7 @@ fn sink_stop(e: SinkError) -> Stop {
 }
 
 /// A `put` that may have been damaged in transit is repeated; other content under the key is not (Q-284).
-fn put_stop(e: SinkError) -> Stop {
+pub(super) fn put_stop(e: SinkError) -> Stop {
     match e {
         SinkError::HashMismatch { .. } => Stop::Retry(e),
         e => sink_stop(e),
@@ -107,7 +114,7 @@ fn port(e: crate::port::PortError) -> Stop {
     Stop::Fail(UploadError::Port(e))
 }
 
-fn io_stop(e: io::Error) -> Stop {
+pub(super) fn io_stop(e: io::Error) -> Stop {
     Stop::Fail(UploadError::Io(e))
 }
 
@@ -227,6 +234,11 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
     }
 
     async fn next_object(&mut self, snap: &Catalogue, now: Duration) -> Out<bool> {
+        // Q-614: a record's marker goes up before anything after it.
+        if self.marker_due() {
+            self.put_marker(snap.generation()).await?;
+            return Ok(true);
+        }
         let front = self.cursor.as_ref().and_then(|c| c.pending.front());
         if let Some(u) = front
             && ready(&u.record, snap)
@@ -280,6 +292,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         let g = snap.generation();
         let prefix = self.keys.records_prefix(g);
         let mut uploaded = 0u64;
+        let mut listed = Vec::new();
         let mut after: Option<String> = None;
         loop {
             let page = self
@@ -292,6 +305,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
                     && generation == g
                 {
                     uploaded = uploaded.max(epoch);
+                    listed.push(epoch);
                 }
             }
             match page.keys.last() {
@@ -299,11 +313,15 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
                 _ => break,
             }
         }
+        let (marked, summary, next_marker) = self.open_marks(g, listed).await?;
         let mut c = Cursor {
             uploaded,
             scanned: 0,
             pending: VecDeque::new(),
             copied_at: BTreeMap::new(),
+            summary,
+            marked,
+            next_marker,
         };
         take(&mut c, self.manifest.records_after(0).map_err(port)?, snap);
         Ok(c)
@@ -336,6 +354,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         if let Some(c) = self.cursor.as_mut() {
             c.pending.pop_front();
             c.uploaded = c.uploaded.max(r.epoch);
+            c.summary.apply(r);
         }
         Ok(())
     }
@@ -410,7 +429,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         Ok(())
     }
 
-    fn seal(&self, key: &str, plain: &[u8]) -> Out<Vec<u8>> {
+    pub(super) fn seal(&self, key: &str, plain: &[u8]) -> Out<Vec<u8>> {
         let sealed = self
             .envelope
             .seal(key, plain)

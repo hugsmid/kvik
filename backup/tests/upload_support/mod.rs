@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+mod markers;
+
+pub use markers::{check_marker_order, check_markers};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -562,6 +566,8 @@ impl Harness {
             }
         }
         assert_eq!(check_chain(&in_bucket(&self.sink.mem)), Ok(()));
+        check_markers(&self.sink.mem, true);
+        check_marker_order(&log.events, &objects);
         check_order(&log.events, &records, &|f| {
             snap.file(f).is_some_and(|e| e.is_live())
         });

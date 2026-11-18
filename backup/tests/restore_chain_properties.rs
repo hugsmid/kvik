@@ -1,7 +1,7 @@
-//! Property tests of the chain of uploaded records at a restore (Q-611): chains built as the upload driver writes
-//! them, with skipped epochs and rebuilt manifests, restore; one random break among the records a restore checks
-//! refuses it, or makes it retry where the bucket still holds the record; a break before a whole rebuilt manifest
-//! refuses nothing.
+//! Property tests of the chain of uploaded records at a restore (Q-611, Q-614): chains built as the upload driver
+//! writes them, each record followed by its last-uploaded marker, with skipped epochs and rebuilt manifests, restore;
+//! one random break among the records a restore checks refuses it, or makes it retry where the bucket still holds the
+//! record; a break before a whole rebuilt manifest refuses nothing.
 
 mod support;
 
@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use kvik_backup::fake::{MemSink, block_on};
 use kvik_backup::keys::Keys;
+use kvik_backup::marker::Summary;
 use kvik_backup::plan::{PlanMode, records_to_read};
 use kvik_backup::restore::{RestoreDriver, RestoreError};
 use kvik_backup::uploaded::opens_manifest;
@@ -104,8 +105,10 @@ fn bucket(mut src: Source, c: &Chain) -> Arc<FaultSink> {
     let mem = MemSink::new();
     upload_files(&mem, &mut src);
     use_copies(&src);
-    for (p, r) in &c.0 {
+    for (i, (p, r)) in c.0.iter().enumerate() {
         put_record(&mem, ID, *p, r);
+        let summary = Summary::of(c.0[..=i].iter().map(|(_, r)| r));
+        put_marker(&mem, ID, 0, i as u64 + 1, summary);
     }
     Arc::new(FaultSink::new(mem))
 }
@@ -136,17 +139,15 @@ fn start(c: &Chain) -> usize {
         .unwrap()
 }
 
-/// The records a break may hit and the restore must see, from the first record read. A lost record must not be the
-/// last, nor one whose successor opens a rebuilt manifest and so names none: no check sees those (Q-614). A hidden
-/// one may be any, as epochs skip less than `TAIL_PROBES` here. A renamed one is any but the first and those that
-/// open a rebuilt manifest, whose predecessor is fixed.
+/// The records a break may hit and the restore must see, from the first record read. A lost or hidden one may be
+/// any: the last, and one whose successor opens a rebuilt manifest and so names none, the marker sees (Q-614). A
+/// renamed one is any but the first and those that open a rebuilt manifest, whose predecessor is fixed.
 fn targets(c: &Chain, b: Break) -> Vec<usize> {
     let s = start(c);
     let n = c.0.len();
     let opens = |i: usize| opens_manifest(&c.0[i].1);
     match b {
-        Break::Lose => (s..n - 1).filter(|&i| !opens(i + 1)).collect(),
-        Break::Hide => (s..n).collect(),
+        Break::Lose | Break::Hide => (s..n).collect(),
         Break::Rename => (s.max(1)..n).filter(|&i| !opens(i)).collect(),
     }
 }
@@ -200,7 +201,15 @@ proptest! {
                 matches!(r, Err(RestoreError::ListingIncomplete { generation: 0 })),
                 "{:?}", r
             ),
-            Break::Lose | Break::Rename => prop_assert!(
+            Break::Lose => prop_assert!(
+                matches!(
+                    r,
+                    Err(RestoreError::BrokenChain { generation: 0, .. }
+                        | RestoreError::MarkerUnreached { generation: 0, .. })
+                ),
+                "{:?}", r
+            ),
+            Break::Rename => prop_assert!(
                 matches!(r, Err(RestoreError::BrokenChain { generation: 0, .. })),
                 "{:?}", r
             ),

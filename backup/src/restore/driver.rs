@@ -16,15 +16,15 @@ use sha2::{Digest, Sha256};
 
 use super::judge::{FileState, Verdict};
 use super::local::{self, Found, invalid};
+use super::source::{Accept, SourceError, Sourced, source_records};
 use super::{
-    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, probe,
+    MARKER_LISTING_TRIES, Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress,
+    RestoreStep, probe,
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
-use crate::plan::{
-    ChainBreak, PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, after_last, check_chain,
-    read_tail, records_to_read,
-};
+use crate::marker::{self, PutError, Summary};
+use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan};
 use crate::uploaded::UploadedRecord;
 use crate::{DriverFuture, LocalStore};
 
@@ -43,6 +43,8 @@ pub struct Restorer<S, E> {
     run: Option<Run<E>>,
     /// The generation this restorer claimed, kept across failed `prepare` calls (Q-266).
     claimed: Option<Claimed>,
+    /// Consecutive `prepare` calls that found the marker ahead of the listing (Q-614).
+    marker_ahead: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -81,14 +83,17 @@ fn verdict(v: Verdict) -> Fetched {
     }
 }
 
-fn open<E: Envelope>(env: &E, key: &str, bytes: &[u8]) -> Result<Vec<u8>, RestoreError> {
+pub(super) fn open<E: Envelope>(env: &E, key: &str, bytes: &[u8]) -> Result<Vec<u8>, RestoreError> {
     env.open(key, bytes).map_err(|e| match e {
         EnvelopeError::WrongKey => RestoreError::WrongKey,
         e => RestoreError::Envelope(e),
     })
 }
 
-async fn list_all<S: BackupSink>(sink: &S, prefix: &str) -> Result<Vec<String>, RestoreError> {
+pub(super) async fn list_all<S: BackupSink>(
+    sink: &S,
+    prefix: &str,
+) -> Result<Vec<String>, RestoreError> {
     let mut out: Vec<String> = Vec::new();
     loop {
         let after = out.last().cloned();
@@ -208,117 +213,6 @@ async fn claim<S: BackupSink>(
             tries = 0;
         }
     }
-}
-
-/// The records a restore reads (`plan::records_to_read`, Q-108) of the highest generation below `generation` that has
-/// any. A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304). The
-/// records from the first read to the last listed must chain (Q-611), and `stat` must report no record after the last
-/// listed or, where the records read end before the listing, after the last read (Q-612).
-async fn source_records<S: BackupSink, E: Envelope>(
-    sink: &S,
-    env: &E,
-    keys: &Keys,
-    generation: u32,
-) -> Result<(u32, Vec<Record>), RestoreError> {
-    let mut g = generation;
-    while let Some(below) = g.checked_sub(1) {
-        g = below;
-        let mut listed: Vec<(u64, String)> = list_all(sink, &keys.records_prefix(g))
-            .await?
-            .into_iter()
-            .filter_map(|k| match keys.parse(&k) {
-                Some(ObjectName::Record { generation, epoch }) if generation == g => {
-                    Some((epoch, k))
-                }
-                _ => None,
-            })
-            .collect();
-        let incomplete = RestoreError::ListingIncomplete { generation: g };
-        let Some(last) = listed.iter().map(|(e, _)| *e).max() else {
-            // Q-304: absence from a listing proves nothing; a generation's first record is at epoch 1.
-            if sink.stat(&keys.record(g, 1)).await?.is_some() {
-                return Err(incomplete);
-            }
-            continue;
-        };
-        // Q-612: right after the listing, so that a record uploaded since, or hidden by it, is seen.
-        if any_reported(sink, keys, g, after_last(last)).await? {
-            return Err(incomplete);
-        }
-        listed.sort();
-        let mut uploaded: Vec<UploadedRecord> = Vec::with_capacity(listed.len());
-        for (epoch, key) in listed {
-            let plain = open(env, &key, &sink.get(&key, None).await?)?;
-            let u = UploadedRecord::decode(&plain)?;
-            if u.record.epoch != epoch || u.record.generation != g {
-                return Err(RestoreError::Record(
-                    kvik_files::record::RecordError::Invalid(
-                        "an uploaded record under another record's key",
-                    ),
-                ));
-            }
-            uploaded.push(u);
-        }
-        let records: Vec<Record> = uploaded.iter().map(|u| u.record.clone()).collect();
-        let read = records_to_read(&records);
-        // With nothing read the listing starts with an unfinished rebuilt manifest, checked from its first record.
-        let first = read.first().map_or(0, |f| {
-            records.iter().position(|r| r.epoch == f.epoch).unwrap_or(0)
-        });
-        match check_chain(&uploaded[first..]) {
-            Ok(()) => {}
-            Err(ChainBreak::Missing { previous, .. })
-                if reported(sink, keys, g, previous).await? =>
-            {
-                return Err(incomplete);
-            }
-            Err(
-                ChainBreak::Missing { epoch, previous } | ChainBreak::Forked { epoch, previous },
-            ) => {
-                return Err(RestoreError::BrokenChain {
-                    generation: g,
-                    epoch,
-                    previous,
-                });
-            }
-            Err(ChainBreak::Repeated { epoch }) => {
-                return Err(SinkError::Failed {
-                    reason: format!("a listing of generation {g}'s records repeats epoch {epoch}"),
-                }
-                .into());
-            }
-        }
-        if any_reported(sink, keys, g, read_tail(&records, read)).await? {
-            return Err(incomplete);
-        }
-        return Ok((g, read.to_vec()));
-    }
-    Err(PlanError::NoRecords.into())
-}
-
-/// Whether `stat` reports record `epoch` of generation `g`; an unanswered `stat` fails the restore (Q-612).
-async fn reported<S: BackupSink>(
-    sink: &S,
-    keys: &Keys,
-    g: u32,
-    epoch: u64,
-) -> Result<bool, RestoreError> {
-    Ok(sink.stat(&keys.record(g, epoch)).await?.is_some())
-}
-
-/// Whether `stat` reports any of `epochs`, asked in order until one is.
-async fn any_reported<S: BackupSink>(
-    sink: &S,
-    keys: &Keys,
-    g: u32,
-    epochs: impl IntoIterator<Item = u64>,
-) -> Result<bool, RestoreError> {
-    for e in epochs {
-        if reported(sink, keys, g, e).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// The files of generation `g` in the bucket that no record of `source` names (Q-613).
@@ -490,6 +384,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             cfg,
             run: None,
             claimed: None,
+            marker_ahead: 0,
         }
     }
 
@@ -574,8 +469,43 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
                 (generation, nonce)
             }
         };
-        let (source_generation, records) =
-            source_records(&self.sink, &env, &keys, generation).await?;
+        let found = source_records(
+            &self.sink,
+            &env,
+            &keys,
+            generation,
+            Accept {
+                unmarked: self.cfg.accept_unmarked,
+                earlier: self.cfg.accept_earlier_state,
+            },
+        )
+        .await;
+        let Sourced {
+            generation: source_generation,
+            records,
+            fallback,
+            earlier,
+        } = match found {
+            Ok(v) => {
+                self.marker_ahead = 0;
+                v
+            }
+            Err(SourceError::Failed(e)) => {
+                self.marker_ahead = 0;
+                return Err(e);
+            }
+            Err(SourceError::MarkerAhead { generation, epoch }) => {
+                self.marker_ahead = self.marker_ahead.saturating_add(1);
+                if self.marker_ahead >= MARKER_LISTING_TRIES {
+                    return Err(RestoreError::MarkerNotListed {
+                        generation,
+                        epoch,
+                        tries: self.marker_ahead,
+                    });
+                }
+                return Err(RestoreError::ListingIncomplete { generation });
+            }
+        };
         let source = Catalogue::replay(&records)
             .map_err(|_| PlanError::Invalid("the records read contradict each other"))?;
         let unnamed = unnamed(&self.sink, &keys, source_generation, &source).await?;
@@ -591,19 +521,23 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         let written = Record::new(1, generation, wall, plan.record.to_body());
         local::write_manifest(&self.local, store_id, &written, wall)?;
         let appender = local::open_appender(&self.local, store_id)?;
-        self.finish(
-            keys,
-            env,
-            appender,
-            written,
-            plan.record,
-            &[],
-            &store,
-            wall,
-            false,
-            unnamed,
-        )
-        .await
+        let mut p = self
+            .finish(
+                keys,
+                env,
+                appender,
+                written,
+                plan.record,
+                &[],
+                &store,
+                wall,
+                false,
+                unnamed,
+            )
+            .await?;
+        p.marker_fallback = fallback;
+        p.earlier_state = earlier;
+        Ok(p)
     }
 
     /// After the record is synced: settle and upload it, read the claims again (Full), copy `STORE`, list what is
@@ -638,6 +572,13 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             let sealed = env.seal(&key, &plain)?;
             let sha = sha256(&sealed);
             self.sink.put(&key, sealed.into(), sha).await?;
+            // Q-614: the generation's first marker, after its first record.
+            marker::put(&self.sink, &env, &keys, g, 1, Summary::of([&written]))
+                .await
+                .map_err(|e| match e {
+                    PutError::Sink(e) => RestoreError::Sink(e),
+                    PutError::Envelope(e) => RestoreError::Envelope(e),
+                })?;
             let top = highest_claimed(&self.sink, &keys, g).await?;
             if top > g {
                 return Err(RestoreError::Superseded { by: top });
@@ -669,6 +610,8 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             record,
             resumed,
             unnamed,
+            marker_fallback: None,
+            earlier_state: None,
         })
     }
 

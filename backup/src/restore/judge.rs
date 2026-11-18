@@ -106,6 +106,8 @@ mod tests {
             lost_over: 10 * MIN,
             retry_first: Duration::from_secs(1),
             retry_max: Duration::from_secs(120),
+            accept_unmarked: false,
+            accept_earlier_state: false,
         }
     }
 
