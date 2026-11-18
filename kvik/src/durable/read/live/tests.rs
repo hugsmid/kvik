@@ -6,35 +6,40 @@ use crate::config::{ReaderConfig, StoreConfig};
 use crate::durable::tests::block_on;
 use crate::env::{Env, ManualClock, MemFs};
 use crate::read::{
-    Answer, Appended, Live, LiveEvent, LiveOptions, Query, Selection, UpdateBatch, Updated,
+    Answer, Appended, Live, LiveEvent, LiveId, LiveOptions, Part, Query, Selection, UpdateBatch,
+    Updated,
 };
 use crate::series::{Kind, SeriesSpec, ValueType};
 use crate::time::Timestamp;
-use crate::types::{Reading, SeriesId, Value};
+use crate::types::{Fact, Position, Reading, SeriesId, Value};
 use crate::{Reader, Select, Store};
 
-const T0: i64 = 1_767_225_600_000_000_000;
-const TICK: Duration = Duration::from_millis(200);
+pub(super) const T0: i64 = 1_767_225_600_000_000_000;
+/// A step of the clock past both the least batch interval and the poll interval.
+pub(super) const TICK: Duration = Duration::from_millis(200);
 
-struct World {
-    clock: ManualClock,
-    env: Env,
-    dir: PathBuf,
+pub(super) struct World {
+    pub(super) clock: ManualClock,
+    pub(super) env: Env,
+    pub(super) fs: MemFs,
+    pub(super) dir: PathBuf,
 }
 
 impl World {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let clock = ManualClock::new(Timestamp(T0));
         let mut env = Env::test(clock.clone());
-        env.fs = Arc::new(MemFs::new());
+        let fs = MemFs::new();
+        env.fs = Arc::new(fs.clone());
         World {
             clock,
             env,
+            fs,
             dir: PathBuf::from(format!("live/{name}")),
         }
     }
 
-    fn open(&self) -> Store {
+    pub(super) fn open(&self) -> Store {
         block_on(Store::open(
             StoreConfig::new(&self.dir, "Europe/London")
                 .create_if_missing(true)
@@ -43,12 +48,12 @@ impl World {
         .unwrap()
     }
 
-    fn reader(&self) -> Reader {
+    pub(super) fn reader(&self) -> Reader {
         Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap()
     }
 }
 
-fn gauge(name: &str) -> SeriesSpec {
+pub(super) fn gauge(name: &str) -> SeriesSpec {
     SeriesSpec::new(
         name,
         Kind::Gauge {
@@ -58,11 +63,79 @@ fn gauge(name: &str) -> SeriesSpec {
     )
 }
 
-fn emit(w: &World, s: &Store, id: SeriesId, v: f64) {
+pub(super) fn emit(w: &World, s: &Store, id: SeriesId, v: f64) {
     block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(v))])).unwrap();
 }
 
-fn kinds(b: &UpdateBatch) -> Vec<&'static str> {
+/// What a consumer holds of one live read: what applying every event it was sent gives.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Held {
+    pub(super) latest: Option<Vec<(SeriesId, Live)>>,
+    pub(super) tail: Vec<Fact>,
+    pub(super) lagged: Vec<(Position, Position)>,
+    pub(super) gaps: Vec<(Position, Position)>,
+    pub(super) resets: Vec<Position>,
+    pub(super) closed: bool,
+}
+
+impl Held {
+    pub(super) fn apply(&mut self, e: &LiveEvent) {
+        match e {
+            LiveEvent::Opened(Answer::Latest(v)) => self.latest = Some(v.clone()),
+            LiveEvent::Opened(Answer::Tail) => {}
+            LiveEvent::Appended(Appended::Facts(f)) => {
+                if let (Some(last), Some(first)) = (self.tail.last(), f.first()) {
+                    assert!(last.position < first.position, "position order");
+                }
+                assert!(f.windows(2).all(|w| w[0].position < w[1].position));
+                self.tail.extend(f.iter().cloned());
+            }
+            LiveEvent::Updated(Updated::Live { series, live }) => {
+                let v = self.latest.as_mut().expect("opened");
+                let at = v.iter_mut().find(|(k, _)| k == series).expect("shown");
+                at.1 = live.clone();
+            }
+            LiveEvent::Reset { above } => {
+                self.resets.push(*above);
+                self.tail.retain(|f| f.position <= *above);
+            }
+            LiveEvent::Gap { first, last } => {
+                self.gaps.push((*first, *last));
+                self.tail
+                    .retain(|f| f.position < *first || f.position > *last);
+            }
+            LiveEvent::Lagged { from, to } => self.lagged.push((*from, *to)),
+            LiveEvent::Joined {
+                series,
+                index,
+                part: Part::Live(live),
+                ..
+            } => {
+                let v = self.latest.as_mut().expect("opened");
+                assert!(!v.iter().any(|(k, _)| k == series));
+                v.insert(*index, (*series, live.clone()));
+            }
+            LiveEvent::Left { series } => {
+                let v = self.latest.as_mut().expect("opened");
+                v.retain(|(k, _)| k != series);
+            }
+            LiveEvent::Closed(_) => self.closed = true,
+        }
+    }
+}
+
+/// Applies a batch to the consumers of its live reads, checking the order of each read's events.
+pub(super) fn apply(held: &mut std::collections::BTreeMap<LiveId, Held>, b: &UpdateBatch) {
+    let mut last: std::collections::BTreeMap<LiveId, u8> = Default::default();
+    for (id, e) in &b.events {
+        let r = crate::read::event_rank(e);
+        let was = last.insert(*id, r).unwrap_or(0);
+        assert!(was <= r, "event order in {b:?}");
+        held.entry(*id).or_default().apply(e);
+    }
+}
+
+pub(super) fn kinds(b: &UpdateBatch) -> Vec<&'static str> {
     b.events
         .iter()
         .map(|(_, e)| match e {

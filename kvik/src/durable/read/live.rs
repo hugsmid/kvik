@@ -48,8 +48,8 @@ struct TailRead {
     sel: Selection,
     opts: LiveOptions,
     opened: bool,
-    /// The registry as of `from`, for a selection by name (Q-895).
-    names: Option<Registry>,
+    /// The registry as of `from`: names and retirements as known at each fact's position (Q-895).
+    names: Registry,
     /// The position its facts are delivered through.
     from: LogPos,
 }
@@ -125,17 +125,11 @@ fn entry_series(e: &Entry) -> Option<u32> {
     }
 }
 
-fn selects(sel: &Selection, registry: Option<&Registry>, id: u32) -> bool {
-    match registry.and_then(|r| r.get(id)) {
+fn selects(sel: &Selection, registry: &Registry, id: u32) -> bool {
+    match registry.get(id) {
         Some(s) => sel.selects(SeriesId(id), &s.names, s.retired()),
         None => sel.selects(SeriesId(id), &[], false),
     }
-}
-
-fn needs_names(sel: &Selection) -> bool {
-    sel.select
-        .iter()
-        .any(|s| matches!(s, crate::consume::Select::Names(_)))
 }
 
 /// What a batch is computed at: the view, the cut (its durable position, or one inside its round) and `now`.
@@ -252,7 +246,7 @@ impl Session {
                 sel,
                 opts,
                 opened: false,
-                names: None,
+                names: Registry::default(),
                 from: LogPos::default(),
             }),
         };
@@ -519,9 +513,7 @@ impl Session {
                         let wants: Vec<LiveId> = reads
                             .iter()
                             .filter_map(|(k, x)| match x {
-                                Read::Tail(t)
-                                    if t.opened && selects(&t.sel, t.names.as_ref(), id) =>
-                                {
+                                Read::Tail(t) if t.opened && selects(&t.sel, &t.names, id) => {
                                     Some(*k)
                                 }
                                 _ => None,
@@ -552,9 +544,8 @@ impl Session {
                         for x in reads.values_mut() {
                             if let Read::Tail(t) = x
                                 && t.opened
-                                && let Some(names) = t.names.as_mut()
                             {
-                                names.apply(e);
+                                t.names.apply(e);
                             }
                         }
                     }
@@ -568,9 +559,7 @@ impl Session {
                                 && t.opened
                             {
                                 t.from = t.from.min(*above);
-                                if t.names.is_some() {
-                                    t.names = Some(v.latest().registry_at(*above));
-                                }
+                                t.names = v.latest().registry_at(*above);
                             }
                         }
                     }
@@ -600,9 +589,7 @@ fn tail(
     if !t.opened {
         t.opened = true;
         t.from = at.cut;
-        if needs_names(&t.sel) {
-            t.names = Some(at.registry());
-        }
+        t.names = at.registry();
         out.push(LiveEvent::Opened(Answer::Tail));
         return;
     }
@@ -623,9 +610,7 @@ fn tail(
                 to: pos(at.cut),
             });
         }
-        if t.names.is_some() {
-            t.names = Some(at.registry());
-        }
+        t.names = at.registry();
     } else if let Some(facts) = w.facts.get(&id).filter(|f| !f.is_empty()) {
         out.push(LiveEvent::Appended(Appended::Facts(
             facts.iter().map(fact_out).collect(),
@@ -730,5 +715,9 @@ fn latest_read(
     Ok(())
 }
 
+#[cfg(test)]
+mod cases;
+#[cfg(test)]
+mod differential;
 #[cfg(test)]
 mod tests;
