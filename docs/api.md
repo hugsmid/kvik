@@ -532,7 +532,7 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   next call fails, and so does every later one until the store, or the reader process, is restarted
   (`LossesUnknown` for `losses()` and `health()` at every poll, `NotAvailable` for every query). A reader that had not,
   a reader process opened later and the next start pass over it, and its positions are reported by none of them
-  (Q-951, open). A `DataLost` holds health `Degraded` until it is closed (spec §8
+  (Q-951; the limit stands until the removal records of roadmap 6.3b). A `DataLost` holds health `Degraded` until it is closed (spec §8
   Self-repair): restored in full from a copy, its re-send stage ended (`repair_done`, `repair.resend_wait`), or by
   `acknowledge_losses`, which with `repair.acknowledge = Manual` is the only way once the re-send stage has ended. A
   `PossibleLoss` is listed by `losses()`, counted, never degrades, has no state and needs no acknowledgement (spec §8

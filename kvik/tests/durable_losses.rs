@@ -642,7 +642,7 @@ fn a_watch_whose_segment_is_removed_reports_losses_unknown() {
 /// A segment no caught-up reader of the process stands in, removed with no record naming the removal, is passed
 /// over: a caught-up reader opens segments by name and skips one no listing holds (Q-852), as it must for a segment
 /// recovery deleted holding no batch in use. The watch reads on and still finds damage written after it; the removed
-/// positions are reported by no reader (Q-951, for the owner).
+/// positions are reported by no reader until the removal records of roadmap 6.3b (Q-951).
 #[test]
 fn a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found() {
     let w = World::new("passed-over");
