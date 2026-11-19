@@ -3330,12 +3330,22 @@ the log only above the directory's `through`; a directory written in that run li
 would never meet it and would report nothing.
 **Built.** A run whose start met a region that no lost range records writes no series directory and removes those on
 disk (`kvik/src/durable/derived.rs` `hook`), as Q-952 does for a loss found while open; readers then read the log
-whole, as before, until a start finds no such region. The cost: on such a store every reader process reads the whole
-kept log at its first call, and the one-shot tool's `latest` (roadmap 9.0e) is as slow as before the directories.
-**Options.** (a) As built. (b) Write directories over such a region and state that a reader process reports only the
-losses the manifest records, the registry file's recovery entries and what its own reads meet, as the query design's
-section 4 reads; the store's own process still reports the loss. (c) Record the range in the manifest when the start
-meets it (part of roadmap 6.3b, which writes manifest records during a run).
+whole, as before.
+**Options and their costs.**
+(a) As built. Every start reads the whole kept log (`kvik/src/durable/start.rs`), so a damaged region in a sealed
+segment is met at every start, and nothing records it until 6.3b: one damaged block turns the series directory off
+for that store until then. Every reader process, and the one-shot `latest` of roadmap 9.0e, reads the whole kept log
+at its first call for as long (hours on a card after a year at the home rate), and its memory stays bounded. No loss
+goes unreported anywhere.
+(b) Write directories over such a region, and state that a reader process reports only the losses the manifest
+records, the registry file's recovery entries and what its own reads meet, as the query design's section 4 reads.
+Given up: a reader process's `losses()` and health omit a `data_lost` that the store's own process reports, for as
+long as the region stays unrecorded. No wrong fact is shown: the run's fold never held the lost facts, so no
+directory names one.
+(c) Record the range in the manifest when the start meets it: a manifest record written during a start, which is the
+part of roadmap 6.3b that writes lost ranges for damage found in a run (Q-755), brought forward; on the order of 300
+lines with its fault tests, most of them 6.3b's own. Readers then see the range in the manifest, as they see any
+other, and directories are written as usual.
 **Pinned by.** `kvik/tests/derived.rs` `a_run_over_a_region_the_start_meets_and_no_lost_range_records_writes_no_series_directory`
 and `a_query_meeting_a_region_the_start_met_adds_no_loss_and_the_run_writes_no_series_directory`, which replace the
 two tests that pinned a directory written in such a run.
