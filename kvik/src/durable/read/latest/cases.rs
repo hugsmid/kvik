@@ -145,7 +145,7 @@ fn a_pending_fact_falling_due_after_the_directory_is_live_from_its_entry_with_no
 }
 
 #[test]
-fn a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_search_per_call() {
+fn a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_is_searched_for_once() {
     let mut rig = Rig::new("bad");
     rig.emit(&[(0, -30, 0, 0, 0), (0, -4, 1, 0, 0)], false);
     rig.emit(&[(0, -2, 0, 3, 0)], false);
@@ -153,8 +153,12 @@ fn a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_s
     let long = durable(&rig.long);
     assert_eq!(long.searches(), 0);
     rig.emit(&[(0, -4, 0, 3, 0)], true);
-    rig.agrees(&rig.long, 0);
+    for _ in 0..3 {
+        rig.agrees(&rig.long, 0);
+    }
     assert_eq!(long.searches(), 1);
+    // A fact folded since ends what was found.
+    rig.emit(&[(0, -40, 1, 0, 0)], false);
     rig.agrees(&rig.long, 0);
     assert_eq!(long.searches(), 2);
     // A reader continuing the directory reads the entry's unsure mark.
@@ -525,4 +529,35 @@ fn a_directory_behind_a_loss_a_later_start_records_is_not_continued() {
     let r = rig.reader();
     assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-AAA"));
     assert!(!durable(&r).seeded());
+}
+
+#[test]
+fn a_value_ahead_the_state_cannot_name_is_found_once_until_the_next_falls_due() {
+    let mut rig = Rig::new("next-value");
+    // A scheduled series given four values, three of them ahead: the entry names the earliest only.
+    rig.emit(
+        &[
+            (1, -4, 0, 0, 0),
+            (1, 30, 1, 0, 0),
+            (1, 60, 0, 0, 0),
+            (1, 90, 1, 0, 0),
+        ],
+        false,
+    );
+    rig.directory();
+    let readers = [rig.reader(), rig.store.as_ref().unwrap().reader()];
+    rig.clock.advance(Duration::from_secs(31));
+    for r in &readers {
+        for _ in 0..5 {
+            rig.agrees(r, 1);
+        }
+        assert_eq!(durable(r).searches(), 1);
+    }
+    rig.clock.advance(Duration::from_secs(30));
+    for r in &readers {
+        for _ in 0..5 {
+            rig.agrees(r, 1);
+        }
+        assert_eq!(durable(r).searches(), 2);
+    }
 }

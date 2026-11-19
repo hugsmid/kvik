@@ -17,13 +17,10 @@ use kvik_log::directory::{DerivedError, Family};
 use kvik_log::lease::CutEnd;
 use kvik_log::manifest::LostRange;
 use kvik_log::mark::ResetStamp as LogStamp;
-use kvik_log::reader::{
-    FoundFact, LogReader, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError, Wanted,
-};
+use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError};
 use kvik_log::writer::Position as LogPos;
 
 use super::clock::Clocks;
-use super::derived::state::Kept;
 use super::index::{Index, Stored, pos};
 use super::loss::{Find, Latch};
 use super::read::cut;
@@ -120,6 +117,8 @@ pub(crate) struct DurableReader {
     /// The full facts of candidates the fold did not meet, read once each, by series.
     rows: Mutex<BTreeMap<u32, Stored>>,
     rows_read: AtomicBool,
+    /// The live facts searched for, by series, while each holds (Q-1004).
+    searched: Mutex<BTreeMap<u32, latest::Searched>>,
     /// Live values found in the log because a state could not tell.
     searches: AtomicU64,
     /// The first round continued a series directory.
@@ -328,6 +327,7 @@ impl DurableReader {
             lookups: Mutex::new(None),
             rows: Mutex::new(BTreeMap::new()),
             rows_read: AtomicBool::new(false),
+            searched: Mutex::new(BTreeMap::new()),
             searches: AtomicU64::new(0),
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
@@ -660,76 +660,6 @@ impl DurableReader {
         }
     }
 
-    /// The facts in the `wanted` ranges at `v`'s cut, read from the log (Q-1004): the regions the manifest records or
-    /// the process found are lost, any other damage or a segment that cannot be read is `NotAvailable`, and a mark
-    /// under another reset stamp or generation than the cut's ends it.
-    pub(crate) fn lookup(&self, v: &View, wanted: &[Wanted]) -> Result<Vec<FoundFact>, QueryError> {
-        let mut g = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
-        if g.is_none() {
-            *g = Some(
-                self.second_reader()
-                    .map_err(|e| query_error(&self.dir, e))?,
-            );
-        }
-        let reader = g.as_mut().expect("opened above");
-        #[cfg(test)]
-        self.lookups_made.fetch_add(1, Ordering::Relaxed);
-        let recorded = v.lost_ranges();
-        let skip = |file_id: u64, start: u64, end: u64| {
-            recorded.iter().any(|l| {
-                l.file_id == file_id
-                    && l.offset <= start
-                    && end <= l.offset.saturating_add(l.length)
-            }) || self.latch.covers(file_id, start, end)
-        };
-        let l = reader
-            .lookup(wanted, &skip)
-            .map_err(|e| query_error(&self.dir, e))?;
-        let cut = v.cut();
-        if l.stamp != cut.stamp
-            || l.durable.generation != cut.durable.generation
-            || l.durable < cut.durable
-        {
-            return Err(QueryError::CutExpired);
-        }
-        if l.complete.iter().any(|c| !c) {
-            return Err(QueryError::NotAvailable {
-                reason: "a log segment that may hold the series cannot be read".into(),
-            });
-        }
-        Ok(l.facts
-            .into_iter()
-            .filter(|f| f.position <= cut.durable)
-            .collect())
-    }
-
-    /// The full fact of series `id`'s candidate `k`, which the fold did not meet: read at its position once, with
-    /// every such candidate of `v` the first time (Q-1004).
-    pub(crate) fn resolved(
-        &self,
-        v: &View,
-        id: u32,
-        k: Kept,
-        now: i64,
-    ) -> Result<Option<Stored>, QueryError> {
-        let hit = |rows: &BTreeMap<u32, Stored>| {
-            rows.get(&id).filter(|s| s.position == k.position).cloned()
-        };
-        if let Some(s) = hit(&self.rows.lock().unwrap_or_else(PoisonError::into_inner)) {
-            return Ok(Some(s));
-        }
-        let first = !self.rows_read.swap(true, Ordering::SeqCst);
-        let read = latest::rows_for(self, v, id, k, now, first)?;
-        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        rows.extend(read);
-        Ok(hit(&rows))
-    }
-
-    /// Counts a live value found in the log because a state could not tell.
-    pub(crate) fn count_search(&self) {
-        self.searches.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Live values found in the log because a state could not tell.
     #[cfg(test)]
     pub(crate) fn searches(&self) -> u64 {
@@ -802,5 +732,6 @@ pub(crate) fn losses_of(v: &View) -> Vec<LossReport> {
     out
 }
 
+mod at_cut;
 #[cfg(test)]
 mod tests;

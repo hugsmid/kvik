@@ -3379,21 +3379,28 @@ Decided by the lead with roadmap 9.0c, for review.
 candidate is the answer when the state is sure, the candidate lies at or below `now`, an observed interval reading is
 ready, and its reading is valid (spec §2.3). Where the fold met the candidate the reader holds its full fact, at most
 three per series (the candidate and the earliest and latest fact ahead). A candidate continued from a directory is
-read once at its position, every such candidate of the view at the first need (one lookup), and kept. Otherwise (an
+read once at its position, every such candidate of the view at the first need (one lookup), and kept; each is read
+from the one segment that holds its position, found by the segments' header base sequences, with no listing of
+`log/` and no sealed segment's index read (`LogReader::lookup_at`). Otherwise (an
 unsure mark, more pending facts than the state names, a candidate above `now` or not yet ready, a reading that is not
 valid) the live fact is searched for backwards in event time from `now` at the call's cut, in spans that double from
 the recent window's, through the A.8 indexes; this is the only read whose cost grows with how long the series has
-been quiet. A lookup that cannot read a place that may hold the range is `NotAvailable`, never absence. A fact a
+been quiet. What a search finds is kept, with the first time a fact it saw after it may become live (one lookup
+forward), and answers again while the series folds no further fact under the same reset stamp: a value ahead that
+the state cannot name is found once until the next falls due (the query design's section 4). A lookup that cannot read a place that may hold the range is `NotAvailable`, never absence. A fact a
 directory names that a complete lookup does not find is `NotAvailable` too, unless a lost range the manifest records
 holds its position: a segment removed before the lookups' reader opened is passed over by it as by any reader opened
 since (Q-951), and the entry is the only witness. The lookups use a log reader of their own, opened at the first
 lookup and renewed only by lookups; a lookup under another reset stamp or generation than the cut's, or behind it,
 ends with `CutExpired`.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
-`a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_search_per_call`,
+`a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_is_searched_for_once`,
 `a_candidate_above_the_readers_now_is_not_live`,
 `future_and_outranked_facts_are_live_only_when_current_and_due_with_no_search`,
 `a_quiet_series_candidate_is_read_once_with_every_other_unmet_one`,
+`a_value_ahead_the_state_cannot_name_is_found_once_until_the_next_falls_due`; `log/tests/reader_start.rs`
+`a_lookup_at_positions_reads_one_segment_each_and_finds_what_a_lookup_by_time_finds`,
+`a_lookup_at_a_position_whose_segment_is_gone_never_finds_it_elsewhere`; and in `cases.rs`
 `a_text_candidate_in_a_maximal_batch_is_read_whole_from_its_position`,
 `a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over`.
 

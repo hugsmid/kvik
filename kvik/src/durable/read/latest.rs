@@ -18,7 +18,8 @@ use kvik_log::content::Item;
 use kvik_log::directory::series::SeriesDirectory;
 use kvik_log::entries::{Entry, Versioning};
 use kvik_log::manifest::LostRange;
-use kvik_log::reader::{FoundFact, ReadEvent, Wanted};
+use kvik_log::mark::ResetStamp as LogStamp;
+use kvik_log::reader::{FoundFact, ReadEvent, Wanted, WantedAt};
 use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 use kvik_model as km;
@@ -296,6 +297,11 @@ impl Latest {
         }
     }
 
+    /// The facts of series `id` folded, those of a continued entry counted.
+    pub(crate) fn fact_count(&self, id: u32) -> u64 {
+        self.series.get(&id).map_or(0, |h| h.state.count())
+    }
+
     /// Every series whose candidate at `now` the fold did not meet, with it.
     pub(crate) fn unmet(&self, now: i64) -> Vec<(u32, Kept)> {
         self.series
@@ -377,22 +383,83 @@ fn search(
     }
 }
 
+/// A live fact searched for in the log, kept while it is the answer: while its series folds no further fact, under
+/// the same reset stamp, for a `now` from the one it was found at up to the first time a fact the search saw ahead of
+/// it may become live (the query design's section 4: the reader finds the next value once).
+#[derive(Clone, Debug)]
+pub(crate) struct Searched {
+    facts: u64,
+    stamp: LogStamp,
+    from: i64,
+    until: i64,
+    found: Option<Stored>,
+}
+
+/// [`search`], or the fact a search found before while it still holds.
+fn searched(
+    r: &DurableReader,
+    v: &View,
+    series: &Series,
+    p: &Params,
+    now: i64,
+) -> Result<Option<Stored>, QueryError> {
+    let id = series.def.id;
+    let facts = v.latest().fact_count(id);
+    let stamp = v.state().stamp;
+    if let Some(s) = r
+        .searched(id)
+        .filter(|s| s.facts == facts && s.stamp == stamp && s.from <= now && now < s.until)
+    {
+        return Ok(s.found);
+    }
+    let found = search(r, v, series, p, now)?;
+    let versioned = series.def.versioning != Versioning::None;
+    // Every current fact after the one found that is valid is ahead of `now` or not yet ready: the first of them to
+    // become live ends what the search found.
+    let after = found
+        .as_ref()
+        .map_or(i64::MIN, |s| s.row.t.saturating_add(1));
+    let ahead = [Wanted {
+        series_id: id,
+        from: after,
+        to: i64::MAX,
+    }];
+    let until = current(r.lookup(v, &ahead)?, versioned)
+        .values()
+        .filter(|s| windows::reading_of(series, s).is_some())
+        .map(|s| p.ready_at(s.row.t))
+        .filter(|t| *t > now)
+        .min()
+        .unwrap_or(i64::MAX);
+    r.keep_searched(
+        id,
+        Searched {
+            facts,
+            stamp,
+            from: now,
+            until,
+            found: found.clone(),
+        },
+    );
+    Ok(found)
+}
+
 /// The facts at the positions `wanted` names, from the log at `v`'s cut, by series.
 fn resolve(
     r: &DurableReader,
     v: &View,
     wanted: &[(u32, Kept)],
 ) -> Result<BTreeMap<u32, Stored>, QueryError> {
-    let ranges: Vec<Wanted> = wanted
+    let at: Vec<WantedAt> = wanted
         .iter()
-        .map(|(id, k)| Wanted {
+        .map(|(id, k)| WantedAt {
             series_id: *id,
-            from: k.t,
-            to: k.t,
+            t: k.t,
+            position: k.position,
         })
         .collect();
     let mut out = BTreeMap::new();
-    for f in r.lookup(v, &ranges)? {
+    for f in r.lookup_at(v, &at)? {
         let id = f.row.series_id;
         if wanted
             .iter()
@@ -439,8 +506,8 @@ pub(crate) fn live(
         Judged::Fact(s) if windows::reading_of(series, &s).is_some() => Some(s),
         Judged::Row(k) => match r.resolved(v, id.0, k, now)? {
             Some(s) if windows::reading_of(series, &s).is_some() => Some(s),
-            Some(_) => search(r, v, series, &p, now)?,
-            None if recorded_lost(v.lost_ranges(), k.position) => search(r, v, series, &p, now)?,
+            Some(_) => searched(r, v, series, &p, now)?,
+            None if recorded_lost(v.lost_ranges(), k.position) => searched(r, v, series, &p, now)?,
             // A fact the directory names that the log no longer holds, as a segment removed before the lookup's
             // reader opened (Q-951): never read as absence (Q-1004).
             None => {
@@ -449,7 +516,7 @@ pub(crate) fn live(
                 });
             }
         },
-        Judged::Fact(_) | Judged::Unsure => search(r, v, series, &p, now)?,
+        Judged::Fact(_) | Judged::Unsure => searched(r, v, series, &p, now)?,
     };
     Ok(match fact {
         Some(s) => windows::live_with(&p, r.clocks(), id, &s, now),

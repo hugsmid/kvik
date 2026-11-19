@@ -85,6 +85,11 @@ impl State {
         [self.pending, self.last_ahead]
     }
 
+    /// The facts folded, a fact a state continued from a file counted.
+    pub(crate) fn count(&self) -> u64 {
+        self.facts
+    }
+
     /// The latest recorded `t` and the lateness reference (spec §2.2).
     pub(crate) fn latest(&self) -> (Option<i64>, Option<i64>) {
         (self.latest_t, self.reference)
