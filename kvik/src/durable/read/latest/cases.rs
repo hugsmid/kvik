@@ -3,10 +3,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::tests::{Rig, S, plain, write_directory, write_directory_under};
+use super::tests::{
+    Rig, S, newest_directory, plain, restamp_directory, write_directory, write_directory_under,
+};
 use crate::config::LogConfig;
 use crate::durable::reader::DurableReader;
-use crate::env::Fs;
+use crate::env::{Fs, OpenMode};
 use crate::error::QueryError;
 use crate::health::LossKind;
 use crate::read::Live;
@@ -84,6 +86,19 @@ impl Rig {
     }
 
     /// The one log segment holding `bytes`.
+    /// Emits texts enough to fill a 16 MiB segment, which then seals by size, at times from `from` on.
+    fn fill(&mut self, from: i64) {
+        for round in 0..3 {
+            let readings: Vec<Reading> = (0..26_000i64)
+                .map(|k| {
+                    let t = from + k + round * 30_000;
+                    Reading::new(self.ids[2], Timestamp(t), Value::Text(format!("{k:0>255}")))
+                })
+                .collect();
+            self.emit_readings(&readings, Intent::Normal);
+        }
+    }
+
     fn holding(&self, bytes: &[u8]) -> std::path::PathBuf {
         let mut found = self.segments().into_iter().filter(|p| {
             self.fs
@@ -319,16 +334,7 @@ fn a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over
         &[Reading::new(rig.ids[0], rig.at(-4), Value::F64(v))],
         Intent::Normal,
     );
-    // Texts enough to fill the segment, which then seals by size.
-    for round in 0..3 {
-        let readings: Vec<Reading> = (0..26_000i64)
-            .map(|k| {
-                let t = rig.at(-3).0 - 26_000 + k + round * 30_000;
-                Reading::new(rig.ids[2], Timestamp(t), Value::Text(format!("{k:0>255}")))
-            })
-            .collect();
-        rig.emit_readings(&readings, Intent::Normal);
-    }
+    rig.fill(rig.at(-3).0 - 26_000);
     let sealed = rig.wait_sealed_with(&v.to_le_bytes());
     rig.directory();
     rig.emit_readings(&[rig.note(-2, "NOTE-NEW")], Intent::Normal);
@@ -575,4 +581,99 @@ fn the_writers_own_reader_reads_no_file_while_the_writer_has_made_nothing_durabl
     let read = durable(&other).parts_taken();
     rig.agrees(&other, 0);
     assert!(durable(&other).parts_taken() > read);
+}
+
+#[test]
+fn a_directory_candidate_inside_a_recorded_lost_range_is_searched_for_not_unavailable() {
+    let log = LogConfig {
+        segment_size: 16 << 20,
+        max_batch_bytes: 8 << 20,
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("candidate-lost", log);
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
+    rig.emit(&[(0, -4, 1, 0, 0)], false);
+    rig.directory();
+    let folded = newest_directory(&rig.fs, &rig.dir);
+    rig.power_loss();
+    rig.damage(b"NOTE-BBB");
+    rig.reopen();
+    // Older texts, which leave the live value alone, seal the segment the start recorded the range in, so that a
+    // start after a directory through the mark meets no damage.
+    rig.fill(rig.at(-90).0);
+    let sealed = rig.wait_sealed_with(b"OTE-BBB");
+    rig.emit(&[(0, -3, 1, 0, 0)], false);
+    assert_ne!(rig.holding(&rig.at(-3).0.to_le_bytes()), sealed);
+    rig.shut();
+    restamp_directory(&rig.env, &rig.dir, &folded, 1);
+    let r = rig.reader();
+    assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-AAA"));
+    let d = durable(&r);
+    assert!(d.seeded() && !d.footprint().1);
+    assert_eq!(d.searches(), 1);
+}
+
+#[test]
+fn a_candidate_read_at_its_position_is_never_taken_for_another_fact_at_its_time() {
+    let mut rig = Rig::new("candidate-position");
+    rig.emit(&[(3, -4, 0, 0, 2)], false);
+    // Outranked: an older version at the same time, at a later position.
+    rig.emit(&[(3, -4, 1, 0, 1)], true);
+    rig.directory();
+    let r = rig.reader();
+    let Live::Value(v) = r.live(rig.ids[3]).unwrap() else {
+        panic!("a live value");
+    };
+    assert_eq!(v.fact.changed_at, Some(2));
+    let d = durable(&r);
+    assert!(d.seeded());
+    assert_eq!((d.lookups(), d.searches()), (1, 0));
+}
+
+#[test]
+fn a_registry_file_of_another_generation_or_above_the_mark_is_passed_over() {
+    use kvik_log::registry::{self, RegistryFile};
+    let mut rig = Rig::new("registry-file");
+    rig.emit(&[(0, -4, 1, 0, 0)], false);
+    rig.directory();
+    rig.shut();
+    let fs = &*rig.env.fs;
+    let store_id = kvik_log::store::read_descriptor(fs, &rig.dir)
+        .unwrap()
+        .store_id;
+    let (newest, file) = registry::read_latest(fs, &rig.dir, &store_id)
+        .unwrap()
+        .expect("a registry file");
+    // Without its definitions: a reader that took it would know no series.
+    let bare = RegistryFile {
+        entries: Vec::new(),
+        max_series_id: 0,
+        ..file.clone()
+    };
+    let forged = [
+        RegistryFile {
+            through: file.through + 1_000,
+            ..bare.clone()
+        },
+        RegistryFile {
+            generation: file.generation + 1,
+            ..bare
+        },
+    ];
+    for f in &forged {
+        let id = newest + 1;
+        let path = rig
+            .dir
+            .join("registry")
+            .join(registry::file_name(f.generation, id));
+        let out = fs.open(&path, OpenMode::CreateNew).unwrap();
+        out.write_at(&registry::encode(f, store_id, id, 0).unwrap(), 0)
+            .unwrap();
+        drop(out);
+        let r = rig.reader();
+        assert!(r.live(rig.ids[0]).is_ok(), "{f:?}");
+        assert!(durable(&r).seeded());
+        fs.remove_file(&path).unwrap();
+    }
 }

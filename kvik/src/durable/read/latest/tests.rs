@@ -445,7 +445,7 @@ pub(super) fn plain(l: Live) -> Live {
 /// With the store shut down: a series directory as the writer's fold gives it as of the `k`-th batch boundary (in
 /// a cycle; the last for `usize::MAX`), written as the newest generation, under the registry file the clean stop
 /// wrote (Q-1001). `None` without a batch.
-pub(super) fn write_directory(
+pub(in crate::durable::read) fn write_directory(
     env: &Env,
     dir: &Path,
     k: usize,
@@ -513,6 +513,50 @@ pub(super) fn write_directory_under(
     let bytes = d.encode(frame, store_id).unwrap();
     kvik_log::directory::write_file(&*env.fs, dir, Family::Series, id, &bytes).unwrap();
     Some(through)
+}
+
+/// The newest series directory's bytes.
+pub(super) fn newest_directory(fs: &MemFs, dir: &Path) -> Vec<u8> {
+    let (_, path) = kvik_log::directory::generations(fs, dir, Family::Series)
+        .into_iter()
+        .next()
+        .expect("a series directory");
+    fs.read(&path).unwrap()
+}
+
+/// Writes the series directory `bytes` again as of the mark, under its reset stamp and through its position, claiming
+/// `lost` lost entries below: a directory the reader's checks accept whatever the log lost since it was folded.
+pub(super) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) {
+    let fs = &*env.fs;
+    let store_id = kvik_log::store::read_descriptor(fs, dir).unwrap().store_id;
+    let (frame, d) = SeriesDirectory::decode(bytes, &store_id).unwrap();
+    let clock = Arc::new(kvik_log::writer::SystemClock::default());
+    let mut log = LogReader::open(LogReaderConfig::new(
+        dir,
+        env.fs.clone(),
+        clock,
+        env.boot.current(),
+        [0xae; 16],
+    ))
+    .unwrap();
+    let st = log.refresh().unwrap().state;
+    let _ = log.close();
+    let d = SeriesDirectory {
+        through: st.durable,
+        stamp: Some(st.stamp),
+        lost,
+        ..d
+    };
+    let id = kvik_log::directory::generations(fs, dir, Family::Series)
+        .first()
+        .map_or(frame.file_id, |(id, _)| *id)
+        + 1;
+    let frame = Frame {
+        file_id: id,
+        ..frame
+    };
+    let bytes = d.encode(frame, store_id).unwrap();
+    kvik_log::directory::write_file(fs, dir, Family::Series, id, &bytes).unwrap();
 }
 
 /// Runs a history and checks at its end.

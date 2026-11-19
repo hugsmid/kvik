@@ -191,25 +191,28 @@ mod tests {
                         return;
                     }
                     left -= 1;
-                    let b = m.read(&path).unwrap();
-                    let (_, mark) = kvik_log::mark::read_mark(&b, &store_id(&b))
-                        .unwrap()
-                        .unwrap();
-                    let next = kvik_log::mark::MarkSlot {
-                        counter: mark.counter + 1,
-                        stamp: kvik_log::mark::ResetStamp::new_at(
-                            mark.last_sequence + u64::from(n),
-                        ),
-                        ..mark
-                    };
-                    m.poke(
-                        &path,
-                        0,
-                        &kvik_log::mark::encode_mark_file([Some(next), None]),
-                    );
+                    new_stamp(m, &path, u64::from(n));
                 }))),
             );
         }
+    }
+
+    /// Writes a mark under a reset stamp not seen before, `k` past the mark's last sequence.
+    fn new_stamp(m: &MemFs, path: &Path, k: u64) {
+        let b = m.read(path).unwrap();
+        let (_, mark) = kvik_log::mark::read_mark(&b, &store_id(&b))
+            .unwrap()
+            .unwrap();
+        let next = kvik_log::mark::MarkSlot {
+            counter: mark.counter + 1,
+            stamp: kvik_log::mark::ResetStamp::new_at(mark.last_sequence + k),
+            ..mark
+        };
+        m.poke(
+            path,
+            0,
+            &kvik_log::mark::encode_mark_file([Some(next), None]),
+        );
     }
 
     fn facts(r: &DurableReader) -> Result<usize, QueryError> {
@@ -308,6 +311,58 @@ mod tests {
             facts(&twice).unwrap(),
             2,
             "nothing of the failed call was kept"
+        );
+    }
+
+    #[test]
+    fn a_reset_between_the_directorys_check_and_the_first_pass_breaks_the_state() {
+        let rig = Rig::new("cut-seed-reset");
+        let dir = Path::new(rig.dir);
+        crate::durable::read::latest::tests::write_directory(&rig.env, dir, usize::MAX)
+            .expect("a batch");
+        let control = rig.reader();
+        control.refresh().unwrap();
+        assert!(control.seeded() && !control.footprint().1);
+        let r = rig.reader();
+        let path = dir.join("log/MARK");
+        // Read 0 is the seed's, read 1 the first pass's.
+        *rig.fs.hook.lock().unwrap() = (
+            0,
+            Some(HookBox(Box::new(move |m: &MemFs, n: u32| {
+                if n == 1 {
+                    new_stamp(m, &path, 1);
+                }
+            }))),
+        );
+        r.refresh().unwrap();
+        assert!(
+            r.footprint().1,
+            "the state broke and the fact index answers"
+        );
+        assert_eq!(facts(&r).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_lookup_under_another_reset_stamp_than_its_cut_is_cut_expired() {
+        let rig = Rig::new("cut-lookup-stamp");
+        let r = rig.reader();
+        let path = Path::new(rig.dir).join("log/MARK");
+        let all = [kvik_log::reader::Wanted {
+            series_id: 1,
+            from: i64::MIN,
+            to: i64::MAX,
+        }];
+        let before = r.with_latest(|v| r.lookup(v, &all).map(|f| f.len()));
+        assert_eq!(before.unwrap(), 2);
+        let mut during = None;
+        let _ = r.with_latest(|v| {
+            new_stamp(&rig.fs.inner, &path, 1);
+            during = Some(r.lookup(v, &all).map(|f| f.len()));
+            Ok(())
+        });
+        assert!(
+            matches!(during, Some(Err(QueryError::CutExpired))),
+            "{during:?}"
         );
     }
 }

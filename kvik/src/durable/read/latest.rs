@@ -565,4 +565,4 @@ mod cases;
 #[cfg(test)]
 mod snapshots;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
