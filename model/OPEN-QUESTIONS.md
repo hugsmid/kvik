@@ -3447,14 +3447,25 @@ lost no position a query shows, so no gap), a range another read of the process 
 ranges, as the views forget them), and a lost range the manifest records that the session had not seen (a start
 recorded it). A batch never carries a fact inside a gap or above a reset it names, a `Tail`'s consumer drops facts
 it already holds inside a gap, and a `Latest` is opened again after any reset or gap, so it never shows a lost
-fact. Gaps are not narrowed to what a `Tail` delivered: one below its opening drops nothing. The model backend has
-neither resets nor losses, so these kinds are checked against the history a reader opened afterwards reads and the
-static read at the batch's cut.
+fact. Gaps are not narrowed to what a `Tail` delivered: one below its opening drops nothing. A batch a row limit
+stops (Q-1014) names every gap among what the session took, past the stop too, and takes no fact a later void or
+gap drops, so its cut lies below every void after it, which the next batch applies; a round the shared tail trims
+keeps each void and gap where it stood. A range another read found reaches the shared tail by the session's own
+refresh before a batch could carry its fact. The `Opened` after a `Reset` is a `Latest`'s whole answer; a `Tail`'s
+says only that it goes on from `above`, its consumer keeping what it holds at or below it. The model backend has
+neither resets nor losses, so these kinds are checked against the history a reader opened afterwards reads, the
+losses the writer and a reader opened afterwards report (each named to the `Tail`, none of its facts inside one)
+and the static read of a reader opened afterwards.
 **Pinned by.** `kvik/src/durable/read/live/cases.rs`
 `a_reset_voids_what_the_tail_holds_above_it_and_opens_latest_again`,
+`a_reset_that_voids_an_alias_takes_it_from_what_a_tail_selects_by`,
 `damage_a_tail_meets_is_a_gap_and_its_fact_is_never_shown`,
 `a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back`,
-`a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail`.
+`a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail`; `kvik/src/durable/read/live/stops.rs`
+`a_row_limited_batch_never_carries_a_fact_the_reader_already_reports_lost`,
+`a_gap_after_a_row_limit_stop_is_named_in_that_batch_and_survives_the_round_s_trim`;
+`kvik/src/durable/read/live/lags.rs`
+`a_loss_found_after_delivery_in_a_round_since_trimmed_is_still_named_to_a_lagging_tail`.
 
 ## Q-1012 — A live read's selection, membership and canonical order
 Decided by the lead with roadmap 9.0d, for review.
@@ -3482,12 +3493,18 @@ session allows (`max_backlog_rows`, and `max_backlog_bytes` counted as the bytes
 log's); past it the oldest refreshes keep only their voids and gaps, and a refresh that alone reads more keeps none of
 its facts. A session that needs facts no longer kept, or whose backlog passes the limit of any of its `Tail`s, lags:
 each `Tail` gets `Lagged { from, to }` up to the batch's cut and continues there, and each `Latest` judges every member
-again (it coalesces by construction). The lag is the session's, not a read's, so that one batch keeps one cut. A
-session not polled for `cut_max_age` is marked idle by the next refresh from any call, holds nothing more, and its
-next call returns `Closed(Idle)` for each read; a read opened afterwards starts afresh.
+again (it coalesces by construction). `Lagged.from` is the position after the last one the `Tail` stood at. The lag
+is the session's, not a read's, so that one batch keeps one cut. Refreshes that read nothing keep one round for a run
+of them, so a subscriber not called holds a round per refresh that read something, not per refresh. A session whose
+`next` was not called for `cut_max_age` (any call counts, whatever it found) is marked idle by the next refresh from
+any call, holds nothing more, and its next call returns `Closed(Idle)` for each read; a read opened afterwards starts
+afresh.
 **Pinned by.** `kvik/src/durable/read/live/cases.rs`
 `a_slow_tail_gets_lagged_to_the_mark_and_the_shared_tail_stays_within_its_backlog`,
-`a_session_not_polled_for_the_cut_age_is_closed_as_idle`.
+`a_session_not_polled_for_the_cut_age_is_closed_as_idle`; `kvik/src/durable/read/live/lags.rs`; and
+`kvik/src/durable/read/live/waits.rs`
+`a_session_polled_through_a_spell_longer_than_the_cut_age_is_not_closed_in_either_process`,
+`refreshes_that_read_nothing_keep_one_round_for_a_session_not_called`.
 
 ## Q-1014 — A row limit met inside one refresh's read
 Decided by the lead with roadmap 9.0d, for review.
@@ -3507,7 +3524,11 @@ Decided by the lead with roadmap 9.0d, for review.
 **Decided.** In the writer's process a session waits on the writer's progress (the notification its delivery thread
 waits on, raised at every writer turn that published something, the mark's moves among them) and reads the mark only
 when it moved; in a reader process it sleeps and reads the mark once `poll_interval` has passed on the environment's
-monotonic clock, so an injected clock decides freshness in tests. `min_batch_interval` is measured on the same clock.
+monotonic clock, so an injected clock decides freshness in tests. Within a second of its last full refresh such a
+poll reads the mark alone and asks nothing more when it is unchanged and nothing is due; a change to the manifest
+alone (a range recorded while the writer runs) waits for the next full refresh, at most a second. `next` sleeps out
+the rest of `min_batch_interval`, measured on the same clock, and the whole timeout with no live read, so it never
+turns while it waits.
 A `Latest` member is due at the earliest of: a fact ahead falling due, a candidate above `now` or an interval reading
 becoming ready, and its staleness passing (in event time, or from the refreshing commit in the writer's process,
 spec §5.4); at once, and so at every batch interval, when its state cannot tell. A batch judges again only the
@@ -3516,14 +3537,18 @@ refreshed since the last batch (its acknowledgement can follow the batch that br
 with nothing due costs nothing and one with a due time costs one judgement per due time.
 **Pinned by.** `kvik/src/durable/read/live/cases.rs`
 `staleness_and_a_value_falling_due_update_latest_with_no_new_fact`,
-`a_reading_is_in_a_batch_within_the_poll_interval_in_a_reader_process_and_at_once_in_the_writers`; the budget S13 in
-`kvik/tests/live_budgets.rs`.
+`a_reading_is_in_a_batch_within_the_poll_interval_in_a_reader_process_and_at_once_in_the_writers`;
+`kvik/src/durable/read/live/waits.rs` `next_sleeps_out_the_least_batch_interval_and_a_session_with_no_live_read`,
+`a_waiting_next_in_the_writer_s_process_returns_soon_after_a_reading`,
+`an_acknowledgement_after_the_batch_that_carried_its_fact_makes_latest_fresh_again`; the budget S13 in
+`kvik/tests/live_budgets.rs` (Q-1017).
 
 ## Q-1016 — A live read and an unavailable segment or tier
 Decided by the lead with roadmap 9.0d, for review.
 **Decided.** A session reads nothing but the shared tail: the segments from the reader's position to the mark. A
 lagging `Tail` never reads back; its consumer reads the skipped span statically and meets the stated errors there. An
-error of the shared read is returned by `next` at every call it lasts, never passed over: `NotAvailable` for a
+error of the shared read is returned by `next` at every call it lasts, never passed over (a failed refresh leaves the
+next poll due, in a reader process too): `NotAvailable` for a
 segment the reader stands in that is missing (Q-951, until a restart), and the tier-unavailable error once cold
 segments exist (roadmap 8.1g).
 **Pinned by.** `kvik/src/durable/read/live/cases.rs` `a_missing_segment_under_the_tail_is_an_error_at_every_next`.

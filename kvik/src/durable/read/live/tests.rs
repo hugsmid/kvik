@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::config::{LogConfig, ReaderConfig, StoreConfig};
 use crate::durable::tests::block_on;
 use crate::env::{Env, FixedBootId, ManualClock, MemFs};
-use crate::health::LossKind;
+use crate::health::{LossKind, LossReport};
 use crate::read::{
     Answer, Appended, Live, LiveEvent, LiveId, LiveOptions, Part, Query, Selection, UpdateBatch,
     Updated,
@@ -72,6 +72,11 @@ impl World {
 
     /// Damages `text` in every segment file that holds it.
     pub(super) fn damage(&self, text: &[u8]) {
+        assert!(self.damage_any(text));
+    }
+
+    /// Damages `text` in every segment file that holds it; whether one did.
+    pub(super) fn damage_any(&self, text: &[u8]) -> bool {
         let mut found = false;
         for (p, b) in self.segments() {
             if let Some(at) = b.windows(text.len()).position(|w| w == text) {
@@ -79,7 +84,7 @@ impl World {
                 found = true;
             }
         }
-        assert!(found);
+        found
     }
 
     /// Every fact the store holds in position order, as a reader opened now reads them.
@@ -163,9 +168,19 @@ pub(super) fn poll(
 }
 
 /// Asserts that a `Tail` opened at `open` holds at `cut` what it owes: the facts a reader opened now reads there,
-/// less the spans it was told of; and that every loss the writer and a fresh reader report there was named to it,
-/// none of its facts inside one.
+/// less the spans it was told of, and [`losses_named`] for the losses the writer and a fresh reader report.
 pub(super) fn tail_is_owed(w: &World, s: &Store, open: Position, cut: Position, h: &Held) {
+    tail_is_owed_but(w, s, (open, cut), h, &|_| false);
+}
+
+/// [`tail_is_owed`] for a `Tail` that does not select the facts `unselected` names.
+pub(super) fn tail_is_owed_but(
+    w: &World,
+    s: &Store,
+    (open, cut): (Position, Position),
+    h: &Held,
+    unselected: &dyn Fn(&Fact) -> bool,
+) {
     let skipped = |p: Position| {
         h.lagged
             .iter()
@@ -176,10 +191,17 @@ pub(super) fn tail_is_owed(w: &World, s: &Store, open: Position, cut: Position, 
         .history()
         .into_iter()
         .filter(|f| f.position > open && f.position <= cut && !skipped(f.position))
+        .filter(|f| !unselected(f))
         .collect();
     assert_eq!(h.tail, owed);
-    let reports = s.losses().into_iter().chain(w.reader().losses());
-    for l in reports.filter(|l| l.kind == LossKind::DataLost) {
+    let reports: Vec<LossReport> = s.losses().into_iter().chain(w.reader().losses()).collect();
+    losses_named(&reports, open, cut, h);
+}
+
+/// Asserts that every loss of `reports` between `open` and `cut` was named to a `Tail`, and that it holds no fact
+/// inside one.
+pub(super) fn losses_named(reports: &[LossReport], open: Position, cut: Position, h: &Held) {
+    for l in reports.iter().filter(|l| l.kind == LossKind::DataLost) {
         let (Some(first), Some(last)) = (l.first, l.last) else {
             continue;
         };

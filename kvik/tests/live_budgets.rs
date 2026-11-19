@@ -1,8 +1,10 @@
 //! The tail-while-writing budget S13 of the query design (roadmap 9.0d), timed: an empty poll of a live session (target
 //! 50 µs, 200 µs on the minimal class) and a reading acknowledged by the writer until it is in a batch of a reader
 //! process's session (target: commit latency plus the poll interval, 10 ms at least and 100 ms by default). The store
-//! is on the real file system under the temporary directory, with a seal after every few rounds of readings. Run in a
-//! release build, alone: `cargo test --release -p kvik --test live_budgets -- --ignored --nocapture`.
+//! is on the real file system under the temporary directory, with a seal after every few rounds of readings. A reader
+//! process's empty poll reads the mark alone and runs a full refresh once a second, so each run's mean holds one full
+//! refresh per second of polls; the single polls over the target are those (Q-1017). Run in a release build, alone:
+//! `cargo test --release -p kvik --test live_budgets -- --ignored --nocapture`.
 
 mod common;
 
