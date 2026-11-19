@@ -8,6 +8,7 @@
 //! answers from its fact index until it is reopened (Q-1006). What a state cannot tell, the reader finds in the log
 //! at the call's cut ([`live`], Q-1004).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -77,11 +78,11 @@ pub(crate) struct Latest {
 
 /// What a state tells of a series' live fact at `now`.
 #[derive(Debug)]
-pub(crate) enum Judged {
+pub(crate) enum Judged<'a> {
     /// No live fact.
     None,
     /// This fact, met by the fold.
-    Fact(Stored),
+    Fact(&'a Stored),
     /// The fact at this position, which the fold did not meet.
     Row(Kept),
     /// The state cannot tell.
@@ -277,21 +278,20 @@ impl Latest {
     /// What the state tells of series `id`'s live fact at `now` (spec §2.3): the candidate once the facts ahead
     /// that fell due are promoted, unless it may not be the live fact (A.18 bit 3) or is not ready at `now`: above
     /// it (a reader's clock behind the writer's, A.18), or an observed interval reading not yet ended.
-    pub(crate) fn judge(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Judged {
+    pub(crate) fn judge(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Judged<'_> {
         let Some(h) = self.series.get(&id) else {
             return Judged::None;
         };
-        let mut st = h.state.clone();
-        st.promote(now, versioned);
-        if st.unsure() {
+        let (candidate, unsure) = h.state.promoted(now, versioned);
+        if unsure {
             return Judged::Unsure;
         }
-        match st.candidate() {
+        match candidate {
             None => Judged::None,
             // `ready_at(t)` is never before `t`.
             Some(c) if p.ready_at(c.t) > now => Judged::Unsure,
             Some(c) => match h.rows.iter().find(|r| r.position == c.position) {
-                Some(r) => Judged::Fact(r.clone()),
+                Some(r) => Judged::Fact(r),
                 None => Judged::Row(c),
             },
         }
@@ -311,9 +311,7 @@ impl Latest {
                     .registry
                     .get(*id)
                     .is_some_and(|s| s.def.versioning != Versioning::None);
-                let mut st = h.state.clone();
-                st.promote(now, versioned);
-                let c = st.candidate()?;
+                let c = h.state.promoted(now, versioned).0?;
                 (!h.rows.iter().any(|r| r.position == c.position)).then_some((*id, c))
             })
             .collect()
@@ -501,13 +499,15 @@ pub(crate) fn live(
         return Ok(Live::None);
     }
     let versioned = series.def.versioning != Versioning::None;
-    let fact = match latest.judge(id.0, versioned, &p, now) {
+    let fact: Option<Cow<'_, Stored>> = match latest.judge(id.0, versioned, &p, now) {
         Judged::None => None,
-        Judged::Fact(s) if windows::reading_of(series, &s).is_some() => Some(s),
+        Judged::Fact(s) if windows::has_reading(series, s) => Some(Cow::Borrowed(s)),
         Judged::Row(k) => match r.resolved(v, id.0, k, now)? {
-            Some(s) if windows::reading_of(series, &s).is_some() => Some(s),
-            Some(_) => searched(r, v, series, &p, now)?,
-            None if recorded_lost(v.lost_ranges(), k.position) => searched(r, v, series, &p, now)?,
+            Some(s) if windows::has_reading(series, &s) => Some(Cow::Owned(s)),
+            Some(_) => searched(r, v, series, &p, now)?.map(Cow::Owned),
+            None if recorded_lost(v.lost_ranges(), k.position) => {
+                searched(r, v, series, &p, now)?.map(Cow::Owned)
+            }
             // A fact the directory names that the log no longer holds, as a segment removed before the lookup's
             // reader opened (Q-951): never read as absence (Q-1004).
             None => {
@@ -516,7 +516,7 @@ pub(crate) fn live(
                 });
             }
         },
-        Judged::Fact(_) | Judged::Unsure => searched(r, v, series, &p, now)?,
+        Judged::Fact(_) | Judged::Unsure => searched(r, v, series, &p, now)?.map(Cow::Owned),
     };
     Ok(match fact {
         Some(s) => windows::live_with(&p, r.clocks(), id, &s, now),
@@ -562,5 +562,7 @@ pub(crate) fn rows_for(
 
 #[cfg(test)]
 mod cases;
+#[cfg(test)]
+mod snapshots;
 #[cfg(test)]
 mod tests;

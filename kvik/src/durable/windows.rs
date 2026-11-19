@@ -86,6 +86,16 @@ pub(crate) fn reading_of(series: &Series, s: &Stored) -> Option<Reading> {
     Some((r.t, v))
 }
 
+/// Whether [`reading_of`] gives a reading, without building it.
+pub(crate) fn has_reading(series: &Series, s: &Stored) -> bool {
+    s.row.quality != LogQuality::Bad
+        && match &s.row.value {
+            LogValue::F64(_) | LogValue::Bool(_) | LogValue::Text(_) => true,
+            LogValue::State(i) => series.def.state_names.get(usize::from(*i)).is_some(),
+            LogValue::Decimal { .. } | LogValue::Absent { .. } => false,
+        }
+}
+
 /// Whether a current fact can be a series' live-state fact at `now` (spec §2.3): not bad quality, and for an
 /// observed interval series ended (`t + d ≤ now`).
 pub(crate) fn may_be_live(series: &Series, p: &Params, s: &Stored, now: i64) -> bool {

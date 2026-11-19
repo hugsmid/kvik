@@ -118,6 +118,17 @@ impl State {
         }
     }
 
+    /// The candidate, and whether it may not be the live fact, once the facts ahead that fell due by `horizon` are
+    /// promoted: what [`State::promote`] would leave, the state unchanged.
+    pub(crate) fn promoted(&self, horizon: i64, versioned: bool) -> (Option<Kept>, bool) {
+        let mut st = State {
+            bad: BTreeMap::new(),
+            ..*self
+        };
+        st.promote(horizon, versioned);
+        (st.candidate, st.unsure())
+    }
+
     /// Whether a fact ahead that the state does not name may have fallen due.
     pub(crate) fn ahead_unsure(&self) -> bool {
         self.ahead_lost || (self.pending.is_none() && self.pending_more)

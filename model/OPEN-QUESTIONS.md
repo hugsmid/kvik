@@ -126,6 +126,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1004 | §2.3, §7 Readers; `format.md` A.18 | What a reader finds in the log because the state cannot tell (decided by the lead) |
 | Q-1005 | `api.md` Reading | `Snapshot`: what it answers at one cut (decided by the lead) |
 | Q-1006 | §7 Readers; `api.md` Health | A reader whose latest values no longer follow the log (decided by the lead) |
+| Q-1007 | query design §1 S1 | Where S1 stands: the writer's own latest values (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3430,6 +3431,26 @@ the rule Q-952 sets for the writer's fold. Cost: after such a fault the reader h
 `damage_under_a_directorys_candidate_never_shows_the_lost_fact`; `kvik/tests/durable_losses_open.rs`
 `a_loss_found_while_open_decides_as_a_restart_over_it_does`.
 
+## Q-1007 — Where S1 stands: the writer's own latest values
+Decided by the lead at the review of roadmap 9.0c (technical).
+**Scenario.** The query design's S1 is 400 latest values from one snapshot in the writer's process, from live state
+in memory: 0.2 ms on the desktop class, 2 ms on the minimal class (two targets, one per class). The writer's own
+`live` and `snapshot` go through the same reader as another process's, which reads the mark file, checks the
+manifest and reads the new bytes of the open segment at each round.
+**Decided.** Now: in the writer's process a round whose current view is at the writer's durable position, with every
+closed range of the latch taken, no fact index wanted that it lacks and no lease renewal due, publishes that view
+again with no file read (the manifest changes only at a start, Q-704); and the per-call cost of `live` was cut (one
+cut check per snapshot call, the state judged without a copy, the fact borrowed, the reading checked without being
+built). With roadmap 9.0d's follow-up the writer's reader takes its new batches from the shared tail hub in memory
+instead of the segment file, which removes the refresh that remains after a write.
+**Measured** (release, best of five with the spread, a shared four-core virtual machine, 400 gauges, 1,108 sealed
+segments; `kvik/tests/latest_budgets.rs`): S1 with nothing written since 0.127 ms (spread 0.049); S1 after a round of
+400 readings 0.406 ms (spread 0.031), of which the refresh is about 0.3 ms; S2 0.202 ms and 0.406 ms. The first
+snapshot of a reader just opened is about 0.1 s here, folding the log since the only directory. The figures on the
+two hardware classes are roadmap 9.0e's.
+**Pinned by.** `kvik/src/durable/read/latest/cases.rs`
+`the_writers_own_reader_reads_no_file_while_the_writer_has_made_nothing_durable_since`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -3577,6 +3598,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-1004 | 9.0c | Decided by the lead: what the reader finds by lookup at the cut, and a named fact not found reported unavailable; for review |
 | Q-1005 | 9.0f | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; windows and facts join with 9.0f's sources |
 | Q-1006 | 9.0f | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; replaced by 9.0f's sources |
+| Q-1007 | 9.0d | Decided by the lead at 9.0c's review: no file read while the writer has made nothing durable since; the in-memory feed from 9.0d's hub; figures per class with 9.0e |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

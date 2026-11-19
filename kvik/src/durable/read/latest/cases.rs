@@ -561,3 +561,27 @@ fn a_value_ahead_the_state_cannot_name_is_found_once_until_the_next_falls_due() 
         assert_eq!(durable(r).searches(), 2);
     }
 }
+
+#[test]
+fn the_writers_own_reader_reads_no_file_while_the_writer_has_made_nothing_durable_since() {
+    let mut rig = Rig::new("unchanged");
+    rig.emit(&[(0, -4, 0, 0, 0)], false);
+    let own = rig.store.as_ref().unwrap().reader();
+    rig.agrees(&own, 0);
+    let d = durable(&own);
+    let read = d.parts_taken();
+    for _ in 0..5 {
+        rig.agrees(&own, 0);
+        own.snapshot().unwrap().live(rig.ids[0]).unwrap();
+    }
+    assert_eq!(d.parts_taken(), read);
+    rig.emit(&[(0, -2, 1, 0, 0)], false);
+    rig.agrees(&own, 0);
+    assert!(d.parts_taken() > read);
+    // Another process's reader reads the mark at every call.
+    let other = rig.reader();
+    rig.agrees(&other, 0);
+    let read = durable(&other).parts_taken();
+    rig.agrees(&other, 0);
+    assert!(durable(&other).parts_taken() > read);
+}

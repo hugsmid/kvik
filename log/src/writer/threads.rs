@@ -249,6 +249,11 @@ impl Watch {
         lock(&self.shared.info).stats.clone()
     }
 
+    /// The durable position, without copying the rest of the statistics.
+    pub fn durable(&self) -> super::Position {
+        lock(&self.shared.info).stats.durable
+    }
+
     /// The last synced mark, without copying the rest of the statistics.
     pub fn mark_synced(&self) -> super::Position {
         lock(&self.shared.info).stats.mark_synced

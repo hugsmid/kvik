@@ -109,6 +109,8 @@ pub(crate) struct DurableReader {
     /// Where the losses its reads find go: the writer's, for the reader of its own process.
     latch: Arc<Latch>,
     store_id: [u8; 16],
+    /// The writer's progress, for the reader of its own process: a round that would find nothing new is skipped.
+    writer: Option<kvik_log::writer::Watch>,
     /// A call asked for facts: the next round opens the fact index (Q-1000).
     want_facts: AtomicBool,
     /// The log reader of the reads at a cut that a state cannot answer (Q-1004), opened on first use; locked for one
@@ -282,17 +284,19 @@ impl DurableReader {
             (lease_refresh, cut_max_age),
             Arc::new(Clocks::new(env.clock.clone())),
             Arc::default(),
+            None,
         )
     }
 
     /// [`DurableReader::open`] with the window clock, refresh instants and loss latch of the process; `ages` is
-    /// `lease_refresh` and `cut_max_age`.
+    /// `lease_refresh` and `cut_max_age`; `writer`, the writer's progress for the reader of its own process.
     pub(crate) fn open_with(
         dir: &Path,
         env: &Env,
         ages: (Duration, Duration),
         clocks: Arc<Clocks>,
         latch: Arc<Latch>,
+        writer: Option<kvik_log::writer::Watch>,
     ) -> Result<Self, OpenError> {
         let mut cfg = log_config(dir, env, Arc::new(ReaderClock(env.clock.clone())));
         (cfg.lease_refresh, cfg.cut_max_age) = ages;
@@ -323,6 +327,7 @@ impl DurableReader {
             created_zone: descriptor.site_zone,
             store_id: descriptor.store_id,
             latch,
+            writer,
             want_facts: AtomicBool::new(false),
             lookups: Mutex::new(None),
             rows: Mutex::new(BTreeMap::new()),
@@ -366,7 +371,16 @@ impl DurableReader {
     /// A view read after this call began ([`Flight`]).
     fn view(&self) -> Result<Arc<View>, QueryError> {
         self.flight
-            .get(|current| self.round(current))
+            .get(|current| self.round(current, false))
+            .map_err(unshare)
+    }
+
+    /// [`DurableReader::view`] for a call that reads the latest values only: in the writer's process, a view at the
+    /// writer's durable position is kept rather than read again (Q-1007). A call that reads facts reads the files,
+    /// and with them checks again the last batch its log reader returned.
+    fn view_latest(&self) -> Result<Arc<View>, QueryError> {
+        self.flight
+            .get(|current| self.round(current, true))
             .map_err(unshare)
     }
 
@@ -414,7 +428,7 @@ impl DurableReader {
     /// A view for the latest values, a snapshot's among them (Q-722, Q-1005): read after the call began, with every
     /// fact if its state is broken.
     pub(crate) fn snapshot(&self) -> Result<Arc<View>, QueryError> {
-        let v = self.view()?;
+        let v = self.view_latest()?;
         if v.latest().broken() && v.index().is_none() {
             drop(v);
             return self.view_with_facts();
@@ -501,7 +515,7 @@ impl DurableReader {
     /// One refresh, which the call leading a round runs: releases the cuts of dropped views, reads what was appended
     /// since the last round, brings the fact index to the same position when there is one or a call asked for it,
     /// and publishes the next view, holding its own cut.
-    fn round(&self, current: Option<Arc<View>>) -> Result<Arc<View>, Arc<QueryError>> {
+    fn round(&self, current: Option<Arc<View>>, quick: bool) -> Result<Arc<View>, Arc<QueryError>> {
         let began = self.monotonic();
         let mut w = self.lock();
         let w = &mut *w;
@@ -511,6 +525,17 @@ impl DurableReader {
         let failed = |e: ReaderError| Arc::new(query_error(&self.dir, e));
         for id in self.cuts.take_dropped() {
             log.release(id);
+        }
+        // In the writer's process, a view at the writer's durable position, with every closed range taken, is what
+        // a read of the files would publish again (the manifest changes only at a start, Q-704): it is kept while
+        // young enough that no lease renewal is due (the query design's S1).
+        if let (true, Some(v), Some(watch)) = (quick, &current, &self.writer)
+            && watch.durable() == v.state().durable
+            && self.latch.closed_count() == w.closed_seen
+            && (v.index().is_some() || !self.want_facts.load(Ordering::SeqCst))
+            && v.age(began) < self.lease_refresh / 2
+        {
+            return Ok(v.clone());
         }
         if w.latest.is_none() {
             let (l, stamp) = self.seed(log).map_err(failed)?;
@@ -670,6 +695,12 @@ impl DurableReader {
     #[cfg(test)]
     pub(crate) fn seeded(&self) -> bool {
         self.seeded.load(Ordering::Relaxed)
+    }
+
+    /// Refreshes of the log the rounds have run, each of which reads the mark file.
+    #[cfg(test)]
+    pub(crate) fn parts_taken(&self) -> u64 {
+        self.lock().parts
     }
 
     /// Lookups made at a cut.
