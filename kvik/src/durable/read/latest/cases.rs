@@ -3,9 +3,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kvik_log::directory::Family;
-use kvik_log::directory::series::SeriesDirectory;
-
 use super::tests::{Rig, S, plain, write_directory, write_directory_under};
 use crate::config::LogConfig;
 use crate::durable::reader::DurableReader;
@@ -31,14 +28,6 @@ fn text(l: &Live) -> Option<&str> {
     }
 }
 
-/// A log that seals by time: seals run on the log's own monotonic clock, which the rig's clock does not drive.
-fn sealing() -> LogConfig {
-    LogConfig {
-        seal_interval: Duration::from_millis(300),
-        ..LogConfig::default()
-    }
-}
-
 impl Rig {
     /// Waits until the segment holding `bytes` is sealed; returns its path.
     fn wait_sealed_with(&self, bytes: &[u8]) -> std::path::PathBuf {
@@ -56,29 +45,6 @@ impl Rig {
                 return p;
             }
             assert!(Instant::now() < deadline, "not sealed: {holding:?}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// Waits until the writer has written a series directory through `sequence` or later.
-    fn wait_directory(&self, sequence: u64) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let store_id = kvik_log::store::read_descriptor(&*self.env.fs, &self.dir)
-            .unwrap()
-            .store_id;
-        let through = || {
-            kvik_log::directory::read_latest(&*self.env.fs, &self.dir, Family::Series, |b| {
-                SeriesDirectory::decode(b, &store_id)
-            })
-            .ok()
-            .flatten()
-            .map_or(0, |(_, d)| d.through.sequence)
-        };
-        while through() < sequence {
-            assert!(
-                Instant::now() < deadline,
-                "no series directory through {sequence}"
-            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -105,6 +71,37 @@ impl Rig {
         self.shut();
         write_directory(&self.env, &self.dir, usize::MAX).expect("a batch");
         self.reopen();
+    }
+
+    /// The process stops, the power goes and the machine boots again with a new boot identity; the store is not
+    /// opened again.
+    fn power_loss(&mut self, boot: u8) {
+        self.fs.crash_after(0);
+        drop(self.store.take());
+        self.fs.power_loss();
+        self.env.boot = Arc::new(crate::env::FixedBootId::new(Some([boot; 16])));
+    }
+
+    /// Damages the first copy of `text` in every log segment.
+    fn damage(&self, text: &[u8]) {
+        for p in self.segments() {
+            let bytes = self.fs.read(&p).unwrap();
+            if let Some(at) = bytes.windows(text.len()).position(|w| w == text) {
+                self.fs.poke(&p, at, b"X");
+            }
+        }
+    }
+
+    /// The one log segment holding `bytes`.
+    fn holding(&self, bytes: &[u8]) -> std::path::PathBuf {
+        let mut found = self.segments().into_iter().filter(|p| {
+            self.fs
+                .read(p)
+                .is_some_and(|b| b.windows(bytes.len()).any(|w| w == bytes))
+        });
+        let p = found.next().expect("a segment holding the bytes");
+        assert!(found.next().is_none());
+        p
     }
 
     fn segments(&self) -> Vec<std::path::PathBuf> {
@@ -316,16 +313,31 @@ fn a_loss_found_while_open_breaks_the_state_shows_the_loss_and_never_the_lost_fa
 
 #[test]
 fn a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over() {
-    let mut rig = Rig::with_log("missing", sealing());
+    let log = LogConfig {
+        segment_size: 16 << 20,
+        max_batch_bytes: 8 << 20,
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("missing", log);
     let v = 2_222.5f64;
     rig.emit_readings(
         &[Reading::new(rig.ids[0], rig.at(-4), Value::F64(v))],
         Intent::Normal,
     );
-    let written = rig.long.refresh().unwrap().durable.sequence;
+    // Texts enough to fill the segment, which then seals by size.
+    for round in 0..3 {
+        let readings: Vec<Reading> = (0..26_000i64)
+            .map(|k| {
+                let t = rig.at(-3).0 - 26_000 + k + round * 30_000;
+                Reading::new(rig.ids[2], Timestamp(t), Value::Text(format!("{k:0>255}")))
+            })
+            .collect();
+        rig.emit_readings(&readings, Intent::Normal);
+    }
     let sealed = rig.wait_sealed_with(&v.to_le_bytes());
-    rig.wait_directory(written);
-    rig.emit(&[(2, -2, 1, 0, 0)], false);
+    rig.directory();
+    rig.emit_readings(&[rig.note(-2, "NOTE-NEW")], Intent::Normal);
+    assert_ne!(rig.holding(b"NOTE-NEW"), sealed);
     let r = rig.reader();
     r.refresh().unwrap();
     assert!(durable(&r).seeded());
@@ -434,4 +446,83 @@ fn a_series_directory_under_another_reset_stamp_is_not_continued() {
     rig.agrees(&r, 0);
     assert!(durable(&r).seeded());
     rig.reopen();
+}
+
+#[test]
+fn a_continuing_reader_never_shows_a_fact_a_start_recorded_lost() {
+    let mut rig = Rig::new("recorded");
+    rig.emit(&[(0, -60, 0, 0, 0), (2, -60, 0, 0, 0)], false);
+    rig.directory();
+    let r = rig.reader();
+    r.refresh().unwrap();
+    assert!(durable(&r).seeded());
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
+    rig.emit(&[(0, -4, 1, 0, 0)], false);
+    assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-BBB"));
+    rig.power_loss(2);
+    rig.damage(b"NOTE-BBB");
+    rig.reopen();
+    let fresh = rig.reader();
+    let lost = |l: &[crate::LossReport]| l.iter().filter(|l| l.kind == LossKind::DataLost).count();
+    assert_eq!(lost(&fresh.losses()), 1);
+    assert_eq!(text(&fresh.live(rig.ids[2]).unwrap()), Some("NOTE-AAA"));
+    for id in &rig.ids {
+        assert_eq!(
+            plain(r.live(*id).unwrap()),
+            plain(fresh.live(*id).unwrap()),
+            "{id:?}"
+        );
+    }
+    assert_eq!(r.losses(), fresh.losses());
+}
+
+#[test]
+fn a_reader_opened_before_the_newest_directory_continues_it() {
+    let mut rig = Rig::new("opened-before");
+    rig.emit(&[(0, -60, 0, 0, 0)], false);
+    rig.directory();
+    let r = rig.reader();
+    rig.emit(&[(0, -30, 1, 0, 0), (2, -30, 0, 0, 0)], false);
+    rig.directory();
+    r.refresh().unwrap();
+    assert!(durable(&r).seeded());
+    for i in [0, 2] {
+        rig.agrees(&r, i);
+    }
+    rig.check().unwrap();
+}
+
+#[test]
+fn a_newest_directory_a_reader_cannot_continue_falls_back_to_the_one_kept_before_it() {
+    let mut rig = Rig::new("fallback");
+    rig.emit(&[(0, -60, 0, 0, 0)], false);
+    rig.directory();
+    rig.emit(&[(0, -30, 1, 0, 0)], false);
+    rig.shut();
+    let other = kvik_log::mark::ResetStamp {
+        sequence: 1,
+        nonce: 7,
+    };
+    write_directory_under(&rig.env, &rig.dir, usize::MAX, Some(other)).unwrap();
+    rig.reopen();
+    let r = rig.reader();
+    r.refresh().unwrap();
+    assert!(durable(&r).seeded());
+    rig.agrees(&r, 0);
+}
+
+#[test]
+fn a_directory_behind_a_loss_a_later_start_records_is_not_continued() {
+    let mut rig = Rig::new("behind-loss");
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
+    rig.emit(&[(0, -4, 1, 0, 0)], false);
+    rig.directory();
+    rig.power_loss(2);
+    rig.damage(b"NOTE-BBB");
+    rig.reopen();
+    let r = rig.reader();
+    assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-AAA"));
+    assert!(!durable(&r).seeded());
 }

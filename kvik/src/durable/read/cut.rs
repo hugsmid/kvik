@@ -179,14 +179,15 @@ mod tests {
             .unwrap()
         }
 
-        /// From now on, the second read of the mark in each of the next `times` passes finds a new reset stamp.
+        /// From now on, the second read of the mark in each of the next `times` passes finds a new reset stamp. A new
+        /// reader's first read is its seed's (`LogReader::reread`), before any pass.
         fn reset_at_second_reads(&self, times: u32) {
             let path = Path::new(self.dir).join("log/MARK");
             let mut left = times;
             *self.fs.hook.lock().unwrap() = (
                 0,
                 Some(HookBox(Box::new(move |m: &MemFs, n: u32| {
-                    if n.is_multiple_of(2) || left == 0 {
+                    if n == 0 || !n.is_multiple_of(2) || left == 0 {
                         return;
                     }
                     left -= 1;

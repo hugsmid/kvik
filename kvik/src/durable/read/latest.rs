@@ -155,6 +155,7 @@ impl Latest {
                             Item::Fact(_) => {}
                             Item::Entry(e) if matches!(**e, Entry::Ignored { .. }) => {}
                             Item::Entry(e) if p > self.file_through => {
+                                self.folded = self.folded.max(p);
                                 self.registry.apply(e);
                                 self.entries
                                     .insert(p, (b.content.received_at, (**e).clone()));
@@ -224,6 +225,14 @@ impl Latest {
             .iter()
             .any(|r| r.first <= at(first) && at(last) <= r.last);
         if first <= self.folded && !held {
+            self.broken = true;
+        }
+    }
+
+    /// A range the manifest records since the state was seeded or last compared: one that starts at or below what was
+    /// folded breaks the state, since the log reader does not read again what it returned (Q-1006).
+    pub(crate) fn lose_recorded(&mut self, first: LogPos) {
+        if first <= self.folded {
             self.broken = true;
         }
     }

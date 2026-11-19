@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
-use kvik_log::directory::Family;
 use kvik_log::directory::logdir::LostEntry;
 use kvik_log::directory::series::SeriesDirectory;
+use kvik_log::directory::{DerivedError, Family};
 use kvik_log::lease::CutEnd;
 use kvik_log::manifest::LostRange;
 use kvik_log::mark::ResetStamp as LogStamp;
@@ -246,11 +246,15 @@ fn take(
 }
 
 /// The manifest's lost ranges merged by identity, as a series directory's `lost` counts them (`format.md` A.18).
-fn lost_entries(ranges: &[LostRange]) -> Vec<LostEntry> {
-    let at = |(generation, sequence)| LogPos {
+fn record_pos((generation, sequence): (u32, u64)) -> LogPos {
+    LogPos {
         generation,
         sequence,
-    };
+    }
+}
+
+fn lost_entries(ranges: &[LostRange]) -> Vec<LostEntry> {
+    let at = record_pos;
     let mut by: BTreeMap<(u32, u64), LostEntry> = BTreeMap::new();
     for l in ranges {
         let e = by.entry(l.identity).or_insert(LostEntry {
@@ -455,28 +459,36 @@ impl DurableReader {
     /// under its reset stamp, not behind a loss since (`format.md` A.18), with a registry file of that generation,
     /// and the log reader started after the directory's `through`; otherwise the kept log from its start.
     fn seed(&self, log: &mut LogReader) -> Result<(Latest, Option<LogStamp>), ReaderError> {
+        // The mark and the manifest as they are now, not as at the open: a directory written since is judged
+        // against a mark at or past its `through` (the query design's section 3.2).
+        log.reread()?;
         let st = log.state();
+        let lost = lost_entries(log.lost_ranges());
         let fs = &*self.env.fs;
         let id = self.store_id;
+        // The conditions are applied per generation, so a newest file that fails them falls back to the one kept.
         let dir = kvik_log::directory::read_latest(fs, &self.dir, Family::Series, |b| {
-            SeriesDirectory::decode(b, &id)
-        })
-        .ok()
-        .flatten()
-        .filter(|(f, d)| {
-            f.generation == st.generation
+            let (f, d) = SeriesDirectory::decode(b, &id)?;
+            let valid = f.generation == st.generation
                 && d.through.generation == st.generation
                 && d.through <= st.durable
                 && d.stamp.unwrap_or_default() == st.stamp
                 && d.lost != u32::MAX
-                && kvik_log::writer::lost_below(&lost_entries(log.lost_ranges()), d.through)
-                    <= d.lost
-        });
-        let file = kvik_log::registry::read_latest(fs, &self.dir, &id)
-            .ok()
-            .flatten()
-            .map(|(_, f)| f)
-            .filter(|f| f.generation == st.generation && f.through <= st.durable.sequence);
+                && kvik_log::writer::lost_below(&lost, d.through) <= d.lost;
+            if valid {
+                Ok((f, d))
+            } else {
+                Err(DerivedError::Invalid("not valid for this reader"))
+            }
+        })
+        .ok()
+        .flatten();
+        let file = kvik_log::registry::read_latest_where(fs, &self.dir, &id, |f| {
+            f.generation == st.generation && f.through <= st.durable.sequence
+        })
+        .ok()
+        .flatten()
+        .map(|(_, f)| f);
         if let (Some((frame, d)), Some(file)) = (dir, file)
             && log.start_after(d.through)?
         {
@@ -505,6 +517,8 @@ impl DurableReader {
             w.latest = Some(l);
             self.seeded.store(stamp.is_some(), Ordering::Relaxed);
             w.seed_stamp = stamp;
+            // The ranges the seed was judged against; any recorded later is compared with what was folded.
+            w.lost_ranges = log.lost_ranges().into();
         }
         let latest = w.latest.as_mut().expect("seeded above");
         let mut own = Vec::new();
@@ -532,6 +546,17 @@ impl DurableReader {
         // A reset between the directory's check and the first pass: the directory may cover what it voided.
         if w.seed_stamp.take().is_some_and(|s| s != st.stamp) {
             latest.break_off();
+        }
+        // A range the manifest records since the last round (a start found it): the log reader never reads again
+        // what it returned, so a range at or below what was folded is met only here (Q-1006).
+        let recorded_since: Vec<(LogPos, LogPos)> = log
+            .lost_ranges()
+            .iter()
+            .filter(|r| !w.lost_ranges.contains(r))
+            .map(|r| (record_pos(r.first), record_pos(r.last)))
+            .collect();
+        for (first, _) in &recorded_since {
+            latest.lose_recorded(*first);
         }
         // The ranges this pass found held no fact it folded; any other closed range may (Q-938).
         let mut lose =
@@ -565,6 +590,9 @@ impl DurableReader {
             )
             .map_err(failed)?
             .map_err(Arc::new)?;
+            for (first, last) in &recorded_since {
+                index.forget(*first, *last);
+            }
             let fs = f.log.state();
             if (fs.generation, fs.stamp) != (st.generation, st.stamp) || fs.durable < st.durable {
                 // Read under another reset stamp than the main reader's: read whole again at the next round.
