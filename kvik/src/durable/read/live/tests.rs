@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,6 +6,7 @@ use std::time::Duration;
 use crate::config::{LogConfig, ReaderConfig, StoreConfig};
 use crate::durable::tests::block_on;
 use crate::env::{Env, FixedBootId, ManualClock, MemFs};
+use crate::health::LossKind;
 use crate::read::{
     Answer, Appended, Live, LiveEvent, LiveId, LiveOptions, Part, Query, Selection, UpdateBatch,
     Updated,
@@ -12,7 +14,7 @@ use crate::read::{
 use crate::series::{Kind, SeriesSpec, ValueType};
 use crate::time::Timestamp;
 use crate::types::{Fact, Position, Reading, SeriesId, Value};
-use crate::{Reader, Select, Store};
+use crate::{LiveSession, Reader, Select, Store};
 
 pub(super) const T0: i64 = 1_767_225_600_000_000_000;
 /// A step of the clock past both the least batch interval and the poll interval.
@@ -117,6 +119,101 @@ pub(super) fn emit(w: &World, s: &Store, id: SeriesId, v: f64) {
     block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(v))])).unwrap();
 }
 
+pub(super) const S: i64 = 1_000_000_000;
+
+pub(super) fn note(w: &World, s: &Store, id: SeriesId, secs: i64, text: &str) -> Position {
+    let r = Reading::new(
+        id,
+        Timestamp(w.clock.wall().0 + secs * S),
+        Value::Text(text.into()),
+    );
+    block_on(s.emit(&[r])).unwrap().last().unwrap()
+}
+
+pub(super) fn tail_all() -> Query {
+    Query::Tail {
+        sel: Selection::all(),
+    }
+}
+
+/// A session with a `Latest` and a `Tail` of every series, opened and polled once.
+pub(super) fn watched(
+    r: &Reader,
+    tail: LiveOptions,
+) -> (LiveSession, LiveId, LiveId, BTreeMap<LiveId, Held>) {
+    let mut s = r.session();
+    let l = s
+        .open(Query::Latest(Selection::all()), LiveOptions::default())
+        .unwrap();
+    let t = s.open(tail_all(), tail).unwrap();
+    let mut held = BTreeMap::new();
+    apply(&mut held, &s.next(Duration::ZERO).unwrap().unwrap());
+    (s, l, t, held)
+}
+
+pub(super) fn poll(
+    w: &World,
+    s: &mut LiveSession,
+    held: &mut BTreeMap<LiveId, Held>,
+) -> Option<UpdateBatch> {
+    w.clock.advance(TICK);
+    let b = s.next(Duration::ZERO).unwrap()?;
+    apply(held, &b);
+    Some(b)
+}
+
+/// Asserts that a `Tail` opened at `open` holds at `cut` what it owes: the facts a reader opened now reads there,
+/// less the spans it was told of; and that every loss the writer and a fresh reader report there was named to it,
+/// none of its facts inside one.
+pub(super) fn tail_is_owed(w: &World, s: &Store, open: Position, cut: Position, h: &Held) {
+    let skipped = |p: Position| {
+        h.lagged
+            .iter()
+            .chain(&h.gaps)
+            .any(|(a, b)| *a <= p && p <= *b)
+    };
+    let owed: Vec<Fact> = w
+        .history()
+        .into_iter()
+        .filter(|f| f.position > open && f.position <= cut && !skipped(f.position))
+        .collect();
+    assert_eq!(h.tail, owed);
+    let reports = s.losses().into_iter().chain(w.reader().losses());
+    for l in reports.filter(|l| l.kind == LossKind::DataLost) {
+        let (Some(first), Some(last)) = (l.first, l.last) else {
+            continue;
+        };
+        if last <= open || first > cut {
+            continue;
+        }
+        assert!(
+            h.gaps
+                .iter()
+                .chain(&h.lagged)
+                .any(|(a, b)| *a <= last && first <= *b),
+            "{l:?} not named: {h:?}"
+        );
+        assert!(
+            h.tail
+                .iter()
+                .all(|f| f.position < first || f.position > last),
+            "{l:?}"
+        );
+    }
+}
+
+/// Asserts that a `Latest` of every series holds what a reader opened now reads.
+pub(super) fn latest_is_static(w: &World, h: &Held) {
+    let snap = w.reader().snapshot().unwrap();
+    let want: Vec<(SeriesId, Live)> = snap
+        .select(&Selection::all())
+        .unwrap()
+        .into_iter()
+        .map(|id| (id, snap.live(id).unwrap()))
+        .collect();
+    assert_eq!(h.latest.as_ref().unwrap(), &want);
+}
+
 /// What a consumer holds of one live read: what applying every event it was sent gives.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Held {
@@ -175,8 +272,8 @@ impl Held {
 }
 
 /// Applies a batch to the consumers of its live reads, checking the order of each read's events.
-pub(super) fn apply(held: &mut std::collections::BTreeMap<LiveId, Held>, b: &UpdateBatch) {
-    let mut last: std::collections::BTreeMap<LiveId, u8> = Default::default();
+pub(super) fn apply(held: &mut BTreeMap<LiveId, Held>, b: &UpdateBatch) {
+    let mut last: BTreeMap<LiveId, u8> = BTreeMap::new();
     for (id, e) in &b.events {
         let r = crate::read::event_rank(e);
         let was = last.insert(*id, r).unwrap_or(0);

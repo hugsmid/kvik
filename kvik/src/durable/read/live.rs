@@ -88,6 +88,10 @@ pub(crate) struct Session {
     judged: Duration,
     /// The manifest's lost ranges at the last batch.
     recorded: Vec<(LogPos, LogPos)>,
+    /// The gaps named that stand after the piece the last batch stopped at.
+    named: Vec<(LogPos, LogPos)>,
+    /// The process's lost ranges counted at the last refresh.
+    found_lost: usize,
 }
 
 impl Drop for Session {
@@ -196,6 +200,7 @@ struct Next {
     reads: Option<BTreeMap<LiveId, Read>>,
     at: (u64, usize),
     recorded: Vec<(LogPos, LogPos)>,
+    named: Vec<(LogPos, LogPos)>,
     refreshes: u64,
     /// The session was closed as idle.
     idle: bool,
@@ -212,6 +217,8 @@ struct Walk {
     facts: BTreeMap<LiveId, Vec<Stored>>,
     /// Where the batch stopped inside a round: (round, pieces taken, cut).
     stop: Option<(u64, usize, LogPos)>,
+    /// The gaps named that stand after the stop.
+    named: Vec<(LogPos, LogPos)>,
 }
 
 impl Session {
@@ -234,6 +241,8 @@ impl Session {
             refreshes: 0,
             judged: Duration::ZERO,
             recorded: Vec::new(),
+            named: Vec::new(),
+            found_lost: 0,
         }
     }
 
@@ -362,6 +371,9 @@ impl Session {
             };
         let due = self.due().is_some_and(|d| d <= r.now());
         let refreshed = r.clocks().refreshes() != self.refreshes;
+        // A loss another read found reaches the shared tail by a refresh, before any batch could show its fact.
+        let found_lost = r.found_lost();
+        let poll = poll || found_lost != self.found_lost;
         // Rounds other calls ran since the last batch serve it with no read of the mark, while their cut is live.
         let current = if poll || due || refreshed {
             None
@@ -376,6 +388,7 @@ impl Session {
                 if let Some(p) = progress {
                     self.progress = p;
                 }
+                self.found_lost = found_lost;
                 r.snapshot()?
             }
             None => return Ok(None),
@@ -396,6 +409,7 @@ impl Session {
         }
         self.at = next.at;
         self.recorded = next.recorded;
+        self.named = next.named;
         self.refreshes = next.refreshes;
         self.judged = mono;
         if next.idle {
@@ -424,7 +438,7 @@ impl Session {
         let quiet = !taken.idle
             && !taken.lagged
             && taken.backlog == (0, 0)
-            && taken.rounds.iter().all(|x| x.pieces.is_empty())
+            && taken.rounds.iter().all(|x| x.is_empty())
             && refreshes == self.refreshes
             && recorded == self.recorded
             && self.reads.values().all(Read::opened)
@@ -435,6 +449,7 @@ impl Session {
                 reads: None,
                 at: (v.round(), 0),
                 recorded,
+                named: Vec::new(),
                 refreshes,
                 idle: false,
             });
@@ -455,6 +470,7 @@ impl Session {
                 reads: Some(reads),
                 at: self.at,
                 recorded,
+                named: Vec::new(),
                 refreshes,
                 idle: true,
             });
@@ -474,6 +490,7 @@ impl Session {
                 walk.gaps.push((*a, *b));
             }
         }
+        let named = std::mem::take(&mut walk.named);
         let (cut, inside, at) = match walk.stop {
             Some((seq, n, cut)) => (cut, true, (seq - 1, n)),
             None => (v.state().durable, false, (v.round(), 0)),
@@ -518,13 +535,16 @@ impl Session {
             reads: Some(reads),
             at,
             recorded,
+            named,
             refreshes,
             idle: false,
         })
     }
 
     /// Walks the pieces of the rounds after the session's cursor: the facts each opened `Tail` takes, up to the
-    /// first row limit met, and what the `Latest`s must judge again.
+    /// first row limit met, and what the `Latest`s must judge again. Every gap taken is named, past the stop too, so
+    /// no batch carries a fact the reader knows lost nor leaves a loss below its cut unnamed (Q-1011); a fact a
+    /// later void or gap drops is never taken, so the stop's cut lies below every void after it, which waits.
     fn walk(
         &self,
         v: &View,
@@ -532,86 +552,106 @@ impl Session {
         reads: &mut BTreeMap<LiveId, Read>,
         lagged: bool,
     ) -> Walk {
+        let pieces: Vec<(u64, usize, &Piece)> = rounds
+            .iter()
+            .flat_map(|r| r.pieces().map(move |(i, p)| (r.seq, i, p)))
+            .filter(|(seq, i, _)| *seq != self.at.0 + 1 || *i >= self.at.1)
+            .collect();
+        let mut later_void = vec![None; pieces.len()];
+        let mut least: Option<LogPos> = None;
+        for (k, (_, _, p)) in pieces.iter().enumerate().rev() {
+            later_void[k] = least;
+            if let Piece::Void(above) = p {
+                least = Some(least.map_or(*above, |l| l.min(*above)));
+            }
+        }
+        let gaps: Vec<(usize, LogPos, LogPos)> = pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(k, (_, _, p))| match p {
+                Piece::Gap(a, b) => Some((k, *a, *b)),
+                _ => None,
+            })
+            .collect();
+        let dropped = |k: usize, at: LogPos| {
+            later_void[k].is_some_and(|above| at > above)
+                || gaps.iter().any(|(j, a, b)| *j > k && *a <= at && at <= *b)
+        };
         let mut w = Walk::default();
-        'rounds: for round in rounds {
-            let skip = if round.seq == self.at.0 + 1 {
-                self.at.1
-            } else {
-                0
-            };
-            for (i, piece) in round.pieces.iter().enumerate().skip(skip) {
-                match piece {
-                    Piece::Fact(s) => {
-                        let id = s.row.series_id;
-                        w.touched.insert(id);
-                        if lagged {
-                            continue;
-                        }
-                        let wants: Vec<LiveId> = reads
-                            .iter()
-                            .filter_map(|(k, x)| match x {
-                                Read::Tail(t) if t.opened && selects(&t.sel, &t.names, id) => {
-                                    Some(*k)
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        let full = wants.iter().any(|k| {
-                            let max = match &reads[k] {
-                                Read::Tail(t) => t.opts.max_rows,
-                                Read::Latest(_) => usize::MAX,
-                            };
-                            w.facts.get(k).map_or(0, Vec::len) >= max
-                        });
-                        if full {
-                            let cut = LogPos {
-                                generation: s.position.generation,
-                                sequence: s.position.sequence.saturating_sub(1),
-                            };
-                            w.stop = Some((round.seq, i, cut));
-                            break 'rounds;
-                        }
-                        for k in wants {
-                            w.facts.entry(k).or_default().push(s.clone());
-                        }
+        for (k, (seq, i, piece)) in pieces.iter().enumerate() {
+            if w.stop.is_some() {
+                if let Piece::Gap(a, b) = piece {
+                    w.named.push((*a, *b));
+                    self.name(&mut w, (*a, *b));
+                }
+                continue;
+            }
+            match piece {
+                Piece::Fact(s) => {
+                    let id = s.row.series_id;
+                    w.touched.insert(id);
+                    if lagged || dropped(k, s.position) {
+                        continue;
                     }
-                    Piece::Entry(e) => {
-                        w.entries = true;
-                        w.touched.extend(entry_series(e));
-                        for x in reads.values_mut() {
-                            if let Read::Tail(t) = x
-                                && t.opened
-                            {
-                                t.names.apply(e);
-                            }
-                        }
+                    let wants: Vec<LiveId> = reads
+                        .iter()
+                        .filter_map(|(k, x)| match x {
+                            Read::Tail(t) if t.opened && selects(&t.sel, &t.names, id) => Some(*k),
+                            _ => None,
+                        })
+                        .collect();
+                    let full = wants.iter().any(|k| {
+                        let max = match &reads[k] {
+                            Read::Tail(t) => t.opts.max_rows,
+                            Read::Latest(_) => usize::MAX,
+                        };
+                        w.facts.get(k).map_or(0, Vec::len) >= max
+                    });
+                    if full {
+                        let cut = LogPos {
+                            generation: s.position.generation,
+                            sequence: s.position.sequence.saturating_sub(1),
+                        };
+                        w.stop = Some((*seq, *i, cut));
+                        continue;
                     }
-                    Piece::Void(above) => {
-                        w.reset = Some(w.reset.map_or(*above, |r| r.min(*above)));
-                        for f in w.facts.values_mut() {
-                            f.retain(|s| s.position <= *above);
-                        }
-                        for x in reads.values_mut() {
-                            if let Read::Tail(t) = x
-                                && t.opened
-                            {
-                                t.from = t.from.min(*above);
-                                t.names = v.latest().registry_at(*above);
-                            }
-                        }
+                    for k in wants {
+                        w.facts.entry(k).or_default().push(s.clone());
                     }
-                    Piece::Gap(a, b) => {
-                        for f in w.facts.values_mut() {
-                            f.retain(|s| s.position < *a || s.position > *b);
-                        }
-                        if !w.gaps.contains(&(*a, *b)) {
-                            w.gaps.push((*a, *b));
+                }
+                Piece::Entry(e) => {
+                    w.entries = true;
+                    w.touched.extend(entry_series(e));
+                    for x in reads.values_mut() {
+                        if let Read::Tail(t) = x
+                            && t.opened
+                        {
+                            t.names.apply(e);
                         }
                     }
                 }
+                Piece::Void(above) => {
+                    w.reset = Some(w.reset.map_or(*above, |r| r.min(*above)));
+                    for x in reads.values_mut() {
+                        if let Read::Tail(t) = x
+                            && t.opened
+                        {
+                            t.from = t.from.min(*above);
+                            t.names = v.latest().registry_at(*above);
+                        }
+                    }
+                }
+                Piece::Gap(a, b) => self.name(&mut w, (*a, *b)),
             }
         }
         w
+    }
+
+    /// Names gap `g` in the batch unless a batch that stopped before it named it already.
+    fn name(&self, w: &mut Walk, g: (LogPos, LogPos)) {
+        if !self.named.contains(&g) && !w.gaps.contains(&g) {
+            w.gaps.push(g);
+        }
     }
 }
 
@@ -756,5 +796,7 @@ fn latest_read(
 mod cases;
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod stops;
 #[cfg(test)]
 mod tests;

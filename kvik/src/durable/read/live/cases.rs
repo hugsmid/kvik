@@ -1,79 +1,19 @@
-use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::tests::{Held, TICK, World, apply, emit, gauge, kinds};
+use super::tests::{
+    S, TICK, World, apply, emit, gauge, kinds, latest_is_static, note, poll, tail_all,
+    tail_is_owed, watched,
+};
 use crate::config::{LogConfig, ReaderConfig};
 use crate::durable::tests::block_on;
 use crate::error::QueryError;
 use crate::read::{
-    Answer, CloseReason, Live, LiveEvent, LiveId, LiveOptions, Query, Selection, SessionOptions,
-    UpdateBatch, Updated, View,
+    Answer, CloseReason, Live, LiveEvent, LiveOptions, Query, SessionOptions, Updated, View,
 };
 use crate::series::{Kind, SeriesSpec, Timing};
 use crate::time::Timestamp;
-use crate::types::{Fact, Position, Reading, SeriesId, Value};
-use crate::{LiveSession, Reader, Select, Store};
-
-const S: i64 = 1_000_000_000;
-
-fn note(w: &World, s: &Store, id: SeriesId, secs: i64, text: &str) -> Position {
-    let r = Reading::new(
-        id,
-        Timestamp(w.clock.wall().0 + secs * S),
-        Value::Text(text.into()),
-    );
-    block_on(s.emit(&[r])).unwrap().last().unwrap()
-}
-
-fn tail_all() -> Query {
-    Query::Tail {
-        sel: Selection::all(),
-    }
-}
-
-/// A session with a `Latest` and a `Tail` of every series, opened and polled once.
-fn watched(r: &Reader, tail: LiveOptions) -> (LiveSession, LiveId, LiveId, BTreeMap<LiveId, Held>) {
-    let mut s = r.session();
-    let l = s
-        .open(Query::Latest(Selection::all()), LiveOptions::default())
-        .unwrap();
-    let t = s.open(tail_all(), tail).unwrap();
-    let mut held = BTreeMap::new();
-    apply(&mut held, &s.next(Duration::ZERO).unwrap().unwrap());
-    (s, l, t, held)
-}
-
-fn poll(w: &World, s: &mut LiveSession, held: &mut BTreeMap<LiveId, Held>) -> Option<UpdateBatch> {
-    w.clock.advance(TICK);
-    let b = s.next(Duration::ZERO).unwrap()?;
-    apply(held, &b);
-    Some(b)
-}
-
-/// The facts a `Tail` opened at `open` must hold at `cut`: the history's, less the spans it was told of.
-fn owed(w: &World, open: Position, cut: Position, h: &Held) -> Vec<Fact> {
-    let skipped = |p: Position| {
-        h.lagged
-            .iter()
-            .chain(&h.gaps)
-            .any(|(a, b)| *a <= p && p <= *b)
-    };
-    w.history()
-        .into_iter()
-        .filter(|f| f.position > open && f.position <= cut && !skipped(f.position))
-        .collect()
-}
-
-fn latest_is_static(r: &Reader, h: &Held) {
-    let snap = r.snapshot().unwrap();
-    let want: Vec<(SeriesId, Live)> = snap
-        .select(&Selection::all())
-        .unwrap()
-        .into_iter()
-        .map(|id| (id, snap.live(id).unwrap()))
-        .collect();
-    assert_eq!(h.latest.as_ref().unwrap(), &want);
-}
+use crate::types::{Fact, Position, Reading, Value};
+use crate::{LiveSession, Reader, Select};
 
 #[test]
 fn a_reset_voids_what_the_tail_holds_above_it_and_opens_latest_again() {
@@ -127,8 +67,8 @@ fn a_reset_voids_what_the_tail_holds_above_it_and_opens_latest_again() {
         .collect();
     assert!(!texts.contains(&"RS-39".to_string()), "{texts:?}");
     assert!(texts.ends_with(&["RS-NEW-0".into(), "RS-NEW-1".into(), "RS-NEW-2".into()]));
-    assert_eq!(held[&t].tail, owed(&w, open, b.durable, &held[&t]));
-    latest_is_static(&r, &held[&l]);
+    tail_is_owed(&w, &s, open, b.durable, &held[&t]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
 
@@ -167,8 +107,8 @@ fn a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail() {
     assert_eq!(held[&l].gaps, [(lost, lost)]);
     assert_eq!(held[&t].tail.len(), 10);
     assert!(held[&t].tail.iter().all(|f| f.position != lost));
-    assert_eq!(held[&t].tail, owed(&w, open, b.durable, &held[&t]));
-    latest_is_static(&r, &held[&l]);
+    tail_is_owed(&w, &s, open, b.durable, &held[&t]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
 
@@ -192,8 +132,8 @@ fn damage_a_tail_meets_is_a_gap_and_its_fact_is_never_shown() {
     assert!(held[&l].gaps == held[&t].gaps);
     assert_eq!(held[&t].tail.len(), 2);
     assert!(held[&t].tail.iter().all(|f| f.position != lost));
-    assert_eq!(held[&t].tail, owed(&w, open, b.durable, &held[&t]));
-    latest_is_static(&r, &held[&l]);
+    tail_is_owed(&w, &s, open, b.durable, &held[&t]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
 
@@ -231,7 +171,7 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
             .iter()
             .any(|(k, e)| *k == l && matches!(e, LiveEvent::Opened(_)))
     );
-    latest_is_static(&r, &held[&l]);
+    latest_is_static(&w, &held[&l]);
     // A session that takes the fact and the loss in one batch is never sent the fact.
     let b = later.next(Duration::ZERO).unwrap().unwrap();
     apply(&mut later_held, &b);
@@ -308,7 +248,7 @@ fn a_slow_tail_gets_lagged_to_the_mark_and_the_shared_tail_stays_within_its_back
     assert_eq!(to, b.durable);
     assert!(from.sequence < to.sequence - 150, "{from:?} {to:?}");
     assert!(held[&t].tail.is_empty());
-    latest_is_static(&r, &held[&l]);
+    latest_is_static(&w, &held[&l]);
     emit(&w, &s, id, 1000.0);
     poll(&w, &mut session, &mut held).unwrap();
     assert_eq!(held[&t].tail.len(), 1);
@@ -379,10 +319,10 @@ fn a_row_limit_stops_every_live_read_of_the_session_at_one_cut_inside_the_read()
             _ => None,
         };
         assert_eq!(shown.map(|f| f.value), want.map(|f| f.value), "{b:?}");
-        assert_eq!(held[&t].tail, owed(&w, open, b.durable, &held[&t]));
+        tail_is_owed(&w, &s, open, b.durable, &held[&t]);
     }
     assert_eq!(sizes, [10, 20, 30, 35]);
-    latest_is_static(&r, &held[&l]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
 
@@ -406,7 +346,7 @@ fn staleness_and_a_value_falling_due_update_latest_with_no_new_fact() {
         .collect();
     for _ in 0..200 {
         w.clock.advance(TICK);
-        for (r, ((session, l, _, held), updates)) in readers.iter().zip(&mut sessions) {
+        for ((session, l, _, held), updates) in &mut sessions {
             if let Some(b) = session.next(Duration::ZERO).unwrap() {
                 apply(held, &b);
                 for (_, e) in &b.events {
@@ -415,7 +355,7 @@ fn staleness_and_a_value_falling_due_update_latest_with_no_new_fact() {
                     }
                 }
             }
-            latest_is_static(r, &held[l]);
+            latest_is_static(&w, &held[l]);
         }
     }
     // One update when the scheduled value falls due, one when the gauge goes stale; none for the third.
@@ -561,7 +501,7 @@ fn a_maximal_batch_reaches_the_tail_whole_in_row_limited_batches() {
     }
     assert_eq!(batches, 3);
     assert_eq!(held[&t].tail.len(), 26_000);
-    assert_eq!(held[&t].tail, owed(&w, open, cut, &held[&t]));
-    latest_is_static(&r, &held[&l]);
+    tail_is_owed(&w, &s, open, cut, &held[&t]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }

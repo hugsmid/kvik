@@ -45,12 +45,13 @@ impl Piece {
     }
 }
 
-/// What one refresh read, with the durable position of the view it published.
+/// What one refresh read.
 #[derive(Debug)]
 pub(crate) struct Round {
     pub(crate) seq: u64,
-    pub(crate) durable: LogPos,
-    pub(crate) pieces: Vec<Piece>,
+    pieces: Vec<Piece>,
+    /// Each piece's index in the round as read, once trimmed; a session stopped inside the round counts by it.
+    index: Vec<usize>,
     /// Every fact and entry is held; otherwise only the voids and gaps are.
     pub(crate) whole: bool,
     rows: u64,
@@ -58,16 +59,28 @@ pub(crate) struct Round {
 }
 
 impl Round {
+    /// The pieces held, each with its index in the round as read.
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = (usize, &Piece)> {
+        self.pieces
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (self.index.get(i).copied().unwrap_or(i), p))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
     fn trimmed(&self) -> Round {
+        let (index, pieces) = self
+            .pieces()
+            .filter(|(_, p)| p.kept_when_trimmed())
+            .map(|(i, p)| (i, p.clone()))
+            .unzip();
         Round {
             seq: self.seq,
-            durable: self.durable,
-            pieces: self
-                .pieces
-                .iter()
-                .filter(|p| p.kept_when_trimmed())
-                .cloned()
-                .collect(),
+            pieces,
+            index,
             whole: false,
             rows: 0,
             bytes: 0,
@@ -209,15 +222,9 @@ impl Hub {
         })
     }
 
-    /// Ends a refresh that published a view at `durable`: keeps what it gathered, marks sessions idle past
-    /// `idle_after` and trims to the largest backlog allowed. Returns the round's number, the view's.
-    pub(crate) fn finish(
-        &self,
-        c: Option<Collector>,
-        durable: LogPos,
-        now: Duration,
-        idle_after: Duration,
-    ) -> u64 {
+    /// Ends a refresh: keeps what it gathered, marks sessions idle past `idle_after` and trims to the largest backlog
+    /// allowed. Returns the round's number, the view's.
+    pub(crate) fn finish(&self, c: Option<Collector>, now: Duration, idle_after: Duration) -> u64 {
         let mut s = self.lock();
         s.last += 1;
         let seq = s.last;
@@ -233,8 +240,8 @@ impl Hub {
             s.bytes += c.bytes;
             s.rounds.push_back(Arc::new(Round {
                 seq,
-                durable,
                 pieces: c.pieces,
+                index: Vec::new(),
                 whole: c.whole,
                 rows: c.rows,
                 bytes: c.bytes,

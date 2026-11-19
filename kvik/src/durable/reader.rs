@@ -434,6 +434,11 @@ impl DurableReader {
         &self.hub
     }
 
+    /// How many lost ranges the process found; the next round hands the new ones to the shared tail.
+    pub(crate) fn found_lost(&self) -> usize {
+        self.latch.closed_count()
+    }
+
     /// Ends a call on `v`: whether its cut is still live, and the release of views no call holds.
     pub(crate) fn end(&self, v: Arc<View>) -> Result<(), QueryError> {
         let live = self.check(&v);
@@ -602,9 +607,7 @@ impl DurableReader {
         if log.lost_ranges() != &*w.lost_ranges {
             w.lost_ranges = log.lost_ranges().into();
         }
-        let seq = self
-            .hub
-            .finish(tail, st.durable, self.monotonic(), self.cut_max_age);
+        let seq = self.hub.finish(tail, self.monotonic(), self.cut_max_age);
         Ok(Arc::new(View::new(
             (latest.clone(), w.facts.as_ref().map(|f| f.index.clone())),
             st,
