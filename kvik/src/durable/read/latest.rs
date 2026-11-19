@@ -147,15 +147,16 @@ impl Latest {
                         };
                         sequence += item.sequences();
                         match item {
-                            Item::Fact(row) if p > self.seeded => {
+                            // The started log reader returns no batch at or below the directory (Q-1003).
+                            Item::Fact(row) => {
                                 self.fact(Stored {
                                     position: p,
                                     received_at: b.content.received_at,
                                     row: row.clone(),
                                 });
                             }
-                            Item::Fact(_) => {}
                             Item::Entry(e) if matches!(**e, Entry::Ignored { .. }) => {}
+                            // A registry file newer than the directory holds entries the log returns above it.
                             Item::Entry(e) if p > self.file_through => {
                                 self.folded = self.folded.max(p);
                                 self.registry.apply(e);

@@ -239,7 +239,8 @@ pub(crate) fn live_in(
 /// ([`super::read::latest::live`]).
 pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> {
     let now = r.now();
-    r.with_latest(|v| super::read::latest::live(r, v, id, now))
+    // A lookup under another reset stamp than the view's is computed once more under a new cut (query design 3.2).
+    r.with_latest_again(|v| super::read::latest::live(r, v, id, now))
 }
 
 /// A window result (spec §6), a calendar result among them (spec §5.7: a window over its span, in the site zone or

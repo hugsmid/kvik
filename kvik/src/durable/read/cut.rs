@@ -83,6 +83,8 @@ mod tests {
     struct HookFs {
         inner: MemFs,
         hook: Mutex<(u32, Option<HookBox>)>,
+        /// Run once, before the next lease file is created: a log reader opening.
+        on_lease: Mutex<Option<HookBox>>,
     }
 
     struct HookBox(MarkHook);
@@ -102,6 +104,12 @@ mod tests {
                 if let Some(HookBox(f)) = h.1.as_mut() {
                     f(&self.inner, n);
                 }
+            }
+            if mode == OpenMode::CreateNew
+                && path.parent().is_some_and(|d| d.ends_with("leases"))
+                && let Some(HookBox(mut f)) = self.on_lease.lock().unwrap().take()
+            {
+                f(&self.inner, 0);
             }
             self.inner.open(path, mode)
         }
@@ -139,6 +147,7 @@ mod tests {
             let fs = Arc::new(HookFs {
                 inner: MemFs::new(),
                 hook: Mutex::new((0, None)),
+                on_lease: Mutex::new(None),
             });
             let mut env = Env::test(clock.clone());
             env.fs = fs.clone();
@@ -364,5 +373,28 @@ mod tests {
             matches!(during, Some(Err(QueryError::CutExpired))),
             "{during:?}"
         );
+    }
+
+    #[test]
+    fn a_live_value_looked_up_under_a_reset_is_read_once_more_under_the_new_cut() {
+        let rig = Rig::new("cut-live-again");
+        let dir = Path::new(rig.dir);
+        crate::durable::read::latest::tests::write_directory(&rig.env, dir, usize::MAX)
+            .expect("a batch");
+        let r = rig.reader();
+        r.refresh().unwrap();
+        assert!(r.seeded());
+        let path = dir.join("log/MARK");
+        // The lookups' log reader opens under a reset stamp the view's cut does not have.
+        *rig.fs.on_lease.lock().unwrap() = Some(HookBox(Box::new(move |m: &MemFs, _| {
+            new_stamp(m, &path, 1)
+        })));
+        rig.clock.advance(Duration::from_secs(1));
+        let live = crate::durable::windows::live(&r, SeriesId(1)).unwrap();
+        let crate::read::Live::Value(v) = live else {
+            panic!("a live value: {live:?}");
+        };
+        assert_eq!(v.fact.value, Value::F64(2.0));
+        assert!(r.lookups() >= 2, "looked up under each cut");
     }
 }
