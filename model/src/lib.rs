@@ -29,6 +29,7 @@
 pub mod calendar;
 pub mod condition;
 pub mod engine;
+pub mod labels;
 pub mod oracle;
 pub mod recovery;
 pub mod registry;

@@ -1,5 +1,9 @@
 //! Series registry (§2.1). Definitions, aliases and retirements are log entries;
 //! the registry is rebuilt by applying them in position order.
+//!
+//! Label entries (type 10) are not registry events: the registry file does not
+//! hold them (§2.1 Labels, Q-892). They are folded by [`crate::labels`], which
+//! takes this registry to tell orphaned label entries apart.
 
 use std::collections::BTreeMap;
 

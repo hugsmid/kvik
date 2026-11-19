@@ -49,7 +49,7 @@ each is deferred to, are listed there under "Open at v0.2".
 | `timing` | `observed` (default), `scheduled` or `forecast`; fixed for the life of the series. **Scheduled:** values known in advance that take effect at their `t`, such as published prices; a scheduled source that revises its values must be versioned. **Forecast:** values about future times, re-issued over time; the series must be versioned with `changed_at kind` `time`, `changed_at` being the issue time and `t` the valid time. The engine does not report a silent forecast source: its adapter emits an observed series with an expected interval on each successful fetch, to which stale-for applies |
 
 Series definitions, parameter changes (with an effective event time, except a change of retention class or of the
-excess-precision policy or the durability level, which take effect at their position), aliases, retirements, scale raises, site-zone entries and tzdata entries (§5.7) are log entries. A parameter other than the retention class, the
+excess-precision policy or the durability level, which take effect at their position), aliases, retirements, scale raises, label changes (Labels below), site-zone entries and tzdata entries (§5.7) are log entries. A parameter other than the retention class, the
 excess-precision policy and the durability level applies to readings with `t` at or after its effective time. A definition entry always has a lower
 position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
 registry file that stays on the hot tier (tree checkpoints carry a copy, §8; `format.md` A.16). The registry file is a
@@ -58,10 +58,12 @@ carrying the id floor (Q-33), and the writer writes it again after each routing 
 returns (Q-130). Site-zone entries and tzdata entries
 (§5.7) and routing changes (§4) are registry entries in this sense: the registry file holds each with its position,
 so they are in force wherever the registry is, whether or not the log segment that holds them is local. Recovery
-entries (§3) are compacted into it too, each with its position.
+entries (§3) are compacted into it too, each with its position. **Label changes are the exception:** they are
+registry entries for every other rule, but the registry file does not hold them and its Derived check wants exactly
+the kept log's registry entries other than label changes; they are held in label parts (Labels below, Q-892).
 
 After a lost range (§3) only the entries of the kept log apply; a lost definition, parameter change, alias,
-retirement, scale raise, routing change or zone entry is never appended again by the engine and is issued again through the
+retirement, scale raise, label change, routing change or zone entry is never appended again by the engine and is issued again through the
 normal calls; a definition issued again is a new series. A kept fact whose series has no definition in the kept log
 is an **orphaned fact**: kept in the log and through compaction, outside views, trees, indexes, routing and
 delivery, counted per id (`orphaned_facts`) and exported for re-ingest. New ids are assigned above every id floor,
@@ -73,11 +75,61 @@ log; when a log segment whose facts are already compacted is lost, which definit
 held by the registry file or a chunk) is open, as is how derived files are brought back to a function of the kept
 log (Q-33).
 
+**Labels.** A series may carry key–value labels, versioned like facts (Q-880, Q-890, Q-891). Labels belong to the
+id: an alias or a rename leaves them alone, a retired series keeps them and still takes label changes, and a new
+series (a change of kind, type or unit) starts with none. Names stay the identity, the clustering order and the
+export key; a label never replaces a segment.
+
+| Part | Rule |
+|---|---|
+| Key | ASCII `[a-z][a-z0-9_]*`, 1–63 bytes |
+| Value | UTF-8, 1–255 bytes, no control character (U+0000–U+001F, U+007F); compared byte for byte, never normalised. There is no empty value: absence is removal |
+| Reserved keys | `site`, `area`, `device`, `metric`, `month`, `series` and every key starting `kvik_`; setting one is refused (Q-881) |
+| Per series | at most 64 distinct keys ever used, every version counting its key; at most `limits.label_versions_per_series` versions (1,024) |
+| Per store | at most `limits.label_versions` versions (1,000,000; 100,000 on the minimal class) and `limits.label_bytes` of label entries, each counted at its encoded length (`format.md` A.6; 32 MiB; 4 MiB on the minimal class), orphaned entries included (Q-1022) |
+
+- **A label change** is one log entry (`format.md` A.6 type 10) naming a series, an **effective time** (`from`: UTC
+  nanoseconds, or *always*, which sorts before every time) and 1 to 64 items with distinct keys, each a **set** (a
+  value), a **remove** or a **withdraw**. Each item is a **label version** `(series, key, from, position, item)`. A
+  change may take effect before or after it is recorded; a future `from` takes effect when event time reaches it.
+  A label change shares the log's one position order with the series' facts; where a store keeps several logs, it
+  is written to its series' log.
+- **Calls.** `set_labels` and `set_labels_many` (`api.md` Labels) write one batch with a forced mark sync (§3
+  Commit). One bad item refuses the whole call and appends nothing. A definition may carry labels: the call appends
+  the definition and a label change effective *always* in one batch; defining an existing series again leaves its
+  labels alone and says so (Q-884). `declare_labels` sets, effective at `now`, each listed key whose value in force
+  now differs, and appends nothing for the others; a key it does not list is left alone. A change on an id with no
+  definition is refused.
+- **Duplicates.** An item is dropped only when the current version (§2.3 Label views) at exactly its
+  `(series, key, from)`, earlier entries of the same batch included, is already that item (Q-1025). Whatever a caller
+  was told succeeded is recorded, and the labels do not depend on the order of calls. A change left with no item is
+  not written.
+- **Limits are checked at the call only**, on the versions the call adds (Q-1024). They are ceilings that only
+  configuration lifts: nothing is deleted, and a removal or a correction is itself a version. Replay, rebuild,
+  restore and readers apply every kept label change also when the configured limit is now lower, and a start never
+  fails on its own log. Health gives a notice at 80 % of a store limit and names each series at 80 % of its own
+  (Q-1029).
+- **Lost and orphaned.** A label change in a lost range is gone and is issued again through the calls. A kept label
+  change whose series has no definition in the kept log is an **orphaned label entry**: kept in the log, through
+  compaction and in the label parts, outside every view, the label index and routing, and counted
+  (`orphaned_label_entries`).
+- **Where they are held.** Besides the log and compacted files, which carry them as every entry that is not a fact,
+  label changes are held in **label parts** (`format.md` A.19): immutable synced files under `registry/labels/`, each
+  holding the label changes of the kept log of one generation in a range of sequences, written after a seal whose
+  segment holds any and at a clean stop for those not yet sealed, and merged occasionally. A sealed segment records
+  whether it holds any label change (`has_labels`, `format.md` A.8), so the label state is the label parts in force
+  and the flagged segments above the last of them. Label parts are derived from the kept log: one that overlaps a
+  lost range, holds positions set aside by a restore, is missing, fails its checksum or differs from the local log is
+  rebuilt from what is kept, and until the rebuild ends label calls and selections fail with `LabelsUnavailable`
+  while reads without them are unaffected. They are not in the registry file, the series directory, the chunk index
+  or chunk headers (Q-893). A log segment that carries `has_labels` is removed locally only under §8 Eviction's
+  condition for label parts.
+
 **Retirement** is effective at `t_r`: facts with `t < t_r` are still accepted; facts with `t ≥ t_r` are refused
 and counted. The old id stays reachable by id.
 
 ### 2.2 Log entries, positions and facts
-- Every log entry (fact, definition, parameter, alias, retirement, scale raise, site zone, tzdata, routing change, recovery
+- Every log entry (fact, definition, parameter, alias, retirement, scale raise, label change, site zone, tzdata, routing change, recovery
   entry, §3) has a **position** `(generation: u32, sequence: u64)`, ordered lexicographically. Every generation starts
   at sequence 1; `(g, 0)` means "before the first entry of generation g" and `(0, 0)` means none. Sequence is strictly
   increasing and gap-free within a generation across restarts, except for lost ranges, each recorded in the manifest
@@ -124,6 +176,25 @@ and counted. The old id stays reachable by id.
 | As-of time T | as-of P, where P is the last position whose batch `commit_time` ≤ T |
 | History | all facts for `(series, t)` in position order, each with its `changed_at` in a versioned series |
 | Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad; a forecast series has none. While a restore brings detail back, a series has live state **unknown**, not none, when its live-state fact may be in a file not yet local: that is, unless the fact with its latest recorded `t` (§8 Restore step 1) is local or in a stored node and is itself the live-state fact (`t ≤ now`, quality not bad), such as a state or text series with no stored level whose last fact predates the log replayed in step 1 (open: what ends it when that fact stays in deep or is lost, Q-84) |
+
+**Label views.** The labels of a series are a function of the kept log's label versions (§2.1 Labels) over two time
+axes, as a fact has `t` and position. The versions **known at P** are those with position ≤ P. Among them, of the
+versions with one `(series, key, from)` the one of highest position is **current**, the others **superseded** (the
+fact rule with `(series, key, from)` in place of `(series, t)`). The labels **in force** at event time T, as known at
+P, hold for each key the current version with the greatest `from ≤ T` among those that are not withdrawals, when
+that version is a set: a current remove makes the key absent from its `from`, and a current withdraw makes its
+`(key, from)` contribute nothing, so the labels read as if no change had been made at that time, whatever is later
+corrected before it; a later set or remove at the same `from` reinstates it (Q-1026).
+
+| Label view | Definition |
+|---|---|
+| Now | in force at `now`, as known at the read's cut; it depends on the clock once a future `from` exists |
+| At T | in force at T, as known at the read's cut |
+| As-of P | in force at T, as known at P |
+| As-of time T′ | as-of P, where P is the last position whose batch `commit_time` ≤ T′ |
+| History | every version in position order, each marked current or superseded |
+
+A series with no definition in the kept log has no labels in any view (Q-1028).
 
 A fact that is not current for its key is a **revision**. In a versioned series a fact can be a revision from the
 moment it is recorded: it is **outranked** when a fact of higher rank for its key is already recorded.
@@ -789,7 +860,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 | Encryption | Always: there is no unencrypted mode. On the machine before upload, with a key supplied by the embedding application: XChaCha20-Poly1305 in authenticated 64 KiB chunks under a header carrying the format version, the algorithm, a key check value and the nonce base, so that a range decrypts on its own and a wrong key is told from damage. The nonce base is derived from the key, the object key and the plaintext's hash, so the envelope of a file is the same at every attempt (`format.md` A.17). |
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. It must create an object only where its key is absent, and must check the SHA-256 sent with a single-part upload and report it. `attach_backup`, and a restore before it claims, check both with a probe (`format.md` A.17) and refuse a bucket that fails (`BackupRefused`); there is no weaker mode. Versioning and object lock are the operator's to confirm. |
-| Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay, except as the retention class allows. A file that holds a lost range leaves the local tiers (by any rule of this section) only after the manifest record of that loss is uploaded or in the mirror path, so that a manifest rebuild never needs the file to find the loss again (§7 Manifest). |
+| Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. A sealed log segment whose index carries `has_labels` (`format.md` A.8) is removed locally, by this or any rule of this section and by the release of a compacted segment (Q-745), only once a label part covering its label changes has been written and read back, and, on a store with a backup, uploaded and verified. Current detail and the stored tree stay, except as the retention class allows. A file that holds a lost range leaves the local tiers (by any rule of this section) only after the manifest record of that loss is uploaded or in the mirror path, so that a manifest rebuild never needs the file to find the loss again (§7 Manifest). |
 | Retention class | For a diagnostic series (§2.1), raw detail (current and revision chunks) whose span ends more than the retention period before `now` leaves hot once verified in cold or deep; for revision chunks, the earlier of this and their own age applies. The stored tree stays hot. Nothing is deleted: such detail is fetched on demand like moved current detail, so, as with any moved detail, the duplicate check for it can be unchecked (§2.4) and window edges over it are approximate (§6). |
 | Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes, revised-key index and version index never move (§12 D4). |
 | Behind consumers | A consumer whose cursor, or whose catch-up position after overflow, is older than the oldest local log segment receives `resync`, not a replay. The engine never downloads from deep for catch-up. Its `resync` carries `forget_above` and an id as §4 Resync gives for the cursor case and the catch-up case; recovery entries in segments that are no longer local are not needed. |
