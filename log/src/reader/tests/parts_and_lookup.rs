@@ -775,3 +775,16 @@ fn a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact() {
     let fresh = reader(&fs, 52).lookup(&wanted, &|_, _, _| false).unwrap();
     assert_eq!(fresh.facts, first.facts);
 }
+
+#[test]
+fn the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch() {
+    let (fs, log) = store(2);
+    let mut r = reader(&fs, 1);
+    assert!(r.mark_moved().unwrap());
+    r.refresh().unwrap();
+    assert!(!r.mark_moved().unwrap());
+    log.submit(vec![fact(1, 99, 1)]).unwrap().wait().unwrap();
+    assert!(r.mark_moved().unwrap());
+    assert!(!r.refresh().unwrap().events.is_empty());
+    assert!(!r.mark_moved().unwrap());
+}

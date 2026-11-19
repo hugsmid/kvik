@@ -69,6 +69,9 @@ impl Read {
     }
 }
 
+/// The longest a reader process's polls go on the mark alone.
+const FULL_REFRESH_EVERY: Duration = Duration::from_secs(1);
+
 /// See the module documentation.
 #[derive(Debug)]
 pub(crate) struct Session {
@@ -82,6 +85,8 @@ pub(crate) struct Session {
     reads: BTreeMap<LiveId, Read>,
     last_batch: Option<Duration>,
     last_poll: Option<Duration>,
+    /// When the last full refresh of a poll ran.
+    last_full: Option<Duration>,
     progress: u64,
     refreshes: u64,
     /// When the last batch was computed, on the reader's monotonic clock.
@@ -247,6 +252,7 @@ impl Session {
             reads: BTreeMap::new(),
             last_batch: None,
             last_poll: None,
+            last_full: None,
             progress: 0,
             refreshes: 0,
             judged: Duration::ZERO,
@@ -380,20 +386,27 @@ impl Session {
             .watch
             .as_ref()
             .map(|w| w.wait_progress(self.progress, Duration::ZERO));
-        let poll = opening
-            || match progress {
-                Some(p) => p != self.progress,
-                None => self
-                    .last_poll
-                    .is_none_or(|t| mono.saturating_sub(t) >= self.opts.poll_interval),
-            };
         let due = self.due().is_some_and(|d| d <= r.now());
         let refreshed = r.clocks().refreshes() != self.refreshes;
         // A loss another read found reaches the shared tail by a refresh, before any batch could show its fact.
         let found_lost = r.found_lost();
-        let poll = poll || found_lost != self.found_lost;
-        // Rounds other calls ran since the last batch serve it with no read of the mark, while their cut is live.
-        let current = if poll || due || refreshed {
+        let must = opening
+            || due
+            || refreshed
+            || found_lost != self.found_lost
+            || progress.is_some_and(|p| p != self.progress);
+        let interval = progress.is_none()
+            && self
+                .last_poll
+                .is_none_or(|t| mono.saturating_sub(t) >= self.opts.poll_interval);
+        // Within a second of its last refresh a reader process's poll reads the mark alone (S13): unchanged, the log
+        // holds no new batch; a change to the manifest alone waits for the next full refresh.
+        let fresh = self
+            .last_full
+            .is_some_and(|t| mono.saturating_sub(t) < FULL_REFRESH_EVERY);
+        let refresh = must || (interval && (!fresh || r.mark_moved() != Some(false)));
+        // Rounds other calls ran since the last batch serve it with no refresh, while their cut is live.
+        let current = if refresh {
             None
         } else {
             r.current()
@@ -401,15 +414,22 @@ impl Session {
         };
         let v = match current {
             Some(v) => v,
-            None if poll || due || refreshed => {
-                self.last_poll = Some(mono);
+            None if refresh => {
+                // A failed refresh leaves the poll due, so its error comes at every call it lasts (Q-951).
+                let v = r.snapshot().inspect_err(|_| self.last_full = None)?;
+                (self.last_poll, self.last_full) = (Some(mono), Some(mono));
                 if let Some(p) = progress {
                     self.progress = p;
                 }
                 self.found_lost = found_lost;
-                r.snapshot()?
+                v
             }
-            None => return Ok(Turn::Wait),
+            None => {
+                if interval {
+                    self.last_poll = Some(mono);
+                }
+                return Ok(Turn::Wait);
+            }
         };
         if !self.started {
             self.started = true;

@@ -434,6 +434,13 @@ impl DurableReader {
         &self.hub
     }
 
+    /// Whether the mark changed since the last round read it, reading the mark alone; `None` while a round runs or
+    /// when the mark cannot be read.
+    pub(crate) fn mark_moved(&self) -> Option<bool> {
+        let w = self.work.try_lock().ok()?;
+        w.log.as_ref()?.mark_moved().ok()
+    }
+
     /// How many lost ranges the process found; the next round hands the new ones to the shared tail.
     pub(crate) fn found_lost(&self) -> usize {
         self.latch.closed_count()

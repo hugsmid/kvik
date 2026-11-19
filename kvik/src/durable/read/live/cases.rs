@@ -228,8 +228,11 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next() {
     w.log.seal_interval = Duration::from_millis(20);
     let s = w.open();
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
-    let r = w.reader();
-    let (mut session, _, _, mut held) = watched(&r, LiveOptions::default());
+    let readers = [w.reader(), s.reader()];
+    let mut sessions: Vec<_> = readers
+        .iter()
+        .map(|r| watched(r, LiveOptions::default()))
+        .collect();
     let sealed = |text: &[u8]| {
         for _ in 0..500 {
             if w.segments().iter().any(|(p, b)| {
@@ -246,7 +249,9 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next() {
     sealed(b"MS-ZERO");
     note(&w, &s, id, 1, "MS-ONE");
     sealed(b"MS-ONE");
-    poll(&w, &mut session, &mut held).unwrap();
+    for (session, _, _, held) in &mut sessions {
+        poll(&w, session, held).unwrap();
+    }
     note(&w, &s, id, 2, "MS-TWO");
     sealed(b"MS-TWO");
     let (path, _) = w
@@ -255,13 +260,21 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next() {
         .find(|(_, b)| b.windows(6).any(|x| x == b"MS-ONE"))
         .unwrap();
     crate::env::Fs::remove_file(&*w.env.fs, &path).unwrap();
-    for _ in 0..3 {
-        w.clock.advance(TICK);
-        let got = session.next(Duration::ZERO);
-        assert!(
-            matches!(got, Err(QueryError::NotAvailable { .. })),
-            "{got:?}"
-        );
+    for step in [
+        TICK,
+        TICK,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::from_millis(10),
+    ] {
+        w.clock.advance(step);
+        for (session, ..) in &mut sessions {
+            let got = session.next(Duration::ZERO);
+            assert!(
+                matches!(got, Err(QueryError::NotAvailable { .. })),
+                "{got:?}"
+            );
+        }
     }
     block_on(s.shutdown()).unwrap();
 }

@@ -395,6 +395,8 @@ pub struct LogReader {
     /// What [`LogReader::lookup`] keeps of sealed segments' indexes and of segments' batches.
     caches: lookup::Caches,
     closed: bool,
+    /// The update counter of the mark the last refresh read.
+    mark_counter: u64,
 }
 
 impl LogReader {
@@ -442,6 +444,7 @@ impl LogReader {
             lost_stale: false,
             caches: lookup::Caches::default(),
             closed: false,
+            mark_counter: 0,
             cfg,
         };
         let mark = r.read_mark()?;
@@ -512,6 +515,12 @@ impl LogReader {
         upto: Position,
     ) -> Result<(Update, bool), ReaderError> {
         self.refresh_inner(Some(max_items.max(1)), Some(upto))
+    }
+
+    /// Whether the mark changed since the last refresh read it, reading the mark alone: a refresh that finds it
+    /// unchanged reads no new batch. The manifest is not read, so a change to it alone is not seen.
+    pub fn mark_moved(&self) -> Result<bool, ReaderError> {
+        Ok(self.read_mark()?.counter != self.mark_counter)
     }
 
     /// Before the first refresh: starts the reader in the segment of the mark's generation that holds the position
@@ -613,6 +622,8 @@ impl LogReader {
             ));
         }
         self.view = view;
+        // A refresh that stopped short of the mark has not read all it shows.
+        self.mark_counter = if more { 0 } else { mark.counter };
         if self.lost_stale {
             self.lost = self.manifest.lost.clone();
             self.lost_stale = false;
