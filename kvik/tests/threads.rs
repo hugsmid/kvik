@@ -36,6 +36,9 @@ fn handles_and_results_are_send_and_sync() {
     assert_send_sync::<ConsumerError>();
     assert_send_sync::<kvik::env::Env>();
     assert_send_sync::<kvik::StoreConfig>();
+    // A live session moves to the thread that waits in `next`.
+    assert_send_sync::<kvik::LiveSession>();
+    assert_send_sync::<kvik::UpdateBatch>();
 }
 
 #[test]

@@ -211,7 +211,8 @@ pub struct UpdateBatch {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum LiveEvent {
-    /// The result at the batch's cut: replaces whatever the consumer held.
+    /// The result at the batch's cut. A `Latest`'s replaces whatever the consumer held; a `Tail`'s holds no fact, and
+    /// after a `Reset` says only that the read goes on from `above`, the consumer keeping what it holds up to it.
     Opened(Answer),
     /// New facts at the end.
     Appended(Appended),

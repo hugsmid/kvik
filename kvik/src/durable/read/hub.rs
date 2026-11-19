@@ -30,14 +30,15 @@ pub(crate) enum Piece {
 
 impl Piece {
     fn bytes(&self) -> u64 {
-        let text = match self {
+        let held = match self {
             Piece::Fact(s) => match &s.row.value {
                 LogValue::Text(t) => t.len(),
                 _ => 0,
             },
+            Piece::Entry(e) => usize::try_from(e.encoded_len()).unwrap_or(usize::MAX),
             _ => 0,
         };
-        (std::mem::size_of::<Piece>() + text) as u64
+        (std::mem::size_of::<Piece>().saturating_add(held)) as u64
     }
 
     fn kept_when_trimmed(&self) -> bool {

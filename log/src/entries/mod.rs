@@ -494,6 +494,11 @@ pub(crate) fn entry_len(e: &Entry) -> u64 {
 }
 
 impl Entry {
+    /// The bytes it takes in an entries body: its header, fields and padding to 8.
+    pub fn encoded_len(&self) -> u64 {
+        entry_len(self)
+    }
+
     /// The sequences this entry takes: 1, or the count of an [`Entry::Ignored`].
     pub fn sequences(&self) -> u64 {
         match self {

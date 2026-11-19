@@ -8,6 +8,7 @@
 //! facts its selection takes as known at each fact's position (Q-895); a reset, a loss and a lag are events, never
 //! silence (Q-1011, Q-1013).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,11 +157,11 @@ struct At<'a> {
 }
 
 impl At<'_> {
-    fn registry(&self) -> Registry {
+    fn registry(&self) -> Cow<'_, Registry> {
         if self.inside {
-            self.v.latest().registry_at(self.cut)
+            Cow::Owned(self.v.latest().registry_at(self.cut))
         } else {
-            self.v.latest().registry().clone()
+            Cow::Borrowed(self.v.latest().registry())
         }
     }
 
@@ -707,7 +708,7 @@ fn tail(
     if !t.opened {
         t.opened = true;
         t.from = at.cut;
-        t.names = at.registry();
+        t.names = at.registry().into_owned();
         out.push(LiveEvent::Opened(Answer::Tail));
         return;
     }
@@ -728,7 +729,7 @@ fn tail(
                 to: pos(at.cut),
             });
         }
-        t.names = at.registry();
+        t.names = at.registry().into_owned();
     } else if let Some(facts) = w.facts.get(&id).filter(|f| !f.is_empty()) {
         out.push(LiveEvent::Appended(Appended::Facts(
             facts.iter().map(fact_out).collect(),
