@@ -1,11 +1,11 @@
 //! Sessions the shared tail outran: what a trimmed round still tells them, and where their `Lagged` starts.
 
-use super::tests::{S, World, emit, gauge, latest_is_static, note, poll, tail_is_owed, watched};
+use super::tests::{World, emit, gauge, latest_is_static, note, poll, tail_is_owed, watched};
 use crate::durable::tests::block_on;
 use crate::read::{LiveOptions, View};
 use crate::series::{Kind, SeriesSpec};
 use crate::time::Timestamp;
-use crate::types::{Position, Reading, Value};
+use crate::types::Position;
 
 fn after(p: Position) -> Position {
     Position {
@@ -60,8 +60,8 @@ fn a_lagged_latest_judges_a_series_whose_only_new_fact_was_trimmed() {
     emit(&w, &s, b, 1.0);
     let r = w.reader();
     let (mut session, l, t, mut held) = watched(&r, LiveOptions::default().max_backlog(5, 1 << 30));
-    let at = Timestamp(w.clock.wall().0 + S);
-    block_on(s.emit(&[Reading::new(b, at, Value::F64(2.0))])).unwrap();
+    w.clock.advance(std::time::Duration::from_secs(1));
+    emit(&w, &s, b, 2.0);
     r.refresh().unwrap();
     for k in 0..10 {
         emit(&w, &s, a, f64::from(k));
@@ -116,5 +116,25 @@ fn lagged_starts_at_the_position_after_the_last_fact_delivered() {
     }
     let b = poll(&w, &mut session, &mut held).unwrap();
     assert_eq!(held[&t].lagged[1], (after(last), b.durable));
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_backlog_of_entries_past_its_bytes_lags_by_what_their_names_hold() {
+    let w = World::new("lag-entries");
+    let s = w.open();
+    let r = w.reader();
+    let piece = std::mem::size_of::<crate::durable::read::hub::Piece>();
+    let cap = u64::try_from(40 * piece).unwrap();
+    let (mut session, l, t, mut held) =
+        watched(&r, LiveOptions::default().max_backlog(1_000_000, cap));
+    for k in 0..30 {
+        let name = format!("{}/{}/m{k:02}", "a".repeat(60), "b".repeat(60));
+        block_on(s.define_series(gauge(&name))).unwrap();
+        r.refresh().unwrap();
+    }
+    poll(&w, &mut session, &mut held).unwrap();
+    assert_eq!(held[&t].lagged.len(), 1, "{:?}", held[&t]);
+    latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }

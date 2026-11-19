@@ -220,6 +220,35 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
     block_on(s.shutdown()).unwrap();
 }
 
+#[test]
+fn a_loss_the_writer_s_scan_finds_is_a_gap_at_the_next_call_of_its_process_s_session() {
+    let w = World::new("gap-scan");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let r = s.reader();
+    let (mut session, l, t, mut held) = watched(&r, LiveOptions::default());
+    note(&w, &s, id, -3, "SCAN-ONE");
+    let lost = note(&w, &s, id, -2, "SCAN-TWO");
+    note(&w, &s, id, -1, "SCAN-THREE");
+    poll(&w, &mut session, &mut held).unwrap();
+    assert_eq!(held[&t].tail.len(), 3);
+    w.damage(b"SCAN-TWO");
+    // The writer's scan for `losses` meets the damage; the writer does not move, so nothing else wakes the session.
+    assert!(
+        s.losses()
+            .iter()
+            .any(|l| l.first <= Some(lost) && Some(lost) <= l.last)
+    );
+    let b = poll(&w, &mut session, &mut held).unwrap();
+    assert!(
+        held[&t].gaps.iter().any(|(a, z)| *a <= lost && lost <= *z),
+        "{b:?}"
+    );
+    assert!(held[&t].tail.iter().all(|f| f.position != lost));
+    assert!(held[&l].gaps == held[&t].gaps);
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Q-951: a reader whose newest batch lies in a segment removed with no record fails every call until reopened;
 /// its live session returns the error at every `next`, never silence.
 #[test]
