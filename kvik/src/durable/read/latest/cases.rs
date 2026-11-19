@@ -73,15 +73,6 @@ impl Rig {
         self.reopen();
     }
 
-    /// The process stops, the power goes and the machine boots again with a new boot identity; the store is not
-    /// opened again.
-    fn power_loss(&mut self, boot: u8) {
-        self.fs.crash_after(0);
-        drop(self.store.take());
-        self.fs.power_loss();
-        self.env.boot = Arc::new(crate::env::FixedBootId::new(Some([boot; 16])));
-    }
-
     /// Damages the first copy of `text` in every log segment.
     fn damage(&self, text: &[u8]) {
         for p in self.segments() {
@@ -464,7 +455,7 @@ fn a_continuing_reader_never_shows_a_fact_a_start_recorded_lost() {
     rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
     rig.emit(&[(0, -4, 1, 0, 0)], false);
     assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-BBB"));
-    rig.power_loss(2);
+    rig.power_loss();
     rig.damage(b"NOTE-BBB");
     rig.reopen();
     let fresh = rig.reader();
@@ -523,7 +514,7 @@ fn a_directory_behind_a_loss_a_later_start_records_is_not_continued() {
     rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
     rig.emit(&[(0, -4, 1, 0, 0)], false);
     rig.directory();
-    rig.power_loss(2);
+    rig.power_loss();
     rig.damage(b"NOTE-BBB");
     rig.reopen();
     let r = rig.reader();
