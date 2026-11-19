@@ -92,6 +92,9 @@ pub(crate) struct Session {
     named: Vec<(LogPos, LogPos)>,
     /// The process's lost ranges counted at the last refresh.
     found_lost: usize,
+    /// Calls of `try_batch`, for the tests of waiting.
+    #[cfg(test)]
+    pub(crate) turns: u64,
 }
 
 impl Drop for Session {
@@ -193,6 +196,13 @@ impl At<'_> {
     }
 }
 
+/// What a call of `next` found: a batch, a time to sleep before anything can come, or nothing new yet.
+enum Turn {
+    Batch(UpdateBatch),
+    Sleep(Duration),
+    Wait,
+}
+
 /// A batch and the session's state after it, kept once the batch's cut proved live.
 struct Next {
     batch: Option<UpdateBatch>,
@@ -243,6 +253,8 @@ impl Session {
             recorded: Vec::new(),
             named: Vec::new(),
             found_lost: 0,
+            #[cfg(test)]
+            turns: 0,
         }
     }
 
@@ -319,35 +331,41 @@ impl Session {
     pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError> {
         let until = Instant::now() + timeout;
         loop {
-            if let Some(b) = self.try_batch()? {
-                return Ok(Some(b));
-            }
+            let turn = self.try_batch()?;
             let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(None);
-            }
-            let wait = left.min(self.opts.poll_interval);
+            let rest = match turn {
+                Turn::Batch(b) => return Ok(Some(b)),
+                _ if left.is_zero() => return Ok(None),
+                Turn::Sleep(d) => d,
+                Turn::Wait => self.opts.poll_interval,
+            };
             match &self.watch {
-                Some(w) if !w.stopped() => {
-                    w.wait_progress(self.progress, wait);
+                Some(w) if matches!(turn, Turn::Wait) && !w.stopped() => {
+                    w.wait_progress(self.progress, left.min(rest));
                 }
-                _ => std::thread::sleep(wait),
+                _ => std::thread::sleep(left.min(rest)),
             }
         }
     }
 
-    fn try_batch(&mut self) -> Result<Option<UpdateBatch>, QueryError> {
+    fn try_batch(&mut self) -> Result<Turn, QueryError> {
+        #[cfg(test)]
+        {
+            self.turns += 1;
+        }
         if self.reads.is_empty() {
-            return Ok(None);
+            return Ok(Turn::Sleep(Duration::MAX));
         }
         let mono = self.mono();
+        if let Some(s) = self.sub {
+            self.reader.hub().touch(s, mono);
+        }
         let opening = self.reads.values().any(|r| !r.opened());
-        if !opening
-            && self
-                .last_batch
-                .is_some_and(|t| mono.saturating_sub(t) < self.opts.min_batch_interval)
-        {
-            return Ok(None);
+        if !opening && let Some(t) = self.last_batch {
+            let since = mono.saturating_sub(t);
+            if since < self.opts.min_batch_interval {
+                return Ok(Turn::Sleep(self.opts.min_batch_interval - since));
+            }
         }
         let r = self.reader.clone();
         let sub = match self.sub {
@@ -391,7 +409,7 @@ impl Session {
                 self.found_lost = found_lost;
                 r.snapshot()?
             }
-            None => return Ok(None),
+            None => return Ok(Turn::Wait),
         };
         if !self.started {
             self.started = true;
@@ -417,10 +435,13 @@ impl Session {
         } else {
             r.hub().advance(sub, next.at.0);
         }
-        if next.batch.is_some() {
-            self.last_batch = Some(mono);
-        }
-        Ok(next.batch)
+        Ok(match next.batch {
+            Some(b) => {
+                self.last_batch = Some(mono);
+                Turn::Batch(b)
+            }
+            None => Turn::Wait,
+        })
     }
 
     /// The batch at view `v` and the session's next state, which the caller keeps once the cut proved live.
@@ -797,6 +818,10 @@ mod cases;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
+mod lags;
+#[cfg(test)]
 mod stops;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod waits;

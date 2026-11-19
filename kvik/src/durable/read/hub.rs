@@ -45,10 +45,12 @@ impl Piece {
     }
 }
 
-/// What one refresh read.
+/// What one refresh read, or a run of refreshes that read nothing.
 #[derive(Debug)]
 pub(crate) struct Round {
     pub(crate) seq: u64,
+    /// The number of the last refresh of the run; `seq` for a round with pieces.
+    last: u64,
     pieces: Vec<Piece>,
     /// Each piece's index in the round as read, once trimmed; a session stopped inside the round counts by it.
     index: Vec<usize>,
@@ -79,6 +81,7 @@ impl Round {
             .unzip();
         Round {
             seq: self.seq,
+            last: self.last,
             pieces,
             index,
             whole: false,
@@ -238,14 +241,30 @@ impl Hub {
             }
             s.rows += c.rows;
             s.bytes += c.bytes;
-            s.rounds.push_back(Arc::new(Round {
-                seq,
-                pieces: c.pieces,
-                index: Vec::new(),
-                whole: c.whole,
-                rows: c.rows,
-                bytes: c.bytes,
-            }));
+            let nothing = c.whole && c.pieces.is_empty();
+            match s.rounds.back_mut() {
+                // An idle subscriber keeps one round for a run of refreshes that read nothing (Q-1013).
+                Some(b) if nothing && b.whole && b.is_empty() => {
+                    *b = Arc::new(Round {
+                        seq: b.seq,
+                        last: seq,
+                        pieces: Vec::new(),
+                        index: Vec::new(),
+                        whole: true,
+                        rows: 0,
+                        bytes: 0,
+                    });
+                }
+                _ => s.rounds.push_back(Arc::new(Round {
+                    seq,
+                    last: seq,
+                    pieces: c.pieces,
+                    index: Vec::new(),
+                    whole: c.whole,
+                    rows: c.rows,
+                    bytes: c.bytes,
+                })),
+            }
         }
         trim(&mut s);
         seq
@@ -284,6 +303,13 @@ impl Hub {
         }
     }
 
+    /// Notes that `sub` was polled at `now`, whatever its call found.
+    pub(crate) fn touch(&self, sub: u64, now: Duration) {
+        if let Some(x) = self.lock().subs.get_mut(&sub) {
+            x.polled = now;
+        }
+    }
+
     /// The rounds after `sub`'s cursor up to `upto`, at `now`.
     pub(crate) fn take(&self, sub: u64, upto: u64, now: Duration) -> Taken {
         let mut s = self.lock();
@@ -300,16 +326,20 @@ impl Hub {
         let rounds: Vec<Arc<Round>> = s
             .rounds
             .iter()
-            .filter(|r| r.seq > cursor && r.seq <= upto)
+            .filter(|r| r.last > cursor && r.seq <= upto)
             .cloned()
             .collect();
         let backlog = s
             .rounds
             .iter()
-            .filter(|r| r.seq > cursor)
+            .filter(|r| r.last > cursor)
             .fold((0, 0), |(a, b), r| (a + r.rows, b + r.bytes));
-        let wanted = usize::try_from(upto.saturating_sub(cursor)).unwrap_or(usize::MAX);
-        let lagged = idle || rounds.len() < wanted || rounds.iter().any(|r| !r.whole);
+        let counted: u64 = rounds
+            .iter()
+            .map(|r| (r.last.min(upto) + 1).saturating_sub(r.seq.max(cursor + 1)))
+            .sum();
+        let lagged =
+            idle || counted < upto.saturating_sub(cursor) || rounds.iter().any(|r| !r.whole);
         Taken {
             rounds,
             lagged,
@@ -355,7 +385,7 @@ fn cap(s: &State) -> Option<(u64, u64)> {
 fn trim(s: &mut State) {
     let floor = s.subs.values().filter(|x| !x.idle).map(|x| x.cursor).min();
     while let Some(r) = s.rounds.front() {
-        if floor.is_some_and(|f| r.seq > f) {
+        if floor.is_some_and(|f| r.last > f) {
             break;
         }
         s.rows -= r.rows;

@@ -381,6 +381,8 @@ fn a_session_not_polled_for_the_cut_age_is_closed_as_idle() {
     w.clock.advance(Duration::from_secs(61));
     emit(&w, &s, id, 1.0);
     r.refresh().unwrap();
+    // Idle, the session holds nothing back before it is called again.
+    assert_eq!(r.durable().unwrap().unwrap().hub().held(), (0, 0, 0));
     let b = session.next(Duration::ZERO).unwrap().unwrap();
     assert_eq!(kinds(&b), ["closed", "closed"]);
     assert!(

@@ -103,6 +103,17 @@ impl LiveSession {
     }
 }
 
+#[cfg(test)]
+impl LiveSession {
+    /// Calls of the durable session's `try_batch`.
+    pub(crate) fn turns(&self) -> u64 {
+        match &self.inner {
+            Inner::Durable(d) => d.session.as_ref().map_or(0, |s| s.turns),
+            Inner::Model(_) => 0,
+        }
+    }
+}
+
 pub(crate) fn check(q: &Query) -> Result<(), QueryError> {
     match q {
         Query::Latest(sel) | Query::Tail { sel } => sel.check(),
