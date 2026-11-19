@@ -214,7 +214,7 @@ impl Caches {
     }
 
     /// Drops the least recently used entries until the caches hold at most [`LOOKUP_CACHE_BYTES`].
-    fn trim(&mut self) {
+    pub(super) fn trim(&mut self) {
         if self.bytes <= self.cap {
             return;
         }
@@ -320,12 +320,12 @@ fn header(f: &dyn crate::fs::FsFile, id: &SegmentIdentity) -> Option<HeaderState
 }
 
 /// What one segment's read is for: the wanted ranges by series, the mark, and the regions taken as lost.
-struct Query<'a> {
-    by_series: BTreeMap<u32, Vec<(i64, i64)>>,
-    ranges: Vec<(i64, i64)>,
-    generation: u32,
-    last_sequence: u64,
-    lost: &'a dyn Fn(u64, u64, u64) -> bool,
+pub(super) struct Query<'a> {
+    pub(super) by_series: BTreeMap<u32, Vec<(i64, i64)>>,
+    pub(super) ranges: Vec<(i64, i64)>,
+    pub(super) generation: u32,
+    pub(super) last_sequence: u64,
+    pub(super) lost: &'a dyn Fn(u64, u64, u64) -> bool,
 }
 
 impl Query<'_> {
@@ -462,7 +462,7 @@ impl LogReader {
     /// Reads one segment for `query`; returns whether every batch that may hold a wanted fact was read and only lost
     /// regions were met. Batches a lookup has read before are read again only when their event times may hold a
     /// wanted key ([`SegmentMap`]); batches appended since are scanned a part at a time and added to the map.
-    fn lookup_segment(
+    pub(super) fn lookup_segment(
         &mut self,
         name: SegmentName,
         limit: ScanLimit,

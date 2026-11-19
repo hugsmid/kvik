@@ -699,9 +699,11 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
 mod files;
 mod lease;
 mod lookup;
+mod lookup_at;
 mod manifest;
 mod pass;
 #[cfg(test)]
 mod tests;
 
 pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted};
+pub use lookup_at::WantedAt;

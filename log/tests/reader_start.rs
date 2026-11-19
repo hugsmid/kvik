@@ -295,3 +295,122 @@ fn a_range_a_restart_records_below_what_was_read_reaches_a_started_reader_only_a
         "{lost:?}"
     );
 }
+
+/// Facts of each batch, with their positions, as `(series, t, position)`.
+fn facts_of(b: &ReadBatch) -> Vec<(u32, i64, Position)> {
+    let mut sequence = b.first.sequence;
+    let mut out = Vec::new();
+    for item in &b.content.items {
+        if let Item::Fact(r) = item {
+            out.push((
+                r.series_id,
+                r.t,
+                Position {
+                    generation: b.first.generation,
+                    sequence,
+                },
+            ));
+        }
+        sequence += item.sequences();
+    }
+    out
+}
+
+#[test]
+fn a_lookup_at_positions_reads_one_segment_each_and_finds_what_a_lookup_by_time_finds() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let picked: Vec<(u64, (u32, i64, Position))> = whole
+        .iter()
+        .step_by(37)
+        .flat_map(|b| facts_of(b).into_iter().take(2).map(|f| (b.file_id, f)))
+        .collect();
+    let wanted: Vec<WantedAt> = picked
+        .iter()
+        .map(|(_, (s, t, p))| WantedAt {
+            series_id: *s,
+            t: *t,
+            position: *p,
+        })
+        .collect();
+    let mut r = reader(&fs, 10);
+    let at = r.lookup_at(&wanted, &|_, _, _| false).unwrap();
+    assert!(at.complete.iter().all(|c| *c));
+    let mut segments: Vec<u64> = picked.iter().map(|(f, _)| *f).collect();
+    segments.dedup();
+    assert!(segments.len() >= 4, "{segments:?}");
+    assert_eq!(at.segments_read, segments.len() as u64);
+    for w in &wanted {
+        assert!(
+            at.facts
+                .iter()
+                .any(|f| f.position == w.position && f.row.t == w.t),
+            "{w:?}"
+        );
+    }
+    let by_time = r
+        .lookup(
+            &wanted
+                .iter()
+                .map(|w| Wanted {
+                    series_id: w.series_id,
+                    from: w.t,
+                    to: w.t,
+                })
+                .collect::<Vec<_>>(),
+            &|_, _, _| false,
+        )
+        .unwrap();
+    assert_eq!(at.facts, by_time.facts);
+}
+
+#[test]
+fn a_lookup_at_a_position_whose_segment_is_gone_never_finds_it_elsewhere() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let b = &whole[whole.len() / 2];
+    let (s, t, p) = facts_of(b)[0];
+    let gone = fs
+        .paths()
+        .into_iter()
+        .find(|x| {
+            x.to_string_lossy()
+                .contains(&format!("{:016x}.kvl", b.file_id))
+        })
+        .unwrap();
+    fs.remove_file(&gone).unwrap();
+    let mut r = reader(&fs, 10);
+    let at = r
+        .lookup_at(
+            &[WantedAt {
+                series_id: s,
+                t,
+                position: p,
+            }],
+            &|_, _, _| false,
+        )
+        .unwrap();
+    assert!(at.facts.iter().all(|f| f.position != p), "{:?}", at.facts);
+}
+
+#[test]
+fn a_start_after_the_second_last_position_of_a_segment_reads_from_that_segment() {
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    // A batch whose successor, of one position, is the last batch of its segment: the next segment's base is two
+    // above the start.
+    let k = (0..whole.len() - 2)
+        .find(|&k| {
+            whole[k + 1].file_id == whole[k].file_id
+                && whole[k + 2].file_id != whole[k].file_id
+                && whole[k + 1].first == whole[k + 1].last
+        })
+        .expect("such a batch");
+    let mut r = reader(&fs, 10);
+    assert!(r.start_after(whole[k].last).unwrap());
+    let got = batches(&r.refresh().unwrap().events);
+    assert_eq!(got.first(), Some(&whole[k + 1]));
+    assert_eq!(got.len(), whole.len() - k - 1);
+}
