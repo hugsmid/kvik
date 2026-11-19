@@ -180,7 +180,7 @@ fn future_and_outranked_facts_are_live_only_when_current_and_due_with_no_search(
     let mut rig = Rig::new("ahead");
     rig.emit(&[(0, -4, 0, 0, 0), (0, 30, 1, 0, 0)], false);
     rig.emit(&[(3, -4, 0, 0, 2)], false);
-    rig.emit(&[(3, -4, 1, 0, 1)], true);
+    rig.emit(&[(3, -4, 1, 0, 1)], false);
     for secs in [0, 31] {
         rig.clock.advance(Duration::from_secs(secs));
         for i in [0, 3] {
@@ -520,9 +520,13 @@ fn a_directory_behind_a_loss_a_later_start_records_is_not_continued() {
     rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
     rig.emit(&[(0, -4, 1, 0, 0)], false);
     rig.directory();
+    let folded = newest_directory(&rig.fs, &rig.dir);
     rig.power_loss();
     rig.damage(b"NOTE-BBB");
     rig.reopen();
+    rig.shut();
+    // Under the mark's reset stamp, so that only the count of lost positions tells it is behind the loss.
+    restamp_directory(&rig.env, &rig.dir, &folded, 0);
     let r = rig.reader();
     assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("NOTE-AAA"));
     assert!(!durable(&r).seeded());
@@ -618,8 +622,8 @@ fn a_directory_candidate_inside_a_recorded_lost_range_is_searched_for_not_unavai
 fn a_candidate_read_at_its_position_is_never_taken_for_another_fact_at_its_time() {
     let mut rig = Rig::new("candidate-position");
     rig.emit(&[(3, -4, 0, 0, 2)], false);
-    // Outranked: an older version at the same time, at a later position.
-    rig.emit(&[(3, -4, 1, 0, 1)], true);
+    // Outranked and recorded: an older version at the same time, at a later position.
+    rig.emit(&[(3, -4, 1, 0, 1)], false);
     rig.directory();
     let r = rig.reader();
     let Live::Value(v) = r.live(rig.ids[3]).unwrap() else {

@@ -44,9 +44,10 @@ fn a_snapshot_answers_at_its_cut_and_now_while_facts_arrive_and_ends_once_its_cu
         .iter()
         .map(|i| snap.series(rig.ids[*i]).unwrap().latest_t)
         .collect();
-    // Later facts at times up to `now`, and the clock moves on.
+    // Later facts at times up to `now`, series 1's at `now` (looked up after them, never taken), and the clock moves
+    // on.
     rig.emit(
-        &[(0, -1, 1, 0, 0), (1, -1, 1, 0, 0), (2, -1, 1, 0, 0)],
+        &[(0, -1, 1, 0, 0), (1, 0, 0, 0, 0), (2, -1, 1, 0, 0)],
         false,
     );
     rig.clock.advance(Duration::from_secs(5));
