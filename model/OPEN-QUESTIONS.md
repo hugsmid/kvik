@@ -133,6 +133,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1014 | query design §3.6 | A row limit met inside one refresh's read (decided by the lead) |
 | Q-1015 | query design §1 S13, §3.6 | Waking, pacing and due times of a live session (decided by the lead) |
 | Q-1016 | query design §2.1; roadmap 8.1g | A live read and an unavailable segment or tier (decided by the lead) |
+| Q-1017 | query design §1 S13 | The empty poll of a reader process against S13 (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3553,6 +3554,23 @@ segment the reader stands in that is missing (Q-951, until a restart), and the t
 segments exist (roadmap 8.1g).
 **Pinned by.** `kvik/src/durable/read/live/cases.rs` `a_missing_segment_under_the_tail_is_an_error_at_every_next`.
 
+## Q-1017 — The empty poll of a reader process against S13
+Decided by the lead with roadmap 9.0d, for review; a performance target is the lead's.
+**Scenario.** S13 asks 50 µs for an empty poll of a live session (200 µs on the minimal class). A reader process's
+full refresh finding nothing costs about that alone: 54 to 60 µs on a shared four-core machine in
+`kvik/tests/live_budgets.rs`, 300 rounds of 400 series with a seal every few. Built on it, the empty poll measured 56
+µs best and 89 to 101 µs in the review (99 to 128 µs with a `Latest` of 400 series).
+**Decided.** A reader process's poll reads the mark alone within a second of its last full refresh and asks nothing
+more when it is unchanged, nothing is due and no loss was found since (Q-1015); refreshes that read nothing with a
+session subscribed keep no round of their own (Q-1013). Measured once afterwards on the same machine (best mean of
+five runs of 50 polls 21 ms apart, so one full refresh per run): `Tail` 31 µs (31 to 40), `Tail` and a `Latest` of
+400 series 36 µs (36 to 68); the writer's process 4 and 12 µs. What remains over 50 µs is the full refresh a poll runs
+once a second, 60 µs here and up to 108 µs for the slowest single poll, and the run disturbed by other work (68 µs).
+These are figures of one shared machine, not of the minimal class, which was not measured; the year of seals the
+design's budget test asks for is roadmap 9.0e's, which measures again.
+**Pinned by.** `kvik/tests/live_budgets.rs` (a measurement, ignored by default);
+`log/src/reader/tests/parts_and_lookup.rs` `the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -3566,7 +3584,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -3708,6 +3726,7 @@ recorded and decided Q-1010 to Q-1016 by the lead.
 | Q-1014 | 9.0j | Decided by the lead: a cut inside a refresh's read judges `Latest` by search; a `Joined`'s info from the refresh's end; revisited with 9.0j's shapes |
 | Q-1015 | 9.0d | Decided by the lead: the writer's progress wakes, the poll and batch intervals on the environment's clock, due times per member; for review |
 | Q-1016 | 8.1g | Decided by the lead: a session reads only the shared tail; its errors at every `next`; the tier-unavailable error with cold segments |
+| Q-1017 | 9.0e | Decided by the lead: a reader process's poll reads the mark alone within a second of a full refresh; one shared machine's figures, measured again by 9.0e |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
