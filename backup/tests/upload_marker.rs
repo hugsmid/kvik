@@ -95,6 +95,40 @@ fn puts_since(h: &Harness, from: usize) -> Vec<String> {
         .collect()
 }
 
+/// Steps a driver into a rebuilt manifest until three of its carried records are up, then drops it; returns the
+/// epoch of the rebuild record that opens it.
+fn into_unfinished_rebuild(h: &mut Harness) -> u64 {
+    for _ in 0..3 {
+        h.seal(20);
+    }
+    run_idle(&mut h.driver(), &mut Duration::default());
+    h.close();
+    h.set_app(rebuild_final(h));
+    let mut d = h.driver();
+    loop {
+        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+        let opened = in_bucket(&h.sink.mem)
+            .into_iter()
+            .filter(|u| u.record.old_epoch.is_some())
+            .count();
+        if opened >= 3 {
+            return in_bucket(&h.sink.mem)
+                .into_iter()
+                .find(|u| matches!(u.record.body, kvik_files::record::Body::Rebuild(_)))
+                .unwrap()
+                .record
+                .epoch;
+        }
+    }
+}
+
+fn damage(h: &Harness, key: &str) {
+    let mut b = h.sink.mem.objects()[key].clone();
+    let mid = b.len() / 2;
+    b[mid] ^= 1;
+    h.sink.mem.set(key, &b);
+}
+
 /// Steps until record `epoch` is put.
 fn step_to_record(d: &mut Driver, h: &Harness, epoch: u64) {
     let key = Keys::new(ID).record(0, epoch);
@@ -172,11 +206,7 @@ fn q614_an_unreadable_latest_marker_is_followed_by_one_made_from_the_records() {
     run_idle(&mut h.driver(), &mut Duration::default());
     let keys = Keys::new(ID);
     let n = (1..).take_while(|s| marker(&h, *s).is_some()).count() as u64;
-    let k = keys.marker(0, n);
-    let mut b = h.sink.mem.objects()[&k].clone();
-    let mid = b.len() / 2;
-    b[mid] ^= 1;
-    h.sink.mem.set(&k, &b);
+    damage(&h, &keys.marker(0, n));
     let from = h.events().len();
     run_idle(&mut h.driver(), &mut Duration::default());
     assert_eq!(puts_since(&h, from), [keys.marker(0, n + 1)]);
@@ -235,30 +265,8 @@ fn q614_a_record_put_before_a_restart_and_a_rebuild_and_hidden_by_the_listing_is
 fn q614_a_catch_up_whose_listing_hides_a_record_the_others_name_retries_instead_of_putting_a_marker()
  {
     let mut h = Harness::new();
-    for _ in 0..3 {
-        h.seal(20);
-    }
-    run_idle(&mut h.driver(), &mut Duration::default());
-    h.close();
-    h.set_app(rebuild_final(&h));
+    let opener = into_unfinished_rebuild(&mut h);
     let keys = Keys::new(ID);
-    let mut d = h.driver();
-    let opener = loop {
-        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
-        let opened = in_bucket(&h.sink.mem)
-            .into_iter()
-            .filter(|u| u.record.old_epoch.is_some())
-            .count();
-        if opened >= 3 {
-            break in_bucket(&h.sink.mem)
-                .into_iter()
-                .find(|u| matches!(u.record.body, kvik_files::record::Body::Rebuild(_)))
-                .unwrap()
-                .record
-                .epoch;
-        }
-    };
-    drop(d);
     for m in all_markers(&h) {
         h.sink.mem.remove(&keys.marker(0, m.sequence));
     }
@@ -313,4 +321,80 @@ fn q614_a_catch_up_over_a_record_the_bucket_lost_puts_its_marker_instead_of_retr
         marker(&h, 1).unwrap().summary.epoch,
         in_bucket(&h.sink.mem).last().unwrap().record.epoch
     );
+}
+
+#[test]
+fn q614_a_catch_up_past_an_unreadable_latest_marker_starts_from_the_readable_one_and_keeps_naming_a_lost_record()
+ {
+    let mut h = Harness::new();
+    let opener = into_unfinished_rebuild(&mut h);
+    let keys = Keys::new(ID);
+    let latest = all_markers(&h).len() as u64;
+    let readable = marker(&h, latest - 1).unwrap().summary;
+    let last_old = in_bucket(&h.sink.mem)
+        .iter()
+        .map(|u| u.record.epoch)
+        .filter(|e| *e < opener)
+        .max()
+        .unwrap();
+    assert_eq!(readable.read.map(|r| r.1), Some(last_old));
+    damage(&h, &keys.marker(0, latest));
+    h.sink.mem.remove(&keys.record(0, last_old));
+    let (_, mut d) = hiding(&h, &[]);
+    for _ in 0..100 {
+        if h.sink
+            .mem
+            .objects()
+            .contains_key(&keys.marker(0, latest + 1))
+        {
+            break;
+        }
+        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+    }
+    let next = marker(&h, latest + 1).unwrap().summary;
+    assert_eq!(next.read, readable.read);
+    assert_ne!(next.read, bucket_summary(&h).read);
+}
+
+#[test]
+fn q960_a_later_version_marker_below_an_unreadable_latest_one_stops_uploads() {
+    let mut h = Harness::new();
+    h.seal(10);
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let n = all_markers(&h).len() as u64;
+    assert!(n >= 2);
+    let keys = Keys::new(ID);
+    let k = keys.marker(0, n - 1);
+    let mut later = marker(&h, n - 1).unwrap().encode();
+    later[4] = 2;
+    h.sink
+        .mem
+        .set(&k, &TestEnvelope::new(KEY).seal(&k, &later).unwrap());
+    damage(&h, &keys.marker(0, n));
+    h.seal(10);
+    let step = run(&mut h.driver(), &mut Duration::default(), 1_000);
+    assert!(
+        matches!(step, Step::Failed(UploadError::MarkerVersion { sequence, version: 2 }) if sequence == n - 1),
+        "{step:?}"
+    );
+    assert!(!h.sink.mem.objects().contains_key(&keys.marker(0, n + 1)));
+}
+
+#[test]
+fn q614_a_catch_up_passes_over_an_unreadable_latest_marker_and_one_the_bucket_no_longer_holds() {
+    let mut h = Harness::new();
+    h.seal(10);
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let n = all_markers(&h).len() as u64;
+    assert!(n >= 3);
+    let keys = Keys::new(ID);
+    damage(&h, &keys.marker(0, n));
+    h.sink.mem.remove(&keys.marker(0, n - 1));
+    let from = h.events().len();
+    let step = run(&mut h.driver(), &mut Duration::default(), 1_000);
+    assert!(matches!(step, Step::Idle), "{step:?}");
+    assert_eq!(puts_since(&h, from), [keys.marker(0, n + 1)]);
+    assert_eq!(marker(&h, n + 1).unwrap().summary, bucket_summary(&h));
 }

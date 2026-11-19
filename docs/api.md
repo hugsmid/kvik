@@ -656,8 +656,8 @@ only, boxed `Send` futures):
   of one driver that finds it so (`MARKER_LISTING_TRIES`), `MarkerNotListed { generation, epoch, tries }`. The
   bound counts calls, so the caller paces its retries. Each is reported by `Store::restore` as the additive
   `BackupError::Marker { generation, reason }`, and the switches reach it, with roadmap 8.3d (Q-961). The upload
-  driver stops with `UploadError::MarkerVersion { sequence, version }` on a latest marker of a version it does not
-  read. A full restore whose
+  driver starts from the latest marker that can be read, passing over those that cannot as a restore does, and stops
+  with `UploadError::MarkerVersion { sequence, version }` on a marker of a version it does not read met on the way. A full restore whose
   `prepare` fails after its claim, retried on the same driver, runs in the generation it claimed while no higher one
   is claimed; a new driver, or a new process, claims the next (Q-266).
 - **Superseded writer.** The upload driver reads the claim above its generation before each record upload; once a

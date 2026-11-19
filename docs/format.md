@@ -891,10 +891,13 @@ its own prefix, which the engine never sees.
   records listed above it and those `stat` reports within 8 epochs after the highest it knows (as a restore asks,
   Q-612), checks that their uploaded forms chain from the marker's epoch (a break whose predecessor `stat` reports
   is a lagging listing: the step is retried), and puts a marker at once if they are ahead of it (a restart between a
-  record and its marker, a latest marker that cannot be read, a bucket written before markers). A latest marker of a
-  version it does not read stops its uploads (`UploadError::MarkerVersion`): an earlier version is never put after
-  a later one. A restore checks the latest marker that opens and decodes, passing over and reporting those after it
-  that do not, but never one of a later version (`spec.md` §8 Generations, `api.md` Restore).
+  record and its marker, a latest marker that cannot be read, a bucket written before markers). A restore checks the
+  latest marker that opens and decodes, passing over and reporting those after it that do not, but never one of a
+  later version (`spec.md` §8 Generations, `api.md` Restore); the upload driver starts from the same marker, or from
+  none when none can be read. A marker of a version it does not read stops its uploads
+  (`UploadError::MarkerVersion`): an earlier version is never put after a later one that opens. The version is inside
+  the envelope, so a later-version marker damaged so that its envelope does not open cannot be told from a damaged
+  version 1 marker and is passed over. The scan down has no bound: N unreadable markers in a row cost N `get` (Q-1020).
 - **Probe** (Q-162). The conditional-write probe at `<sid>/probe` is an envelope whose plaintext is never read. A
   checksum probe at `<sid>/probe/<nonce>` is unsealed: the 19 ASCII bytes `kvik checksum probe` (Q-340).
   `attach_backup`, and a restore before it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to

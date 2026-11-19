@@ -24,9 +24,9 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
     /// applied) and the sequence the next marker tries. The records above it are those `listed` and those `stat`
     /// reports within `TAIL_PROBES` epochs after the highest known, as a restore asks (Q-612): a record put just before
     /// a restart that the listing hides is still counted. Their uploaded forms must chain from the marker's epoch; a
-    /// break whose predecessor `stat` reports is a lagging listing, retried (Q-614). A latest marker that cannot be read
-    /// counts as none, so the next marker, made from every record found, replaces it; so does a bucket written before
-    /// markers. One of a version this build does not read stops uploads.
+    /// break whose predecessor `stat` reports is a lagging listing, retried (Q-614). The marker counted is the latest
+    /// readable one, as at a restore; with none readable, or none at all (a bucket written before markers), the next
+    /// marker is made from every record found.
     pub(super) async fn open_marks(
         &mut self,
         g: u32,
@@ -35,20 +35,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         let latest = marker::latest(&self.sink, &self.keys, g)
             .await
             .map_err(sink_stop)?;
-        let mut marked = Summary::default();
-        if latest > 0 {
-            match marker::read(&self.sink, &self.envelope, &self.keys, g, latest).await {
-                Ok(m) => marked = m.summary,
-                Err(ReadError::Unreadable(_)) => {}
-                Err(ReadError::Version(version)) => {
-                    return Err(Stop::Fail(UploadError::MarkerVersion {
-                        sequence: latest,
-                        version,
-                    }));
-                }
-                Err(ReadError::Sink(e)) => return Err(sink_stop(e)),
-            }
-        }
+        let marked = self.latest_readable(g, latest).await?;
         listed.sort_unstable();
         listed.dedup();
         let mut found = Vec::new();
@@ -87,6 +74,23 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
             summary.apply(&u.record);
         }
         Ok((marked, summary, latest.saturating_add(1)))
+    }
+
+    /// What the latest readable marker of `g` at or below `latest` names, scanning down past those that do not open,
+    /// decode or match their key, or that the bucket no longer holds (Q-614 (c)); one of a version this build does not
+    /// read stops uploads (Q-960). The scan has no bound (Q-1020).
+    async fn latest_readable(&mut self, g: u32, latest: u64) -> Out<Summary> {
+        for sequence in (1..=latest).rev() {
+            match marker::read(&self.sink, &self.envelope, &self.keys, g, sequence).await {
+                Ok(m) => return Ok(m.summary),
+                Err(ReadError::Unreadable(_) | ReadError::Sink(SinkError::NotFound { .. })) => {}
+                Err(ReadError::Version(version)) => {
+                    return Err(Stop::Fail(UploadError::MarkerVersion { sequence, version }));
+                }
+                Err(ReadError::Sink(e)) => return Err(sink_stop(e)),
+            }
+        }
+        Ok(Summary::default())
     }
 
     async fn record_reported(&mut self, g: u32, epoch: u64) -> Out<bool> {
