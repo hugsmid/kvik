@@ -73,6 +73,46 @@ fn a_reset_voids_what_the_tail_holds_above_it_and_opens_latest_again() {
 }
 
 #[test]
+fn a_reset_that_voids_an_alias_takes_it_from_what_a_tail_selects_by() {
+    let mut w = World::new("reset-alias");
+    w.log = LogConfig {
+        segment_size: 16 << 20,
+        mark_sync: crate::config::MarkSync::Interval(Duration::from_secs(3_600)),
+        ..LogConfig::default()
+    };
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("h/d0/note", Kind::Text, ""))).unwrap();
+    let r = w.reader();
+    let mut session = r.session();
+    let t = session
+        .open(
+            Query::Tail {
+                sel: Select::Names("x/*/*".into()).into(),
+            },
+            LiveOptions::default(),
+        )
+        .unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    apply(&mut held, &session.next(Duration::ZERO).unwrap().unwrap());
+    note(&w, &s, id, -2, "RA-ONE");
+    block_on(s.alias(id, "x/d0/alias")).unwrap();
+    poll(&w, &mut session, &mut held);
+    assert!(held[&t].tail.is_empty());
+    // The alias is the newest batch, torn by the power cut: the start truncates it (spec §3 Recovery rule 3).
+    w.fs.crash_after(0);
+    drop(s);
+    w.fs.power_loss();
+    w.boot.set(Some([2; 16]));
+    w.damage(b"x/d0/alias");
+    let s = w.open();
+    note(&w, &s, id, -1, "RA-TWO");
+    let b = poll(&w, &mut session, &mut held).unwrap();
+    assert_eq!(held[&t].resets.len(), 1, "{b:?}");
+    assert!(held[&t].tail.is_empty(), "{b:?}");
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
 fn a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail() {
     let mut w = World::new("recorded");
     w.log = LogConfig {
