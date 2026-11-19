@@ -255,3 +255,43 @@ fn a_recovery_entry_at_or_below_the_start_voids_nothing_the_start_passes_over() 
         assert_eq!(batches(&u.events), want);
     }
 }
+
+/// A reader never reads again a batch it returned: damage to one below its last that a later start records as a
+/// lost range reaches a started reader, as it does one that read the log from its start, only through
+/// [`LogReader::lost_ranges`], never as an event.
+#[test]
+fn a_range_a_restart_records_below_what_was_read_reaches_a_started_reader_only_as_a_lost_range() {
+    let fs = written(20);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let mut full = reader(&fs, 10);
+    let mut started = reader(&fs, 11);
+    assert!(started.start_after(whole[whole.len() - 6].last).unwrap());
+    full.refresh().unwrap();
+    started.refresh().unwrap();
+    let target = &whole[whole.len() - 3];
+    fs.power_loss();
+    let segment = fs
+        .paths()
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "kvl" || e == "open"))
+        .find(|p| {
+            p.to_string_lossy()
+                .contains(&format!("{:016x}", target.file_id))
+        })
+        .unwrap();
+    fs.poke(&segment, target.offset as usize + 40, b"XXXXXXXX");
+    fs.restart();
+    start_on(&fs, 2).shutdown().unwrap();
+    let f = full.refresh().unwrap().events;
+    let s = started.refresh().unwrap().events;
+    assert!(s.iter().all(|e| matches!(e, ReadEvent::Batch(_))), "{s:?}");
+    assert_eq!(batches(&s), batches(&f));
+    let lost = started.lost_ranges();
+    assert_eq!(lost, full.lost_ranges());
+    assert!(
+        lost.len() == 1
+            && lost[0].first <= (target.first.generation, target.first.sequence)
+            && (target.last.generation, target.last.sequence) <= lost[0].last,
+        "{lost:?}"
+    );
+}
