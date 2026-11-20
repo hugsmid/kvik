@@ -14,7 +14,8 @@ use crate::series::SeriesKey;
 use crate::time::{TimeRange, Timestamp};
 use crate::types::{Fact, SeriesId};
 
-/// What a read of `ids` in `view` selects at `v`'s cut.
+/// What a read of `ids` in `view` selects at `v`'s cut. As of a time meets damage as a pass does: the scanning read
+/// finds it first, and the search runs once more (Q-1064).
 fn plan(r: &DurableReader, v: &View, ids: &[SeriesId], view: ReadView) -> Result<Plan, QueryError> {
     let mut series = Vec::with_capacity(ids.len());
     for id in ids {
@@ -27,7 +28,13 @@ fn plan(r: &DurableReader, v: &View, ids: &[SeriesId], view: ReadView) -> Result
     let bound = match view {
         ReadView::History | ReadView::Current => cut,
         ReadView::AsOf(p) => log_pos(p).min(cut),
-        ReadView::AsOfTime(t) => r.position_at(v, t.0)?,
+        ReadView::AsOfTime(t) => match r.position_at(v, t.0) {
+            Err(QueryError::NotAvailable { .. }) => {
+                r.find_losses()?;
+                r.position_at(v, t.0)?
+            }
+            other => other?,
+        },
     };
     Ok(Plan {
         series,

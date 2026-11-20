@@ -6,7 +6,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 
 use kvik_log::mark::ResetStamp as LogStamp;
-use kvik_log::reader::{FoundFact, LogReader, Lookup, ReaderError, Wanted, WantedAt};
+use kvik_log::reader::{FoundFact, LogReader, Lookup, ReaderError, Wanted, WantedAt, Within};
 use kvik_log::writer::Position as LogPos;
 
 use super::{DurableReader, query_error};
@@ -24,23 +24,24 @@ impl DurableReader {
         self.at_cut(v, |r, lost| r.lookup(wanted, lost))
     }
 
-    /// [`DurableReader::lookup`] keeping at most `budget` bytes of facts (`kvik_log::reader::fact_bytes`); `None`
-    /// when they would pass it.
+    /// [`DurableReader::lookup`] within `within`, with the segments listed; no facts when they would pass its
+    /// budget.
     pub(crate) fn lookup_within(
         &self,
         v: &View,
         wanted: &[Wanted],
-        budget: u64,
-    ) -> Result<Option<Vec<FoundFact>>, QueryError> {
-        let l = self.read_at_cut(
+        within: Within,
+    ) -> Result<(Option<Vec<FoundFact>>, Vec<u64>), QueryError> {
+        let mut l = self.read_at_cut(
             v,
-            |r, lost| r.lookup_within(wanted, lost, budget),
+            |r, lost| r.lookup_within(wanted, lost, within),
             |l| (l.stamp, l.durable),
         )?;
+        let listed = std::mem::take(&mut l.listed);
         if l.overflowed {
-            return Ok(None);
+            return Ok((None, listed));
         }
-        complete(l, v).map(Some)
+        Ok((Some(complete(l, v)?), listed))
     }
 
     /// The last position at or below `v`'s cut whose batch was committed at or before `at` (`spec.md` §2.3 As-of

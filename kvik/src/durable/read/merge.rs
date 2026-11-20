@@ -48,36 +48,32 @@ pub(crate) fn merge(mut parts: Vec<Vec<Stored>>) -> Vec<Stored> {
 
 /// The rank of a fact among those of its key (spec §2.2): its position, or `(changed_at, position)` in a versioned
 /// series.
-fn rank(s: &Stored, versioned: bool) -> (Option<u64>, kvik_log::writer::Position) {
+pub(crate) fn rank(s: &Stored, versioned: bool) -> (Option<u64>, kvik_log::writer::Position) {
     (if versioned { s.row.changed_at } else { None }, s.position)
 }
 
-/// The rows of a view from merged rows: every row in history, else the one of highest rank per `(t, series)`.
-pub(crate) fn select<'a>(
-    rows: &'a [Stored],
-    history: bool,
-    versioned: impl Fn(u32) -> bool + 'a,
-) -> impl Iterator<Item = &'a Stored> + 'a {
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        let first = rows.get(i)?;
-        if history {
-            i += 1;
-            return Some(first);
-        }
-        let v = versioned(first.row.series_id);
-        let mut best = first;
+/// Keeps the rows of a view, in place and in order: every row in history, else the one of highest rank per
+/// `(t, series)`.
+pub(crate) fn keep_view(rows: &mut Vec<Stored>, history: bool, versioned: impl Fn(u32) -> bool) {
+    if history {
+        return;
+    }
+    let (mut w, mut i) = (0, 0);
+    while i < rows.len() {
+        let key = (rows[i].row.t, rows[i].row.series_id);
+        let v = versioned(key.1);
+        let mut best = i;
         i += 1;
-        while let Some(r) = rows.get(i)
-            && (r.row.t, r.row.series_id) == (first.row.t, first.row.series_id)
-        {
-            if rank(r, v) > rank(best, v) {
-                best = r;
+        while i < rows.len() && (rows[i].row.t, rows[i].row.series_id) == key {
+            if rank(&rows[i], v) > rank(&rows[best], v) {
+                best = i;
             }
             i += 1;
         }
-        Some(best)
-    })
+        rows.swap(w, best);
+        w += 1;
+    }
+    rows.truncate(w);
 }
 
 #[cfg(test)]
@@ -128,16 +124,20 @@ mod tests {
             let mut want = all.clone();
             sort(&mut want);
             prop_assert_eq!(merge(parts), want.clone());
-            let current: Vec<&Stored> = select(&want, false, |s| s == 1).collect();
+            let mut current = want.clone();
+            keep_view(&mut current, false, |s| s == 1);
             for (s, t) in want.iter().map(|r| (r.row.series_id, r.row.t)) {
                 let best = want
                     .iter()
                     .filter(|r| (r.row.series_id, r.row.t) == (s, t))
                     .max_by_key(|r| rank(r, s == 1))
                     .unwrap();
-                prop_assert!(current.contains(&best));
+                prop_assert!(current.contains(best));
             }
-            prop_assert_eq!(select(&want, true, |_| false).count(), want.len());
+            prop_assert_eq!(current.len(), current.iter().map(|r| (r.row.t, r.row.series_id)).collect::<std::collections::BTreeSet<_>>().len());
+            let mut history = want.clone();
+            keep_view(&mut history, true, |_| false);
+            prop_assert_eq!(history, want.clone());
         }
     }
 }

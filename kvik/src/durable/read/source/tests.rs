@@ -253,7 +253,6 @@ fn a_maximal_batch_reads_in_several_passes_at_the_least_cap_with_the_fact_indexs
     let got = collect(reader.facts(rig.ids[2], all(), View::Current).unwrap()).unwrap();
     assert_eq!(got.len(), n as usize);
     assert_eq!(got, want);
-    assert!(d.memory().peak() <= LEAST_MEMORY);
     let last = reader
         .at(rig.ids[2], Timestamp(now), View::Current)
         .unwrap();

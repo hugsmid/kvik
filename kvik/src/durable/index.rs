@@ -110,6 +110,19 @@ pub(crate) fn quality_in(q: Quality) -> LogQuality {
     }
 }
 
+/// [`fact_out`], its text moved rather than copied.
+pub(crate) fn fact_into(mut s: Stored) -> Fact {
+    let text = match &mut s.row.value {
+        LogValue::Text(t) => Some(std::mem::take(t)),
+        _ => None,
+    };
+    let mut f = fact_out(&s);
+    if let (Some(t), Value::Text(x)) = (text, &mut f.value) {
+        *x = t;
+    }
+    f
+}
+
 /// A fact as the interface shows it. The log keeps the adapter-supplied quality; the quality after stamping
 /// follows from the flags: bad without a value, at best suspect when `future` (spec §2.2, §2.5).
 pub(crate) fn fact_out(s: &Stored) -> Fact {
