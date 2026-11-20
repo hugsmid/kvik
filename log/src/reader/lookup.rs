@@ -202,7 +202,7 @@ pub(super) struct Caches {
     index: HashMap<u64, Cached<SealIndex>>,
     maps: HashMap<u64, Cached<SegmentMap>>,
     /// Segments a lookup took a fact from: one gone with no record naming its removal makes every later lookup of
-    /// this reader incomplete (Q-951).
+    /// this reader incomplete (Q-951, Q-1066).
     stood: std::collections::BTreeSet<u64>,
     tick: u64,
     bytes: usize,

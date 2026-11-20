@@ -275,7 +275,7 @@ fn a_reader_below_the_least_memory_cap_is_refused() {
 }
 
 #[test]
-fn as_of_a_time_in_two_generations_is_the_later_position_committed_by_then() {
+fn as_of_a_time_across_a_restart_with_the_clock_set_back_is_the_last_position_committed_by_then() {
     let mut rig = Rig::new("as-of-restart");
     let id = rig.ids[0];
     let now = rig.clock.wall().0;
@@ -308,7 +308,7 @@ fn as_of_a_time_in_two_generations_is_the_later_position_committed_by_then() {
     assert_eq!(
         got,
         vec![0, 1, 2, 3],
-        "the second generation's first batch is the last committed by then"
+        "the first batch after the restart is the last committed by then"
     );
     let want = reader
         .with(|i, _| i.facts(id, all(), View::AsOfTime(t)))

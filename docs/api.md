@@ -459,8 +459,13 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   (Q-1003, Q-1004). `facts` and `at` read the log at the call's cut through the segment indexes (Q-1060); windows,
   `buckets` and calendar results build the full fact index at their first use and keep it, until roadmap 9.0h (Q-1000).
 - `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
-  `OpenError::Config`): a read that needs more works in more passes over narrower event-time ranges, with equal
-  results; a stream's rows not yet taken by the caller are outside it, at most one pass's (Q-1063).
+  `OpenError::Config`), a stream's rows not yet taken by the caller included: a read that needs more works in more
+  passes over narrower event-time ranges, down to one key's positions, with equal results at any cap (Q-1063,
+  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, and the fact index a reader builds once, and then
+  keeps, to find damage a read met (Q-1060, Q-1069).
+- A reader whose `facts` or `at` took facts from a sealed segment that is then removed with no record naming the
+  removal fails those calls with `NotAvailable` until it is opened again; a stream or `at` ends with `NotAvailable`
+  when a segment its first pass listed is gone (Q-951, Q-1066).
 - Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
   what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
   segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at

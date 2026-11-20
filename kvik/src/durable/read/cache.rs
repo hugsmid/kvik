@@ -44,7 +44,7 @@ impl Sizes {
 }
 
 /// The rows a stream holds for delivery, with the grant that counts them; emptied by an admission that needs the
-/// memory, after which the stream reads them again (Q-1066).
+/// memory, after which the stream reads them again (Q-1067).
 pub(crate) type Shelf = Mutex<Option<(std::vec::IntoIter<Stored>, Grant)>>;
 
 #[derive(Debug, Default)]
@@ -120,7 +120,7 @@ impl Accountant {
 
     /// Admits a pass: takes all that is free when that is under two least grants, else half of it. While less than
     /// the least grant is free it waits for running passes, which wait on nothing, when their grants would make
-    /// room, and otherwise empties shelves, so no admission waits on a caller's iteration (Q-1063, Q-1066).
+    /// room, and otherwise empties shelves, so no admission waits on a caller's iteration (Q-1063, Q-1067).
     pub(crate) fn admit(self: &Arc<Self>) -> Grant {
         let least = self.least();
         let mut s = self.lock();

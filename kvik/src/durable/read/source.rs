@@ -1,6 +1,6 @@
 //! Sources and the passes over them (the query design's §2.2): a pass reads several series over one event-time range
 //! from every source within one memory grant; a read that would pass the grant narrows its range and reads again,
-//! pass by pass, down to one key's positions, so that results are equal at any cap (Q-1063, Q-1067). Static `facts`
+//! pass by pass, down to one key's positions, so that results are equal at any cap (Q-1063, Q-1068). Static `facts`
 //! streams pass by pass; `at` searches back from its time in spans that double.
 
 use std::sync::{Arc, PoisonError};
@@ -211,7 +211,7 @@ fn too_large() -> QueryError {
     }
 }
 
-/// The parts of a read still to come and the state of one key read in several parts (Q-1067).
+/// The parts of a read still to come and the state of one key read in several parts (Q-1068).
 #[derive(Debug)]
 struct Parts {
     stack: Vec<Part>,
@@ -290,7 +290,7 @@ impl Parts {
 
 /// Static `facts` (spec §2.3), streamed pass by pass at one cut: event-time order, then series, then position. The
 /// rows of a pass wait for delivery on a shelf under their grant; an admission that empties the shelf has the stream
-/// read that part again and pass over what it delivered (Q-1066).
+/// read that part again and pass over what it delivered (Q-1067).
 #[derive(Debug)]
 pub(crate) struct FactStream {
     reader: Arc<DurableReader>,
