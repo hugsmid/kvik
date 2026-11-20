@@ -37,14 +37,25 @@ pub struct DirEntry {
     pub name: String,
     /// Length in bytes.
     pub len: u64,
+    /// Whether the entry is a directory.
+    pub dir: bool,
 }
 
 impl DirEntry {
-    /// An entry, for implementations of [`Fs::read_dir`].
+    /// A file's entry, for implementations of [`Fs::read_dir`].
     pub fn new(name: impl Into<String>, len: u64) -> Self {
         DirEntry {
             name: name.into(),
             len,
+            dir: false,
+        }
+    }
+
+    /// A directory's entry.
+    pub fn directory(name: impl Into<String>) -> Self {
+        DirEntry {
+            dir: true,
+            ..DirEntry::new(name, 0)
         }
     }
 }
@@ -145,6 +156,7 @@ impl Fs for StdFs {
             out.push(DirEntry {
                 name: e.file_name().to_string_lossy().into_owned(),
                 len: if meta.is_file() { meta.len() } else { 0 },
+                dir: meta.is_dir(),
             });
         }
         out.sort();
@@ -779,7 +791,12 @@ impl Fs for MemFs {
             } else {
                 lock(d).bytes.len() as u64
             };
-            out.entry(name.clone()).or_insert(DirEntry { name, len });
+            let e = out.entry(name.clone()).or_insert(DirEntry {
+                name,
+                len,
+                dir: deeper,
+            });
+            e.dir |= deeper;
         }
         Ok(out.into_values().collect())
     }
@@ -1065,11 +1082,14 @@ mod tests {
         drop(fs.open(Path::new("d/g"), OpenMode::CreateNew).unwrap());
         assert_eq!(
             fs.read_dir(Path::new("d")).unwrap(),
-            vec![DirEntry::new("g", 0), DirEntry::new("sub", 0)]
+            vec![DirEntry::new("g", 0), DirEntry::directory("sub")]
         );
         let dir = std::env::temp_dir().join(format!("kvik-dirs-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        assert_eq!(StdFs.read_dir(&dir).unwrap(), vec![DirEntry::new("sub", 0)]);
+        assert_eq!(
+            StdFs.read_dir(&dir).unwrap(),
+            vec![DirEntry::directory("sub")]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

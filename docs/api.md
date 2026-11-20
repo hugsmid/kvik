@@ -759,7 +759,7 @@ pub enum OpenMode { Read, ReadWrite, CreateNew }
 pub trait Fs: Send + Sync {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;               // DirEntry { name: String, len: u64 }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;               // DirEntry { name: String, len: u64, dir: bool }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;                 // replaces `to`
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
