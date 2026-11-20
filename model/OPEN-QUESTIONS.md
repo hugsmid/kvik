@@ -3360,12 +3360,17 @@ the recovery entries of the latest valid file of the same generation that the ne
 `through` (`kvik_log::registry::write`, `RegistryFile::carry_recovery`), and the derived check at a start compares
 the file with the kept log's entries plus those carried (`format.md` A.16). (b) The deliverer takes a reset point
 from every recovery entry in the registry file of the current generation that no recorded lost range holds, as from
-one in the log, with its consumers' lost cursors (`kvik/src/durable/deliver/mod.rs`). An unreadable registry file
+one in the log, with its consumers' lost cursors (`kvik/src/durable/deliver/mod.rs`). The generation compared is the
+writer's own, not that of the newest batch read, so a restored generation whose readable log holds only earlier
+generations' batches still takes its carried entries. An unreadable registry file
 loses the carried entries with it, as it loses the id floor today.
 **Health.** With the segment removed the start reports no loss and health `Ok`: that is Q-951's limit, ruled by the
 owner to stand until roadmap 6.3b. The zeroed body is Q-1034.
 **Tests.** `kvik/tests/durable_reset_points.rs` (the review's reproduction: control, damaged, removed, zeroed; the
-registry file keeps the entry and passes the derived check); `log/src/registry.rs`
+registry file keeps the entry and passes the derived check, and a confirmed reset point is not sent again at a
+later start); `kvik/src/durable/deliver/tests.rs`
+`kept_resets_are_the_registry_files_recovery_entries_of_the_writers_generation_outside_lost_ranges`;
+`log/src/registry.rs`
 `a_rewrite_keeps_recovery_entries_the_kept_log_no_longer_holds`,
 `write_carries_the_recovery_entries_of_the_latest_file`; the model's side in Q-1031.
 

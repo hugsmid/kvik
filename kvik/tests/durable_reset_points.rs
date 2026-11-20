@@ -149,9 +149,21 @@ fn history(harm: Harm) -> Run {
     }
     block_on(s.shutdown()).unwrap();
     drop(s);
+    let s = open(&w, Duration::from_secs(300));
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut again = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let DeliveryKind::Resync(r) = &d.kind {
+            again.push(r.forget_above);
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
     Run {
         k,
         got,
+        again,
         rewritten_at_start: before != at_start,
         recovery_kept: recovery_entries(&w),
     }
@@ -160,6 +172,8 @@ fn history(harm: Harm) -> Run {
 struct Run {
     k: Position,
     got: Vec<Got>,
+    /// The `forget_above` of each resync at a later start, after every delivery was confirmed.
+    again: Vec<Option<Position>>,
     rewritten_at_start: bool,
     /// The sequences of the recovery entries in the registry file after the last shutdown.
     recovery_kept: Vec<u64>,
@@ -195,6 +209,7 @@ fn told_to_forget_first(harm: Harm) {
     let Run {
         k,
         got,
+        again,
         rewritten_at_start,
         recovery_kept,
     } = history(harm);
@@ -210,6 +225,10 @@ fn told_to_forget_first(harm: Harm) {
             "{harm:?}: the file passes the derived check"
         );
     }
+    assert!(
+        again.iter().all(Option::is_none),
+        "{harm:?}: a confirmed reset point is not sent again: {again:?}"
+    );
     let first_reset = got
         .iter()
         .position(|g| matches!(g, Got::Resync { forget_above: Some(f), .. } if *f <= k));

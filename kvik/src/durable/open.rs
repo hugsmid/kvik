@@ -136,6 +136,7 @@ impl Writer {
             window_budget(&config.limits),
             latch.clone(),
             Some(hook.fold.clone()),
+            writer.generation(),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
