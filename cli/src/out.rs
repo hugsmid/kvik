@@ -187,4 +187,16 @@ mod tests {
             "{\"name\":\"a,\\\"b\\\"\",\"value\":1.5}\n{\"name\":\"tab\\there\",\"value\":null}\n"
         );
     }
+
+    #[test]
+    fn json_escapes_every_control_character() {
+        let mut t = Table::new(&["v"]);
+        t.row(vec!["a\u{1}b\u{1f}".into()]);
+        let mut out = Vec::new();
+        t.write(Format::Jsonl, true, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"v\":\"a\\u0001b\\u001f\"}\n"
+        );
+    }
 }

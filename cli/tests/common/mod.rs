@@ -53,15 +53,23 @@ pub struct Fixture {
 impl Fixture {
     /// Four series of different kinds, one aliased, with readings a minute old and newer; one series has none.
     pub fn new() -> Fixture {
+        Fixture::with_seal_interval(None)
+    }
+
+    /// [`Fixture::new`] whose log seals by time after `seal` of the log's own clock, when given.
+    pub fn with_seal_interval(seal: Option<Duration>) -> Fixture {
         let clock = ManualClock::new(Timestamp(T0));
         let mut env = Env::test(clock.clone());
         let fs = MemFs::new();
         env.fs = Arc::new(fs.clone());
         env.background_timers = false;
         let dir = PathBuf::from("store");
-        let config = StoreConfig::new(&dir, "Etc/UTC")
+        let mut config = StoreConfig::new(&dir, "Etc/UTC")
             .create_if_missing(true)
             .env(env.clone());
+        if let Some(d) = seal {
+            config.log.seal_interval = d;
+        }
         let store = block_on(Store::open(config)).unwrap();
         let f64 = ValueType::F64;
         let specs = [
@@ -113,6 +121,37 @@ impl Fixture {
         }
     }
 
+    /// Opens the store again after [`Fixture::shut`].
+    pub fn reopen(&mut self) {
+        assert!(self.store.is_none());
+        let config = StoreConfig::new(&self.dir, "Etc/UTC").env(self.env.clone());
+        self.store = Some(block_on(Store::open(config)).unwrap());
+    }
+
+    /// Flips a byte of the eight bytes of `v` in every log segment holding them.
+    pub fn damage(&self, v: f64) {
+        let bytes = v.to_bits().to_le_bytes();
+        let mut hit = false;
+        for p in self.fs.paths() {
+            if !p.extension().is_some_and(|e| e == "open" || e == "kvl") {
+                continue;
+            }
+            let Some(b) = self.fs.read(&p) else { continue };
+            if let Some(at) = b.windows(8).position(|x| x == bytes) {
+                self.fs.poke(&p, at, &[b[at] ^ 0xFF]);
+                hit = true;
+            }
+        }
+        assert!(hit, "no segment holds {v}");
+    }
+
+    /// The store id from the descriptor.
+    pub fn store_id(&self) -> [u8; 16] {
+        kvik_log::store::read_descriptor(&self.fs, &self.dir)
+            .unwrap()
+            .store_id
+    }
+
     /// The tool's output for `args`, split at spaces; `--store` is the fixture's.
     pub fn run(&self, args: &str) -> Result<String, kvik_cli::Error> {
         self.run_in(args, self.env.clone())
@@ -120,10 +159,16 @@ impl Fixture {
 
     /// [`Fixture::run`] in `env`.
     pub fn run_in(&self, args: &str, env: Env) -> Result<String, kvik_cli::Error> {
+        let (out, done) = self.run_both(args, env);
+        done.map(|()| out)
+    }
+
+    /// What the tool wrote for `args` in `env`, and how it ended.
+    pub fn run_both(&self, args: &str, env: Env) -> (String, Result<(), kvik_cli::Error>) {
         let v: Vec<String> = args.split_whitespace().map(String::from).collect();
         let mut out = Vec::new();
-        kvik_cli::run(&v, Some(self.dir.clone()), env, &mut out)?;
-        Ok(String::from_utf8(out).unwrap())
+        let done = kvik_cli::run(&v, Some(self.dir.clone()), env, &mut out);
+        (String::from_utf8(out).unwrap(), done)
     }
 
     /// Every file of the store with its bytes.
