@@ -13,6 +13,11 @@ pub trait CallSource {
     fn take(&mut self, max_bytes: u64) -> Vec<Call>;
     /// Puts calls taken by [`CallSource::take`] back at the front, in the same order.
     fn put_back(&mut self, calls: Vec<Call>);
+    /// The wall clock read as the last [`CallSource::take`] ended, after every call it took was queued: a batch's
+    /// `received_at` is no earlier (`spec.md` §2.2 `received_at`, §2.3 As-of time; Q-1070).
+    fn taken_at(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// The queue is full: a call must wait (`emit`) or is refused as busy (`try_emit`).

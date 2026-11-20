@@ -3946,6 +3946,20 @@ no manifest record lists and that fails its checks degrades health (`segment_dam
 **For now.** As built; the reset points it held are kept by Q-1033. Proposed: report it as `segment_damaged`, or
 rule it a removal under Q-951; 6.3b's removal records decide which.
 
+## Q-1070 — A batch's commit time read before its calls were taken
+Decided by the lead (a technical decision: it keeps the promise of §2.2 `received_at` and §2.3 As-of time).
+**Scenario.** The writer thread read the wall clock for a turn, at 52 s, then took the queued calls for that turn's
+batch. A call queued between the two, at 157 s by the same clock, was committed with `received_at` and `commit_time`
+52 s. As of a time between 52 s and 157 s, the durable fact index then held a fact whose `emit` had not begun by that
+time, where the model (whose receive time is the call's) did not. A property comparing the fact index with the model
+in the as-of-time view found it after a power loss and restart; the timing, not the damage, was the cause.
+**Decided.** The batch's `received_at` is at least the wall clock read under the queue's lock as its calls are taken
+(`CallSource::taken_at`), so no call is stamped earlier than it was queued; `commit_time` stays
+`max(received_at, previous commit_time)`. No promise changes: §2.2 says `received_at` is the host clock at commit.
+**Tests.** `log/src/writer/threads.rs`
+`a_call_queued_after_the_writer_read_the_clock_commits_no_earlier_than_it_was_queued` (holds the writer between its
+read of the clock and its take).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

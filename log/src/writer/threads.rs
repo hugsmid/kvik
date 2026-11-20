@@ -205,19 +205,26 @@ impl Shared {
     }
 }
 
-struct SharedSource<'a>(&'a Shared);
+struct SharedSource<'a>(&'a Shared, Option<i64>);
 
 impl CallSource for SharedSource<'_> {
     fn is_empty(&self) -> bool {
         lock(&self.0.front).queue.is_empty()
     }
     fn take(&mut self, max_bytes: u64) -> Vec<Call> {
-        let calls = lock(&self.0.front).queue.take(max_bytes);
+        let mut f = lock(&self.0.front);
+        let calls = f.queue.take(max_bytes);
+        // Read under the queue's lock, so no call taken was queued after it.
+        self.1 = Some(self.0.clock.wall());
+        drop(f);
         self.0.room_cv.notify_all();
         calls
     }
     fn put_back(&mut self, calls: Vec<Call>) {
         lock(&self.0.front).queue.put_back(calls);
+    }
+    fn taken_at(&self) -> Option<i64> {
+        self.1
     }
 }
 
@@ -660,5 +667,99 @@ mod tests {
             (3, 0),
             "two entries and one call held at the acknowledgement, none after"
         );
+    }
+
+    /// A clock moved by hand whose wall reads on the writer thread can be held, each returning the time it was
+    /// read at once released.
+    #[derive(Debug, Default)]
+    struct HeldClock {
+        state: Mutex<(i64, bool, usize, usize)>,
+        cv: Condvar,
+    }
+
+    impl HeldClock {
+        fn set(&self, wall: i64) {
+            lock(&self.state).0 = wall;
+        }
+        fn hold(&self, on: bool) {
+            lock(&self.state).1 = on;
+            self.cv.notify_all();
+        }
+        /// Waits until the writer is held in its `n`th wall read since the hold began.
+        fn held_in(&self, n: usize) {
+            let s = lock(&self.state);
+            drop(
+                self.cv
+                    .wait_while(s, |s| s.2 < n)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+        fn release_one(&self) {
+            lock(&self.state).3 += 1;
+            self.cv.notify_all();
+        }
+    }
+
+    impl Clock for HeldClock {
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn wall(&self) -> i64 {
+            let mut s = lock(&self.state);
+            let at = s.0;
+            if s.1 && std::thread::current().name() == Some("kvik-writer") {
+                s.2 += 1;
+                let me = s.2;
+                self.cv.notify_all();
+                s = self
+                    .cv
+                    .wait_while(s, |s| s.1 && s.3 < me)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(s);
+            at
+        }
+    }
+
+    #[test]
+    fn a_call_queued_after_the_writer_read_the_clock_commits_no_earlier_than_it_was_queued() {
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("s"), Some(&new)).unwrap();
+        let w = LogWriter::open(
+            store,
+            WriterConfig::default(),
+            Some([2; 16]),
+            Duration::ZERO,
+            0,
+        )
+        .unwrap();
+        let clock = Arc::new(HeldClock::default());
+        clock.set(52);
+        let log = Log::start(w, clock.clone()).unwrap();
+        let alias = |id| {
+            Item::from(Entry::Alias {
+                id,
+                name: format!("a{id}"),
+            })
+        };
+        log.submit(vec![alias(1)]).unwrap().wait().unwrap();
+        clock.hold(true);
+        log.shared.wake_writer();
+        // A writer's turn reads the wall clock once handing work to maintenance, then for its step.
+        clock.held_in(1);
+        clock.release_one();
+        clock.held_in(2);
+        clock.set(157);
+        let pending = log.submit(vec![alias(2)]).unwrap();
+        clock.hold(false);
+        pending.wait().unwrap();
+        let committed = log.shutdown_then(|w| w.last_commit_time).unwrap();
+        assert_eq!(committed, 157);
     }
 }

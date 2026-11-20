@@ -1115,6 +1115,7 @@ impl LogWriter {
             }
             if !disk_wait && !source.is_empty() && now >= self.sync_ready_at() {
                 let calls = source.take(self.cfg.max_batch_bytes);
+                let wall = source.taken_at().map_or(wall, |t| t.max(wall));
                 let mut back = Vec::new();
                 match self.commit(calls, now, wall, &mut back) {
                     Some(done) => step.done = done,
