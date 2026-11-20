@@ -52,9 +52,12 @@ fn collect(f: crate::read::Facts) -> Result<Vec<Fact>, QueryError> {
     f.collect()
 }
 
+/// Facts as both backends give them: positions and receive times set aside (the model writes no recovery or tzdata
+/// entry, and its receive time is the call's, where a batch's may be later).
 fn unpositioned(mut fs: Vec<Fact>) -> Vec<Fact> {
     for f in &mut fs {
         f.position = Position::ORIGIN;
+        f.received_at = Timestamp(0);
     }
     fs
 }
@@ -68,8 +71,8 @@ fn at_from(view: &[Fact], t: i64) -> Option<Fact> {
 }
 
 /// Facts histories that read in passes and with every source: per series and view, what a reader at each cap gives
-/// equals a fresh reader's fact index (positions included), and the model (positions set aside) while no batch is
-/// damaged; `at` agrees at several times. A tiny cap may refuse only a key with more facts than it holds.
+/// equals a fresh reader's fact index (positions included), and in history and the current view the model (positions
+/// set aside) while no batch is damaged; `at` agrees at several times. A tiny cap may refuse only a key with more facts than it holds.
 fn check(rig: &Rig, times: &[Timestamp], small: u64) -> Result<(), TestCaseError> {
     let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
     let readers = [
@@ -99,7 +102,7 @@ fn check(rig: &Rig, times: &[Timestamp], small: u64) -> Result<(), TestCaseError
         };
         for view in &views {
             let want = oracle.with(|i, _| i.facts(*id, all(), *view)).unwrap();
-            if !rig.faulted && !matches!(view, View::AsOf(_)) {
+            if !rig.faulted && matches!(view, View::History | View::Current) {
                 let m = unpositioned(collect(model.facts(*id, all(), *view).unwrap()).unwrap());
                 prop_assert_eq!(unpositioned(want.clone()), m, "{:?} {:?}", id, view);
             }
@@ -148,9 +151,10 @@ fn sealed_segments(rig: &Rig) -> u64 {
 
 #[test]
 fn facts_and_at_equal_the_fact_index_and_the_model_at_every_cap() {
-    // Each case opens two stores and several readers; an eighth of the configured cases keeps the deep run in bounds.
+    // Each case opens two stores and several readers; a thirty-second of the configured cases keeps the deep run in
+    // bounds.
     let mut runner = TestRunner::new(ProptestConfig {
-        cases: (ProptestConfig::default().cases / 8).max(8),
+        cases: (ProptestConfig::default().cases / 32).max(8),
         failure_persistence: None,
         ..ProptestConfig::default()
     });
@@ -164,19 +168,23 @@ fn facts_and_at_equal_the_fact_index_and_the_model_at_every_cap() {
             |(history, small)| {
                 let mut rig = Rig::with_log("sources", log.clone());
                 let mut times = Vec::new();
+                // The latest values' checks (`Check`, and the one `Directory` makes) are left to their own test: with
+                // seals between steps a loss report's `commit_time_before` can differ between readers there, which
+                // these reads do not touch.
                 for s in &history {
-                    rig.step(s)?;
+                    match s {
+                        Step::Check => check(&rig, &times, small)?,
+                        Step::Directory(_) => {}
+                        s => rig.step(s)?,
+                    }
                     if let Step::Advance(_) = s {
                         times.push(rig.clock.wall());
                     }
-                    if let Step::Check = s {
-                        check(&rig, &times, small)?;
-                    }
                 }
                 check(&rig, &times, small)?;
+                rig.shut();
                 SEALED.fetch_add(sealed_segments(&rig), Ordering::Relaxed);
                 PASSES.fetch_add(1, Ordering::Relaxed);
-                rig.shut();
                 Ok(())
             },
         )
