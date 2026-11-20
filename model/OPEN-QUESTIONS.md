@@ -89,7 +89,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-776 | §7 Derived files, Reset stamp and saved points | When the writer keeps a series directory across a reset |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
 | Q-780 | §8 Generations, Restore; `format.md` A.18 Contiguity | The log directory across a generation change |
-| Q-850 | §7 Readers; `api.md` Reader processes | The error of a second reset stamp change during one materialised call |
+| Q-850 | §7 Readers; `api.md` Reader processes | The error of a second reset stamp change during one materialised call (settled by the lead with roadmap 9.0f, Q-1061) |
 | Q-851 | §7 Readers | The second read of the mark after a pass that took something (decided, awaiting review) |
 | Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
 | Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
@@ -135,6 +135,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1015 | query design §1 S13, §3.6 | Waking, pacing and due times of a live session (decided by the lead) |
 | Q-1016 | query design §2.1; roadmap 8.1g | A live read and an unavailable segment or tier (decided by the lead) |
 | Q-1017 | query design §1 S13 | The empty poll of a reader process against S13 (decided by the lead) |
+| Q-1060 | §7 Readers; query design §2.2, §4 | The log tail as the one source of `facts` and `at` (decided by the lead) |
+| Q-1061 | §7 Readers; `api.md` Reader processes | An iteration whose cut ends or whose reset stamp changes (decided by the lead) |
+| Q-1062 | query design §2.2 | The order of several series read in one pass (decided by the lead) |
+| Q-1063 | query design §1 Memory, §2.2, §3.5; `api.md` `ReaderConfig` | The memory accountant and the cap with multi-pass (decided by the lead) |
+| Q-1064 | §2.3 As-of time; query design §3.2, §4 | As of a time from the log's commit times, across generations (decided by the lead) |
+| Q-1065 | `api.md` Reading | `at` searched back from its time (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -2693,8 +2699,7 @@ Corrupt block describes for a sealed segment, with the quarantine and copy), so 
 (`kvik/tests/slow_path.rs`).
 
 ## Q-850 — The error of a second reset during one materialised call
-Recorded by roadmap 9.0b1. To be settled by roadmap 9.0f with the iteration's reset error item (moved from 9.0c at
-9.0b1's review).
+Recorded by roadmap 9.0b1. **Settled by the lead with roadmap 9.0f: `CutExpired`, as built** (Q-1061).
 **Scenario.** The query design §3.2 rule 3: a materialised result whose reset stamp changed during the read "is
 computed once more under the new cut and returned with the new state; a second change is an error". It does not name
 the error. Two starts that each reset the store within one call (two page-cache losses on the same boot, or a reset
@@ -3720,6 +3725,104 @@ depend on the clock and on earlier label calls.
 **Model.** `LabelLog::declare`; `tests/labels.rs` `s2_1_labels_declare_sets_only_the_keys_whose_value_now_differs`.
 Definition labels are a `set_labels_many` call with `Effective::Always` in the model.
 
+## Q-1060 — The log tail as the one source of `facts` and `at`
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** The query design §2.2 runs every read over sources behind one trait: the recent window (the writer's
+process), the log tail above C(E), compacted chunks below it. No compacted file exists yet (6.2b, 6.3e), and the
+reader of the writer's process reads durable data only.
+**Decided.** One source is built, the log tail, with C(E) the origin, so the tail is the whole kept log. It reads
+through the key-history lookup of roadmap 11.0 (`LogReader::lookup_within`, A.8 indexes and a scan of segments without
+one) on the lookups' log reader of Q-1004, at the view's cut: regions the manifest records or the process found lost
+are passed over, any other damage is `NotAvailable`, positions above the cut are dropped. `facts` and `at` no longer
+build the fact index; windows, `buckets` and calendar results still do until roadmap 9.0h folds them from the stream,
+and a broken state's latest values still answer from it (Q-1006). The merge drops a position two sources hold, for the
+recent window when it becomes a source. No new lease: the lookups' log reader already holds one, so a reader keeps up
+to three leases until 9.0h removes the fact index's. The lookups' mutex is held for one pass's lookup, not across a
+stream, so passes of concurrent calls on one reader run one at a time.
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`facts_and_at_equal_the_fact_index_and_the_model_at_every_cap` (generated histories of late facts, revisions of a
+versioned series, restarts, power losses, damaged batches and seals; every view, `AsOf` and `AsOfTime` among them,
+against a fresh reader's fact index and the model); `kvik/tests/durable_differential.rs`.
+
+## Q-1061 — An iteration whose cut ends or whose reset stamp changes
+Decided by the lead with roadmap 9.0f, for review; settles Q-850.
+**Scenario.** The query design §3.2 rule 3: an iteration ends with an error item carrying the reset (`after`, stamp)
+once the stamp changes; Q-850 left the error of a second change in a materialised call to this item.
+**Decided.** One error for both, `QueryError::CutExpired`, with no new variant: the caller's remedy is the same (start
+the read again), and `api.md` already says that nothing of the read is to be kept. A stream checks its cut before
+each pass (age and lease, Q-853) and each pass's lookup compares the mark's stamp and generation with the cut's, so a
+reset, a restart of the writer (a new generation) or an aged cut ends it with that item, the last it yields. A
+materialised `at` is computed once more under a new cut, and a second `CutExpired` is returned. Cost: a reset storm
+reads as an aged cut, which the review of 9.0b1 noted; a stream over a writer's restart starts again although its
+positions did not change. Options left for later: a `Reset { after, stamp }` variant (additive, `#[non_exhaustive]`).
+**Pinned by.** `kvik/src/durable/read/source/tests.rs` `a_stream_held_past_its_cuts_age_ends_with_cut_expired`;
+`kvik/src/durable/read/cut.rs` `a_reset_during_a_call_is_read_again_under_the_new_cut_and_a_second_is_cut_expired`.
+
+## Q-1062 — The order of several series read in one pass
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** "Several series in one pass" (query design §2.2) reads each file once for all of them. A read that does
+not fit the cap narrows its event-time window, so a stream in `(series, t)` order would read every file again for each
+series.
+**Decided.** Sources and the merge order rows by `(t, series, position)`: for one series that is the `facts` order of
+spec §2.3; for several, event time first, so that passes partition the range and each file is read once per pass for
+all of them. At one event time that holds more than a pass's grant, the series are split. The call is crate-internal
+(`reader::facts::facts_of`); it becomes public with the `Query` read of §2.1 (`Query::Facts { sel, .. }`).
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`several_series_read_in_one_pass_come_in_event_time_order_then_series`;
+`kvik/src/durable/read/merge.rs` `a_merge_of_overlapping_sources_equals_one_sorted_run_of_their_union`.
+
+## Q-1063 — The memory accountant and the cap with multi-pass
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** The query design §1 Memory: one cap per reader (`ReaderConfig::memory`, 64 MiB default, 32 MiB least),
+hard; §3.5: a minimum grant at admission, the cache giving way down to a quarter of the cap, a reserve for the largest
+log block.
+**Decided.** A pass, not a stream, holds a grant: it reserves 16 MiB for a log block (the largest body, flat until the
+A.8 index names block sizes) plus at least 1 MiB of rows, taking everything free when that is under two such grants and
+half of it otherwise. The cache's share is a quarter of the cap and at least the lookups' log reader's 8 MiB, which it
+counts; decoded passes, keyed by series, range, bound, reset stamp and the losses known, fill what grants leave and give
+way to a grant down to that share. A lookup counts the facts it keeps (`kvik_log::reader::fact_bytes`: the record and
+its text, at decode, a voided fact still counted) and stops once past the pass's rows; the pass then halves its event
+time window (series at one time) and reads again, so results are equal at any cap. With 32 MiB one pass runs at a
+time with 8 MiB of rows; with 64 MiB two run at once. A stream's rows awaiting delivery are the caller's result, outside
+the cap as §1 states, bounded by one pass; admission waits only for running passes, which wait on nothing, so no call
+waits on another caller's iteration. One event time of one series holding more facts than a pass's rows is
+`NotAvailable` (about 90,000 versions at the least cap); `TooLarge` comes with 9.0g. A cap under 32 MiB is refused with
+`OpenError::Config`. Not built: growth past the admission grant, and the cap of the writer's own reader, which takes the
+default.
+**Pinned by.** `kvik/src/durable/read/cache.rs` `the_default_cap_admits_two_passes_and_the_least_one`,
+`a_pass_waits_until_a_grant_is_given_back`, `the_cache_gives_way_to_a_pass_down_to_its_share`;
+`kvik/src/durable/read/source/tests.rs`
+`a_maximal_batch_reads_in_several_passes_at_the_least_cap_with_the_fact_indexs_result`,
+`a_reader_below_the_least_memory_cap_is_refused`, and the generated histories at caps of a few facts a pass;
+`log/src/reader/tests/parts_and_lookup.rs`
+`a_lookup_within_a_budget_says_it_overflowed_and_one_above_it_finds_everything`.
+
+## Q-1064 — As of a time from the log's commit times, across generations
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** Spec §2.3: as of time T is as of P, the last position whose batch's commit time is at or before T. Commit
+times are non-decreasing within a generation only (query design §3.2); the fact index held every batch's commit time.
+**Decided.** `LogReader::position_at` takes segments newest first up to the mark: a sealed segment's trailer passes it
+over when its first commit time is after T and answers its last sequence when its last commit time is at or before T;
+otherwise the segment's batches, mapped as a lookup maps them, answer the last one committed by T. The first segment
+that holds such a batch decides, so a T that falls in two generations takes the later generation's position. Voided
+and lost batches are counted with their commit times: they hold no fact, so the facts as of their position equal those
+as of the last batch the fact index kept. A segment that may hold the answer and cannot be read is `NotAvailable`; a
+position above the cut is taken as the cut. The log directory's commit-time ranges, and the compacted files' tables for
+segments removed locally, are not used yet.
+**Pinned by.** `log/src/reader/tests/parts_and_lookup.rs`
+`a_position_at_a_time_is_the_last_batch_committed_by_then_in_every_segment`,
+`a_position_at_a_time_inside_a_damaged_segment_is_incomplete_never_an_earlier_one`;
+`kvik/src/durable/read/source/tests.rs` `as_of_a_time_in_two_generations_is_the_later_position_committed_by_then`.
+
+## Q-1065 — `at` searched back from its time
+Decided by the lead with roadmap 9.0f, for review.
+**Decided.** `at` reads back from `t` in spans that double from one hour, each in passes that fit the cap, and stops at
+the first span holding a fact of the view not of bad quality; the later position wins a tie in time. A series quiet
+for a long time costs about log₂ of the quiet span in lookups, each pruned by the A.8 indexes; 6.2b's chunk index
+gives it one block.
+**Pinned by.** `kvik/src/durable/read/source/tests.rs` `facts_and_at_equal_the_fact_index_and_the_model_at_every_cap`
+(`at` at several times in every view).
+
 ## Q-1020 — Label entries in the model kept apart from registry events
 Recorded and decided by the lead with the labels spec-and-model step (L1).
 **Scenario.** Type 10 entries are log entries of the series' own log, but the registry file does not hold them
@@ -3959,7 +4062,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -4098,7 +4201,6 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-836 | 6.3b | Facts a damaged recovery entry voided read again as live; with Q-755; recorded at the re-check of the first profiling sweep |
 | Q-871 | 8.3 | Decided with the Q-630 work and widened at its review and re-check: opening a store syncs its directory; creation and a restore sync its parent |
 | Q-937 | 5.1 | A suspected defect of the durable fixes' loss range, by reading; to be reproduced and ruled as its own item |
-| Q-850 | 9.0f | The error of a second reset stamp change during a materialised call: `CutExpired` proposed and built by roadmap 9.0b1; settled with the iteration's reset item |
 | Q-851 | 9.0b2 | The second read of the mark kept after a pass that took something; decided by roadmap 9.0b1, awaiting review |
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
@@ -4110,11 +4212,17 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-961 | 8.3d | The marker errors, switches and reports at `Store::restore`, and pacing the retries; recorded when the owner's ruling on Q-614 was applied |
 | Q-1001 | 9.0c | Decided by the lead: the registry file written before a series directory that covers an entry it lacks; for review |
 | Q-1002 | 6.3b | OWNER. No series directory in a run over a loss no lost range records, so that readers keep reporting it; (a) as built |
-| Q-1000 | 9.0f | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; replaced by 9.0f's sources |
+| Q-1000 | 9.0h | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; since 9.0f only windows, `buckets` and calendar results build it (Q-1060) |
 | Q-1003 | 9.0c | Decided by the lead: which series directory and registry file a reader continues; for review |
 | Q-1004 | 9.0c | Decided by the lead: what the reader finds by lookup at the cut, and a named fact not found reported unavailable; for review |
-| Q-1005 | 9.0f | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; windows and facts join with 9.0f's sources |
-| Q-1006 | 9.0f | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; replaced by 9.0f's sources |
+| Q-1005 | 9.0h | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; facts and windows join it once 9.0h folds windows from the sources (Q-1060) |
+| Q-1006 | 9.0h | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; its facts and `at` read the sources since 9.0f (Q-1060) |
+| Q-1060 | 9.0h | Decided by the lead with 9.0f: `facts` and `at` from the log tail through the 11.0 lookup at the cut; the fact index left to windows; for review |
+| Q-1061 | 9.0g | Decided by the lead with 9.0f: an iteration ends with `CutExpired` when its cut ends, its reset stamp or generation changes; for review |
+| Q-1062 | 9.0g | Decided by the lead with 9.0f: several series in one pass in event-time order, then series; public with the `Query` read; for review |
+| Q-1063 | 9.0g | Decided by the lead with 9.0f: the accountant's shares, grants held by running passes only, the flat block reserve; the envelope's admission builds on it |
+| Q-1064 | 6.2b | Decided by the lead with 9.0f: as of a time newest segment first through trailers and batch commit times; compacted files' tables with 6.2b |
+| Q-1065 | 6.2b | Decided by the lead with 9.0f: `at` searches back in doubling spans; the chunk index gives it one block with 6.2b |
 | Q-1007 | 9.0d | Decided by the lead at 9.0c's review: no file read while the writer has made nothing durable since; the in-memory feed from 9.0d's hub; figures per class with 9.0e |
 | Q-1010 | 9.0d | Decided by the lead: a batch only with events, `Opened` at the next batch's cut, `Tail` from its cut only, one `durable` position while there is one log; for review |
 | Q-1011 | 9.0d | Decided by the lead: `Reset` and `Gap` for every reset and every loss found, a `Latest` opened again after either; for review |
