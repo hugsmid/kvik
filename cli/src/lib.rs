@@ -3,7 +3,7 @@
 //! directory it writes only its lease, under `leases/` (Q-727), released when it ends.
 //!
 //! ```no_run
-//! let args: Vec<String> = ["latest", "--store", "/srv/store", "*/*/power"].map(String::from).into();
+//! let args: Vec<String> = ["latest", "--store", "store", "*/*/power"].map(String::from).into();
 //! kvik_cli::run(&args, None, kvik::env::Env::system(), &mut std::io::stdout()).unwrap();
 //! ```
 
