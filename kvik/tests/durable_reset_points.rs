@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::block_on;
@@ -76,8 +76,9 @@ enum Got {
 
 /// A consumer receives two facts above K (unconfirmed), a power loss takes them and the mark's updates, the start
 /// writes a recovery entry at K + 1 and assigns K + 2 again, the segment is sealed and the store shut down cleanly,
-/// then `harm` is done to that segment. Returns K and what the consumer receives at the next start.
-fn history(harm: Harm) -> (Position, Vec<Got>) {
+/// then `harm` is done to that segment. Returns K, what the consumer receives at the next start, and the registry
+/// files around that start.
+fn history(harm: Harm) -> Run {
     let mut w = World::new(&format!("reset-{harm:?}"));
     let s = open(&w, Duration::from_secs(300));
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
@@ -130,7 +131,9 @@ fn history(harm: Harm) -> (Position, Vec<Got>) {
             w.fs.poke(&sealed, h, &vec![0u8; len - h]);
         }
     }
+    let before = registry_files(&w);
     let s = open(&w, Duration::from_secs(300));
+    let at_start = registry_files(&w);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     let mut got = Vec::new();
     while let Some(d) = c.try_next().unwrap() {
@@ -144,12 +147,69 @@ fn history(harm: Harm) -> (Position, Vec<Got>) {
         }
         block_on(c.confirm(d.id)).unwrap();
     }
-    (k, got)
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    Run {
+        k,
+        got,
+        rewritten_at_start: before != at_start,
+        recovery_kept: recovery_entries(&w),
+    }
+}
+
+struct Run {
+    k: Position,
+    got: Vec<Got>,
+    rewritten_at_start: bool,
+    /// The sequences of the recovery entries in the registry file after the last shutdown.
+    recovery_kept: Vec<u64>,
+}
+
+fn registry_files(w: &World) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> =
+        w.fs.paths()
+            .into_iter()
+            .filter(|p| p.starts_with(&w.dir) && p.extension().is_some_and(|e| e == "reg"))
+            .collect();
+    v.sort();
+    v
+}
+
+fn recovery_entries(w: &World) -> Vec<u64> {
+    let dir = Path::new(&w.dir);
+    let id = kvik_log::store::read_descriptor(&*w.fs, dir)
+        .unwrap()
+        .store_id;
+    let (_, f) = kvik_log::registry::read_latest(&*w.fs, dir, &id)
+        .unwrap()
+        .unwrap();
+    f.entries
+        .iter()
+        .filter(|(_, _, e)| e.is_recovery())
+        .map(|(s, _, _)| *s)
+        .collect()
 }
 
 /// Before any fact above K, the consumer is told to forget every position above K.
 fn told_to_forget_first(harm: Harm) {
-    let (k, got) = history(harm);
+    let Run {
+        k,
+        got,
+        rewritten_at_start,
+        recovery_kept,
+    } = history(harm);
+    assert_eq!(
+        recovery_kept,
+        vec![k.sequence + 1],
+        "{harm:?}: the registry file keeps the entry"
+    );
+    // A removed or zeroed segment also takes the definition and the routing change, so the file is written again.
+    if matches!(harm, Harm::None | Harm::Entry) {
+        assert!(
+            !rewritten_at_start,
+            "{harm:?}: the file passes the derived check"
+        );
+    }
     let first_reset = got
         .iter()
         .position(|g| matches!(g, Got::Resync { forget_above: Some(f), .. } if *f <= k));

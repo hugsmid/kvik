@@ -506,6 +506,58 @@ mod tests {
         assert_eq!(names(&fs, &dir.join(REGISTRY_DIR)).unwrap().len(), 1);
     }
 
+    fn recovery(after: u64) -> Entry {
+        Entry::Recovery(crate::entries::Recovery {
+            after,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: crate::entries::MarkState::Readable,
+            id_floor: 0,
+            consumers: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_rewrite_keeps_recovery_entries_the_kept_log_no_longer_holds() {
+        let mut previous = sample();
+        previous.entries.insert(2, (5, 150, recovery(4)));
+        previous.entries.push((45, 500, recovery(44)));
+        let mut kept = sample();
+        kept.through = 44;
+        kept.entries.retain(|(s, _, _)| *s != 7);
+        kept.carry_recovery(&previous);
+        let mut want = sample();
+        want.through = 44;
+        want.entries.retain(|(s, _, _)| *s != 7);
+        want.entries.insert(2, (5, 150, recovery(4)));
+        assert_eq!(kept, want, "only recovery entries, once, up to through");
+        let mut again = kept.clone();
+        again.carry_recovery(&previous);
+        assert_eq!(again, want);
+        let mut other = sample();
+        other.generation = 1;
+        other.carry_recovery(&previous);
+        assert_eq!(
+            other.entries,
+            sample().entries,
+            "nothing from another generation"
+        );
+    }
+
+    #[test]
+    fn write_carries_the_recovery_entries_of_the_latest_file() {
+        let fs = MemFs::new();
+        let dir = Path::new("store");
+        fs.create_dir_all(dir).unwrap();
+        let mut f = sample();
+        f.entries.insert(2, (5, 150, recovery(4)));
+        write(&fs, dir, [3; 16], 1, &f).unwrap();
+        write(&fs, dir, [3; 16], 2, &sample()).unwrap();
+        assert_eq!(read_latest(&fs, dir, &[3; 16]).unwrap().unwrap().1, f);
+    }
+
     #[test]
     fn ignored_entries_are_neither_written_nor_counted() {
         let mut f = sample();
