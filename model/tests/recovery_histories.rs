@@ -968,6 +968,37 @@ fn a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_poi
     .unwrap();
 }
 
+#[test]
+fn a_recovery_entry_in_a_recorded_lost_range_gives_only_the_range_reset_point() {
+    let ops = [
+        ROp::Ingest(2, None),
+        ROp::Take { c: 0, n: 4 },
+        ROp::PowerLoss(1),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Upload,
+        ROp::LoseObject(0),
+        ROp::CorruptSealed(0),
+        ROp::CheckBucket(3),
+    ];
+    let mut w = RWorld::new(NONE);
+    let mut seen = Seen::default();
+    for op in &ops {
+        w.apply(op, &mut seen).unwrap();
+    }
+    let at = |n| kvik_model::types::Position::new(0, n);
+    let (from, to) = (at(1), at(5));
+    assert!(w.m.recovery_entries().contains_key(&at(3)));
+    assert_eq!(w.m.disk.lost_ranges(), vec![(from, to)]);
+    assert_eq!(
+        w.m.reset_points(),
+        vec![kvik_model::recovery::ResetPoint {
+            id: to,
+            forget_above: at(0),
+        }]
+    );
+}
+
 /// Guards the recovery-history properties (invariants 25–27 and reuse):
 /// positions delivered and then assigned again after a reset (flagged ones
 /// among them), `resync`s carrying `forget_above`, confirmations that forced

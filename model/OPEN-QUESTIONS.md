@@ -3312,12 +3312,13 @@ no lost range is recorded, since the lost-object rule has not judged the object 
 stage 1). The model built reset points from readable entries only, so the entry's reset point vanished, and the
 consumer was given a different fact at 4 with no `forget_above` below it, against principle 5 and §4 Resync.
 **Decided.** A recovery entry is a reset point unless a recorded lost range holds it (that range is then the reset
-point) or a restore sets it aside; whether its segment can be read does not matter, since the registry file and
-each tree checkpoint keep every recovery entry (§11 Health). No promise changes: the model now does what §4 Resync
+point, as §4 Resync says for a range that may have held an entry); whether its segment can be read does not matter,
+since the registry file and each tree checkpoint keep every recovery entry (§11 Health). No promise changes: the model now does what §4 Resync
 already says. The durable backend keeps reset points read at its start for the whole run; whether a start that
 cannot read the segment still finds the entry is not checked here and is left to the durable comparison.
 **Tests.** `tests/recovery_histories.rs`
-`a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point`, and the reuse property
+`a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point`,
+`a_recovery_entry_in_a_recorded_lost_range_gives_only_the_range_reset_point`, and the reuse property
 `s4_a_position_is_given_again_only_after_a_forget_above_below_it`.
 
 ## Open at v0.2

@@ -544,7 +544,7 @@ impl Model {
         let kept: Vec<(Position, RecoveryEntry)> = self
             .recovery_entries()
             .into_iter()
-            .filter(|(p, _)| !self.disk.is_hidden(*p) && !self.disk.set_aside(*p))
+            .filter(|(p, _)| !self.disk.is_hidden(*p))
             .collect();
         crate::recovery::reset_points(&kept, &self.disk.lost_ranges())
     }
