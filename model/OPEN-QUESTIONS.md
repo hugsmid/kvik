@@ -3531,7 +3531,10 @@ and the static read of a reader opened afterwards.
 `a_reset_that_voids_an_alias_takes_it_from_what_a_tail_selects_by`,
 `damage_a_tail_meets_is_a_gap_and_its_fact_is_never_shown`,
 `a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back`,
-`a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail`; `kvik/src/durable/read/live/stops.rs`
+`a_loss_the_start_records_is_a_gap_and_its_fact_leaves_the_tail`; `kvik/src/durable/read/latest/cases.rs`
+`a_live_latest_on_a_continuing_reader_after_a_recorded_loss_is_what_a_fresh_reader_reads` (a range a start records
+at or below what was folded breaks the reader's state, Q-1006, and reaches a live `Latest` as `Gap` and `Opened`);
+`kvik/src/durable/read/live/stops.rs`
 `a_row_limited_batch_never_carries_a_fact_the_reader_already_reports_lost`,
 `a_gap_after_a_row_limit_stop_is_named_in_that_batch_and_survives_the_round_s_trim`;
 `kvik/src/durable/read/live/lags.rs`
