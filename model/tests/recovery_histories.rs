@@ -999,6 +999,53 @@ fn a_recovery_entry_in_a_recorded_lost_range_gives_only_the_range_reset_point() 
     );
 }
 
+/// The durable backend's history in `kvik/tests/durable_reset_points.rs`: the segment holding the recovery entry is
+/// sealed, the engine stops, and the segment is damaged or removed (Q-1033).
+fn entry_segment_harmed(remove: bool) {
+    let mut w = RWorld::new(Checks {
+        reuse: true,
+        ..NONE
+    });
+    let mut seen = Seen::default();
+    for op in [
+        ROp::Ingest(2, None),
+        ROp::Take { c: 0, n: 4 },
+        ROp::PowerLoss(1),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Seal,
+        ROp::Crash,
+    ] {
+        w.apply(&op, &mut seen).unwrap();
+    }
+    let entry = *w.m.recovery_entries().keys().next().unwrap();
+    let f =
+        *w.m.disk
+            .files
+            .iter()
+            .find(|(_, x)| x.sealed && x.entries().any(|e| e.position == entry))
+            .unwrap()
+            .0;
+    if remove {
+        w.m.disk.hot.remove(&f);
+    } else {
+        w.m.corrupt_hot(f);
+        w.m.scrub();
+    }
+    w.apply(&ROp::Take { c: 0, n: 16 }, &mut seen).unwrap();
+    assert!(seen.forget_resyncs + seen.behind_resyncs > 0);
+}
+
+#[test]
+fn a_recovery_entry_in_a_damaged_sealed_segment_stays_a_reset_point() {
+    entry_segment_harmed(false);
+}
+
+#[test]
+fn a_recovery_entry_in_a_removed_sealed_segment_stays_a_reset_point() {
+    entry_segment_harmed(true);
+}
+
 /// Guards the recovery-history properties (invariants 25–27 and reuse):
 /// positions delivered and then assigned again after a reset (flagged ones
 /// among them), `resync`s carrying `forget_above`, confirmations that forced
