@@ -571,6 +571,30 @@ impl LogReader {
         Ok(false)
     }
 
+    /// Reads the mark and the manifest again before the first refresh, so that what a caller judges against
+    /// [`LogReader::state`] and [`LogReader::lost_ranges`] before it starts (a series directory to start after,
+    /// `format.md` A.18) is judged against the files as they are now. `false`, reading nothing, once a refresh or a
+    /// start has run.
+    pub fn reread(&mut self) -> Result<bool, ReaderError> {
+        if self.view.generation.is_some() || self.view.taken != Position::default() {
+            return Ok(false);
+        }
+        let mark = self.read_mark()?;
+        self.take_manifest()?;
+        if self.renewal_due(self.manifest.epoch) {
+            self.renew(self.manifest.epoch, mark.generation)?;
+        }
+        self.lost = self.manifest.lost.clone();
+        self.lost_stale = false;
+        self.state.durable = Position {
+            generation: mark.generation,
+            sequence: mark.last_sequence,
+        };
+        self.state.generation = mark.generation;
+        self.state.stamp = mark.stamp;
+        Ok(true)
+    }
+
     fn refresh_inner(
         &mut self,
         budget: Option<usize>,
@@ -686,9 +710,11 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
 mod files;
 mod lease;
 mod lookup;
+mod lookup_at;
 mod manifest;
 mod pass;
 #[cfg(test)]
 mod tests;
 
 pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted};
+pub use lookup_at::WantedAt;

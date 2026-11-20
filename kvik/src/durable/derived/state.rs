@@ -85,6 +85,11 @@ impl State {
         [self.pending, self.last_ahead]
     }
 
+    /// The facts folded, a fact a state continued from a file counted.
+    pub(crate) fn count(&self) -> u64 {
+        self.facts
+    }
+
     /// The latest recorded `t` and the lateness reference (spec §2.2).
     pub(crate) fn latest(&self) -> (Option<i64>, Option<i64>) {
         (self.latest_t, self.reference)
@@ -111,6 +116,17 @@ impl State {
                 self.pending = self.last_ahead;
             }
         }
+    }
+
+    /// The candidate, and whether it may not be the live fact, once the facts ahead that fell due by `horizon` are
+    /// promoted: what [`State::promote`] would leave, the state unchanged.
+    pub(crate) fn promoted(&self, horizon: i64, versioned: bool) -> (Option<Kept>, bool) {
+        let mut st = State {
+            bad: BTreeMap::new(),
+            ..*self
+        };
+        st.promote(horizon, versioned);
+        (st.candidate, st.unsure())
     }
 
     /// Whether a fact ahead that the state does not name may have fallen due.

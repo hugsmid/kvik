@@ -126,6 +126,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1004 | §2.3, §7 Readers; `format.md` A.18 | What a reader finds in the log because the state cannot tell (decided by the lead) |
 | Q-1005 | `api.md` Reading | `Snapshot`: what it answers at one cut (decided by the lead) |
 | Q-1006 | §7 Readers; `api.md` Health | A reader whose latest values no longer follow the log (decided by the lead) |
+| Q-1007 | query design §1 S1 | Where S1 stands: the writer's own latest values (decided by the lead) |
 | Q-1010 | `api.md` Live reads; query design §2.1, §3.6 | What a live session sends and when (decided by the lead) |
 | Q-1011 | §3 Recovery, §7 Readers; `api.md` Live reads | Resets and losses in a live session (decided by the lead) |
 | Q-1012 | `api.md` Live reads; labels design §2 | A live read's selection, membership and canonical order (decided by the lead) |
@@ -3308,6 +3309,8 @@ another reset stamp or generation than the main reader's is dropped and read aga
 reads only latest values never holds one. Cost: a reader that mixes windows with latest values holds the index as
 before 9.0c, beside the latest values, until 9.0f.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs` `a_readers_memory_does_not_grow_with_the_facts`;
+`kvik/tests/latest_memory.rs` `a_readers_heap_does_not_grow_with_the_facts_it_folds` (the heap allocated and not
+freed while a reader catches up over 280,000 facts, against a reader that builds the index);
 `kvik/src/durable/reader/tests.rs` `a_first_read_in_parts_builds_the_index_one_read_whole_does`;
 `log/tests/reader_start.rs` `a_refresh_upto_returns_nothing_above_it_and_resumes_there`.
 
@@ -3338,12 +3341,22 @@ the log only above the directory's `through`; a directory written in that run li
 would never meet it and would report nothing.
 **Built.** A run whose start met a region that no lost range records writes no series directory and removes those on
 disk (`kvik/src/durable/derived.rs` `hook`), as Q-952 does for a loss found while open; readers then read the log
-whole, as before, until a start finds no such region. The cost: on such a store every reader process reads the whole
-kept log at its first call, and the one-shot tool's `latest` (roadmap 9.0e) is as slow as before the directories.
-**Options.** (a) As built. (b) Write directories over such a region and state that a reader process reports only the
-losses the manifest records, the registry file's recovery entries and what its own reads meet, as the query design's
-section 4 reads; the store's own process still reports the loss. (c) Record the range in the manifest when the start
-meets it (part of roadmap 6.3b, which writes manifest records during a run).
+whole, as before.
+**Options and their costs.**
+(a) As built. Every start reads the whole kept log (`kvik/src/durable/start.rs`), so a damaged region in a sealed
+segment is met at every start, and nothing records it until 6.3b: one damaged block turns the series directory off
+for that store until then. Every reader process, and the one-shot `latest` of roadmap 9.0e, reads the whole kept log
+at its first call for as long (hours on a card after a year at the home rate), and its memory stays bounded. No loss
+goes unreported anywhere.
+(b) Write directories over such a region, and state that a reader process reports only the losses the manifest
+records, the registry file's recovery entries and what its own reads meet, as the query design's section 4 reads.
+Given up: a reader process's `losses()` and health omit a `data_lost` that the store's own process reports, for as
+long as the region stays unrecorded. No wrong fact is shown: the run's fold never held the lost facts, so no
+directory names one.
+(c) Record the range in the manifest when the start meets it: a manifest record written during a start, which is the
+part of roadmap 6.3b that writes lost ranges for damage found in a run (Q-755), brought forward; on the order of 300
+lines with its fault tests, most of them 6.3b's own. Readers then see the range in the manifest, as they see any
+other, and directories are written as usual.
 **Pinned by.** `kvik/tests/derived.rs` `a_run_over_a_region_the_start_meets_and_no_lost_range_records_writes_no_series_directory`
 and `a_query_meeting_a_region_the_start_met_adds_no_loss_and_the_run_writes_no_series_directory`, which replace the
 two tests that pinned a directory written in such a run.
@@ -3353,7 +3366,9 @@ Decided by the lead with roadmap 9.0c, for review.
 **Decided.** The newest series directory whose frame and `through` are of the mark's generation, with `through` at
 or below the mark's durable position, written under the mark's reset stamp, with a `lost` count not saturated and at
 least the positions at or below `through` that the manifest's lost ranges cover now (Q-776), together with a
-registry file of that generation through at most the durable position (Q-1001). The reader takes the registry and
+registry file of that generation through at most the durable position (Q-1001), both judged against the mark and the
+manifest as re-read at the first round; a newer file that fails is passed over for an older one kept. The reader
+takes the registry and
 every recovery entry from the file and the entries above it from the log; each series' state from its entry, judged
 at the later of the file's `judged_at` and its write time; and starts its log reader after `through`
 (`LogReader::start_after`: the reader reads from the segment that holds the next position and passes over every
@@ -3368,7 +3383,14 @@ continue a directory written as the writer's fold gives it at any batch boundary
 `a_reader_started_after_a_position_returns_exactly_the_batches_above_it`,
 `a_started_reader_reads_only_the_segments_from_the_one_holding_the_next_position`,
 `a_start_after_is_refused_after_a_refresh_and_for_another_generation_or_a_position_above_the_mark`,
-`a_recovery_entry_at_or_below_the_start_voids_nothing_the_start_passes_over`.
+`a_recovery_entry_at_or_below_the_start_voids_nothing_the_start_passes_over`,
+`a_start_after_the_second_last_position_of_a_segment_reads_from_that_segment`;
+`kvik/src/durable/read/latest/cases.rs` `a_series_directory_under_another_reset_stamp_is_not_continued`,
+`a_reader_opened_before_the_newest_directory_continues_it`,
+`a_newest_directory_a_reader_cannot_continue_falls_back_to_the_one_kept_before_it`,
+`a_directory_behind_a_loss_a_later_start_records_is_not_continued`,
+`a_registry_file_of_another_generation_or_above_the_mark_is_passed_over`; `kvik/src/durable/read/cut.rs`
+`a_reset_between_the_directorys_check_and_the_first_pass_breaks_the_state`.
 
 ## Q-1004 — What a reader finds in the log because the state cannot tell
 Decided by the lead with roadmap 9.0c, for review.
@@ -3376,38 +3398,59 @@ Decided by the lead with roadmap 9.0c, for review.
 candidate is the answer when the state is sure, the candidate lies at or below `now`, an observed interval reading is
 ready, and its reading is valid (spec §2.3). Where the fold met the candidate the reader holds its full fact, at most
 three per series (the candidate and the earliest and latest fact ahead). A candidate continued from a directory is
-read once at its position, every such candidate of the view at the first need (one lookup), and kept. Otherwise (an
+read once at its position, every such candidate of the view at the first need (one lookup), and kept; each is read
+from the one segment that holds its position, found by the segments' header base sequences, with no listing of
+`log/` and no sealed segment's index read (`LogReader::lookup_at`). Otherwise (an
 unsure mark, more pending facts than the state names, a candidate above `now` or not yet ready, a reading that is not
 valid) the live fact is searched for backwards in event time from `now` at the call's cut, in spans that double from
 the recent window's, through the A.8 indexes; this is the only read whose cost grows with how long the series has
-been quiet. A lookup that cannot read a place that may hold the range is `NotAvailable`, never absence. A fact a
+been quiet. What a search finds is kept, with the first time a fact it saw after it may become live (one lookup
+forward), and answers again while the series folds no further fact under the same reset stamp: a value ahead that
+the state cannot name is found once until the next falls due (the query design's section 4). A lookup that cannot read a place that may hold the range is `NotAvailable`, never absence. A fact a
 directory names that a complete lookup does not find is `NotAvailable` too, unless a lost range the manifest records
 holds its position: a segment removed before the lookups' reader opened is passed over by it as by any reader opened
 since (Q-951), and the entry is the only witness. The lookups use a log reader of their own, opened at the first
 lookup and renewed only by lookups; a lookup under another reset stamp or generation than the cut's, or behind it,
-ends with `CutExpired`.
+ends with `CutExpired`, and a plain `live` is then computed once more under a new cut (the query design's section
+3.2), a snapshot's not. A reader so holds up to three leases: its own, the fact index's while it has one (Q-1000) and
+the lookups'. Each names only the cuts its log reader holds, so the writer keeps nothing older than the oldest of
+them; one lease per reader comes with roadmap 9.0f's sources, which replace the fact index. The lookups' mutex is
+the one lock a reader holds across a read: lookups at a cut run one at a time.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
-`a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_search_per_call`,
+`a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_is_searched_for_once`,
+`a_candidate_above_the_readers_now_is_not_live`,
 `future_and_outranked_facts_are_live_only_when_current_and_due_with_no_search`,
 `a_quiet_series_candidate_is_read_once_with_every_other_unmet_one`,
+`a_value_ahead_the_state_cannot_name_is_found_once_until_the_next_falls_due`; `log/tests/reader_start.rs`
+`a_lookup_at_positions_reads_one_segment_each_and_finds_what_a_lookup_by_time_finds`,
+`a_lookup_at_a_position_whose_segment_is_gone_never_finds_it_elsewhere`; and in `cases.rs`
 `a_text_candidate_in_a_maximal_batch_is_read_whole_from_its_position`,
-`a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over`.
+`a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over`,
+`a_directory_candidate_inside_a_recorded_lost_range_is_searched_for_not_unavailable`,
+`a_candidate_read_at_its_position_is_never_taken_for_another_fact_at_its_time`; `kvik/src/durable/read/cut.rs`
+`a_lookup_under_another_reset_stamp_than_its_cut_is_cut_expired`,
+`a_live_value_looked_up_under_a_reset_is_read_once_more_under_the_new_cut`.
 
 ## Q-1005 — `Snapshot`: what it answers at one cut
 Decided by the lead with roadmap 9.0c, for review.
 **Decided.** `Reader::snapshot` (`api.md` Reading) answers `live`, `series` and `losses` at one cut and one `now`,
 both taken when it is made; `state` and `now` say which. It is owned, `Send + 'static` and cheap to clone (Q-722).
-On the durable backend it holds a published view and checks the cut before and after each call, so it ends with
-`CutExpired` once the cut is `cut_max_age` old or its lease was found gone; a `live` its state cannot tell is looked
+On the durable backend it holds a published view and checks the cut once after each call, so it never returns a
+result computed under a cut that ended and ends with `CutExpired` once the cut is `cut_max_age` old or its lease was
+found gone; a `live` its state cannot tell is looked
 up at its cut (Q-1004). On the model backend every result is taken when it is made. Windows and facts join it with
 the sources of roadmap 9.0f; until then a dashboard's latest values and its windows do not share one cut.
 **Pinned by.** `kvik/src/durable/read/latest/tests.rs` `latest_values_equal_the_models_at_every_check` (a fresh
-reader's snapshot against the model at every check).
+reader's snapshot against the model at every check); `kvik/src/durable/read/latest/snapshots.rs`
+`a_snapshot_answers_at_its_cut_and_now_while_facts_arrive_and_ends_once_its_cut_is_old`; `kvik/tests/threads.rs`
+`handles_and_results_are_send_and_sync`.
 
 ## Q-1006 — A reader whose latest values no longer follow the log
 Decided by the lead with roadmap 9.0c, for review.
 **Decided.** The state breaks on a void below what the reader folded; on a range its process found lost (the
-latch's closed ranges, Q-938) at or below it that no lost range of the manifest holds; on damage its first pass meets
+latch's closed ranges, Q-938) at or below it that no lost range of the manifest holds; on a lost range the manifest
+records since the state was seeded or last compared that starts at or below it (a start found it after the reader
+read past it, and the log reader never reads again what it returned); on damage its first pass meets
 before any batch above the directory, which may hold positions the directory covers; and on a reset between the
 directory's check and the first pass. The reader then answers `live` and `series` from its fact index (Q-1000),
 which forgets the ranges found, until it is reopened, and `losses` merges both finders' reports. A range a pass finds
@@ -3415,8 +3458,34 @@ itself holds no fact it folded and breaks nothing. So a reader never shows a fac
 the rule Q-952 sets for the writer's fold. Cost: after such a fault the reader holds every fact until reopened.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
 `a_loss_found_while_open_breaks_the_state_shows_the_loss_and_never_the_lost_fact`,
-`damage_under_a_directorys_candidate_never_shows_the_lost_fact`; `kvik/tests/durable_losses_open.rs`
-`a_loss_found_while_open_decides_as_a_restart_over_it_does`.
+`a_loss_found_in_a_batch_already_folded_breaks_the_state_and_one_the_pass_finds_does_not`,
+`damage_under_a_directorys_candidate_never_shows_the_lost_fact`,
+`a_continuing_reader_never_shows_a_fact_a_start_recorded_lost`; `kvik/src/durable/read/cut.rs`
+`a_reset_between_the_directorys_check_and_the_first_pass_breaks_the_state`; `kvik/src/durable/read/latest/tests.rs`
+`latest_values_equal_the_models_at_every_check` (histories with power losses and damaged batches, every reader's
+`live`, `series` and `losses` against a fresh reader's fact index after damage); `log/tests/reader_start.rs`
+`a_range_a_restart_records_below_what_was_read_reaches_a_started_reader_only_as_a_lost_range`;
+`kvik/tests/durable_losses_open.rs` `a_loss_found_while_open_decides_as_a_restart_over_it_does`.
+
+## Q-1007 — Where S1 stands: the writer's own latest values
+Decided by the lead at the review of roadmap 9.0c (technical).
+**Scenario.** The query design's S1 is 400 latest values from one snapshot in the writer's process, from live state
+in memory: 0.2 ms on the desktop class, 2 ms on the minimal class (two targets, one per class). The writer's own
+`live` and `snapshot` go through the same reader as another process's, which reads the mark file, checks the
+manifest and reads the new bytes of the open segment at each round.
+**Decided.** Now: in the writer's process a round whose current view is at the writer's durable position, with every
+closed range of the latch taken, no fact index wanted that it lacks and no lease renewal due, publishes that view
+again with no file read (the manifest changes only at a start, Q-704); and the per-call cost of `live` was cut (one
+cut check per snapshot call, the state judged without a copy, the fact borrowed, the reading checked without being
+built). With roadmap 9.0d's follow-up the writer's reader takes its new batches from the shared tail hub in memory
+instead of the segment file, which removes the refresh that remains after a write.
+**Measured** (release, best of five with the spread, a shared four-core virtual machine, 400 gauges, 1,108 sealed
+segments; `kvik/tests/latest_budgets.rs`): S1 with nothing written since 0.127 ms (spread 0.049); S1 after a round of
+400 readings 0.406 ms (spread 0.031), of which the refresh is about 0.3 ms; S2 0.202 ms and 0.406 ms. The first
+snapshot of a reader just opened is about 0.1 s here, folding the log since the only directory. The figures on the
+two hardware classes are roadmap 9.0e's.
+**Pinned by.** `kvik/src/durable/read/latest/cases.rs`
+`the_writers_own_reader_reads_no_file_while_the_writer_has_made_nothing_durable_since`.
 
 ## Q-1010 — What a live session sends and when
 Decided by the lead with roadmap 9.0d, for review.
@@ -3719,6 +3788,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017.
 | Q-1004 | 9.0c | Decided by the lead: what the reader finds by lookup at the cut, and a named fact not found reported unavailable; for review |
 | Q-1005 | 9.0f | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; windows and facts join with 9.0f's sources |
 | Q-1006 | 9.0f | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; replaced by 9.0f's sources |
+| Q-1007 | 9.0d | Decided by the lead at 9.0c's review: no file read while the writer has made nothing durable since; the in-memory feed from 9.0d's hub; figures per class with 9.0e |
 | Q-1010 | 9.0d | Decided by the lead: a batch only with events, `Opened` at the next batch's cut, `Tail` from its cut only, one `durable` position while there is one log; for review |
 | Q-1011 | 9.0d | Decided by the lead: `Reset` and `Gap` for every reset and every loss found, a `Latest` opened again after either; for review |
 | Q-1012 | 9.0d | Decided by the lead: retirement leaves every selection; the canonical order of the entries, matches by id; for review |

@@ -8,6 +8,7 @@
 //! answers from its fact index until it is reopened (Q-1006). What a state cannot tell, the reader finds in the log
 //! at the call's cut ([`live`], Q-1004).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use kvik_log::content::Item;
 use kvik_log::directory::series::SeriesDirectory;
 use kvik_log::entries::{Entry, Versioning};
 use kvik_log::manifest::LostRange;
-use kvik_log::reader::{FoundFact, ReadEvent, Wanted};
+use kvik_log::mark::ResetStamp as LogStamp;
+use kvik_log::reader::{FoundFact, ReadEvent, Wanted, WantedAt};
 use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 use kvik_model as km;
@@ -76,11 +78,11 @@ pub(crate) struct Latest {
 
 /// What a state tells of a series' live fact at `now`.
 #[derive(Debug)]
-pub(crate) enum Judged {
+pub(crate) enum Judged<'a> {
     /// No live fact.
     None,
     /// This fact, met by the fold.
-    Fact(Stored),
+    Fact(&'a Stored),
     /// The fact at this position, which the fold did not meet.
     Row(Kept),
     /// The state cannot tell.
@@ -145,16 +147,18 @@ impl Latest {
                         };
                         sequence += item.sequences();
                         match item {
-                            Item::Fact(row) if p > self.seeded => {
+                            // The started log reader returns no batch at or below the directory (Q-1003).
+                            Item::Fact(row) => {
                                 self.fact(Stored {
                                     position: p,
                                     received_at: b.content.received_at,
                                     row: row.clone(),
                                 });
                             }
-                            Item::Fact(_) => {}
                             Item::Entry(e) if matches!(**e, Entry::Ignored { .. }) => {}
+                            // A registry file newer than the directory holds entries the log returns above it.
                             Item::Entry(e) if p > self.file_through => {
+                                self.folded = self.folded.max(p);
                                 self.registry.apply(e);
                                 self.entries
                                     .insert(p, (b.content.received_at, (**e).clone()));
@@ -228,6 +232,14 @@ impl Latest {
         }
     }
 
+    /// A range the manifest records since the state was seeded or last compared: one that starts at or below what was
+    /// folded breaks the state, since the log reader does not read again what it returned (Q-1006).
+    pub(crate) fn lose_recorded(&mut self, first: LogPos) {
+        if first <= self.folded {
+            self.broken = true;
+        }
+    }
+
     /// Whether a void or a loss reached what was folded (Q-1006).
     pub(crate) fn broken(&self) -> bool {
         self.broken
@@ -265,22 +277,22 @@ impl Latest {
     }
 
     /// What the state tells of series `id`'s live fact at `now` (spec §2.3): the candidate once the facts ahead
-    /// that fell due are promoted, unless it may not be the live fact (A.18 bit 3), lies above `now` (a clock
-    /// step back, A.18), or is an observed interval reading not yet ready.
-    pub(crate) fn judge(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Judged {
+    /// that fell due are promoted, unless it may not be the live fact (A.18 bit 3) or is not ready at `now`: above
+    /// it (a reader's clock behind the writer's, A.18), or an observed interval reading not yet ended.
+    pub(crate) fn judge(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Judged<'_> {
         let Some(h) = self.series.get(&id) else {
             return Judged::None;
         };
-        let mut st = h.state.clone();
-        st.promote(now, versioned);
-        if st.unsure() {
+        let (candidate, unsure) = h.state.promoted(now, versioned);
+        if unsure {
             return Judged::Unsure;
         }
-        match st.candidate() {
+        match candidate {
             None => Judged::None,
-            Some(c) if c.t > now || p.ready_at(c.t) > now => Judged::Unsure,
+            // `ready_at(t)` is never before `t`.
+            Some(c) if p.ready_at(c.t) > now => Judged::Unsure,
             Some(c) => match h.rows.iter().find(|r| r.position == c.position) {
-                Some(r) => Judged::Fact(r.clone()),
+                Some(r) => Judged::Fact(r),
                 None => Judged::Row(c),
             },
         }
@@ -326,6 +338,11 @@ impl Latest {
         .min()
     }
 
+    /// The facts of series `id` folded, those of a continued entry counted.
+    pub(crate) fn fact_count(&self, id: u32) -> u64 {
+        self.series.get(&id).map_or(0, |h| h.state.count())
+    }
+
     /// Every series whose candidate at `now` the fold did not meet, with it.
     pub(crate) fn unmet(&self, now: i64) -> Vec<(u32, Kept)> {
         self.series
@@ -335,9 +352,7 @@ impl Latest {
                     .registry
                     .get(*id)
                     .is_some_and(|s| s.def.versioning != Versioning::None);
-                let mut st = h.state.clone();
-                st.promote(now, versioned);
-                let c = st.candidate()?;
+                let c = h.state.promoted(now, versioned).0?;
                 (!h.rows.iter().any(|r| r.position == c.position)).then_some((*id, c))
             })
             .collect()
@@ -411,22 +426,83 @@ fn search(
     }
 }
 
+/// A live fact searched for in the log, kept while it is the answer: while its series folds no further fact, under
+/// the same reset stamp, for a `now` from the one it was found at up to the first time a fact the search saw ahead of
+/// it may become live (the query design's section 4: the reader finds the next value once).
+#[derive(Clone, Debug)]
+pub(crate) struct Searched {
+    facts: u64,
+    stamp: LogStamp,
+    from: i64,
+    until: i64,
+    found: Option<Stored>,
+}
+
+/// [`search`], or the fact a search found before while it still holds.
+fn searched(
+    r: &DurableReader,
+    v: &View,
+    series: &Series,
+    p: &Params,
+    now: i64,
+) -> Result<Option<Stored>, QueryError> {
+    let id = series.def.id;
+    let facts = v.latest().fact_count(id);
+    let stamp = v.state().stamp;
+    if let Some(s) = r
+        .searched(id)
+        .filter(|s| s.facts == facts && s.stamp == stamp && s.from <= now && now < s.until)
+    {
+        return Ok(s.found);
+    }
+    let found = search(r, v, series, p, (now, None))?;
+    let versioned = series.def.versioning != Versioning::None;
+    // Every current fact after the one found that is valid is ahead of `now` or not yet ready: the first of them to
+    // become live ends what the search found.
+    let after = found
+        .as_ref()
+        .map_or(i64::MIN, |s| s.row.t.saturating_add(1));
+    let ahead = [Wanted {
+        series_id: id,
+        from: after,
+        to: i64::MAX,
+    }];
+    let until = current(r.lookup(v, &ahead)?, versioned)
+        .values()
+        .filter(|s| windows::reading_of(series, s).is_some())
+        .map(|s| p.ready_at(s.row.t))
+        .filter(|t| *t > now)
+        .min()
+        .unwrap_or(i64::MAX);
+    r.keep_searched(
+        id,
+        Searched {
+            facts,
+            stamp,
+            from: now,
+            until,
+            found: found.clone(),
+        },
+    );
+    Ok(found)
+}
+
 /// The facts at the positions `wanted` names, from the log at `v`'s cut, by series.
 fn resolve(
     r: &DurableReader,
     v: &View,
     wanted: &[(u32, Kept)],
 ) -> Result<BTreeMap<u32, Stored>, QueryError> {
-    let ranges: Vec<Wanted> = wanted
+    let at: Vec<WantedAt> = wanted
         .iter()
-        .map(|(id, k)| Wanted {
+        .map(|(id, k)| WantedAt {
             series_id: *id,
-            from: k.t,
-            to: k.t,
+            t: k.t,
+            position: k.position,
         })
         .collect();
     let mut out = BTreeMap::new();
-    for f in r.lookup(v, &ranges)? {
+    for f in r.lookup_at(v, &at)? {
         let id = f.row.series_id;
         if wanted
             .iter()
@@ -468,14 +544,14 @@ pub(crate) fn live(
         return Ok(Live::None);
     }
     let versioned = series.def.versioning != Versioning::None;
-    let fact = match latest.judge(id.0, versioned, &p, now) {
+    let fact: Option<Cow<'_, Stored>> = match latest.judge(id.0, versioned, &p, now) {
         Judged::None => None,
-        Judged::Fact(s) if windows::reading_of(series, &s).is_some() => Some(s),
+        Judged::Fact(s) if windows::has_reading(series, s) => Some(Cow::Borrowed(s)),
         Judged::Row(k) => match r.resolved(v, id.0, k, now)? {
-            Some(s) if windows::reading_of(series, &s).is_some() => Some(s),
-            Some(_) => search(r, v, series, &p, (now, None))?,
+            Some(s) if windows::has_reading(series, &s) => Some(Cow::Owned(s)),
+            Some(_) => searched(r, v, series, &p, now)?.map(Cow::Owned),
             None if recorded_lost(v.lost_ranges(), k.position) => {
-                search(r, v, series, &p, (now, None))?
+                searched(r, v, series, &p, now)?.map(Cow::Owned)
             }
             // A fact the directory names that the log no longer holds, as a segment removed before the lookup's
             // reader opened (Q-951): never read as absence (Q-1004).
@@ -485,7 +561,7 @@ pub(crate) fn live(
                 });
             }
         },
-        Judged::Fact(_) | Judged::Unsure => search(r, v, series, &p, (now, None))?,
+        Judged::Fact(_) | Judged::Unsure => searched(r, v, series, &p, now)?.map(Cow::Owned),
     };
     Ok(match fact {
         Some(s) => windows::live_with(&p, r.clocks(), id, &s, now),
@@ -552,4 +628,6 @@ pub(crate) fn rows_for(
 #[cfg(test)]
 mod cases;
 #[cfg(test)]
-mod tests;
+mod snapshots;
+#[cfg(test)]
+pub(super) mod tests;

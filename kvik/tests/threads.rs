@@ -36,6 +36,11 @@ fn handles_and_results_are_send_and_sync() {
     assert_send_sync::<ConsumerError>();
     assert_send_sync::<kvik::env::Env>();
     assert_send_sync::<kvik::StoreConfig>();
+    // Q-1005: owned, so that another thread may hold it.
+    fn assert_static<T: 'static>() {}
+    assert_clone::<kvik::Snapshot>();
+    assert_send_sync::<kvik::Snapshot>();
+    assert_static::<kvik::Snapshot>();
     // A live session moves to the thread that waits in `next`.
     assert_send_sync::<kvik::LiveSession>();
     assert_send_sync::<kvik::UpdateBatch>();

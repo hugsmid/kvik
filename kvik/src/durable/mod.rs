@@ -294,6 +294,7 @@ impl Writer {
                 (READER_LEASE, READER_LEASE),
                 self.clocks.clone(),
                 self.latch.clone(),
+                self.log().as_ref().map(Log::watch),
             )
             .map_err(|e| QueryError::NotAvailable {
                 reason: e.to_string(),

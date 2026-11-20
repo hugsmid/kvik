@@ -84,6 +84,11 @@ pub(super) enum Step {
     Advance(u64),
     /// The store is shut down and opened again.
     Restart,
+    /// The power goes and the store is opened again after a reboot.
+    PowerLoss,
+    /// The power goes, the batch holding a fact chosen by this number is damaged, and the store is opened again:
+    /// the start finds the damage. Readers are then compared with a fresh reader's fact index, not the model.
+    Damage(u16),
     /// With the store shut down, a series directory as of a batch boundary chosen by this number, and a reader
     /// that continues it.
     Directory(u16),
@@ -104,6 +109,8 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
             .prop_map(|(r, revise)| Step::Emit(r, revise)),
         3 => (0u64..120).prop_map(Step::Advance),
         1 => Just(Step::Restart),
+        1 => Just(Step::PowerLoss),
+        1 => any::<u16>().prop_map(Step::Damage),
         2 => any::<u16>().prop_map(Step::Directory),
         2 => Just(Step::Check),
     ];
@@ -132,6 +139,12 @@ pub(super) struct Rig {
     pub(super) seeded: u64,
     pub(super) searches: u64,
     log: LogConfig,
+    /// The last boot identity.
+    boot: u8,
+    /// A batch was damaged: the model no longer describes the store.
+    faulted: bool,
+    /// Checks made after damage.
+    pub(super) after_damage: u64,
 }
 
 impl Rig {
@@ -183,6 +196,9 @@ impl Rig {
             seeded: 0,
             searches: 0,
             log,
+            boot: 1,
+            faulted: false,
+            after_damage: 0,
         }
     }
 
@@ -240,6 +256,17 @@ impl Rig {
                 self.shut();
                 self.reopen();
             }
+            Step::PowerLoss => {
+                self.power_loss();
+                self.reopen();
+            }
+            Step::Damage(k) => {
+                self.power_loss();
+                if self.damage_batch(usize::from(*k)) {
+                    self.faulted = true;
+                }
+                self.reopen();
+            }
             Step::Directory(k) => {
                 self.shut();
                 if write_directory(&self.env, &self.dir, usize::from(*k)).is_some() {
@@ -258,6 +285,56 @@ impl Rig {
         Ok(())
     }
 
+    /// The process stops, the power goes and the machine boots again with a new boot identity; the store is not
+    /// opened again.
+    pub(super) fn power_loss(&mut self) {
+        self.fs.crash_after(0);
+        drop(self.store.take());
+        self.fs.power_loss();
+        self.boot = self.boot.wrapping_add(1).max(1);
+        self.env.boot = Arc::new(crate::env::FixedBootId::new(Some([self.boot; 16])));
+    }
+
+    /// Damages the batch holding a fact chosen by `k`, in a cycle; `false` with none.
+    fn damage_batch(&self, k: usize) -> bool {
+        let clock = Arc::new(kvik_log::writer::SystemClock::default());
+        let mut log = LogReader::open(LogReaderConfig::new(
+            &self.dir,
+            self.env.fs.clone(),
+            clock,
+            self.env.boot.current(),
+            [0xac; 16],
+        ))
+        .unwrap();
+        let u = log.refresh().unwrap();
+        let _ = log.close();
+        let held: Vec<_> = u
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ReadEvent::Batch(b) => Some(b),
+                _ => None,
+            })
+            .filter(|b| {
+                b.content
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, kvik_log::content::Item::Fact(_)))
+            })
+            .collect();
+        let Some(b) = held.get(k % held.len().max(1)) else {
+            return false;
+        };
+        let Some(segment) = self.fs.paths().into_iter().find(|p| {
+            p.starts_with(self.dir.join("log"))
+                && p.to_string_lossy().contains(&format!("{:016x}", b.file_id))
+        }) else {
+            return false;
+        };
+        self.fs.poke(&segment, b.offset as usize + 40, b"XXXXXXXX");
+        true
+    }
+
     /// A reader opened now.
     pub(super) fn reader(&self) -> Reader {
         Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap()
@@ -267,6 +344,9 @@ impl Rig {
     /// (the model writes no recovery or tzdata entry). Staleness follows from the fact by the rule of roadmap 5.4,
     /// whose defaults differ between the backends (Q-16), so it is not compared.
     pub(super) fn check(&mut self) -> Result<(), TestCaseError> {
+        if self.faulted {
+            return self.check_after_damage();
+        }
         let fresh = Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap();
         let snap = fresh.snapshot().unwrap();
         let own = self.store.as_ref().map(Store::reader);
@@ -313,6 +393,43 @@ impl Rig {
     }
 }
 
+impl Rig {
+    /// After damage, every reader's live state, series and losses, a snapshot's among them, equal what a fresh
+    /// reader's fact index gives (Q-1006): the model holds no loss.
+    fn check_after_damage(&mut self) -> Result<(), TestCaseError> {
+        let reference = self.reader();
+        let d = reference.durable().unwrap().unwrap();
+        let fresh = self.reader();
+        let snap = fresh.snapshot().unwrap();
+        let own = self.store.as_ref().map(Store::reader);
+        let mut readers: Vec<&Reader> = vec![&self.long, &fresh];
+        readers.extend(self.continuing.iter());
+        readers.extend(own.as_ref());
+        let info = |i: crate::SeriesInfo| (i.id, i.latest_t, i.lateness_reference);
+        for id in &self.ids {
+            let (want, wanted) = d
+                .with(|i, _| {
+                    let live = crate::durable::windows::live_in(i, d.clocks(), *id, d.now())?;
+                    Ok((live, i.series(&crate::SeriesKey::Id(*id))?))
+                })
+                .unwrap();
+            for r in &readers {
+                prop_assert_eq!(plain(r.live(*id).unwrap()), plain(want.clone()), "{:?}", id);
+                prop_assert_eq!(info(r.series(*id).unwrap()), info(wanted.clone()));
+            }
+            prop_assert_eq!(plain(snap.live(*id).unwrap()), plain(want));
+        }
+        let want = reference.losses();
+        prop_assert!(!want.is_empty(), "the damage is reported");
+        for r in &readers {
+            prop_assert_eq!(r.losses(), want.clone());
+        }
+        prop_assert_eq!(snap.losses().unwrap(), want);
+        self.after_damage += 1;
+        Ok(())
+    }
+}
+
 /// A live state as the backends agree on it: the fact's position and the staleness set aside.
 pub(super) fn plain(l: Live) -> Live {
     match l {
@@ -328,10 +445,20 @@ pub(super) fn plain(l: Live) -> Live {
 /// With the store shut down: a series directory as the writer's fold gives it as of the `k`-th batch boundary (in
 /// a cycle; the last for `usize::MAX`), written as the newest generation, under the registry file the clean stop
 /// wrote (Q-1001). `None` without a batch.
-pub(super) fn write_directory(
+pub(in crate::durable::read) fn write_directory(
     env: &Env,
     dir: &Path,
     k: usize,
+) -> Option<kvik_log::writer::Position> {
+    write_directory_under(env, dir, k, None)
+}
+
+/// [`write_directory`], recording `stamp` in place of the mark's reset stamp when given.
+pub(super) fn write_directory_under(
+    env: &Env,
+    dir: &Path,
+    k: usize,
+    stamp: Option<kvik_log::mark::ResetStamp>,
 ) -> Option<kvik_log::writer::Position> {
     let store_id = kvik_log::store::read_descriptor(&*env.fs, dir)
         .unwrap()
@@ -371,7 +498,7 @@ pub(super) fn write_directory(
     let d = SeriesDirectory {
         through: e.through,
         lost: 0,
-        stamp: (st.stamp != Default::default()).then_some(st.stamp),
+        stamp: stamp.or((st.stamp != Default::default()).then_some(st.stamp)),
         judged_at: e.judged_at,
         entries: e.entries,
     };
@@ -388,15 +515,59 @@ pub(super) fn write_directory(
     Some(through)
 }
 
+/// The newest series directory's bytes.
+pub(super) fn newest_directory(fs: &MemFs, dir: &Path) -> Vec<u8> {
+    let (_, path) = kvik_log::directory::generations(fs, dir, Family::Series)
+        .into_iter()
+        .next()
+        .expect("a series directory");
+    fs.read(&path).unwrap()
+}
+
+/// Writes the series directory `bytes` again as of the mark, under its reset stamp and through its position, claiming
+/// `lost` lost entries below: a directory the reader's checks accept whatever the log lost since it was folded.
+pub(super) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) {
+    let fs = &*env.fs;
+    let store_id = kvik_log::store::read_descriptor(fs, dir).unwrap().store_id;
+    let (frame, d) = SeriesDirectory::decode(bytes, &store_id).unwrap();
+    let clock = Arc::new(kvik_log::writer::SystemClock::default());
+    let mut log = LogReader::open(LogReaderConfig::new(
+        dir,
+        env.fs.clone(),
+        clock,
+        env.boot.current(),
+        [0xae; 16],
+    ))
+    .unwrap();
+    let st = log.refresh().unwrap().state;
+    let _ = log.close();
+    let d = SeriesDirectory {
+        through: st.durable,
+        stamp: Some(st.stamp),
+        lost,
+        ..d
+    };
+    let id = kvik_log::directory::generations(fs, dir, Family::Series)
+        .first()
+        .map_or(frame.file_id, |(id, _)| *id)
+        + 1;
+    let frame = Frame {
+        file_id: id,
+        ..frame
+    };
+    let bytes = d.encode(frame, store_id).unwrap();
+    kvik_log::directory::write_file(fs, dir, Family::Series, id, &bytes).unwrap();
+}
+
 /// Runs a history and checks at its end.
-pub(super) fn run(history: &[Step]) -> Result<(u64, u64), TestCaseError> {
+pub(super) fn run(history: &[Step]) -> Result<(u64, u64, u64), TestCaseError> {
     let mut rig = Rig::new("history");
     for s in history {
         rig.step(s)?;
     }
     rig.check()?;
     rig.shut();
-    Ok((rig.seeded, rig.searches))
+    Ok((rig.seeded, rig.searches, rig.after_damage))
 }
 
 #[test]
@@ -408,12 +579,13 @@ fn latest_values_equal_the_models_at_every_check() {
         failure_persistence: None,
         ..ProptestConfig::default()
     });
-    let (seeded, searches) = (AtomicU64::new(0), AtomicU64::new(0));
+    let (seeded, searches, damaged) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     runner
         .run(&steps(), |history| {
-            let (s, f) = run(&history)?;
+            let (s, f, d) = run(&history)?;
             seeded.fetch_add(s, Ordering::Relaxed);
             searches.fetch_add(f, Ordering::Relaxed);
+            damaged.fetch_add(d, Ordering::Relaxed);
             Ok(())
         })
         .unwrap();
@@ -424,5 +596,9 @@ fn latest_values_equal_the_models_at_every_check() {
     assert!(
         searches.into_inner() > 0,
         "some live value is found in the log"
+    );
+    assert!(
+        damaged.into_inner() > 0,
+        "some history compares losses after damage"
     );
 }

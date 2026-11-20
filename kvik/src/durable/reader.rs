@@ -11,19 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
-use kvik_log::directory::Family;
 use kvik_log::directory::logdir::LostEntry;
 use kvik_log::directory::series::SeriesDirectory;
+use kvik_log::directory::{DerivedError, Family};
 use kvik_log::lease::CutEnd;
 use kvik_log::manifest::LostRange;
 use kvik_log::mark::ResetStamp as LogStamp;
-use kvik_log::reader::{
-    FoundFact, LogReader, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError, Wanted,
-};
+use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError};
 use kvik_log::writer::Position as LogPos;
 
 use super::clock::Clocks;
-use super::derived::state::Kept;
 use super::index::{Index, Stored, pos};
 use super::loss::{Find, Latch};
 use super::read::cut;
@@ -116,6 +113,8 @@ pub(crate) struct DurableReader {
     /// Where the losses its reads find go: the writer's, for the reader of its own process.
     latch: Arc<Latch>,
     store_id: [u8; 16],
+    /// The writer's progress, for the reader of its own process: a round that would find nothing new is skipped.
+    writer: Option<kvik_log::writer::Watch>,
     /// A call asked for facts: the next round opens the fact index (Q-1000).
     want_facts: AtomicBool,
     /// The log reader of the reads at a cut that a state cannot answer (Q-1004), opened on first use; locked for one
@@ -124,6 +123,8 @@ pub(crate) struct DurableReader {
     /// The full facts of candidates the fold did not meet, read once each, by series.
     rows: Mutex<BTreeMap<u32, Stored>>,
     rows_read: AtomicBool,
+    /// The live facts searched for, by series, while each holds (Q-1004).
+    searched: Mutex<BTreeMap<u32, latest::Searched>>,
     /// Live values found in the log because a state could not tell.
     searches: AtomicU64,
     /// The first round continued a series directory.
@@ -180,11 +181,15 @@ fn take(
 }
 
 /// The manifest's lost ranges merged by identity, as a series directory's `lost` counts them (`format.md` A.18).
-fn lost_entries(ranges: &[LostRange]) -> Vec<LostEntry> {
-    let at = |(generation, sequence)| LogPos {
+fn record_pos((generation, sequence): (u32, u64)) -> LogPos {
+    LogPos {
         generation,
         sequence,
-    };
+    }
+}
+
+fn lost_entries(ranges: &[LostRange]) -> Vec<LostEntry> {
+    let at = record_pos;
     let mut by: BTreeMap<(u32, u64), LostEntry> = BTreeMap::new();
     for l in ranges {
         let e = by.entry(l.identity).or_insert(LostEntry {
@@ -213,17 +218,19 @@ impl DurableReader {
             (lease_refresh, cut_max_age),
             Arc::new(Clocks::new(env.clock.clone())),
             Arc::default(),
+            None,
         )
     }
 
     /// [`DurableReader::open`] with the window clock, refresh instants and loss latch of the process; `ages` is
-    /// `lease_refresh` and `cut_max_age`.
+    /// `lease_refresh` and `cut_max_age`; `writer`, the writer's progress for the reader of its own process.
     pub(crate) fn open_with(
         dir: &Path,
         env: &Env,
         ages: (Duration, Duration),
         clocks: Arc<Clocks>,
         latch: Arc<Latch>,
+        writer: Option<kvik_log::writer::Watch>,
     ) -> Result<Self, OpenError> {
         let mut cfg = log_config(dir, env, Arc::new(ReaderClock(env.clock.clone())));
         (cfg.lease_refresh, cfg.cut_max_age) = ages;
@@ -254,10 +261,12 @@ impl DurableReader {
             created_zone: descriptor.site_zone,
             store_id: descriptor.store_id,
             latch,
+            writer,
             want_facts: AtomicBool::new(false),
             lookups: Mutex::new(None),
             rows: Mutex::new(BTreeMap::new()),
             rows_read: AtomicBool::new(false),
+            searched: Mutex::new(BTreeMap::new()),
             searches: AtomicU64::new(0),
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
@@ -297,7 +306,16 @@ impl DurableReader {
     /// A view read after this call began ([`Flight`]).
     fn view(&self) -> Result<Arc<View>, QueryError> {
         self.flight
-            .get(|current| self.round(current))
+            .get(|current| self.round(current, false))
+            .map_err(unshare)
+    }
+
+    /// [`DurableReader::view`] for a call that reads the latest values only: in the writer's process, a view at the
+    /// writer's durable position is kept rather than read again (Q-1007). A call that reads facts reads the files,
+    /// and with them checks again the last batch its log reader returned.
+    fn view_latest(&self) -> Result<Arc<View>, QueryError> {
+        self.flight
+            .get(|current| self.round(current, true))
             .map_err(unshare)
     }
 
@@ -345,7 +363,7 @@ impl DurableReader {
     /// A view for the latest values, a snapshot's among them (Q-722, Q-1005): read after the call began, with every
     /// fact if its state is broken.
     pub(crate) fn snapshot(&self) -> Result<Arc<View>, QueryError> {
-        let v = self.view()?;
+        let v = self.view_latest()?;
         if v.latest().broken() && v.index().is_none() {
             drop(v);
             return self.view_with_facts();
@@ -414,28 +432,36 @@ impl DurableReader {
     /// under its reset stamp, not behind a loss since (`format.md` A.18), with a registry file of that generation,
     /// and the log reader started after the directory's `through`; otherwise the kept log from its start.
     fn seed(&self, log: &mut LogReader) -> Result<(Latest, Option<LogStamp>), ReaderError> {
+        // The mark and the manifest as they are now, not as at the open: a directory written since is judged
+        // against a mark at or past its `through` (the query design's section 3.2).
+        log.reread()?;
         let st = log.state();
+        let lost = lost_entries(log.lost_ranges());
         let fs = &*self.env.fs;
         let id = self.store_id;
+        // The conditions are applied per generation, so a newest file that fails them falls back to the one kept.
         let dir = kvik_log::directory::read_latest(fs, &self.dir, Family::Series, |b| {
-            SeriesDirectory::decode(b, &id)
-        })
-        .ok()
-        .flatten()
-        .filter(|(f, d)| {
-            f.generation == st.generation
+            let (f, d) = SeriesDirectory::decode(b, &id)?;
+            let valid = f.generation == st.generation
                 && d.through.generation == st.generation
                 && d.through <= st.durable
                 && d.stamp.unwrap_or_default() == st.stamp
                 && d.lost != u32::MAX
-                && kvik_log::writer::lost_below(&lost_entries(log.lost_ranges()), d.through)
-                    <= d.lost
-        });
-        let file = kvik_log::registry::read_latest(fs, &self.dir, &id)
-            .ok()
-            .flatten()
-            .map(|(_, f)| f)
-            .filter(|f| f.generation == st.generation && f.through <= st.durable.sequence);
+                && kvik_log::writer::lost_below(&lost, d.through) <= d.lost;
+            if valid {
+                Ok((f, d))
+            } else {
+                Err(DerivedError::Invalid("not valid for this reader"))
+            }
+        })
+        .ok()
+        .flatten();
+        let file = kvik_log::registry::read_latest_where(fs, &self.dir, &id, |f| {
+            f.generation == st.generation && f.through <= st.durable.sequence
+        })
+        .ok()
+        .flatten()
+        .map(|(_, f)| f);
         if let (Some((frame, d)), Some(file)) = (dir, file)
             && log.start_after(d.through)?
         {
@@ -448,7 +474,7 @@ impl DurableReader {
     /// One refresh, which the call leading a round runs: releases the cuts of dropped views, reads what was appended
     /// since the last round, brings the fact index to the same position when there is one or a call asked for it,
     /// and publishes the next view, holding its own cut.
-    fn round(&self, current: Option<Arc<View>>) -> Result<Arc<View>, Arc<QueryError>> {
+    fn round(&self, current: Option<Arc<View>>, quick: bool) -> Result<Arc<View>, Arc<QueryError>> {
         let began = self.monotonic();
         let mut w = self.lock();
         let w = &mut *w;
@@ -459,11 +485,24 @@ impl DurableReader {
         for id in self.cuts.take_dropped() {
             log.release(id);
         }
+        // In the writer's process, a view at the writer's durable position, with every closed range taken, is what
+        // a read of the files would publish again (the manifest changes only at a start, Q-704): it is kept while
+        // young enough that no lease renewal is due (the query design's S1).
+        if let (true, Some(v), Some(watch)) = (quick, &current, &self.writer)
+            && watch.durable() == v.state().durable
+            && self.latch.closed_count() == w.closed_seen
+            && (v.index().is_some() || !self.want_facts.load(Ordering::SeqCst))
+            && v.age(began) < self.lease_refresh / 2
+        {
+            return Ok(v.clone());
+        }
         if w.latest.is_none() {
             let (l, stamp) = self.seed(log).map_err(failed)?;
             w.latest = Some(l);
             self.seeded.store(stamp.is_some(), Ordering::Relaxed);
             w.seed_stamp = stamp;
+            // The ranges the seed was judged against; any recorded later is compared with what was folded.
+            w.lost_ranges = log.lost_ranges().into();
         }
         let latest = w.latest.as_mut().expect("seeded above");
         let mut own = Vec::new();
@@ -495,6 +534,17 @@ impl DurableReader {
         // A reset between the directory's check and the first pass: the directory may cover what it voided.
         if w.seed_stamp.take().is_some_and(|s| s != st.stamp) {
             latest.break_off();
+        }
+        // A range the manifest records since the last round (a start found it): the log reader never reads again
+        // what it returned, so a range at or below what was folded is met only here (Q-1006).
+        let recorded_since: Vec<(LogPos, LogPos)> = log
+            .lost_ranges()
+            .iter()
+            .filter(|r| !w.lost_ranges.contains(r))
+            .map(|r| (record_pos(r.first), record_pos(r.last)))
+            .collect();
+        for (first, _) in &recorded_since {
+            latest.lose_recorded(*first);
         }
         // The ranges this pass found held no fact it folded; any other closed range may (Q-938).
         let mut lose = |latest: &mut Latest,
@@ -533,6 +583,9 @@ impl DurableReader {
             )
             .map_err(failed)?
             .map_err(Arc::new)?;
+            for (first, last) in &recorded_since {
+                index.forget(*first, *last);
+            }
             let fs = f.log.state();
             if (fs.generation, fs.stamp) != (st.generation, st.stamp) || fs.durable < st.durable {
                 // Read under another reset stamp than the main reader's: read whole again at the next round.
@@ -601,76 +654,6 @@ impl DurableReader {
         }
     }
 
-    /// The facts in the `wanted` ranges at `v`'s cut, read from the log (Q-1004): the regions the manifest records or
-    /// the process found are lost, any other damage or a segment that cannot be read is `NotAvailable`, and a mark
-    /// under another reset stamp or generation than the cut's ends it.
-    pub(crate) fn lookup(&self, v: &View, wanted: &[Wanted]) -> Result<Vec<FoundFact>, QueryError> {
-        let mut g = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
-        if g.is_none() {
-            *g = Some(
-                self.second_reader()
-                    .map_err(|e| query_error(&self.dir, e))?,
-            );
-        }
-        let reader = g.as_mut().expect("opened above");
-        #[cfg(test)]
-        self.lookups_made.fetch_add(1, Ordering::Relaxed);
-        let recorded = v.lost_ranges();
-        let skip = |file_id: u64, start: u64, end: u64| {
-            recorded.iter().any(|l| {
-                l.file_id == file_id
-                    && l.offset <= start
-                    && end <= l.offset.saturating_add(l.length)
-            }) || self.latch.covers(file_id, start, end)
-        };
-        let l = reader
-            .lookup(wanted, &skip)
-            .map_err(|e| query_error(&self.dir, e))?;
-        let cut = v.cut();
-        if l.stamp != cut.stamp
-            || l.durable.generation != cut.durable.generation
-            || l.durable < cut.durable
-        {
-            return Err(QueryError::CutExpired);
-        }
-        if l.complete.iter().any(|c| !c) {
-            return Err(QueryError::NotAvailable {
-                reason: "a log segment that may hold the series cannot be read".into(),
-            });
-        }
-        Ok(l.facts
-            .into_iter()
-            .filter(|f| f.position <= cut.durable)
-            .collect())
-    }
-
-    /// The full fact of series `id`'s candidate `k`, which the fold did not meet: read at its position once, with
-    /// every such candidate of `v` the first time (Q-1004).
-    pub(crate) fn resolved(
-        &self,
-        v: &View,
-        id: u32,
-        k: Kept,
-        now: i64,
-    ) -> Result<Option<Stored>, QueryError> {
-        let hit = |rows: &BTreeMap<u32, Stored>| {
-            rows.get(&id).filter(|s| s.position == k.position).cloned()
-        };
-        if let Some(s) = hit(&self.rows.lock().unwrap_or_else(PoisonError::into_inner)) {
-            return Ok(Some(s));
-        }
-        let first = !self.rows_read.swap(true, Ordering::SeqCst);
-        let read = latest::rows_for(self, v, id, k, now, first)?;
-        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        rows.extend(read);
-        Ok(hit(&rows))
-    }
-
-    /// Counts a live value found in the log because a state could not tell.
-    pub(crate) fn count_search(&self) {
-        self.searches.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Live values found in the log because a state could not tell.
     #[cfg(test)]
     pub(crate) fn searches(&self) -> u64 {
@@ -681,6 +664,12 @@ impl DurableReader {
     #[cfg(test)]
     pub(crate) fn seeded(&self) -> bool {
         self.seeded.load(Ordering::Relaxed)
+    }
+
+    /// Refreshes of the log the rounds have run, each of which reads the mark file.
+    #[cfg(test)]
+    pub(crate) fn parts_taken(&self) -> u64 {
+        self.lock().parts
     }
 
     /// Lookups made at a cut.
@@ -743,6 +732,7 @@ pub(crate) fn losses_of(v: &View) -> Vec<LossReport> {
     out
 }
 
+mod at_cut;
 mod errors;
 #[cfg(test)]
 mod tests;

@@ -331,8 +331,6 @@ pub(super) fn registry_fault(dir: &Path, e: &io::Error) -> LogFault {
     }
 }
 
-/// The ASCII release name of at most 15 bytes a tzdata entry and the store descriptor carry; anything else is
-/// left out.
 /// What makes the registry file cover every entry a series directory covers (Q-1001): written up to the
 /// directory's `through` from the deliverer's index when an entry was taken above the file's `through`, under the
 /// lock every write of the file takes. A failed write is no fault: that directory is not written.
@@ -364,6 +362,8 @@ fn cover_registry(
     }
 }
 
+/// The ASCII release name of at most 15 bytes a tzdata entry and the store descriptor carry; anything else is
+/// left out.
 fn tzdata_name(v: &str) -> String {
     if v.is_empty() || v.len() > 15 || !v.is_ascii() {
         String::new()

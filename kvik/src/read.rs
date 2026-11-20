@@ -386,7 +386,7 @@ impl Snapshot {
         d: &DurableSnapshot,
         f: impl FnOnce(&crate::durable::SnapshotView) -> Result<R, QueryError>,
     ) -> Result<R, QueryError> {
-        d.reader.check(&d.view)?;
+        // One check, after: a result computed under a cut that ended is never returned.
         let r = f(&d.view);
         d.reader.check(&d.view)?;
         r

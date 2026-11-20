@@ -1,7 +1,8 @@
 //! The latest-value budgets of the query design (roadmap 9.0c), timed: S1, 400 latest values from one snapshot in
-//! the writer's process (target 0.2 ms, limit 2 ms), and S2, the same from a reader of another handle that stays
-//! open (target 2 ms, limit 10 ms). The store is on the real file system under the temporary directory, with a seal
-//! after every round of readings. Run in a release build, alone:
+//! the writer's process (target 0.2 ms on the desktop class, 2 ms on the minimal class), and S2, the same from a
+//! reader of another handle that stays open (2 ms desktop, 10 ms minimal). Both figures of a row are targets, one per
+//! hardware class (the design's section 1). The store is on the real file system under the temporary directory, with
+//! a seal after every round of readings. Run in a release build, alone:
 //! `cargo test --release -p kvik --test latest_budgets -- --ignored --nocapture`.
 
 mod common;
