@@ -304,7 +304,7 @@ pub struct Facts {
 #[derive(Debug)]
 enum FactsInner {
     Held(std::vec::IntoIter<Fact>),
-    Stream(crate::durable::read::source::FactStream),
+    Stream(Box<crate::durable::read::source::FactStream>),
 }
 
 impl Facts {
@@ -316,7 +316,7 @@ impl Facts {
 
     pub(crate) fn stream(s: crate::durable::read::source::FactStream) -> Self {
         Facts {
-            inner: FactsInner::Stream(s),
+            inner: FactsInner::Stream(Box::new(s)),
         }
     }
 }

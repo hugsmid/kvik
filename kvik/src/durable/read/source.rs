@@ -391,9 +391,7 @@ impl Iterator for FactStream {
             if self.shelf.is_some() {
                 continue;
             }
-            if self.view.is_none() {
-                return None;
-            }
+            self.view.as_ref()?;
             match self.step() {
                 Ok(true) => {}
                 Ok(false) => {
