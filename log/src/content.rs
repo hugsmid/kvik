@@ -10,6 +10,16 @@ use crate::entries::{EntriesBlock, Entry, entry_len};
 use crate::error::EncodeError;
 use crate::facts::{FactRow, FactsBlock, MAX_PLAIN_LEN};
 
+/// What [`BatchContent::take_wanted`] read of a batch besides the facts it kept.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Taken {
+    /// The least and greatest event time of its facts; `(i64::MAX, i64::MIN)` without one.
+    pub(crate) min_t: i64,
+    pub(crate) max_t: i64,
+    /// The `after` of the recovery entry it holds, alone (A.6).
+    pub(crate) recovery_after: Option<u64>,
+}
+
 /// One entry of a batch: a fact or another entry. Each takes one sequence.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Item {
@@ -222,6 +232,52 @@ impl BatchContent {
             }
         }
         Self::from_bodies(batch.commit.first_sequence, bodies)
+    }
+
+    /// The facts of a complete batch whose bodies were checked that `wants` names by series and event time, each
+    /// given to `keep` with its sequence and the batch's receive time; no other fact's text is decoded (Q-1063).
+    pub(crate) fn take_wanted(
+        batch: &Batch<'_>,
+        wants: &dyn Fn(u32, i64) -> bool,
+        keep: &mut dyn FnMut(u64, i64, FactRow),
+    ) -> Result<Taken, BodyError> {
+        let mut out = Taken {
+            min_t: i64::MAX,
+            max_t: i64::MIN,
+            recovery_after: None,
+        };
+        let mut items = 0u64;
+        for d in &batch.blocks {
+            let body = d.block.body;
+            match d.block.header.block_type {
+                block_type::FACTS => {
+                    let prefix = DataPrefix::decode(block_type::FACTS, body)
+                        .map_err(|_| ContentError::Prefix)?;
+                    let mut put = |k: u64, row: FactRow| {
+                        keep(prefix.first_sequence + k, prefix.received_at, row);
+                    };
+                    let mut w = crate::facts::Wanted::new(wants, &mut put);
+                    crate::facts::walk_wanted(body, &mut w)?;
+                    out.min_t = out.min_t.min(w.min_t);
+                    out.max_t = out.max_t.max(w.max_t);
+                    items += u64::from(prefix.count);
+                }
+                block_type::ENTRIES => {
+                    let e = EntriesBlock::decode(body)?;
+                    for x in &e.entries {
+                        if let Entry::Recovery(r) = x {
+                            out.recovery_after = Some(r.after);
+                        }
+                    }
+                    items += e.entries.len() as u64;
+                }
+                _ => {}
+            }
+        }
+        if items > 1 && out.recovery_after.is_some() {
+            return Err(ContentError::RecoveryNotAlone.into());
+        }
+        Ok(out)
     }
 
     /// The content of a complete batch whose data blocks of known type decoded to `bodies`, in order.

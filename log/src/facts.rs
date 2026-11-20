@@ -445,9 +445,73 @@ thread_local! {
 
 /// What a walk over the rows does with each: [`Collect`] keeps them, [`Check`] keeps none.
 trait Rows {
+    /// Whether the row of `series_id` at `t`, met next, is wanted; called before its text.
+    fn wants(&mut self, _series_id: u32, _t: i64) -> bool {
+        true
+    }
     /// The text `heap[off..end]`, or `None` when it is not UTF-8.
     fn text(&mut self, heap: &[u8], off: usize, end: usize) -> Option<String>;
     fn row(&mut self, row: FactRow);
+}
+
+/// What [`walk_wanted`] keeps: rows by index in the block, and the least and greatest event time of all rows.
+pub(crate) struct Wanted<'a> {
+    pub(crate) wants: &'a dyn Fn(u32, i64) -> bool,
+    pub(crate) keep: &'a mut dyn FnMut(u64, FactRow),
+    pub(crate) min_t: i64,
+    pub(crate) max_t: i64,
+    heap: HeapText,
+    current: bool,
+    index: u64,
+}
+
+impl<'a> Wanted<'a> {
+    pub(crate) fn new(
+        wants: &'a dyn Fn(u32, i64) -> bool,
+        keep: &'a mut dyn FnMut(u64, FactRow),
+    ) -> Self {
+        Wanted {
+            wants,
+            keep,
+            min_t: i64::MAX,
+            max_t: i64::MIN,
+            heap: HeapText::default(),
+            current: false,
+            index: 0,
+        }
+    }
+}
+
+impl Rows for Wanted<'_> {
+    fn wants(&mut self, series_id: u32, t: i64) -> bool {
+        self.min_t = self.min_t.min(t);
+        self.max_t = self.max_t.max(t);
+        self.current = (self.wants)(series_id, t);
+        self.current
+    }
+
+    fn text(&mut self, heap: &[u8], off: usize, end: usize) -> Option<String> {
+        if self.current {
+            std::str::from_utf8(&heap[off..end]).ok().map(str::to_owned)
+        } else {
+            self.heap.is_utf8(heap, off, end).then(String::new)
+        }
+    }
+
+    fn row(&mut self, row: FactRow) {
+        if self.current {
+            (self.keep)(self.index, row);
+        }
+        self.index += 1;
+    }
+}
+
+/// Walks a body with every check of [`FactsBlock::decode`], building only the rows `sink` wants: no other row's text
+/// is allocated (Q-1063). Rows already kept stay kept if a later check fails.
+pub(crate) fn walk_wanted(body: &[u8], sink: &mut Wanted<'_>) -> Result<DataPrefix, BodyError> {
+    #[cfg(test)]
+    FACTS_DECODES.with(|c| c.set(c.get() + 1));
+    walk(body, sink)
 }
 
 struct Collect(Vec<FactRow>);
@@ -601,6 +665,8 @@ fn walk<R: Rows>(body: &[u8], sink: &mut R) -> Result<DataPrefix, BodyError> {
     let (mut any_text, mut any_changed, mut any_decimal) = (false, false, false);
     for i in 0..n {
         let row = i as u32;
+        let (series_id, t) = (u32_at(series, i * 4), i64_at(ts, i * 8));
+        sink.wants(series_id, t);
         let q = quality.as_ref().map_or(0, |q| q[i]);
         let quality = Quality::from_code(q).ok_or(E::Value {
             column: column::QUALITY,
@@ -690,8 +756,8 @@ fn walk<R: Rows>(body: &[u8], sink: &mut R) -> Result<DataPrefix, BodyError> {
             }
         };
         sink.row(FactRow {
-            series_id: u32_at(series, i * 4),
-            t: i64_at(ts, i * 8),
+            series_id,
+            t,
             quality,
             flags: FactFlags {
                 future: f & flag::FUTURE != 0,

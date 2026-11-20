@@ -53,7 +53,10 @@ impl LogReader {
             }
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
-        self.caches.keep_listed(&listed);
+        if self.caches.keep_listed(&listed) {
+            out.complete = false;
+            return Ok(out);
+        }
         let none = Budget::new(0);
         for name in names.into_iter().rev() {
             if name.sealed
@@ -83,6 +86,8 @@ impl LogReader {
                 last_sequence: mark.last_sequence,
                 lost,
                 budget: &none,
+                above: None,
+                upto: None,
             };
             let read = self.lookup_segment(name, limit, &query, &mut Vec::new());
             let found = self.caches.last_committed(name.file_id, at, &query);

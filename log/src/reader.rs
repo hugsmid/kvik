@@ -718,5 +718,5 @@ mod pass;
 mod tests;
 
 pub use commits::CommitFind;
-pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted, fact_bytes};
+pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted, Within};
 pub use lookup_at::WantedAt;

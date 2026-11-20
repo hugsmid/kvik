@@ -69,7 +69,7 @@ pub(super) fn scan_new(
             from.offset,
             if last { len } else { to },
         )?;
-        let mut scanner = Scanner::resume(&buf, id, lim, from).ok()?.keeping_content();
+        let mut scanner = Scanner::resume(&buf, id, lim, from).ok()?;
         // Each finding is taken as it is read; only a region is held back, since one running to the end of a part
         // that is not the last may be a batch the part cut.
         let mut held: Option<(InvalidRegion, Resume)> = None;
@@ -90,8 +90,7 @@ pub(super) fn scan_new(
             match x {
                 Found::Region(r) => held = Some((r, after)),
                 Found::Batch(b) => {
-                    let kept = scanner.take_content();
-                    if take_found(&b, kept, before, after, query, map, first, facts) {
+                    if take_found(&b, before, after, query, map, first, facts) {
                         return Some(());
                     }
                 }
@@ -150,7 +149,7 @@ fn take_complete(
         let min_first = from
             .last_sequence
             .map_or(header_first, |l| l.saturating_add(1));
-        let (b, bodies) = match read_batch_in(
+        let b = match read_batch_in(
             &buf,
             base,
             id,
@@ -158,9 +157,9 @@ fn take_complete(
             limit,
             min_first,
             Refusal::AtOnce,
-            true,
+            false,
         ) {
-            BatchRead::Complete(b, bodies) => (b, bodies),
+            BatchRead::Complete(b, _) => b,
             BatchRead::Refused(_) => return None,
             BatchRead::Incomplete { .. } => break,
         };
@@ -168,8 +167,7 @@ fn take_complete(
             offset: b.end(),
             last_sequence: Some(b.commit.last_sequence),
         };
-        let content = BatchContent::from_bodies(b.commit.first_sequence, bodies).ok();
-        if take_found(&b, content, from, after, query, map, first, facts) {
+        if take_found(&b, from, after, query, map, first, facts) {
             return Some(Taken::Stopped);
         }
         from = after;
@@ -191,7 +189,6 @@ pub(super) fn void_above(facts: &mut Vec<FoundFact>, first: usize, after: Positi
 #[allow(clippy::too_many_arguments)]
 fn take_found(
     b: &crate::batch::Batch<'_>,
-    kept: Option<BatchContent>,
     before: Resume,
     after: Resume,
     query: &Query<'_>,
@@ -204,21 +201,16 @@ fn take_found(
         map.resume = Some(before);
         return true;
     }
-    let Some(content) = kept.or_else(|| BatchContent::decode(b).ok()) else {
+    let at = facts.len();
+    let Some(taken) = query.take(b, facts) else {
+        facts.truncate(at);
         // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region, so that every
         // later lookup of the segment is incomplete too.
         map.regions.push((b.offset, b.end()));
         map.resume = Some(after);
         return false;
     };
-    let (min_t, max_t) = content
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Fact(r) => Some(r.t),
-            _ => None,
-        })
-        .fold((i64::MAX, i64::MIN), |(a, z), t| (a.min(t), z.max(t)));
+    let (min_t, max_t) = (taken.min_t, taken.max_t);
     map.batches.push(Span {
         offset: b.offset,
         end: b.end(),
@@ -229,15 +221,14 @@ fn take_found(
         max_t,
         commit_time: b.commit.commit_time,
     });
-    if let Some(r) = content.recovery() {
+    if let Some(r) = taken.recovery_after {
         let after = Position {
             generation: g,
-            sequence: r.after,
+            sequence: r,
         };
         map.recoveries.push((map.batches.len() - 1, after));
         void_above(facts, first, after);
     }
-    query.take(content, g, b.commit.first_sequence, facts);
     map.resume = Some(after);
     false
 }

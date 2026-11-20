@@ -863,14 +863,56 @@ fn a_lookup_within_a_budget_says_it_overflowed_and_one_above_it_finds_everything
     let mut r = reader(&fs, 3);
     let whole = r.lookup(&wanted, &|_, _, _| false).unwrap();
     assert!(!whole.overflowed && whole.complete[0]);
-    let bytes: u64 = whole.facts.iter().map(|f| fact_bytes(&f.row)).sum();
+    let texts: u64 = whole
+        .facts
+        .iter()
+        .map(|f| match &f.row.value {
+            Value::Text(s) => s.len() as u64,
+            _ => 0,
+        })
+        .sum();
+    let bytes = (whole.facts.capacity() * std::mem::size_of::<FoundFact>()) as u64 + texts;
+    let within = |budget| Within {
+        budget,
+        ..Within::default()
+    };
     let short = r
-        .lookup_within(&wanted, &|_, _, _| false, bytes - 1)
+        .lookup_within(&wanted, &|_, _, _| false, within(bytes - 1))
         .unwrap();
     assert!(short.overflowed);
     assert!(short.facts.len() < whole.facts.len());
-    let exact = r.lookup_within(&wanted, &|_, _, _| false, bytes).unwrap();
+    let exact = r
+        .lookup_within(&wanted, &|_, _, _| false, within(bytes))
+        .unwrap();
     assert!(!exact.overflowed);
     assert_eq!(exact.facts, whole.facts);
+    log.shutdown().unwrap();
+}
+
+#[test]
+fn a_lookup_within_positions_keeps_only_the_facts_between_them() {
+    let (fs, log) = store(40);
+    let wanted = [Wanted {
+        series_id: 3,
+        from: 0,
+        to: 40,
+    }];
+    let mut r = reader(&fs, 3);
+    let whole = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    assert!(whole.facts.len() > 4);
+    let (a, z) = (whole.facts[1].position, whole.facts[3].position);
+    let some = r
+        .lookup_within(
+            &wanted,
+            &|_, _, _| false,
+            Within {
+                above: Some(a),
+                upto: Some(z),
+                ..Within::default()
+            },
+        )
+        .unwrap();
+    assert!(some.complete[0] && !some.overflowed);
+    assert_eq!(some.facts, whole.facts[2..=3].to_vec());
     log.shutdown().unwrap();
 }
