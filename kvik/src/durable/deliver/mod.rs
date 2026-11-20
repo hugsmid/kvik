@@ -397,6 +397,37 @@ impl Deliverer {
             .as_ref()
             .map(|r| r.lost_ranges().to_vec())
             .unwrap_or_default();
+        // A recovery entry the kept log no longer shows is still a reset point unless a recorded lost range holds it:
+        // the registry file keeps every recovery entry (`spec.md` §4 Resync, §11 Health; Q-1033).
+        if let Ok(Some((_, file))) = kvik_log::registry::read_latest(&*env.fs, dir, &store_id)
+            && file.generation == d.head.generation
+        {
+            for (seq, _, e) in &file.entries {
+                let Entry::Recovery(r) = e else {
+                    continue;
+                };
+                let at = (file.generation, *seq);
+                if lost
+                    .iter()
+                    .any(|l| (l.first.0, l.first.1) <= at && at <= (l.last.0, l.last.1))
+                {
+                    continue;
+                }
+                let p = LogPos {
+                    generation: file.generation,
+                    sequence: *seq,
+                };
+                let after = LogPos {
+                    generation: file.generation,
+                    sequence: r.after,
+                };
+                d.resets.entry(p).or_insert(after);
+                for c in &r.consumers {
+                    let l = d.lost.entry(c.clone()).or_insert(after);
+                    *l = (*l).min(after);
+                }
+            }
+        }
         for l in lost {
             let first = LogPos {
                 generation: l.first.0,
