@@ -397,6 +397,7 @@ pub struct LogReader {
     closed: bool,
     /// The update counter of the mark the last refresh read.
     mark_counter: u64,
+    mark_file: std::sync::Mutex<Option<Box<dyn crate::fs::FsFile>>>,
 }
 
 impl LogReader {
@@ -445,6 +446,7 @@ impl LogReader {
             caches: lookup::Caches::default(),
             closed: false,
             mark_counter: 0,
+            mark_file: std::sync::Mutex::default(),
             cfg,
         };
         let mark = r.read_mark()?;
@@ -520,7 +522,7 @@ impl LogReader {
     /// Whether the mark changed since the last refresh read it, reading the mark alone: a refresh that finds it
     /// unchanged reads no new batch. The manifest is not read, so a change to it alone is not seen.
     pub fn mark_moved(&self) -> Result<bool, ReaderError> {
-        Ok(self.read_mark()?.counter != self.mark_counter)
+        Ok(self.read_mark_held()?.counter != self.mark_counter)
     }
 
     /// Before the first refresh: starts the reader in the segment of the mark's generation that holds the position

@@ -441,6 +441,21 @@ fn an_idle_call_reads_the_mark_once_and_one_that_takes_a_batch_twice() {
     assert_eq!(marks(&r), 2);
 }
 
+#[test]
+fn a_mark_only_poll_reads_the_held_mark_with_no_open_and_sees_it_move() {
+    let mut r = Rig::with_sealed(2);
+    r.reader.refresh().unwrap();
+    r.n.marks.swap(0, Ordering::SeqCst);
+    r.n.take();
+    assert!(!r.reader.mark_moved().unwrap());
+    assert_eq!(r.n.marks.swap(0, Ordering::SeqCst), 0);
+    assert_eq!(r.n.take().calls, 1, "one read through the held handle");
+    r.submit(facts(4, 1 << 40));
+    r.n.marks.swap(0, Ordering::SeqCst);
+    assert!(r.reader.mark_moved().unwrap());
+    assert_eq!(r.n.marks.swap(0, Ordering::SeqCst), 0);
+}
+
 fn lost(epoch_floor: u32) -> LostRange {
     LostRange {
         identity: (0, 1),
