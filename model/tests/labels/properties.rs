@@ -160,7 +160,7 @@ proptest! {
 
     #[test]
     fn s2_1_labels_history_never_shrinks(
-        ops in prop::collection::vec((0u8..6, prop::collection::vec(arb_call(), 1..3), 0i64..40), 0..24),
+        ops in prop::collection::vec((0u8..7, prop::collection::vec(arb_call(), 1..3), 0i64..40), 0..24),
     ) {
         let mut st = Store::new(2);
         for (kind, calls, now) in ops {
@@ -171,9 +171,16 @@ proptest! {
                 2 => st.declare(calls[0].0, &[("a", "x"), ("b", "y")], now),
                 3 => st.many(&[(calls[0].0, calls[0].1, LabelChange::new().set("Bad", "x"))]),
                 4 => st.many(&[(SeriesId(9), calls[0].1, calls[0].2.clone())]),
-                _ => {
+                5 => {
                     let limits = st.limits;
                     st.limits.versions = st.log.versions();
+                    let r = st.many(&calls);
+                    st.limits = limits;
+                    r
+                }
+                _ => {
+                    let limits = st.limits;
+                    st.limits.bytes = st.log.bytes();
                     let r = st.many(&calls);
                     st.limits = limits;
                     r

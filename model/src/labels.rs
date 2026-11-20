@@ -257,6 +257,10 @@ impl LabelChange {
 pub struct LabelOutcome {
     /// Position of the last entry appended; `None` when nothing was (Q-1021).
     pub position: Option<Position>,
+    /// The highest position among the entries appended and the versions an
+    /// item was dropped against: the call resolves only once the synced mark
+    /// is at or above it (Q-1040).
+    pub resolves_at: Option<Position>,
     /// Items recorded.
     pub recorded: u32,
     /// Items dropped by the duplicate rule.
@@ -414,7 +418,11 @@ impl LabelLog {
 
     /// The current item of each `(key, from)` of a series among the versions
     /// known at `p`: the one of highest position (§2.3, the fact rule).
-    fn current(&self, series: SeriesId, p: Position) -> BTreeMap<(&str, Effective), &LabelItem> {
+    fn current(
+        &self,
+        series: SeriesId,
+        p: Position,
+    ) -> BTreeMap<(&str, Effective), (Position, &LabelItem)> {
         let mut out = BTreeMap::new();
         for e in self
             .entries
@@ -422,10 +430,36 @@ impl LabelLog {
             .filter(|e| e.series == series && e.position <= p)
         {
             for (key, item) in &e.items {
-                out.insert((key.as_str(), e.from), item);
+                out.insert((key.as_str(), e.from), (e.position, item));
             }
         }
         out
+    }
+
+    /// The set versions in force on `series` at event time `t` under `view`,
+    /// with their positions (§2.3 Label views).
+    fn in_force(
+        &self,
+        series: SeriesId,
+        t: Nanos,
+        view: LabelView,
+    ) -> BTreeMap<&str, (Position, &str)> {
+        let mut latest: BTreeMap<&str, (Effective, Position, &LabelItem)> = BTreeMap::new();
+        for ((key, from), (position, item)) in self.current(series, self.known_at(view)) {
+            if from > Effective::At(t) || *item == LabelItem::Withdraw {
+                continue;
+            }
+            if latest.get(key).is_none_or(|(f, _, _)| from > *f) {
+                latest.insert(key, (from, position, item));
+            }
+        }
+        latest
+            .into_iter()
+            .filter_map(|(key, (_, position, item))| match item {
+                LabelItem::Set(v) => Some((key, (position, v.as_str()))),
+                LabelItem::Remove | LabelItem::Withdraw => None,
+            })
+            .collect()
     }
 
     /// The labels in force on `series` at event time `t` under `view` (§2.3
@@ -437,25 +471,13 @@ impl LabelLog {
         t: Nanos,
         view: LabelView,
     ) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::new();
         if reg.get(series).is_none() {
-            return out;
+            return BTreeMap::new();
         }
-        let mut latest: BTreeMap<&str, (Effective, &LabelItem)> = BTreeMap::new();
-        for ((key, from), item) in self.current(series, self.known_at(view)) {
-            if from > Effective::At(t) || *item == LabelItem::Withdraw {
-                continue;
-            }
-            if latest.get(key).is_none_or(|(f, _)| from > *f) {
-                latest.insert(key, (from, item));
-            }
-        }
-        for (key, (_, item)) in latest {
-            if let LabelItem::Set(v) = item {
-                out.insert(key.to_string(), v.clone());
-            }
-        }
-        out
+        self.in_force(series, t, view)
+            .into_iter()
+            .map(|(k, (_, v))| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// The labels now: in force at `now`, every version known.
@@ -582,6 +604,7 @@ impl LabelLog {
         let mut next = self.clone();
         let mut outcome = LabelOutcome {
             position: None,
+            resolves_at: None,
             recorded: 0,
             duplicates: 0,
         };
@@ -592,7 +615,13 @@ impl LabelLog {
             let items: Vec<(String, LabelItem)> = change
                 .items()
                 .iter()
-                .filter(|(key, item)| current.get(&(key.as_str(), *from)) != Some(&item))
+                .filter(|(key, item)| match current.get(&(key.as_str(), *from)) {
+                    Some((at, held)) if *held == item => {
+                        outcome.resolves_at = outcome.resolves_at.max(Some(*at));
+                        false
+                    }
+                    _ => true,
+                })
                 .cloned()
                 .collect();
             outcome.duplicates += (change.items().len() - items.len()) as u32;
@@ -601,6 +630,7 @@ impl LabelLog {
             }
             outcome.recorded += items.len() as u32;
             outcome.position = Some(position);
+            outcome.resolves_at = outcome.resolves_at.max(Some(position));
             next.apply(LabelEntry {
                 position,
                 recorded_at: batch.recorded_at,
@@ -674,15 +704,20 @@ impl LabelLog {
             .map(|(k, v)| (k.to_string(), LabelItem::Set(v.to_string())))
             .collect();
         check_items(&asked)?;
-        let now_labels = self.labels(reg, series, now);
-        let change = labels
-            .iter()
-            .filter(|(k, v)| now_labels.get(*k).map(String::as_str) != Some(*v))
-            .fold(LabelChange::new(), |c, (k, v)| c.set(k, v));
+        let held = self.in_force(series, now, LabelView::Current);
+        let mut matched = None;
+        let mut change = LabelChange::new();
+        for (k, v) in labels {
+            match held.get(k) {
+                Some((at, value)) if value == v => matched = matched.max(Some(*at)),
+                _ => change = change.set(k, v),
+            }
+        }
         let in_force = (labels.len() - change.items().len()) as u32;
         let mut outcome =
             self.set_labels(reg, limits, series, Effective::At(now), change, batch)?;
         outcome.duplicates += in_force;
+        outcome.resolves_at = outcome.resolves_at.max(matched);
         Ok(outcome)
     }
 }

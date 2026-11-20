@@ -168,7 +168,9 @@ pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { e
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault),      // any call that appends an entry
     NotFinal }                     // acknowledge_manifest_rebuild while the rebuild is provisional (spec §7 Manifest)
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
-    UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
+    UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 },
+    LabelLimit(LabelError),        // a definition's labels would pass a label limit (Labels, Q-1041)
+    Write(WriteError) }
 pub enum LabelError { UnknownSeries, BadKey { key }, Reserved { key }, BadValue { key }, Duplicate { key }, TooManyItems,
     TooManyKeys { limit: usize }, SeriesLimit { limit: u64 }, StoreLimit { which: StoreLimit, limit: u64 },
     Unavailable,                   // label parts being rebuilt (spec §2.1 Labels)
@@ -177,7 +179,8 @@ pub enum StoreLimit { Versions, Bytes }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source },
-    CutExpired }                   // the read's cut ended first (Reader processes); nothing returned; start again
+    CutExpired,                    // the read's cut ended first (Reader processes); nothing returned; start again
+    LabelsUnavailable }            // label parts being rebuilt; label reads and selections only (Labels)
 ```
 Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence),
 `ConsumerError::Pattern(RouteError)` (a name pattern refused, Consuming), and `ConsumerError::RouteCycle` (a route
@@ -268,21 +271,28 @@ reader.label_history(id)? -> Vec<LabelVersion>                    // { key, item
 reader.label_keys()? -> Vec<(Key, u32)>;  reader.label_values(&key)? -> Vec<(Value, u32)>   // series counts now
 ```
 - Each label call writes one batch with a forced mark sync and resolves once it is durable, as the calls of Series
-  do; labelling many series is one `set_labels_many` or `define_many` call, not one call each.
+  do; labelling many series is one `set_labels_many` or `define_many` call, not one call each. A call that writes
+  nothing, every item a duplicate, resolves only once the versions it duplicates are at or below the synced mark,
+  and a `declare_labels` likewise for the versions in force it matched (spec §2.1 Duplicates, Q-1040).
 - `LabelOutcome.position` is the position of the call's last entry, `None` when it appended nothing: a change left
   empty by the duplicate rule writes no entry (Q-1021). `recorded` and `duplicates` count items; `declare_labels`
   counts a listed key already in force as a duplicate (Q-1027).
 - The checks run change by change in the order given, then the limits over the whole call (Q-1023). A label item
-  that a definition carries and the rules refuse is `DefineError::Invalid { field: "labels", .. }`. Defining an
-  existing series returns its id with `labels_ignored` set when the call carried labels; its labels are unchanged
-  (Q-884).
+  that a definition carries and the rules refuse is `DefineError::Invalid { field: "labels", .. }`; one that would
+  pass a label limit is `DefineError::LabelLimit(LabelError)`, carrying `TooManyKeys`, `SeriesLimit` or `StoreLimit`.
+  Either refuses the whole definition (with `define_many`, the whole call), which appends nothing (Q-1041).
+  Defining an existing series returns its id with `labels_ignored` set when the call carried labels; its labels are
+  unchanged. `define_series` returns a bare `SeriesId` and does not report it (Q-884).
 - `Labels` maps keys to values. A series with no definition in the kept log has none; its label changes are counted
   in `LogStats.orphaned_label_entries` (spec §2.1 Labels). `SeriesInfo` carries no labels, so listings do not load
   them; `labels(id)` and the reader calls above do.
 - Health: `Reason::LabelLimit { which: StoreLimit, used, limit }` at 80 % of a store limit and
   `Reason::LabelSeriesLimit { series, used, limit }` for each series at 80 % of its own (Q-1029), both information,
   not degraded; `Reason::LabelsUnavailable` (degraded) while label parts are rebuilt.
-- Built with roadmap L2; selectors (`Selector`, `Select::Where`, `When`, `reader.select`) follow with roadmap L3.
+- Reader calls fail with `QueryError::LabelsUnavailable` and writer calls with `LabelError::Unavailable` while label
+  parts are rebuilt (spec §2.1 Labels).
+- Built by the series labels design's engine step (L2); selectors (`Selector`, `Select::Where`, `When`,
+  `reader.select`) follow with its static selection step (L3).
 
 ## Writing (accepted at gate 3.3)
 ```rust

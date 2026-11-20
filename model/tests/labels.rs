@@ -256,6 +256,7 @@ fn s2_1_labels_a_duplicate_is_only_the_same_item_at_the_same_key_and_effective_t
         o,
         kvik_model::labels::LabelOutcome {
             position: None,
+            resolves_at: Some(Position::new(0, 3)),
             recorded: 0,
             duplicates: 1
         }
@@ -275,6 +276,45 @@ fn s2_1_labels_a_duplicate_counts_earlier_entries_of_the_same_batch() {
         .unwrap();
     assert_eq!((o.recorded, o.duplicates), (1, 1));
     assert_eq!(o.position, Some(Position::first(0)));
+}
+
+#[test]
+fn s2_1_labels_a_call_resolves_at_its_last_entry_or_the_versions_it_duplicates() {
+    let mut st = Store::new(2);
+    st.set(S1, Effective::Always, LabelChange::new().set("a", "1"))
+        .unwrap();
+    st.set(S2, Effective::Always, LabelChange::new().set("a", "1"))
+        .unwrap();
+    st.set(S1, Effective::At(5), LabelChange::new().set("a", "2"))
+        .unwrap();
+    let o = st
+        .many(&[
+            (S1, Effective::Always, LabelChange::new().set("a", "1")),
+            (S2, Effective::Always, LabelChange::new().set("a", "1")),
+        ])
+        .unwrap();
+    assert_eq!(
+        (o.position, o.resolves_at),
+        (None, Some(Position::new(0, 2)))
+    );
+    let o = st
+        .set(
+            S1,
+            Effective::At(5),
+            LabelChange::new().set("a", "2").set("b", "1"),
+        )
+        .unwrap();
+    assert_eq!(o.resolves_at, Some(Position::new(0, 4)));
+    assert_eq!(o.resolves_at, o.position);
+    let o = st.declare(S1, &[("a", "2")], 10).unwrap();
+    assert_eq!(
+        (o.position, o.resolves_at),
+        (None, Some(Position::new(0, 3)))
+    );
+    let o = st.declare(S2, &[("a", "1"), ("c", "1")], 10).unwrap();
+    assert_eq!(o.resolves_at, Some(Position::new(0, 5)));
+    let o = st.set(S1, Effective::At(9), LabelChange::new()).unwrap();
+    assert_eq!(o.resolves_at, None);
 }
 
 #[test]
@@ -505,6 +545,23 @@ fn s2_1_labels_a_series_uses_at_most_64_keys_ever() {
     assert_eq!(st.log, before);
     st.set(S1, Effective::At(2), LabelChange::new().set("k0", "w"))
         .unwrap();
+
+    let mut st = Store::new(1);
+    let taken_back = (0..MAX_KEYS_PER_SERIES).fold(LabelChange::new(), |c, i| {
+        if i % 2 == 0 {
+            c.remove(&format!("k{i}"))
+        } else {
+            c.withdraw(&format!("k{i}"))
+        }
+    });
+    st.set(S1, Effective::At(1), taken_back).unwrap();
+    assert_eq!(st.at(S1, 1), labels(&[]));
+    assert_eq!(
+        st.set(S1, Effective::At(2), LabelChange::new().set("other", "v")),
+        Err(LabelError::TooManyKeys {
+            limit: MAX_KEYS_PER_SERIES
+        })
+    );
 }
 
 #[test]
@@ -521,12 +578,15 @@ fn s2_1_labels_the_series_and_store_limits_refuse_a_call_that_adds_past_them() {
         LabelChange::new().set("a", "1").set("b", "1"),
     )
     .unwrap();
+    let before = st.log.clone();
     assert_eq!(
         st.set(S1, Effective::At(1), LabelChange::new().set("a", "2")),
         Err(LabelError::SeriesLimit { limit: 2 })
     );
+    assert_eq!(st.log, before);
     st.set(S2, Effective::Always, LabelChange::new().set("a", "1"))
         .unwrap();
+    let before = st.log.clone();
     assert_eq!(
         st.set(S2, Effective::At(1), LabelChange::new().set("a", "2")),
         Err(LabelError::StoreLimit {
@@ -534,6 +594,7 @@ fn s2_1_labels_the_series_and_store_limits_refuse_a_call_that_adds_past_them() {
             limit: 3
         })
     );
+    assert_eq!(st.log, before);
     st.limits.versions = u64::MAX;
     st.limits.bytes = st.log.bytes();
     assert_eq!(
@@ -543,6 +604,7 @@ fn s2_1_labels_the_series_and_store_limits_refuse_a_call_that_adds_past_them() {
             limit: st.limits.bytes
         })
     );
+    assert_eq!(st.log, before);
 }
 
 #[test]
