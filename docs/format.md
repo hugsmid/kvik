@@ -1142,7 +1142,7 @@ position, in an immutable file on the hot tier: `registry/labels/<generation>-<a
   header and the name and breaks a tie between two parts of one range. **A part is removed locally**, for whatever
   reason (invalid, merged, set aside), only once a part with a higher `file_id` is durable (synced, its directory
   synced), so the highest local id never falls: no name, and with a backup no bucket key, is ever used twice
-  (Q-1042). A header whose
+  (Q-1042). When nothing replaces a removed part, a part with no entries is written first to carry the higher id. A header whose
   generation or `file_id` differs from the name, or a summary whose `after` or `through` does, is invalid.
 - **Writing.** Written to a temporary name, synced, renamed, and the directory synced (on the first write
   `registry/labels/` is created and `registry/` synced); never changed. A part never names a position above the last
@@ -1160,7 +1160,8 @@ position, in an immutable file on the hot tier: `registry/labels/<generation>-<a
   writer's start lists `registry/labels/` once and opens no part; parts are loaded and checked when labels are first
   needed. A reader lists the directory when it first needs labels, and again only when its cut passes a flagged
   sealed segment above the parts it holds or a part it holds can no longer be opened.
-- **At a start.** Whether a part's `through` is a source of F, as the registry file's is (A.16), is open (Q-1043).
+- **At a start.** Whether a part's `through` is a source of F, as the registry file's is (A.16), is open (Q-1043);
+  a `through` read from a name alone is not checked and is never evidence by itself.
 - **Checks.** As A.16, with kind 18, only type 10 entries, positions inside `(after, through]` and the name matching.
   A part that fails a check, is missing, overlaps a recorded lost range, holds positions set aside by a restore, or
   differs from the local log of its range is invalid and rebuilt from the kept log (compacted files' entries and
