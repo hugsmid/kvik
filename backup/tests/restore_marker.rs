@@ -619,3 +619,52 @@ fn q614_a_resumed_full_restore_puts_the_marker_its_first_try_did_not() {
         1
     );
 }
+
+#[test]
+fn q962_accepting_an_earlier_state_still_retries_a_listing_hiding_a_marked_record_behind_skipped_epochs_beyond_the_bound()
+ {
+    let (src, s1, s2) = segments();
+    let last = 3 + TAIL_PROBES + 3;
+    let sink = bucket(src, &unfinished(&s1, &s2, last, TAIL_PROBES + 3));
+    sink.set(&key(last), Some(Fault::Unlisted));
+    for mode in [PlanMode::Drill, PlanMode::Full] {
+        lagging(block_on(
+            restorer_with(&sink, &MemFs::new(), mode, true).prepare(100),
+        ));
+    }
+    nothing_recorded(&sink);
+}
+
+#[test]
+fn q962_accepting_an_earlier_state_still_refuses_a_mismatch() {
+    let (src, s1, _) = segments();
+    let chain = [
+        up(0, rec(1, Body::Empty)),
+        up(1, rec(2, s1.clone())),
+        up(0, rebuild(3)),
+        up(3, carried(4, 1, Body::Empty)),
+    ];
+    let sink = bucket_marked(src, &chain, 0);
+    let summary = Summary {
+        epoch: 4,
+        open: 1,
+        read: Some((1, 4)),
+    };
+    put_marker(&sink.inner, ID, 0, 1, summary);
+    for mode in [PlanMode::Drill, PlanMode::Full] {
+        let r = block_on(restorer_with(&sink, &MemFs::new(), mode, true).prepare(100));
+        assert!(
+            matches!(
+                r,
+                Err(RestoreError::MarkerMismatch {
+                    generation: 0,
+                    sequence: 1,
+                    marked: (1, 4),
+                    read: Some((1, 2)),
+                })
+            ),
+            "{r:?}"
+        );
+    }
+    nothing_recorded(&sink);
+}

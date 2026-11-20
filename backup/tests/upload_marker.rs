@@ -14,14 +14,15 @@ use kvik_backup::fake::{TestEnvelope, block_on};
 use kvik_backup::keys::{Keys, ObjectName};
 use kvik_backup::marker::{Marker, Summary};
 use kvik_backup::upload::{BackupDriver, Step, UploadError, Uploader};
-use kvik_sink_api::{BackupSink, ListPage, SinkFuture, Stored};
+use kvik_sink_api::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
 use upload_support::*;
 
-/// The harness's sink, with listings that leave out `hidden`.
+/// The harness's sink, with listings that leave out `hidden` and a transient failure for each `get` of `failing`.
 #[derive(Clone)]
 struct Hide {
     inner: RecSink,
     hidden: Arc<Mutex<BTreeSet<String>>>,
+    failing: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl BackupSink for Hide {
@@ -32,6 +33,10 @@ impl BackupSink for Hide {
         self.inner.stat(key)
     }
     fn get<'a>(&'a self, key: &'a str, r: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>> {
+        if lock(&self.failing).contains(key) {
+            let reason = format!("a failing get of {key}");
+            return Box::pin(async move { Err(SinkError::Transient { reason }) });
+        }
         self.inner.get(key, r)
     }
     fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>) -> SinkFuture<'a, ListPage> {
@@ -49,6 +54,7 @@ fn hiding(h: &Harness, keys: &[String]) -> (Hide, Uploader<Hide, TestEnvelope, P
     let s = Hide {
         inner: h.sink.clone(),
         hidden: Arc::new(Mutex::new(keys.iter().cloned().collect())),
+        failing: Arc::default(),
     };
     let d = Uploader::new(
         s.clone(),
@@ -93,6 +99,63 @@ fn puts_since(h: &Harness, from: usize) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Steps a driver into a rebuilt manifest until three of its carried records are up, then drops it; returns the
+/// epoch of the rebuild record that opens it.
+fn into_unfinished_rebuild(h: &mut Harness) -> u64 {
+    for _ in 0..3 {
+        h.seal(20);
+    }
+    run_idle(&mut h.driver(), &mut Duration::default());
+    h.close();
+    h.set_app(rebuild_final(h));
+    let mut d = h.driver();
+    loop {
+        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+        let opened = in_bucket(&h.sink.mem)
+            .into_iter()
+            .filter(|u| u.record.old_epoch.is_some())
+            .count();
+        if opened >= 3 {
+            return in_bucket(&h.sink.mem)
+                .into_iter()
+                .find(|u| matches!(u.record.body, kvik_files::record::Body::Rebuild(_)))
+                .unwrap()
+                .record
+                .epoch;
+        }
+    }
+}
+
+fn damage(h: &Harness, key: &str) {
+    let mut b = h.sink.mem.objects()[key].clone();
+    let mid = b.len() / 2;
+    b[mid] ^= 1;
+    h.sink.mem.set(key, &b);
+}
+
+/// The last record before the rebuild record at `opener`.
+fn last_old(h: &Harness, opener: u64) -> u64 {
+    in_bucket(&h.sink.mem)
+        .iter()
+        .map(|u| u.record.epoch)
+        .filter(|e| *e < opener)
+        .max()
+        .unwrap()
+}
+
+/// Steps until marker `sequence` is put.
+fn step_to_marker<D: BackupDriver>(d: &mut D, h: &Harness, sequence: u64) {
+    let key = Keys::new(ID).marker(0, sequence);
+    for _ in 0..200 {
+        if h.sink.mem.objects().contains_key(&key) {
+            return;
+        }
+        let step = block_on(d.step(Duration::ZERO));
+        assert!(matches!(step, Step::Progress), "{step:?}");
+    }
+    panic!("marker {sequence} never put");
 }
 
 /// Steps until record `epoch` is put.
@@ -172,11 +235,7 @@ fn q614_an_unreadable_latest_marker_is_followed_by_one_made_from_the_records() {
     run_idle(&mut h.driver(), &mut Duration::default());
     let keys = Keys::new(ID);
     let n = (1..).take_while(|s| marker(&h, *s).is_some()).count() as u64;
-    let k = keys.marker(0, n);
-    let mut b = h.sink.mem.objects()[&k].clone();
-    let mid = b.len() / 2;
-    b[mid] ^= 1;
-    h.sink.mem.set(&k, &b);
+    damage(&h, &keys.marker(0, n));
     let from = h.events().len();
     run_idle(&mut h.driver(), &mut Duration::default());
     assert_eq!(puts_since(&h, from), [keys.marker(0, n + 1)]);
@@ -235,30 +294,8 @@ fn q614_a_record_put_before_a_restart_and_a_rebuild_and_hidden_by_the_listing_is
 fn q614_a_catch_up_whose_listing_hides_a_record_the_others_name_retries_instead_of_putting_a_marker()
  {
     let mut h = Harness::new();
-    for _ in 0..3 {
-        h.seal(20);
-    }
-    run_idle(&mut h.driver(), &mut Duration::default());
-    h.close();
-    h.set_app(rebuild_final(&h));
+    let opener = into_unfinished_rebuild(&mut h);
     let keys = Keys::new(ID);
-    let mut d = h.driver();
-    let opener = loop {
-        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
-        let opened = in_bucket(&h.sink.mem)
-            .into_iter()
-            .filter(|u| u.record.old_epoch.is_some())
-            .count();
-        if opened >= 3 {
-            break in_bucket(&h.sink.mem)
-                .into_iter()
-                .find(|u| matches!(u.record.body, kvik_files::record::Body::Rebuild(_)))
-                .unwrap()
-                .record
-                .epoch;
-        }
-    };
-    drop(d);
     for m in all_markers(&h) {
         h.sink.mem.remove(&keys.marker(0, m.sequence));
     }
@@ -313,4 +350,90 @@ fn q614_a_catch_up_over_a_record_the_bucket_lost_puts_its_marker_instead_of_retr
         marker(&h, 1).unwrap().summary.epoch,
         in_bucket(&h.sink.mem).last().unwrap().record.epoch
     );
+}
+
+#[test]
+fn q614_a_catch_up_past_an_unreadable_latest_marker_starts_from_the_readable_one_and_keeps_naming_a_lost_record()
+ {
+    let mut h = Harness::new();
+    let opener = into_unfinished_rebuild(&mut h);
+    let keys = Keys::new(ID);
+    let latest = all_markers(&h).len() as u64;
+    let readable = marker(&h, latest - 1).unwrap().summary;
+    let lost = last_old(&h, opener);
+    assert_eq!(readable.read.map(|r| r.1), Some(lost));
+    damage(&h, &keys.marker(0, latest));
+    h.sink.mem.remove(&keys.record(0, lost));
+    let (_, mut d) = hiding(&h, &[]);
+    step_to_marker(&mut d, &h, latest + 1);
+    let next = marker(&h, latest + 1).unwrap().summary;
+    assert_eq!(next.read, readable.read);
+    assert_ne!(next.read, bucket_summary(&h).read);
+}
+
+#[test]
+fn q960_a_later_version_marker_below_an_unreadable_latest_one_stops_uploads() {
+    let mut h = Harness::new();
+    h.seal(10);
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let n = all_markers(&h).len() as u64;
+    assert!(n >= 2);
+    let keys = Keys::new(ID);
+    let k = keys.marker(0, n - 1);
+    let mut later = marker(&h, n - 1).unwrap().encode();
+    later[4] = 2;
+    h.sink
+        .mem
+        .set(&k, &TestEnvelope::new(KEY).seal(&k, &later).unwrap());
+    damage(&h, &keys.marker(0, n));
+    h.seal(10);
+    let step = run(&mut h.driver(), &mut Duration::default(), 1_000);
+    assert!(
+        matches!(step, Step::Failed(UploadError::MarkerVersion { sequence, version: 2 }) if sequence == n - 1),
+        "{step:?}"
+    );
+    assert!(!h.sink.mem.objects().contains_key(&keys.marker(0, n + 1)));
+}
+
+#[test]
+fn q614_a_catch_up_past_a_damaged_latest_marker_and_one_the_bucket_no_longer_holds_keeps_naming_a_lost_record()
+ {
+    let mut h = Harness::new();
+    let opener = into_unfinished_rebuild(&mut h);
+    let keys = Keys::new(ID);
+    let latest = all_markers(&h).len() as u64;
+    let readable = marker(&h, latest - 2).unwrap().summary;
+    let lost = last_old(&h, opener);
+    assert_eq!(readable.read.map(|r| r.1), Some(lost));
+    damage(&h, &keys.marker(0, latest));
+    h.sink.mem.remove(&keys.marker(0, latest - 1));
+    h.sink.mem.remove(&keys.record(0, lost));
+    let (_, mut d) = hiding(&h, &[]);
+    step_to_marker(&mut d, &h, latest + 1);
+    let next = marker(&h, latest + 1).unwrap().summary;
+    assert_eq!(next.read, readable.read);
+    assert_ne!(next.read, bucket_summary(&h).read);
+}
+
+#[test]
+fn q614_a_transient_failure_reading_the_latest_marker_is_retried_and_not_passed_over() {
+    let mut h = Harness::new();
+    h.seal(10);
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let n = all_markers(&h).len() as u64;
+    assert!(n >= 2);
+    let keys = Keys::new(ID);
+    let (s, mut d) = hiding(&h, &[]);
+    lock(&s.failing).insert(keys.marker(0, n));
+    let from = h.events().len();
+    for _ in 0..3 {
+        let step = block_on(d.step(Duration::ZERO));
+        assert!(matches!(step, Step::Retry { .. }), "{step:?}");
+    }
+    lock(&s.failing).clear();
+    let step = run(&mut d, &mut Duration::default(), 1_000);
+    assert!(matches!(step, Step::Idle), "{step:?}");
+    assert_eq!(puts_since(&h, from), Vec::<String>::new());
 }
