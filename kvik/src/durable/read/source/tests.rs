@@ -603,3 +603,33 @@ fn at_before_a_series_first_fact_ends_after_one_probe_and_finds_a_fact_far_back(
     assert_eq!(far.map(|f| f.t), Some(Timestamp(now - 1_000)));
     rig.shut();
 }
+
+#[test]
+fn a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once() {
+    let mut rig = Rig::new("shelf-emptied");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    let rs: Vec<Reading> = (0..300)
+        .map(|k| Reading::new(id, Timestamp(now - 1_000 + k), Value::F64(k as f64)))
+        .collect();
+    rig.emit_readings(&rs, Intent::Normal);
+    // One pass at a time, and a shelf of any size leaves less than the least grant free.
+    let sizes = Sizes {
+        cap: 400_000,
+        block: 250_000,
+        min_rows: 49_000,
+        lookups: 0,
+    };
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let want = oracle
+        .with(|i, _| i.facts(id, all(), View::History))
+        .unwrap();
+    let r = reader_with(&rig.env, &rig.dir, sizes);
+    let mut s = facts(r.clone(), id, all(), View::History).unwrap();
+    let mut got: Vec<Fact> = s.by_ref().take(10).collect::<Result<_, _>>().unwrap();
+    let t = Timestamp(now - 1_000 + 150);
+    assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
+    got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
+    assert_eq!(got, want);
+    rig.shut();
+}
