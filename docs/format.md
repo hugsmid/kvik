@@ -346,7 +346,7 @@ when read". The one named exception is field 20 of a label change (type 10), who
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
 | 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable); 48 `written` level in force `u8` (1 when a series is at the `written` level in the registry at `after`, making the entry a `possible_loss`, `spec.md` §3 Recovery rule 3; an entry without it reads as 0) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
-| 10 label change | 1 id; 20 effective time `i64` ns, absent for *always* (the exception above); 70 label item (repeated, 1 to 64): `op` `u8` (1 set, 2 remove, 3 withdraw; any other value is an unknown critical value, a version refusal), `key_len` `u8`, the key (`key_len` bytes), then for op 1 the value, the rest of the field (`spec.md` §2.1 Labels). Critical: an older build refuses it (Q-882). Not held by the registry file (A.16) but by label parts (A.19) |
+| 10 label change | 1 id; 20 effective time `i64` ns, absent for *always* (the exception above; a zero-length field 20 is invalid, so *always* has one encoding); 70 label item (repeated, 1 to 64): `op` `u8` (1 set, 2 remove, 3 withdraw; any other value is an unknown critical value, a version refusal), `key_len` `u8`, the key (`key_len` bytes), then for op 1 the value, the rest of the field (`spec.md` §2.1 Labels). Critical: an older build refuses it (Q-882). Not held by the registry file (A.16) but by label parts (A.19) |
 
 Series definition fields, all critical:
 
@@ -425,7 +425,7 @@ recovery entry is checked by the writer's recovery (`spec.md` §3), not by a rea
 
 ### A.8 Segment index body (written at seal)
 `series_count: u32`, `record_size: u16` (24 in v1), `flags: u16` (bit 0 `has_entries`: the segment holds at least
-one entries block; bit 1 `has_labels`: it holds at least one label change, type 10, A.19), then per series, sorted by id, records of `record_size` bytes: `series_id: u32`,
+one entries block; bit 1 `has_labels`: it holds at least one label change, type 10, A.19; set with bit 0 clear, it is invalid), then per series, sorted by id, records of `record_size` bytes: `series_id: u32`,
 `fact_count: u32`, `min_t: i64`, `max_t: i64`. Readers use `record_size` and ignore a record's unknown tail; this is
 the rule for every fixed-size record array. A reader that is catching up, and compaction, skip a segment only if none
 of its series is listed **and** `has_entries` is clear; otherwise they read at least its entries blocks.
@@ -1137,8 +1137,12 @@ position, in an immutable file on the hot tier: `registry/labels/<generation>-<a
   bytes): 0 `after: u64`; 8 `through: u64`; 16 `entry_count: u32`; 20 `block_count: u32`, the entries blocks before
   it. Entries come in position order, positions rising strictly, each above `after` and at most `through`. Canonical
   writing as A.16.
-- **Name and id.** `file_id` is the next of kind 18 by A.12's rule (until the manifest names these files, the highest
-  present plus one); it is in the header and the name and breaks a tie between two parts of one range. A header whose
+- **Name and id.** `file_id` is the next of kind 18 by A.12's rule: 1 + the highest of kind 18 among local names,
+  ids named by any manifest record (each upload is recorded there) and any rebuild record's floor. It is in the
+  header and the name and breaks a tie between two parts of one range. **A part is removed locally**, for whatever
+  reason (invalid, merged, set aside), only once a part with a higher `file_id` is durable (synced, its directory
+  synced), so the highest local id never falls: no name, and with a backup no bucket key, is ever used twice
+  (Q-1042). A header whose
   generation or `file_id` differs from the name, or a summary whose `after` or `through` does, is invalid.
 - **Writing.** Written to a temporary name, synced, renamed, and the directory synced (on the first write
   `registry/labels/` is created and `registry/` synced); never changed. A part never names a position above the last
@@ -1148,14 +1152,15 @@ position, in an immutable file on the hot tier: `registry/labels/<generation>-<a
 - **Chains.** The first part of a generation has `after` 0; each later one starts where one in force ends. The label
   state is the fold over the generations in order, each up to the position its successor was restored from.
 - **The parts in force** are the valid covering set of a generation with the fewest parts, the higher `file_id`
-  winning a tie; a part wholly covered by a valid merged part is ignored. Parts are merged when more than 64 exist
-  (16 on the minimal class): one new part replaces them, and the inputs are removed after the grace hour (`spec.md`
-  §7 Retired files). A merge exists only once renamed after its sync; leftover temporary files are removed at a start.
+  winning a tie; a part wholly covered by a valid merged part is ignored. Parts are merged when more than a threshold
+  exist (provisionally 64, 16 on the minimal class; the writer's choice, which no reader depends on): one new part
+  replaces them, and the inputs are removed after the grace hour (`spec.md` §7 Retired files). A merge exists only once renamed after its sync; leftover temporary files are removed at a start.
 - **Reading.** Every sealed segment above the last part in force whose index carries `has_labels` is read for its
   entries blocks, then the tail above the sealed segments. A segment without the flag holds no label change. The
   writer's start lists `registry/labels/` once and opens no part; parts are loaded and checked when labels are first
   needed. A reader lists the directory when it first needs labels, and again only when its cut passes a flagged
   sealed segment above the parts it holds or a part it holds can no longer be opened.
+- **At a start.** Whether a part's `through` is a source of F, as the registry file's is (A.16), is open (Q-1043).
 - **Checks.** As A.16, with kind 18, only type 10 entries, positions inside `(after, through]` and the name matching.
   A part that fails a check, is missing, overlaps a recorded lost range, holds positions set aside by a restore, or
   differs from the local log of its range is invalid and rebuilt from the kept log (compacted files' entries and
@@ -1164,8 +1169,9 @@ position, in an immutable file on the hot tier: `registry/labels/<generation>-<a
   new part ending at P; parts above P go with the positions set aside.
 - **Backup.** Each part is uploaded once under `labels/` (A.17) and recorded like any uploaded file; a restore lists
   the part objects and takes the covering set up to its position, and one that finds none rebuilds labels from the
-  uploaded files, or fails. An input part's object is retired only after the merged part covering it is uploaded and
-  verified, and after the grace hour.
+  uploaded files, or fails. The engine never deletes from the bucket (`spec.md` §8 Bucket): an input part's object is
+  retired only in the backup record, which stops a restore from taking it, and only after the merged part covering
+  it is uploaded and verified and the grace hour has passed; the object stays.
 - **Release.** A log segment that carries `has_labels` is removed locally only once a part covering its label
   changes has been written and read back, and, on a store with a backup, uploaded and verified (`spec.md` §8
   Eviction, Q-745).
