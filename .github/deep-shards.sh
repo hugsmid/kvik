@@ -35,6 +35,7 @@ names           model names
 durability      model durability
 self_repair     model self_repair
 model           model model
+labels          model labels
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches

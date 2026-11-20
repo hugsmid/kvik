@@ -104,7 +104,7 @@ specified here before the roadmap item that writes it.
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 4 | `magic` | ASCII `KVIK` |
-| 4 | 1 | `kind` | 1 log segment, 2 compacted segment, 3 manifest, 4 cursor, 5 registry, 6 tree, 7 store descriptor, 8 lease; reserved and laid out by their roadmap items: 9 calendar, 10 revised-key index, 11 version index, 12 local restore record, 13 checkpoint bundle, 14 chunk index; derived files (A.18): 15 log directory, 16 series directory, 17 status file |
+| 4 | 1 | `kind` | 1 log segment, 2 compacted segment, 3 manifest, 4 cursor, 5 registry, 6 tree, 7 store descriptor, 8 lease; reserved and laid out by their roadmap items: 9 calendar, 10 revised-key index, 11 version index, 12 local restore record, 13 checkpoint bundle, 14 chunk index; derived files (A.18): 15 log directory, 16 series directory, 17 status file; 18 label part (A.19) |
 | 5 | 1 | `format_major` | 1 |
 | 6 | 2 | `format_minor` | 0 |
 | 8 | 4 | `flags` | reserved |
@@ -333,7 +333,7 @@ are a list of `field_id: u16`, `field_len: u16`, value, padded to 4. Fields appe
 appears once unless marked repeated. A zero-length field means "none". An unknown entry type or field is skipped or
 refused by the critical and ignorable rule. **Every default is resolved when the entry is written:** a definition
 carries each applicable field explicitly, and an absent field means "not applicable", never "the default in force
-when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a terminator.
+when read". The one named exception is field 20 of a label change (type 10), whose absence means *always*. Durations are `i64` nanoseconds. Strings are UTF-8 without a terminator.
 
 | Entry type | Fields |
 |---:|---|
@@ -346,6 +346,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
 | 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable); 48 `written` level in force `u8` (1 when a series is at the `written` level in the registry at `after`, making the entry a `possible_loss`, `spec.md` §3 Recovery rule 3; an entry without it reads as 0) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
+| 10 label change | 1 id; 20 effective time `i64` ns, absent for *always* (the exception above; a zero-length field 20 is invalid, so *always* has one encoding); 70 label item (repeated, 1 to 64): `op` `u8` (1 set, 2 remove, 3 withdraw; any other value is an unknown critical value, a version refusal), `key_len` `u8`, the key (`key_len` bytes), then for op 1 the value, the rest of the field (`spec.md` §2.1 Labels). Critical: an older build refuses it (Q-882). Not held by the registry file (A.16) but by label parts (A.19) |
 
 Series definition fields, all critical:
 
@@ -382,7 +383,9 @@ or a field overrunning its container; a critical field out of order or repeated 
 outside its range above; a field missing where the tables say it is present (the "Present" column, field 27 with
 field 8, field 20 in a parameter change, the recovery entry's fields, a routing change's fields per change and kind),
 or present where it does not apply; a named-state series with no state name; a recovery entry that is not the only
-entry of its batch. Kind and value type are not compared beyond the tables. Fields without a stated range take any
+entry of its batch; in a label change, no item or more than 64, a key or value outside the grammar of `spec.md` §2.1
+Labels (a reserved key is refused by the calls, not by a reader), `key_len` past the field, a key twice in one
+entry, or a value with op 2 or 3. Kind and value type are not compared beyond the tables. Fields without a stated range take any
 value, and a parameter change carrying only field 1 is valid. Entry type 5 is laid out since roadmap 5.2 (until then
 it was refused as an unknown critical type, Q-106 (f)); field 41 of a recovery entry is 16 bytes with a non-zero
 nonce. **Splitting:** consecutive entries share one
@@ -422,7 +425,7 @@ recovery entry is checked by the writer's recovery (`spec.md` §3), not by a rea
 
 ### A.8 Segment index body (written at seal)
 `series_count: u32`, `record_size: u16` (24 in v1), `flags: u16` (bit 0 `has_entries`: the segment holds at least
-one entries block), then per series, sorted by id, records of `record_size` bytes: `series_id: u32`,
+one entries block; bit 1 `has_labels`: it holds at least one label change, type 10, A.19; set with bit 0 clear, it is invalid), then per series, sorted by id, records of `record_size` bytes: `series_id: u32`,
 `fact_count: u32`, `min_t: i64`, `max_t: i64`. Readers use `record_size` and ignore a record's unknown tail; this is
 the rule for every fixed-size record array. A reader that is catching up, and compaction, skip a segment only if none
 of its series is listed **and** `has_entries` is clear; otherwise they read at least its entries blocks.
@@ -558,6 +561,7 @@ while it exists; a new file is created only when none exists.
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
 <dir>/leases/<reader_id:32 hex>.lease        kind 8 (A.15)
 <dir>/registry/<generation:8 hex>-<file_id:16 hex>.reg   kind 5 (A.16)
+<dir>/registry/labels/<generation:8 hex>-<after:16 hex>-<through:16 hex>-<file_id:16 hex>.lab   kind 18 (A.19)
 <dir>/derived/logdir-<file_id:16 hex>.root  kinds 15–17 (A.18): log directory root and groups, series directory, status file
 <dir>/derived/logdir-<group:8 hex>-<file_id:16 hex>.grp | series-<file_id:16 hex>.sdir | status-<file_id:16 hex>.stat
 <dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.2, 7.1 and 8.1
@@ -793,7 +797,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
 
 ## A.16 Registry file (`kind = 5`)
 The registry entries of the kept log (`spec.md` §2.1: definitions, parameter changes, aliases, retirements, scale
-raises, site-zone, tzdata, routing and recovery entries), each with its position, and an id floor, in one file on the
+raises, site-zone, tzdata, routing and recovery entries; never label changes, type 10, which label parts hold,
+A.19), each with its position, and an id floor, in one file on the
 hot tier: `registry/<generation>-<file_id>.reg`.
 
 - **Layout.** An A.1 header (kind 5; `generation` the generation its positions belong to; `base_sequence` 0), then
@@ -823,7 +828,7 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   rule 3), and `max_series_id` and every id it defines count toward the id floor (`spec.md` §2.1), as do its
   definitions' interval lengths toward the segment index's reach (A.8). Once the log is recovered, the writer
   rebuilds the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must
-  hold exactly the kept log's registry entries up to the last synced mark, with an id floor at least the writer's;
+  hold exactly the kept log's registry entries other than label changes up to the last synced mark, with an id floor at least the writer's;
   if it does not, it is written again from the kept log, with the writer's id floor, so the id of a lost definition
   stays assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
   a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
@@ -848,9 +853,11 @@ its own prefix, which the engine never sees.
 <sid>/uploaded/<generation:8 hex>/<sequence:16 hex>  a last-uploaded marker (Q-614)
 <sid>/probe                                          the conditional-write probe
 <sid>/files/<kind:2 hex>/<generation:8 hex>-<file_id:16 hex>   a file of any other kind (A.1)
+<sid>/labels/<generation:8 hex>-<after:16 hex>-<through:16 hex>-<file_id:16 hex>   a label part (A.19)
 <sid>/probe/<nonce:32 hex>                           a checksum probe; stored only by a bucket that is refused (Q-213)
 ```
-  A log segment (kind 1) is only under `log/`; `files/01/` names nothing. A listing of
+  A log segment (kind 1) is only under `log/` and a label part (kind 18) only under `labels/`; `files/01/` and
+  `files/12/` name nothing. A listing of
   `<sid>/manifest/<generation>/` returns a generation's records in epoch order, and one of
   `<sid>/uploaded/<generation>/` its last-uploaded markers in sequence order. Generation 0 has no claim marker; it
   counts as claimed (`spec.md` §8 Generations). A reader ignores a key under `<sid>/` that this table does not name,
@@ -1035,7 +1042,7 @@ generation below it.
 (104 in v1); 10 reserved (6). Group *n* holds the sealed segments `256n` to `256n + 255`, counted in position order;
 a full group's membership never changes: a segment removed locally (Q-745) keeps its record, with flag bit 1 "not
 local" (Q-779, laid out by roadmap 6.3e). Segment record (104): 0 `file_id`; 8 generation `u32`; 12 flags `u8` (bit 0
-`has_entries`, A.8; bit 1 reserved as above), 3 reserved; 16
+`has_entries`, A.8; bit 1 reserved as above; bit 2 `has_labels`, copied from A.8), 3 reserved; 16
 first and 24 last sequence; 32 first and 40 last commit time (A.9); 48 fact count (the sum of the segment index's
 counts); 56 the file's length; 64 the trailer's `file_crc32c`, 4 reserved; 72 SHA-256 of the whole file (32). Checks:
 records in strictly ascending position, each segment's last above the previous one's, first at or below last in
@@ -1126,6 +1133,56 @@ keeps the previous generation and rebuilds forward from it: a group's records ar
 the catalogue and only segments no valid group lists are read again; the series directory is continued from the
 newest one that is still a function of the kept log (`spec.md` §7 Derived files), with the facts above its `through`.
 A full rebuild from the log is the last resort.
+
+## A.19 Label part (`kind = 18`)
+The label changes (A.6 type 10) of the kept log of one generation with a sequence in `(after, through]`, each with its
+position, in an immutable file on the hot tier: `registry/labels/<generation>-<after>-<through>-<file_id>.lab`
+(`spec.md` §2.1 Labels, Q-892). Never on cold.
+
+- **Layout.** An A.1 header (kind 18; `generation` that of its positions; `base_sequence` 0), then zero or more
+  entries blocks (type `0x02`, the A.6 body, type 10 entries only), then one **summary** block (type `0x40`, 24
+  bytes): 0 `after: u64`; 8 `through: u64`; 16 `entry_count: u32`; 20 `block_count: u32`, the entries blocks before
+  it. Entries come in position order, positions rising strictly, each above `after` and at most `through`. Canonical
+  writing as A.16.
+- **Name and id.** `file_id` is the next of kind 18 by A.12's rule: 1 + the highest of kind 18 among local names,
+  ids named by any manifest record (each upload is recorded there) and any rebuild record's floor. It is in the
+  header and the name and breaks a tie between two parts of one range. **A part is removed locally**, for whatever
+  reason (invalid, merged, set aside), only once a part with a higher `file_id` is durable (synced, its directory
+  synced), so the highest local id never falls: no name, and with a backup no bucket key, is ever used twice
+  (Q-1042). When nothing replaces a removed part, a part with no entries is written first to carry the higher id. A header whose
+  generation or `file_id` differs from the name, or a summary whose `after` or `through` does, is invalid.
+- **Writing.** Written to a temporary name, synced, renamed, and the directory synced (on the first write
+  `registry/labels/` is created and `registry/` synced); never changed. A part never names a position above the last
+  synced mark. The writer writes one after a seal whose segment carries `has_labels` (A.8), covering the label
+  changes above the last part, and at a clean stop for label changes not yet sealed. A crash between a seal and its
+  part leaves a flagged segment with no part.
+- **Chains.** The first part of a generation has `after` 0; each later one starts where one in force ends. The label
+  state is the fold over the generations in order, each up to the position its successor was restored from.
+- **The parts in force** are the valid covering set of a generation with the fewest parts, the higher `file_id`
+  winning a tie; a part wholly covered by a valid merged part is ignored. Parts are merged when more than a threshold
+  exist (provisionally 64, 16 on the minimal class; the writer's choice, which no reader depends on): one new part
+  replaces them, and the inputs are removed after the grace hour (`spec.md` §7 Retired files). A merge exists only once renamed after its sync; leftover temporary files are removed at a start.
+- **Reading.** Every sealed segment above the last part in force whose index carries `has_labels` is read for its
+  entries blocks, then the tail above the sealed segments. A segment without the flag holds no label change. The
+  writer's start lists `registry/labels/` once and opens no part; parts are loaded and checked when labels are first
+  needed. A reader lists the directory when it first needs labels, and again only when its cut passes a flagged
+  sealed segment above the parts it holds or a part it holds can no longer be opened.
+- **At a start.** Whether a part's `through` is a source of F, as the registry file's is (A.16), is open (Q-1043);
+  a `through` read from a name alone is not checked and is never evidence by itself.
+- **Checks.** As A.16, with kind 18, only type 10 entries, positions inside `(after, through]` and the name matching.
+  A part that fails a check, is missing, overlaps a recorded lost range, holds positions set aside by a restore, or
+  differs from the local log of its range is invalid and rebuilt from the kept log (compacted files' entries and
+  flagged segments); a newer `format_major` or an unknown critical element is a version refusal.
+- **Restore to P.** Parts wholly at or below P stay; the entries at or below P of a part spanning P are written as a
+  new part ending at P; parts above P go with the positions set aside.
+- **Backup.** Each part is uploaded once under `labels/` (A.17) and recorded like any uploaded file; a restore lists
+  the part objects and takes the covering set up to its position, and one that finds none rebuilds labels from the
+  uploaded files, or fails. The engine never deletes from the bucket (`spec.md` §8 Bucket): an input part's object is
+  retired only in the backup record, which stops a restore from taking it, and only after the merged part covering
+  it is uploaded and verified and the grace hour has passed; the object stays.
+- **Release.** A log segment that carries `has_labels` is removed locally only once a part covering its label
+  changes has been written and read back, and, on a store with a backup, uploaded and verified (`spec.md` §8
+  Eviction, Q-745).
 
 ## B. Outline of the remaining files (not yet normative)
 

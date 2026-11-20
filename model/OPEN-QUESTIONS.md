@@ -142,6 +142,23 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-983 | §3 Group commit, §13 Sync rate and SSD wear; `design.md` Budgets | The device-time term of the budget against the latency of loads above it (OWNER) |
 | Q-984 | §3 Group commit; `kvik_log::LogStats` | The smoothed sync time and `sync_interval` under the budget |
 | Q-985 | §3 Group commit | The burst of the sync budget: four batch syncs |
+| Q-880 | §2.1 Labels | The label rules and limits as a promise (OWNER) |
+| Q-881 | §2.1 Labels | Reserved label keys (OWNER) |
+| Q-884 | §2.1 Labels; `api.md` Labels | Labels in a definition are initial only (OWNER) |
+| Q-1020 | §2.1 Labels | Label entries in the model kept apart from registry events (decided by the lead) |
+| Q-1021 | §2.1 Labels; `api.md` Labels | A label call that appends nothing, and the outcome's position (decided by the lead) |
+| Q-1022 | §2.1 Labels; `format.md` A.6 | What `limits.label_bytes` and `limits.label_versions` count (decided by the lead) |
+| Q-1023 | `api.md` Labels | The order of a label call's checks (decided by the lead) |
+| Q-1024 | §2.1 Labels | A limit refuses only a call that adds versions (decided by the lead) |
+| Q-1025 | §2.1 Labels, Duplicates | Duplicates within one batch of label changes (decided by the lead) |
+| Q-1026 | §2.1 Labels, §2.3 Label views | A withdrawal with nothing to withdraw (decided by the lead) |
+| Q-1027 | §2.1 Labels; `api.md` Labels | What `declare_labels` checks and reports (decided by the lead) |
+| Q-1028 | §2.3 Label views | Label views of orphaned and retired series, and as of a time (decided by the lead) |
+| Q-1029 | §2.1 Labels; `api.md` Health | The 80 % notices and the fixed key limit (decided by the lead) |
+| Q-1040 | §2.1 Labels, Duplicates; `api.md` Labels | A call that writes nothing resolves once what it duplicates is synced (decided by the lead) |
+| Q-1041 | §2.1 Labels; `api.md` Labels, Errors | A definition whose labels pass a limit (decided by the lead) |
+| Q-1042 | `format.md` A.19 | Label part file ids are never reused (decided by the lead) |
+| Q-1043 | `format.md` A.16, A.19; §3 Recovery rule 3 | A label part's `through` at a start |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -3643,6 +3660,213 @@ design's budget test asks for is roadmap 9.0e's, which measures again.
 **Pinned by.** `kvik/tests/live_budgets.rs` (a measurement, ignored by default);
 `log/src/reader/tests/parts_and_lookup.rs` `the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch`.
 
+## Q-880 — The label rules and limits as a promise (OWNER)
+Recorded by the series labels design; applied by the labels spec-and-model step (L1) with the design's proposal.
+For the owner.
+**Scenario.** Keys `[a-z][a-z0-9_]*` of 1 to 63 bytes, values of 1 to 255 bytes compared byte for byte, at most 64
+keys and `limits.label_versions_per_series` (1,024) versions a series, `limits.label_versions` (1,000,000; 100,000 on
+the minimal class) and `limits.label_bytes` (32 MiB; 4 MiB) a store. Nothing is deleted, so a limit is a ceiling until
+configuration raises it, and a series at its cap cannot be corrected; the store limit costs up to about 85 MB (9 MB
+minimal) in each process that uses labels (design §3.2).
+**Consequences the owner is asked to accept** (both permanent for a user, both following from the design):
+(1) the 64 keys a series may ever use are a format constant, not configuration (Q-1029), and every version counts
+its key, so a key that was only ever removed or withdrawn, such as a mistyped key taken back at once, uses one of
+the 64 for good; (2) orphaned label entries count towards `limits.label_versions` and `limits.label_bytes`
+(Q-1022), so after a lost definition the lost series' labels take room that nothing gives back short of raising the
+limit.
+**Options.** (a) Accept, the per-series cap configurable (the design's proposal, applied); costs: (1) and (2) above.
+(b) Higher defaults, at the memory cost per process. (c) A way to fold old versions away, which breaks "nothing is
+deleted" and history. (d) For (1): count only keys that were ever set, so a key taken back costs nothing; the index
+then tracks keys apart from versions, and a series may hold more distinct keys in its history than 64. (e) For (2):
+leave orphaned entries out of the limits; the memory figure per process then no longer bounds what a process holds.
+**Model.** (a): `labels::LabelLimits`, `MAX_KEYS_PER_SERIES`; `tests/labels.rs`
+`s2_1_labels_the_series_and_store_limits_refuse_a_call_that_adds_past_them`,
+`s2_1_labels_a_series_uses_at_most_64_keys_ever` (keys only removed or withdrawn included),
+`s2_1_labels_an_orphaned_entry_is_kept_and_counted_outside_every_view`.
+
+## Q-881 — Reserved label keys (OWNER)
+Recorded by the series labels design; applied by the labels spec-and-model step (L1) with the design's proposal.
+For the owner.
+**Scenario.** `site`, `area`, `device`, `metric`, `month` and `series` are the export layout's folder names, and
+`area`, `device` and `metric` are the keys a user reaches for first. Every key starting `kvik_` is kept for the engine.
+**Options.** (a) Reserve them and refuse a call that sets one (`LabelError::Reserved`), and from the static label
+selection step (L3) read the three name segments in selectors as fixed labels under `area`, `device` and `metric` (the proposal, applied for the
+refusal). (b) Allow them, and rename the export folders, which the owner's ruling on the layout fixed. (c) Allow
+them, and let the export layout win in a conflict, so a label could disagree with the folder it is exported under.
+**Model.** (a): `labels::RESERVED_KEYS`; `tests/labels.rs`
+`s2_1_labels_a_bad_item_refuses_the_whole_call_and_appends_nothing`. The fixed labels are L3's.
+
+## Q-884 — Labels in a definition are initial only (OWNER)
+Recorded by the series labels design; applied by the labels spec-and-model step (L1) with the design's proposal
+(spec and `api.md`; the labels engine step, L2, builds it). For the owner.
+**Scenario.** An adapter defines its series at every start with `SeriesSpec::label`. Defining an existing series
+again with other labels either changes them or does not.
+**Options.** (a) Initial only: the definition's labels are written as an entry effective *always* in the
+definition's batch; defining again returns the id, leaves the labels alone and says so (`labels_ignored`), and
+`declare_labels` is the start-up form (the proposal, applied). (b) A definition again sets the labels it carries from
+now, as `declare_labels` does; every start then writes entries whenever two adapters disagree.
+**Consequences of (a) as the interface stands.** (1) Only `define_many` reports ignored labels (`Defined {
+labels_ignored }`); `define_series` returns a bare `SeriesId` and cannot say so, so the spec's "says so" holds for
+the batch call only. Options: (i) leave `define_series` as it is and document that it does not report (applied);
+(ii) give it a result carrying `labels_ignored`, a breaking change to a call accepted at gate 3.3; (iii) log a
+warning through `tracing`, which a program cannot test. (2) Whether `labels_ignored` is set when the labels carried
+equal those in force: (i) set whenever the call carried labels (applied), simple and true of the call; (ii) set only
+when they differ from those in force now, which tells an adapter whether its labels drifted but makes the result
+depend on the clock and on earlier label calls.
+**Model.** `LabelLog::declare`; `tests/labels.rs` `s2_1_labels_declare_sets_only_the_keys_whose_value_now_differs`.
+Definition labels are a `set_labels_many` call with `Effective::Always` in the model.
+
+## Q-1020 — Label entries in the model kept apart from registry events
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Scenario.** Type 10 entries are log entries of the series' own log, but the registry file does not hold them
+(spec §2.1 Labels, Q-892). A `RegistryEvent` variant for them would also change every exhaustive conversion of
+registry events (the log crate's model differential) ahead of L2's encoding.
+**Decided.** The model folds label entries in `labels::LabelLog`, a list of the kept log's label entries in position
+order, beside the `Registry` built from the same kept log; every label view takes the registry to tell orphaned
+entries apart. The engine's model (`engine::Model`) gains its label calls with the labels engine step (L2), which compares both
+backends with `LabelLog`. **Tests.** `tests/labels.rs` throughout.
+
+## Q-1021 — A label call that appends nothing, and the outcome's position
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Scenario.** An entry holds 1 to 64 items (`format.md` A.6 type 10). A call with an empty change, or whose every
+item is a duplicate, has nothing to write.
+**Decided.** Such a change writes no entry and the call succeeds: `LabelOutcome { position: None, recorded: 0, .. }`.
+A call that writes entries reports the position of its last entry, the position at which the whole change is known.
+Each change of `set_labels_many` that keeps any item is one entry, at consecutive positions in one batch.
+When it resolves is Q-1040.
+**Tests.** `tests/labels.rs` `s2_1_labels_an_empty_change_appends_nothing`,
+`s2_1_labels_a_duplicate_is_only_the_same_item_at_the_same_key_and_effective_time`,
+`s2_1_labels_a_duplicate_counts_earlier_entries_of_the_same_batch`.
+
+## Q-1022 — What `limits.label_bytes` and `limits.label_versions` count
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Scenario.** The design states the byte limit as "the bytes of all label entries" without a measure.
+**Decided.** Each entry counts its encoded length in an entries block (`format.md` A.6): its 8-byte header and its
+fields with their headers and padding to 4, the entry padded to 8 (a set of `room` = `hall` effective at a time is 48
+bytes). A version is one item. Both count every label entry the kept log holds, orphaned ones included, since the
+engine keeps them in its label parts and index structures alike. The measure does not depend on how a part or a
+block is laid out, so both backends and every process agree. **Tests.** `tests/labels.rs`
+`s2_1_labels_an_entry_is_measured_by_its_encoded_length`,
+`s2_1_labels_an_orphaned_entry_is_kept_and_counted_outside_every_view`.
+
+## Q-1023 — The order of a label call's checks
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** A call is checked change by change in the order given: the series (`UnknownSeries`), then each item in
+order for the key grammar (`BadKey`), a reserved key (`Reserved`), the value (`BadValue`) and a key given twice
+(`Duplicate`), then the item count (`TooManyItems`). Only then does the duplicate rule drop items, and the limits are
+checked on what remains, for the whole call: the keys of each series it adds to (`TooManyKeys`), their versions
+(`SeriesLimit`), then the store's versions and bytes (`StoreLimit`). The first failure is reported and nothing is
+appended. **Tests.** `tests/labels.rs` `s2_1_labels_a_bad_item_refuses_the_whole_call_and_appends_nothing`,
+`s2_1_labels_the_series_and_store_limits_refuse_a_call_that_adds_past_them`.
+
+## Q-1024 — A limit refuses only a call that adds versions
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Scenario.** Limits are checked at the call only, so after a limit is lowered the kept log can hold more than it
+allows (spec §2.1 Labels). A call whose items are all duplicates adds nothing.
+**Decided.** A limit refuses a call only when the versions it would add take a count above the limit; the
+per-series limits apply to the series the call adds to. A call that appends nothing succeeds whatever the counts,
+so re-asserting what is recorded never fails. **Tests.** `tests/labels.rs`
+`s2_1_labels_replay_under_a_lowered_limit_applies_every_entry`.
+
+## Q-1025 — Duplicates within one batch of label changes
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** As for facts (spec §2.4), the duplicate rule sees the earlier entries of the same batch: two changes of
+one `set_labels_many` call with the same item at the same `(series, key, from)` record it once. Two changes for one
+series and effective time are two entries; a key given twice within one change is refused (`Duplicate`).
+**Tests.** `tests/labels.rs` `s2_1_labels_a_duplicate_counts_earlier_entries_of_the_same_batch`.
+
+## Q-1026 — A withdrawal with nothing to withdraw
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** A withdrawal at a `(series, key, from)` with no version is recorded, as the caller asserted it, and reads
+as no change; a withdrawal whose current version is already a withdrawal is a duplicate. A later set or remove at
+the same key and time reinstates a change (spec §2.3 Label views). **Tests.** `tests/labels.rs`
+`s2_1_labels_a_withdrawal_reads_as_no_change_whatever_is_corrected_before_it`,
+`s2_1_labels_a_withdrawal_reads_as_if_no_change_was_made_and_a_later_set_reinstates_it`.
+
+## Q-1027 — What `declare_labels` checks and reports
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** Every listed pair is checked as a set item (grammar, reservation, a key once, at most 64) before any is
+compared, so a bad list appends nothing even where its keys already hold their values. The sets are effective at
+`now`, so a `declare_labels` at the effective time of an existing version is a correction of it. Keys already in force
+with the listed value count as duplicates in the outcome. **Tests.** `tests/labels.rs`
+`s2_1_labels_declare_sets_only_the_keys_whose_value_now_differs`.
+
+## Q-1028 — Label views of orphaned and retired series, and as of a time
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** A series with no definition in the kept log has no labels in any view, no history, and is in no count of
+`label_keys` or `label_values`; its entries are kept and counted (`orphaned_label_entries`). A retired series keeps
+its labels, takes corrections and is counted. `labels_at` under `AsOfTime(T)` takes the versions at or below the last
+label position whose batch commit time is at most T: the label versions at or below spec §2.3's P are the same, as
+commit times never decrease. Versions of one entry are listed in the order of its items. **Tests.**
+`tests/labels.rs` `s2_1_labels_an_orphaned_entry_is_kept_and_counted_outside_every_view`,
+`s2_1_labels_a_retired_series_keeps_and_still_takes_labels`,
+`s2_3_label_views_as_of_time_takes_the_versions_committed_by_then`.
+
+## Q-1029 — The 80 % notices and the fixed key limit
+Recorded and decided by the lead with the labels spec-and-model step (L1).
+**Decided.** A notice is given when a count is at least four fifths of its limit (count × 5 ≥ limit × 4, in integers),
+for the store's versions and bytes and for each defined series' versions; a start reports them and never refuses its
+own log. The 64 keys a series may ever use are a format constant, not configuration: every version counts its key,
+removals and withdrawals included. **Tests.** `tests/labels.rs` `s2_1_labels_notices_name_limits_at_80_percent`,
+`s2_1_labels_a_series_uses_at_most_64_keys_ever`.
+
+## Q-1040 — A call that writes nothing resolves once what it duplicates is synced
+Recorded with the fix round of the labels spec-and-model step (L1); decided by the lead.
+**Scenario.** A label call whose every item is a duplicate writes nothing, so it has no position to wait for. If
+the version it duplicates is in a batch still being synced (a second caller, or a retry after `OutcomeUnknown`),
+reporting success at once could tell a caller a version is recorded that a power loss then removes, against "what
+a caller was told succeeded is recorded" and "resolves once it is durable".
+**Decided.** A label call resolves only once the synced durable mark is at or above both its own last entry and
+every version one of its items was dropped against; a `declare_labels` also waits for the versions in force it
+matched. This keeps the existing promise; nothing is written for a duplicate. The model gives the position in
+`LabelOutcome::resolves_at` (`None` only for a call with no item at all). **Tests.** `tests/labels.rs`
+`s2_1_labels_a_call_resolves_at_its_last_entry_or_the_versions_it_duplicates`,
+`s2_1_labels_a_duplicate_is_only_the_same_item_at_the_same_key_and_effective_time`.
+
+## Q-1041 — A definition whose labels pass a limit
+Recorded with the fix round of the labels spec-and-model step (L1); decided by the lead.
+**Scenario.** A definition carrying labels appends a label change, which can pass `limits.label_versions`,
+`limits.label_bytes` or the per-series limit; only a grammar refusal was named (`DefineError::Invalid { field:
+"labels" }`).
+**Decided.** The definition is refused whole and appends nothing, as one bad item refuses a label call: a grammar
+or reservation refusal is `DefineError::Invalid { field: "labels", .. }`, a limit `DefineError::LabelLimit(
+LabelError)` carrying the label error. `define_many` is refused whole likewise. A definition is never written
+without the labels it carried. **Tests.** None in the model, which has no definition with labels; the labels engine
+step (L2) pins it on both backends.
+
+## Q-1042 — Label part file ids are never reused
+Recorded with the fix round of the labels spec-and-model step (L1); decided by the lead (`format.md` A.19).
+**Scenario.** With "the highest present plus one", an invalid part that is the highest present could be removed
+before its replacement is written; the replacement then takes the same id and range, so the same name and bucket
+key with other content, where the bucket creates a key only when absent and the tie rule cannot tell them apart.
+**Decided.** Two rules, the simplest that keep names and keys unique for ever. (1) The id is A.12's for every kind:
+1 + the highest of kind 18 among local names, ids named by any manifest record (each upload is recorded there) and
+any rebuild record's floor of kind 18. (2) A part is removed locally, whatever the reason (invalid, merged, set
+aside), only once a part with a higher `file_id` is durable (synced, its directory synced). So the highest local id
+never falls and no local name is used twice; with a backup, every uploaded id is named by the manifest, so no key
+is taken twice, and a restore starts a new generation, which is in every name. When nothing replaces a removed part
+(every label change of its range lost, or an in-place restore to a position below every label change), a part with
+no entries is written to carry the higher id first; the layout allows zero entries blocks. A directory emptied by
+hand on a store without a backup may start the ids again, which no name outside the store can meet. **Residual, a
+double fault:** a part uploaded, its copy-verified record (`format.md` A.14 `0x27`) not yet synced, and the
+`registry/labels/` directory then lost or emptied while the store stays in its generation: the id can be taken
+again. Rebuilt from the same kept log the bytes are the same and the upload matches; where they differ the bucket
+refuses the second create (it creates a key only where absent), so the fault is loud, never silent.
+
+## Q-1043 — A label part's `through` at a start
+Recorded with the fix round of the labels spec-and-model step (L1). Open, for the labels engine step (L2).
+**Scenario.** A.16 makes the registry file's `through` a source of F (Recovery rule 3): the file never names a
+position above the last synced mark, so one that does shows a loss. A label part obeys the same bound, but A.19
+said nothing about it at a start.
+**Proposal.** Treat it as the registry file is treated: a part's `through` is a source of F, and a part above the
+recovered log is then invalid and rebuilt from what is kept. Three conditions for the engine step, or the evidence
+can be false: (1) only parts of the current generation count, since a part of an older generation above its
+restored end is set aside, not lost; (2) a part that waits for its replacement under Q-1042 and overlaps a recorded
+lost range names positions already reported, and must not report them again; (3) the start opens no part, and a
+`through` read from a file name alone is unauthenticated, where the registry file's is read from a checked file:
+either open and check the highest part of the generation at a start (one open), or do not use the name as
+evidence. Until L2 decides, nothing depends on it: the model has no parts.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -3656,7 +3880,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -3766,6 +3990,23 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-983 | 4.9 | OWNER. Gate; the `8 × d` term against closed-loop latency above the budget, and the burst in the stated bound; (a) for now |
 | Q-984 | 4.9 | Decided by the flush-pacing change; for the lead's acceptance |
 | Q-985 | 4.9 | Decided by the flush-pacing change (a burst of four); for the lead's acceptance |
+| Q-880 | labels engine (L2) | OWNER. The label rules and limits; the design's proposal (a) applied by L1 |
+| Q-881 | label selection (L3) | OWNER. Reserved keys refused since L1; the fixed segment labels are L3's |
+| Q-884 | labels engine (L2) | OWNER. Definition labels initial only; the design's proposal (a) in the spec since L1 |
+| Q-1020 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); L2 compares both backends with `LabelLog` |
+| Q-1021 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1022 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1023 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1024 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1025 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1026 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1027 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1028 | label selection (L3) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1029 | labels engine (L2) | Decided by the lead with the labels spec-and-model step (L1); for review |
+| Q-1040 | labels engine (L2) | Decided by the lead at L1's review; L2 pins it on both backends |
+| Q-1041 | labels engine (L2) | Decided by the lead at L1's review |
+| Q-1042 | labels engine (L2) | Decided by the lead at L1's review (`format.md` A.19) |
+| Q-1043 | labels engine (L2) | Open; proposal: a source of F, as the registry file's `through` |
 | Q-760 | 5.6 | Gate; recorded when the owner's ruling on Q-195 (a) was applied |
 | Q-761 | 6.4b | Partitioned export layout; recorded when the owner's ruling on Q-196 was applied |
 | Q-832 | 7.1b | A start that skips old segments; kept with Q-752 by the lead; recorded by the first profiling sweep |
@@ -4126,6 +4367,11 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.9 ns a byte, the body checks of a crafted 64 MiB segment about 0.8 s; see the question) |
 | Q-873 | The time of the header walk on a crafted file | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by roadmap 4.9e as a technical decision with no format change: once damage is found a header checksum at most twice per 8-byte step (the chain ends, and a torn tail's commit search) and a block's header read at most eight times, the chain ends and a boundary read's verdicts kept in rings by offset; time measured, the dearest crafted 64 MiB segment built 0.61 s; what a start is promised is Q-970; see the question) |
 | Q-970 | What a start is promised on a crafted or damaged file, against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md`; `api.md` Configuration (settled by the owner's ruling of 2026-11-18: the measured per-file figure at the default `log.segment_size`, plus a warning for a larger segment size; no bound in seconds, no format change). Scenario: the work of a scan is bounded per byte (Q-110, Q-651, Q-873), but not its time: a header read costs about 20 to 31 ns and a body byte checked at most about 2.9 ns on one machine, and the bounds allow more of both than any file built uses. Bodies: at most 264 MiB checked for a 64 MiB segment, priced at the dearest entry 0.8 s, while the dearest file built to the body bound measured 0.22 s. Header reads: for 16-byte blocks at the measured cost about 1 s at 64 MiB before any body is checked, while the dearest file built measured 0.61 s. No argument excludes a file that stacks overlapping bodies on the header reads. Ruling: what a start is promised for one crafted or damaged file is the figure measured at the default segment size: a 64 MiB log segment 0.25 to 0.61 s on one shared 4-core cloud machine (release build, best of five), a 16 MiB manifest about 0.3 to 0.4 s with its body checks. The work is linear in a file's length, so a segment of `segment_size` costs about `segment_size / 64 MiB` times as much (the 1 GiB maximum some 10 s), and a start that reads several crafted files pays for each. A store whose `log.segment_size` is above the default warns when it reads files from a bucket others can write; it cannot tell who can write a bucket, so it warns for every bucket it is given: `Store::attach_backup` on the durable backend first logs a `tracing` warning naming the size and its ratio to the default (`LogConfig::bucket_warning`). `Store::restore` takes no configuration, so a restored store is to give the same warning at its first open, when roadmap 8.3d wires the restore. `kvik/src/config.rs` `the_bucket_warning_is_given_above_the_default_segment_size_only_and_names_the_ratio`; `kvik/tests/backup_interfaces.rs` `attaching_a_bucket_warns_only_above_the_default_segment_size_on_the_durable_backend` |
+| Q-882 | Entry type 10 added inside format version 1 as a critical type, its item carrying an `op` byte (series labels design) | `format.md` A.6 type 10 |
+| Q-890 | A label change is per-key items, not a whole-set replacement (series labels design) | §2.1 Labels |
+| Q-891 | Effective times in the future are allowed (series labels design) | §2.1 Labels, §2.3 Label views |
+| Q-892 | Label entries held in immutable label parts, not in the registry file, with the `has_labels` flag (series labels design) | §2.1, `format.md` A.8, A.16, Label parts |
+| Q-893 | Labels kept out of the series directory, the chunk index and chunk headers (series labels design) | §2.1 Labels |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

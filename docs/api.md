@@ -73,6 +73,9 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
+| `limits.label_versions_per_series` | `u64` | 1,024 | spec §2.1 Labels; checked at a label call only, on the versions it adds (Q-1024); a start applies every kept version whatever the limit |
+| `limits.label_versions` | `u64` | 1,000,000 (`LABEL_VERSIONS_DESKTOP`) | spec §2.1 Labels, as above; 100,000 (`LABEL_VERSIONS_MINIMAL`) suits the minimal class. Each process that reads labels holds about 48 bytes a version (Q-880) |
+| `limits.label_bytes` | `u64` bytes | 32 MiB (`LABEL_BYTES_DESKTOP`) | spec §2.1 Labels, as above, each label change at its encoded length (Q-1022); 4 MiB (`LABEL_BYTES_MINIMAL`) suits the minimal class |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
 | `limits.disk_critical` | `u64` bytes | 512 MiB | |
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
@@ -165,11 +168,19 @@ pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { e
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault),      // any call that appends an entry
     NotFinal }                     // acknowledge_manifest_rebuild while the rebuild is provisional (spec §7 Manifest)
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
-    UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
+    UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 },
+    LabelLimit(LabelError),        // a definition's labels would pass a label limit (Labels, Q-1041)
+    Write(WriteError) }
+pub enum LabelError { UnknownSeries, BadKey { key }, Reserved { key }, BadValue { key }, Duplicate { key }, TooManyItems,
+    TooManyKeys { limit: usize }, SeriesLimit { limit: u64 }, StoreLimit { which: StoreLimit, limit: u64 },
+    Unavailable,                   // label parts being rebuilt (spec §2.1 Labels)
+    Write(WriteError) }            // label calls; one bad item refuses the whole call and appends nothing
+pub enum StoreLimit { Versions, Bytes }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source },
-    CutExpired }                   // the read's cut ended first (Reader processes); nothing returned; start again
+    CutExpired,                    // the read's cut ended first (Reader processes); nothing returned; start again
+    LabelsUnavailable }            // label parts being rebuilt; label reads and selections only (Labels)
 ```
 Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence),
 `ConsumerError::Pattern(RouteError)` (a name pattern refused, Consuming), and `ConsumerError::RouteCycle` (a route
@@ -241,6 +252,47 @@ enum IntervalLength { Fixed { d: Duration, phase: Duration }, Calendar { unit: C
 enum CalendarUnit { Day { start: LocalTime }, Month }
 ```
 `SeriesInfo` carries `latest_t` and the optional `lateness_reference` (spec §2.2).
+
+## Labels
+Versioned key–value labels on a series (spec §2.1 Labels, §2.3 Label views).
+```rust
+SeriesSpec::new(name, kind, unit).label("room", "kitchen")       // written effective `Always` with the definition
+store.define_many(specs).await? -> Vec<Defined>                   // one batch, one sync; Defined { id, labels_ignored: bool }
+store.set_labels(id, Effective::At(t), LabelChange::new().set("room", "hall").remove("floor")).await?;
+store.set_labels(id, Effective::At(t), LabelChange::new().withdraw("room")).await?;   // as if no change at t
+store.set_labels_many(vec![(id, Effective::Always, change), …]).await?;               // one batch, one sync
+store.declare_labels(id, &[("room", "hall")]).await?;            // start-up form: sets from now what differs now
+pub enum Effective { Always, At(Timestamp) }
+pub struct LabelOutcome { pub position: Option<Position>, pub recorded: u32, pub duplicates: u32 }
+
+reader.labels(id)? -> Labels                                      // now, at the call's cut
+reader.labels_at(id, t, view)? -> Labels                          // View::Current, AsOf, AsOfTime
+reader.label_history(id)? -> Vec<LabelVersion>                    // { key, item, from, position, recorded_at, superseded }
+reader.label_keys()? -> Vec<(Key, u32)>;  reader.label_values(&key)? -> Vec<(Value, u32)>   // series counts now
+```
+- Each label call writes one batch with a forced mark sync and resolves once it is durable, as the calls of Series
+  do; labelling many series is one `set_labels_many` or `define_many` call, not one call each. A call that writes
+  nothing, every item a duplicate, resolves only once the versions it duplicates are at or below the synced mark,
+  and a `declare_labels` likewise for the versions in force it matched (spec §2.1 Duplicates, Q-1040).
+- `LabelOutcome.position` is the position of the call's last entry, `None` when it appended nothing: a change left
+  empty by the duplicate rule writes no entry (Q-1021). `recorded` and `duplicates` count items; `declare_labels`
+  counts a listed key already in force as a duplicate (Q-1027).
+- The checks run change by change in the order given, then the limits over the whole call (Q-1023). A label item
+  that a definition carries and the rules refuse is `DefineError::Invalid { field: "labels", .. }`; one that would
+  pass a label limit is `DefineError::LabelLimit(LabelError)`, carrying `TooManyKeys`, `SeriesLimit` or `StoreLimit`.
+  Either refuses the whole definition (with `define_many`, the whole call), which appends nothing (Q-1041).
+  Defining an existing series returns its id with `labels_ignored` set when the call carried labels; its labels are
+  unchanged. `define_series` returns a bare `SeriesId` and does not report it (Q-884).
+- `Labels` maps keys to values. A series with no definition in the kept log has none; its label changes are counted
+  in `LogStats.orphaned_label_entries` (spec §2.1 Labels). `SeriesInfo` carries no labels, so listings do not load
+  them; `labels(id)` and the reader calls above do.
+- Health: `Reason::LabelLimit { which: StoreLimit, used, limit }` at 80 % of a store limit and
+  `Reason::LabelSeriesLimit { series, used, limit }` for each series at 80 % of its own (Q-1029), both information,
+  not degraded; `Reason::LabelsUnavailable` (degraded) while label parts are rebuilt.
+- Reader calls fail with `QueryError::LabelsUnavailable` and writer calls with `LabelError::Unavailable` while label
+  parts are rebuilt (spec §2.1 Labels).
+- Built by the series labels design's engine step (L2); selectors (`Selector`, `Select::Where`, `When`,
+  `reader.select`) follow with its static selection step (L3).
 
 ## Writing (accepted at gate 3.3)
 ```rust
@@ -521,7 +573,9 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     LocalDataUnreadable { readings: u64, deliveries: u64, evaluations: u64, regions: u64 },
         // decided this run with a check unmade for want of local data (Q-750, Q-925); damaged regions no lost range
         // and no loss this process reports stands for, at every start until repaired or recorded as lost (Q-755, Q-929)
-    StorageSuspect { corruptions: u32, within: Span } }   // repeated corruption (spec §8 Self-repair, Q-247)
+    StorageSuspect { corruptions: u32, within: Span },    // repeated corruption (spec §8 Self-repair, Q-247)
+    LabelLimit { which: StoreLimit, used: u64, limit: u64 }, LabelSeriesLimit { series: SeriesId, used: u64, limit: u64 },
+    LabelsUnavailable }            // Labels: the limit reasons are information, not degraded
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
     pub commit_time_first: Timestamp, pub commit_time_last: Timestamp }
@@ -560,7 +614,7 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //               start_whole /* the start read the log whole into memory, Q-752 */ }
 // LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
-//            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+//            manifest_rebuilds, loss_identities_rebuilt, orphaned_label_entries /* spec §2.1 Labels */ }   ClockStats { jumps, last: Option<ClockJump> }
 // DeliveryStats { refresh_errors /* reads of the log that failed, tried again */, corruptions /* invalid regions the
 //               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
 //               window */, unchecked /* deliveries flagged `unchecked` */, evaluations_unchecked /* condition
