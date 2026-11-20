@@ -59,7 +59,7 @@ pub fn value(v: &Value, kind: Option<&Kind>) -> Cell {
                 .map_or_else(|| Cell::Text(format!("#{k}")), |n| Cell::Text(n.clone())),
             _ => Cell::Text(format!("#{k}")),
         },
-        Value::Bool(b) => Cell::Text(b.to_string()),
+        Value::Bool(b) => Cell::Num(b.to_string()),
         Value::Text(t) => Cell::Text(t.clone()),
         Value::Absent => Cell::Null,
         _ => Cell::Text(format!("{v:?}")),
@@ -143,7 +143,7 @@ pub fn latest(
             Cell::Text(clock.time(v.fact.t)),
             value(&v.fact.value, kind),
             Cell::Text(lower(v.fact.quality)),
-            Cell::Text(v.stale.to_string()),
+            Cell::Num(v.stale.to_string()),
             Cell::Text(position(v.fact.position)),
         ],
         other => vec![

@@ -9,7 +9,7 @@ use crate::args::Format;
 pub enum Cell {
     /// Text.
     Text(String),
-    /// A number, already formatted.
+    /// A number or boolean, already formatted; bare in JSON.
     Num(String),
     /// No value.
     Null,

@@ -23,6 +23,14 @@ fn main() -> ExitCode {
             eprintln!("kvik: {e}\n\n{}", kvik_cli::USAGE);
             ExitCode::from(2)
         }
+        Err(e @ kvik_cli::Error::Query(kvik::QueryError::Invalid { .. })) => {
+            eprintln!("kvik: {e}");
+            ExitCode::from(2)
+        }
+        // A reader that stopped reading (`kvik latest | head`) is not a failure.
+        Err(kvik_cli::Error::Output(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("kvik: {e}");
             ExitCode::FAILURE

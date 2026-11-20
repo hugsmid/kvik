@@ -12,7 +12,7 @@ use kvik::{
 use crate::Error;
 use crate::args::Format;
 use crate::commands::{Ctx, selected};
-use crate::out::{Cell, Table};
+use crate::out::{Cell, Table, num};
 use crate::show::{self, position};
 
 const LATEST: &[&str] = &[
@@ -60,8 +60,16 @@ fn common(head: &[&str], cut: &str, e: &LiveEvent, names: &mut Names) -> Option<
             one("lagged", format!("{}..{}", position(*from), position(*to)))
         }
         LiveEvent::Left { series } => {
-            names.0.remove(series);
-            one("left", format!("series {}", series.0))
+            let name = names.0.remove(series).map(|i| i.name);
+            let mut row = marker(head, cut, "left", format!("series {}", series.0));
+            for (h, c) in head.iter().zip(&mut row) {
+                match *h {
+                    "id" => *c = num(series.0),
+                    "name" => *c = name.clone().into(),
+                    _ => {}
+                }
+            }
+            Some(vec![row])
         }
         LiveEvent::Closed(r) => one("closed", show::lower(r)),
         _ => None,

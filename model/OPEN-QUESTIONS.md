@@ -3665,9 +3665,11 @@ the as-of time of roadmap 9.0f (Q-1010).
 stopped, or for `--for <duration>`; `--interval` (default 200 ms, at least 20 ms) is the session's least batch
 interval, and its poll interval is half of it (at least 10 ms). `tail --since` and `--once` are refused with the
 reason until 9.0f gives a tail from a time; without them `--once` would have no recent facts to stop after. A
-usage error exits with status 2 and the usage text, any other error with status 1; an error is never printed as an
-empty answer. `series` shows every name of a series (the defining name first) in place of a separate alias column.
-Tables, CSV with a header line, and JSON lines with numbers bare; times in RFC 3339.
+usage error exits with status 2 and the usage text, a malformed query (a pattern outside the grammar) with status 2,
+output closed by its reader (a broken pipe) with status 0, any other error with status 1; an error is never printed
+as an empty answer. `series` shows every name of a series (the defining name first) in place of a separate alias
+column. Tables, CSV with a header line, and JSON lines with numbers and booleans bare; times in RFC 3339. A live
+`left` row names the series in `id` and `name`.
 **Pinned by.** `cli/src/args.rs` tests; `cli/tests/output.rs`.
 
 ## Q-1051 — What `health` and `info` read besides the reader

@@ -6,11 +6,11 @@ cut,event,id,name,state,t,value,quality,stale,position
 0:12,reset,,,,,,,,above 0:7
 0:12,gap,,,,,,,,0:8..0:9
 0:12,lagged,,,,,,,,0:10..0:12
-0:12,left,,,,,,,,series 3
+0:12,left,3,,,,,,,series 3
 0:12,closed,,,,,,,,idle
 cut,event,position,id,name,t,value,quality
 0:12,reset,above 0:7,,,,,
 0:12,gap,0:8..0:9,,,,,
 0:12,lagged,0:10..0:12,,,,,
-0:12,left,series 3,,,,,
+0:12,left,series 3,3,,,,
 0:12,closed,idle,,,,,
