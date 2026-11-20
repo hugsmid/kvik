@@ -23,9 +23,8 @@ use super::registry::{Registry, Series};
 use super::summary::Summary;
 use crate::backend::Error;
 use crate::health::{LossCause, LossReport, MarkState};
-use crate::read::View;
 use crate::series::{SeriesInfo, SeriesKey, Timing};
-use crate::time::{TimeRange, Timestamp};
+use crate::time::Timestamp;
 use crate::types::{Fact, FactFlags, Position, Quality, SeriesId, Value};
 
 /// A kept fact with its position and its batch's receive time.
@@ -444,12 +443,13 @@ impl Index {
     }
 
     /// The facts of a series with `t` in `range`, in a view (spec §2.3), in `t` order (and position order in the
-    /// history view).
+    /// history view): the oracle of the sources' reads (roadmap 9.0f).
+    #[cfg(test)]
     pub(crate) fn facts(
         &self,
         id: SeriesId,
-        range: TimeRange,
-        view: View,
+        range: crate::time::TimeRange,
+        view: crate::read::View,
     ) -> Result<Vec<Fact>, Error> {
         let s = self.lookup(&SeriesKey::Id(id))?;
         let versioned = s.spec.versioned.is_some();
@@ -458,10 +458,10 @@ impl Index {
             .series_facts(id.0)
             .filter(move |f| (a..b).contains(&f.row.t));
         let limit = match view {
-            View::History => return Ok(in_range.map(fact_out).collect()),
-            View::Current => None,
-            View::AsOf(p) => Some(log_pos(p)),
-            View::AsOfTime(t) => Some(self.position_at(t.0)),
+            crate::read::View::History => return Ok(in_range.map(fact_out).collect()),
+            crate::read::View::Current => None,
+            crate::read::View::AsOf(p) => Some(log_pos(p)),
+            crate::read::View::AsOfTime(t) => Some(self.position_at(t.0)),
         };
         // The fact of highest rank per `t`: position, or `(changed_at, position)` in a versioned series.
         let mut current: BTreeMap<i64, &Stored> = BTreeMap::new();

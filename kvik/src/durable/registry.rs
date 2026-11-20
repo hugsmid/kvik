@@ -556,7 +556,7 @@ mod tests {
 
         let w = Writer::open(&config).unwrap();
         let range = t..Timestamp(t.0 + 1);
-        let got: Vec<_> = facts(&w.reader().unwrap(), id, range.into(), View::Current)
+        let got: Vec<_> = facts(w.reader().unwrap(), id, range.into(), View::Current)
             .unwrap()
             .collect();
         assert_eq!(got.len(), 1, "readable by id");

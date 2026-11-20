@@ -35,16 +35,25 @@ impl Reader {
                 reason: "must be above zero".into(),
             });
         }
+        if config.memory < durable::LEAST_MEMORY {
+            return Err(OpenError::Config {
+                key: "memory",
+                reason: "must be at least 32 MiB".into(),
+            });
+        }
         let inner = match config.backend {
             Backend::Model => {
                 ReaderInner::Model(backend::find(&config.dir).map_err(|e| e.open(&config.dir))?)
             }
-            Backend::Durable => ReaderInner::Process(Arc::new(DurableReader::open(
-                &config.dir,
-                &config.env,
-                config.lease_refresh,
-                config.cut_max_age,
-            )?)),
+            Backend::Durable => ReaderInner::Process(Arc::new(
+                DurableReader::open(
+                    &config.dir,
+                    &config.env,
+                    config.lease_refresh,
+                    config.cut_max_age,
+                )?
+                .with_memory(durable::Sizes::of(config.memory)),
+            )),
         };
         Ok(Reader { inner })
     }
@@ -169,10 +178,10 @@ impl Reader {
         view: View,
     ) -> Result<Facts, QueryError> {
         let range = range.into();
-        self.on(
-            |s| s.with(|s| s.facts(id, range, view)).map_err(|e| e.query()),
-            |r| durable::facts(r, id, range, view),
-        )
+        match &self.inner {
+            ReaderInner::Model(s) => s.with(|s| s.facts(id, range, view)).map_err(|e| e.query()),
+            _ => durable::facts(self.durable().expect("a durable reader")?, id, range, view),
+        }
     }
 
     /// The latest fact at or before `t` that a window can credit (not bad

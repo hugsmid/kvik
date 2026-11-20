@@ -19,10 +19,10 @@ use crate::time::Timestamp;
 use crate::types::{Intent, Position, Quality, Reading, SeriesId, Value};
 use crate::{Reader, Store, ValueType};
 
-pub(super) const T0: i64 = 1_767_225_600_000_000_000;
-pub(super) const S: i64 = 1_000_000_000;
+pub(in crate::durable::read) const T0: i64 = 1_767_225_600_000_000_000;
+pub(in crate::durable::read) const S: i64 = 1_000_000_000;
 
-pub(super) fn specs() -> Vec<SeriesSpec> {
+pub(in crate::durable::read) fn specs() -> Vec<SeriesSpec> {
     let f64 = || Kind::Gauge {
         value: ValueType::F64,
     };
@@ -60,7 +60,7 @@ pub(super) fn specs() -> Vec<SeriesSpec> {
 }
 
 /// A value of the series' type, or none: index 5's state 5 is undeclared, so never live.
-pub(super) fn value(series: usize, code: u8) -> Value {
+pub(in crate::durable::read) fn value(series: usize, code: u8) -> Value {
     match (series, code % 3) {
         (_, 2) => Value::Absent,
         (2, k) => Value::Text(["one", "two"][usize::from(k)].into()),
@@ -71,13 +71,13 @@ pub(super) fn value(series: usize, code: u8) -> Value {
     }
 }
 
-pub(super) fn quality(code: u8) -> Quality {
+pub(in crate::durable::read) fn quality(code: u8) -> Quality {
     [Quality::Good, Quality::Good, Quality::Suspect, Quality::Bad][usize::from(code % 4)]
 }
 
 /// One step of a generated history.
 #[derive(Clone, Debug)]
-pub(super) enum Step {
+pub(in crate::durable::read) enum Step {
     /// Readings (series, seconds from now, value code, quality code, `changed_at`), with revise intent or not.
     Emit(Vec<(usize, i64, u8, u8, u64)>, bool),
     /// The clock moves on by this many seconds.
@@ -96,7 +96,7 @@ pub(super) enum Step {
     Check,
 }
 
-fn steps() -> impl Strategy<Value = Vec<Step>> {
+pub(in crate::durable::read) fn steps() -> impl Strategy<Value = Vec<Step>> {
     let reading = (
         0usize..7,
         prop_oneof![3 => prop::sample::select(vec![-60i64, -30, -4, 0, 4, 30, 90]), 2 => -300i64..120],
@@ -123,37 +123,37 @@ fn next() -> u64 {
 }
 
 /// Both backends on one clock, the durable store's readers, and what they found.
-pub(super) struct Rig {
-    pub(super) clock: ManualClock,
-    pub(super) env: Env,
-    pub(super) dir: PathBuf,
-    pub(super) fs: MemFs,
-    pub(super) store: Option<Store>,
-    pub(super) model: Store,
-    pub(super) ids: Vec<SeriesId>,
+pub(in crate::durable::read) struct Rig {
+    pub(in crate::durable::read) clock: ManualClock,
+    pub(in crate::durable::read) env: Env,
+    pub(in crate::durable::read) dir: PathBuf,
+    pub(in crate::durable::read) fs: MemFs,
+    pub(in crate::durable::read) store: Option<Store>,
+    pub(in crate::durable::read) model: Store,
+    pub(in crate::durable::read) ids: Vec<SeriesId>,
     /// A reader opened with the store, kept across its restarts.
-    pub(super) long: Reader,
+    pub(in crate::durable::read) long: Reader,
     /// Readers that continue a series directory written for them.
-    pub(super) continuing: Vec<Reader>,
+    pub(in crate::durable::read) continuing: Vec<Reader>,
     /// Readers that started from a directory.
-    pub(super) seeded: u64,
-    pub(super) searches: u64,
+    pub(in crate::durable::read) seeded: u64,
+    pub(in crate::durable::read) searches: u64,
     log: LogConfig,
     /// The last boot identity.
     boot: u8,
     /// A batch was damaged: the model no longer describes the store.
-    faulted: bool,
+    pub(in crate::durable::read) faulted: bool,
     /// Checks made after damage.
-    pub(super) after_damage: u64,
+    pub(in crate::durable::read) after_damage: u64,
 }
 
 impl Rig {
-    pub(super) fn new(name: &str) -> Self {
+    pub(in crate::durable::read) fn new(name: &str) -> Self {
         Rig::with_log(name, LogConfig::default())
     }
 
     /// A rig whose durable store has this log configuration.
-    pub(super) fn with_log(name: &str, log: LogConfig) -> Self {
+    pub(in crate::durable::read) fn with_log(name: &str, log: LogConfig) -> Self {
         let clock = ManualClock::new(Timestamp(T0));
         let mut env = Env::test(clock.clone());
         let fs = MemFs::new();
@@ -202,20 +202,24 @@ impl Rig {
         }
     }
 
-    pub(super) fn reopen(&mut self) {
+    pub(in crate::durable::read) fn reopen(&mut self) {
         let config = StoreConfig::new(&self.dir, "Europe/London")
             .env(self.env.clone())
             .log(self.log.clone());
         self.store = Some(block_on(Store::open(config)).unwrap());
     }
 
-    pub(super) fn shut(&mut self) {
+    pub(in crate::durable::read) fn shut(&mut self) {
         if let Some(s) = self.store.take() {
             block_on(s.shutdown()).unwrap();
         }
     }
 
-    pub(super) fn emit(&mut self, rs: &[(usize, i64, u8, u8, u64)], revise: bool) {
+    pub(in crate::durable::read) fn emit(
+        &mut self,
+        rs: &[(usize, i64, u8, u8, u64)],
+        revise: bool,
+    ) {
         let now = self.clock.wall().0;
         let readings: Vec<Reading> = rs
             .iter()
@@ -241,14 +245,14 @@ impl Rig {
     }
 
     /// Emits `readings` to both backends, which accept or refuse the call alike.
-    pub(super) fn emit_readings(&mut self, readings: &[Reading], intent: Intent) {
+    pub(in crate::durable::read) fn emit_readings(&mut self, readings: &[Reading], intent: Intent) {
         let m = block_on(self.model.emit_with(readings, intent)).map(|a| a.outcomes.len());
         let store = self.store.as_ref().expect("an open store");
         let d = block_on(store.emit_with(readings, intent)).map(|a| a.outcomes.len());
         assert_eq!(m.is_ok(), d.is_ok(), "{m:?} {d:?}");
     }
 
-    fn step(&mut self, s: &Step) -> Result<(), TestCaseError> {
+    pub(in crate::durable::read) fn step(&mut self, s: &Step) -> Result<(), TestCaseError> {
         match s {
             Step::Emit(rs, revise) => self.emit(rs, *revise),
             Step::Advance(secs) => self.clock.advance(Duration::from_secs(*secs)),
@@ -287,7 +291,7 @@ impl Rig {
 
     /// The process stops, the power goes and the machine boots again with a new boot identity; the store is not
     /// opened again.
-    pub(super) fn power_loss(&mut self) {
+    pub(in crate::durable::read) fn power_loss(&mut self) {
         self.fs.crash_after(0);
         drop(self.store.take());
         self.fs.power_loss();
@@ -336,14 +340,14 @@ impl Rig {
     }
 
     /// A reader opened now.
-    pub(super) fn reader(&self) -> Reader {
+    pub(in crate::durable::read) fn reader(&self) -> Reader {
         Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap()
     }
 
     /// Every durable reader's live state, series and losses equal the model's: the facts with positions set aside
     /// (the model writes no recovery or tzdata entry). Staleness follows from the fact by the rule of roadmap 5.4,
     /// whose defaults differ between the backends (Q-16), so it is not compared.
-    pub(super) fn check(&mut self) -> Result<(), TestCaseError> {
+    pub(in crate::durable::read) fn check(&mut self) -> Result<(), TestCaseError> {
         if self.faulted {
             return self.check_after_damage();
         }
@@ -431,7 +435,7 @@ impl Rig {
 }
 
 /// A live state as the backends agree on it: the fact's position and the staleness set aside.
-pub(super) fn plain(l: Live) -> Live {
+pub(in crate::durable::read) fn plain(l: Live) -> Live {
     match l {
         Live::Value(mut v) => {
             v.fact.position = Position::ORIGIN;
@@ -454,7 +458,7 @@ pub(in crate::durable::read) fn write_directory(
 }
 
 /// [`write_directory`], recording `stamp` in place of the mark's reset stamp when given.
-pub(super) fn write_directory_under(
+pub(in crate::durable::read) fn write_directory_under(
     env: &Env,
     dir: &Path,
     k: usize,
@@ -516,7 +520,7 @@ pub(super) fn write_directory_under(
 }
 
 /// The newest series directory's bytes.
-pub(super) fn newest_directory(fs: &MemFs, dir: &Path) -> Vec<u8> {
+pub(in crate::durable::read) fn newest_directory(fs: &MemFs, dir: &Path) -> Vec<u8> {
     let (_, path) = kvik_log::directory::generations(fs, dir, Family::Series)
         .into_iter()
         .next()
@@ -526,7 +530,7 @@ pub(super) fn newest_directory(fs: &MemFs, dir: &Path) -> Vec<u8> {
 
 /// Writes the series directory `bytes` again as of the mark, under its reset stamp and through its position, claiming
 /// `lost` lost entries below: a directory the reader's checks accept whatever the log lost since it was folded.
-pub(super) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) {
+pub(in crate::durable::read) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) {
     let fs = &*env.fs;
     let store_id = kvik_log::store::read_descriptor(fs, dir).unwrap().store_id;
     let (frame, d) = SeriesDirectory::decode(bytes, &store_id).unwrap();
@@ -560,7 +564,7 @@ pub(super) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) 
 }
 
 /// Runs a history and checks at its end.
-pub(super) fn run(history: &[Step]) -> Result<(u64, u64, u64), TestCaseError> {
+pub(in crate::durable::read) fn run(history: &[Step]) -> Result<(u64, u64, u64), TestCaseError> {
     let mut rig = Rig::new("history");
     for s in history {
         rig.step(s)?;

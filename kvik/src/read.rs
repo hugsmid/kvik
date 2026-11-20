@@ -291,16 +291,32 @@ pub enum Live {
 }
 
 /// The facts of a query, streamed (`docs/api.md` Reading). The model backend
-/// holds them in memory already; the engine streams them block by block.
+/// holds them in memory already.
+///
+/// The durable backend reads them pass by pass at one cut within the reader's memory cap
+/// ([`ReaderConfig::memory`](crate::ReaderConfig::memory)); an error item, such as
+/// [`QueryError::CutExpired`] when the cut ends, is the last.
 #[derive(Debug)]
 pub struct Facts {
-    inner: std::vec::IntoIter<Fact>,
+    inner: FactsInner,
+}
+
+#[derive(Debug)]
+enum FactsInner {
+    Held(std::vec::IntoIter<Fact>),
+    Stream(crate::durable::read::source::FactStream),
 }
 
 impl Facts {
     pub(crate) fn new(facts: Vec<Fact>) -> Self {
         Facts {
-            inner: facts.into_iter(),
+            inner: FactsInner::Held(facts.into_iter()),
+        }
+    }
+
+    pub(crate) fn stream(s: crate::durable::read::source::FactStream) -> Self {
+        Facts {
+            inner: FactsInner::Stream(s),
         }
     }
 }
@@ -308,10 +324,16 @@ impl Facts {
 impl Iterator for Facts {
     type Item = Result<Fact, QueryError>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Ok)
+        match &mut self.inner {
+            FactsInner::Held(i) => i.next().map(Ok),
+            FactsInner::Stream(s) => s.next(),
+        }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        match &self.inner {
+            FactsInner::Held(i) => i.size_hint(),
+            FactsInner::Stream(_) => (0, None),
+        }
     }
 }
 

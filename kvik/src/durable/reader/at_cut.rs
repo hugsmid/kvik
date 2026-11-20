@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 
+use kvik_log::mark::ResetStamp as LogStamp;
 use kvik_log::reader::{FoundFact, LogReader, Lookup, ReaderError, Wanted, WantedAt};
+use kvik_log::writer::Position as LogPos;
 
 use super::{DurableReader, query_error};
 use crate::durable::derived::state::Kept;
@@ -20,6 +22,39 @@ impl DurableReader {
     /// another reset stamp or generation than the cut's ends it.
     pub(crate) fn lookup(&self, v: &View, wanted: &[Wanted]) -> Result<Vec<FoundFact>, QueryError> {
         self.at_cut(v, |r, lost| r.lookup(wanted, lost))
+    }
+
+    /// [`DurableReader::lookup`] keeping at most `budget` bytes of facts (`kvik_log::reader::fact_bytes`); `None`
+    /// when they would pass it.
+    pub(crate) fn lookup_within(
+        &self,
+        v: &View,
+        wanted: &[Wanted],
+        budget: u64,
+    ) -> Result<Option<Vec<FoundFact>>, QueryError> {
+        let l = self.read_at_cut(
+            v,
+            |r, lost| r.lookup_within(wanted, lost, budget),
+            |l| (l.stamp, l.durable),
+        )?;
+        if l.overflowed {
+            return Ok(None);
+        }
+        complete(l, v).map(Some)
+    }
+
+    /// The last position at or below `v`'s cut whose batch was committed at or before `at` (`spec.md` §2.3 As-of
+    /// time); the origin when there is none.
+    pub(crate) fn position_at(&self, v: &View, at: i64) -> Result<LogPos, QueryError> {
+        let f = self.read_at_cut(
+            v,
+            |r, lost| r.position_at(at, lost),
+            |f| (f.stamp, f.durable),
+        )?;
+        if !f.complete {
+            return Err(unreadable());
+        }
+        Ok(f.position.unwrap_or_default().min(v.cut().durable))
     }
 
     /// The facts at the positions `wanted` names, at `v`'s cut, each read from the one segment that holds it, as
@@ -37,6 +72,16 @@ impl DurableReader {
         v: &View,
         read: impl FnOnce(&mut LogReader, &dyn Fn(u64, u64, u64) -> bool) -> Result<Lookup, ReaderError>,
     ) -> Result<Vec<FoundFact>, QueryError> {
+        let l = self.read_at_cut(v, read, |l| (l.stamp, l.durable))?;
+        complete(l, v)
+    }
+
+    fn read_at_cut<T>(
+        &self,
+        v: &View,
+        read: impl FnOnce(&mut LogReader, &dyn Fn(u64, u64, u64) -> bool) -> Result<T, ReaderError>,
+        mark: impl FnOnce(&T) -> (LogStamp, LogPos),
+    ) -> Result<T, QueryError> {
         let mut g = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
         if g.is_none() {
             *g = Some(
@@ -57,21 +102,14 @@ impl DurableReader {
         };
         let l = read(reader, &skip).map_err(|e| query_error(&self.dir, e))?;
         let cut = v.cut();
-        if l.stamp != cut.stamp
-            || l.durable.generation != cut.durable.generation
-            || l.durable < cut.durable
+        let (stamp, durable) = mark(&l);
+        if stamp != cut.stamp
+            || durable.generation != cut.durable.generation
+            || durable < cut.durable
         {
             return Err(QueryError::CutExpired);
         }
-        if l.complete.iter().any(|c| !c) {
-            return Err(QueryError::NotAvailable {
-                reason: "a log segment that may hold the series cannot be read".into(),
-            });
-        }
-        Ok(l.facts
-            .into_iter()
-            .filter(|f| f.position <= cut.durable)
-            .collect())
+        Ok(l)
     }
 
     /// The full fact of series `id`'s candidate `k`, which the fold did not meet: read at its position once, with
@@ -117,4 +155,22 @@ impl DurableReader {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, s);
     }
+}
+
+fn unreadable() -> QueryError {
+    QueryError::NotAvailable {
+        reason: "a log segment that may hold the series cannot be read".into(),
+    }
+}
+
+/// The facts of a complete lookup at or below `v`'s cut; an incomplete one is `NotAvailable` (Q-1004).
+fn complete(l: Lookup, v: &View) -> Result<Vec<FoundFact>, QueryError> {
+    if l.complete.iter().any(|c| !c) {
+        return Err(unreadable());
+    }
+    let durable = v.cut().durable;
+    Ok(l.facts
+        .into_iter()
+        .filter(|f| f.position <= durable)
+        .collect())
 }

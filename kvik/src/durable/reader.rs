@@ -23,6 +23,7 @@ use kvik_log::writer::Position as LogPos;
 use super::clock::Clocks;
 use super::index::{Index, Stored, pos};
 use super::loss::{Find, Latch};
+use super::read::cache::{Accountant, DEFAULT_MEMORY, Sizes};
 use super::read::cut;
 use super::read::flight::Flight;
 use super::read::hub::{Collector, Hub};
@@ -131,6 +132,8 @@ pub(crate) struct DurableReader {
     seeded: AtomicBool,
     /// What each round read, for the live sessions on this reader.
     hub: Hub,
+    /// The memory cap of its queries (Q-1063).
+    memory: Arc<Accountant>,
     #[cfg(test)]
     lookups_made: AtomicU64,
 }
@@ -272,7 +275,19 @@ impl DurableReader {
             lookups_made: AtomicU64::new(0),
             seeded: AtomicBool::new(false),
             hub: Hub::default(),
+            memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),
         })
+    }
+
+    /// The reader with a memory cap of `sizes` (`ReaderConfig::memory`).
+    pub(crate) fn with_memory(mut self, sizes: Sizes) -> Self {
+        self.memory = Accountant::new(sizes);
+        self
+    }
+
+    /// The memory cap of its queries.
+    pub(crate) fn memory(&self) -> &Arc<Accountant> {
+        &self.memory
     }
 
     /// The window clock now (spec §6 `now`).
@@ -734,5 +749,6 @@ pub(crate) fn losses_of(v: &View) -> Vec<LossReport> {
 
 mod at_cut;
 mod errors;
+pub(crate) mod facts;
 #[cfg(test)]
 mod tests;

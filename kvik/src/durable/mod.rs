@@ -69,9 +69,9 @@ use crate::health::{
     ClockStats, DiskStats, Health, IngestStats, Latency, LogStats, LossKind, LossReport,
     MarkSyncMode, Reason, SeriesStats, Stats,
 };
-use crate::read::{Facts, ReaderState, View};
+use crate::read::ReaderState;
 use crate::series::{IntervalLength, Kind, ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
-use crate::time::{TimeRange, Timestamp, ZoneName};
+use crate::time::{Timestamp, ZoneName};
 use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
 use completion::Completion;
 pub(crate) use completion::{Emitted, Queued};
@@ -79,6 +79,7 @@ use entries::Decided;
 use index::{Index, cause_out, fact_out, mark_state_out, pos};
 use ingest::{Decider, Decision};
 use loss::Latch;
+pub(crate) use read::cache::{LEAST_MEMORY, Sizes};
 pub(crate) use read::latest::{live as live_at, series as series_at};
 pub(crate) use read::view::View as SnapshotView;
 pub(crate) use reader::DurableReader;
@@ -325,39 +326,7 @@ fn window_budget(l: &Limits) -> usize {
     usize::try_from(l.window_memory / 2).unwrap_or(usize::MAX)
 }
 
-/// Reads of a durable store: the queries a log reader can answer.
-pub(crate) fn facts(
-    r: &DurableReader,
-    id: SeriesId,
-    range: TimeRange,
-    view: View,
-) -> Result<Facts, QueryError> {
-    r.with(|i, _| i.facts(id, range, view)).map(Facts::new)
-}
-
-/// The latest fact at or before `t` that a window can credit (not bad quality), in a view, ignoring the
-/// staleness limit.
-pub(crate) fn at(
-    r: &DurableReader,
-    id: SeriesId,
-    t: Timestamp,
-    view: View,
-) -> Result<Option<Fact>, QueryError> {
-    let Some(end) = t.0.checked_add(1) else {
-        return Ok(None);
-    };
-    r.with(|i, _| {
-        let fs = i.facts(
-            id,
-            TimeRange::new(Timestamp(i64::MIN), Timestamp(end)),
-            view,
-        )?;
-        Ok(fs
-            .into_iter()
-            .filter(|f| f.quality != crate::types::Quality::Bad)
-            .max_by_key(|f| (f.t, f.position)))
-    })
-}
+pub(crate) use reader::facts::{at, facts};
 
 /// The interval of a fixed-length interval series that contains `t`.
 pub(crate) fn interval(
