@@ -3706,10 +3706,13 @@ minimal class. On a year of seals it measured 195–213 ms median: a reader star
 entry and its metadata per sealed segment, about 1.7 µs a segment here. The design says a reader's system calls per
 call do not depend on the sealed-segment count (9.0b1) and that a reader starts from recorded positions.
 **Decided.** `start_after` tries the mark's segment and the two before it by name, then a binary search over headers
-opened by name (`segment_holding`, about 17 header reads at a year); it lists no directory. Measured again on 41,299
-sealed segments: 22.0 ms median in process and 25.5 ms as a process with the built tail, rising to 40.3 and 55.0 ms
+opened by name (`segment_holding`); it lists no directory. The search starts at the lowest file id the manifest's
+records name in the mark's generation, so it costs about 17 header reads at a year whatever ids earlier generations
+used (file ids are never reused, `format.md` A.12). Measured again on 41,299 sealed segments: 22.0 ms median in
+process and 25.5 ms as a process after the run's own first rounds, rising to 40.3 and 55.0 ms
 as the runs' own writes doubled the tail read after the series directory (`docs/measurements/9.0e-latest-and-tail.md`).
-**Pinned by.** `log/tests/reader_start.rs` `a_start_after_lists_no_directory_and_opens_few_headers`.
+**Pinned by.** `log/tests/reader_start.rs` `a_start_after_lists_no_directory_and_opens_few_headers`,
+`a_start_in_a_later_generation_searches_from_its_first_segment_not_file_id_1`.
 
 ## Q-1054 — The empty poll of a reader process against S13's 50 µs
 Decided by the lead with roadmap 9.0e's fix round; the desktop-class figure waits for roadmap 9.2.
@@ -3723,10 +3726,11 @@ file after the same sleep costs that much. The rise between the two figures is t
 opened by path (the query design's section 3.1), one positioned read and no open; the full refresh once a second
 opens it by path again. The harness prints the reference read beside each poll figure. Measured again on 41,299 sealed
 segments: 41.4–45.4 µs median for a reader handle's `Tail`, beside 56.3–59.7 µs for the reference read.
-What remains over 50 µs is this machine's wake-up cost, not engine work; the desktop-class figure waits for the
+What remains is this machine's wake-up cost, not engine work; the desktop-class figure waits for the
 hardware run of roadmap 9.2.
-**Pinned by.** `log/tests/reader_calls.rs` `a_mark_only_poll_reads_the_held_mark_with_no_open_and_sees_it_move`;
-`kvik/benches/read.rs`.
+**Pinned by.** `log/tests/reader_calls.rs` `a_mark_only_poll_reads_the_held_mark_with_no_open_and_sees_it_move`,
+`a_replaced_mark_is_followed_by_the_held_read_after_one_full_refresh`,
+`a_held_mark_that_reads_no_valid_mark_is_read_again_by_path`; `kvik/benches/read.rs`.
 
 ## Q-1055 — S1 after a write misses its desktop target
 Decided by the lead with roadmap 9.0e's fix round: a known miss, scheduled.
@@ -3745,7 +3749,8 @@ roadmap 9.0f (Q-1010).
 **Decided.** `kvik series` shows a `facts` column from `Snapshot::fact_count` (the fold's count; the fact index's
 when the fold is broken, Q-1006; the model backend's recorded count), no format change. `--since` and `--once` stay
 refused with the reason and follow 9.0f.
-**Pinned by.** `cli/tests/output.rs` (the `series` snapshots).
+**Pinned by.** `cli/tests/output.rs` (the `series` snapshots); `kvik/tests/api.rs` `define_emit_and_read` (both
+backends' counts agree, and an unknown series is refused).
 
 ## Open at v0.2
 

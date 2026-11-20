@@ -102,7 +102,8 @@ impl LogReader {
     }
 
     /// The file id, at most `last`, of the segment of `generation` that holds `sequence`: a binary search over file
-    /// ids by header base sequence, passing over ids with no readable segment.
+    /// ids by header base sequence from the generation's lowest listed segment (`format.md` A.12: file ids are not
+    /// reused, so a later generation's ids start high), passing over ids with no readable segment.
     pub(super) fn segment_holding(
         &self,
         sequence: u64,
@@ -110,7 +111,8 @@ impl LogReader {
         last: u64,
         bases: &mut HashMap<u64, Option<u64>>,
     ) -> Result<Option<u64>, ReaderError> {
-        let (mut lo, mut hi) = (1u64, last);
+        let first = self.manifest.firsts.get(&generation).copied();
+        let (mut lo, mut hi) = (first.filter(|f| (1..=last).contains(f)).unwrap_or(1), last);
         let mut best = None;
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
