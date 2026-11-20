@@ -138,10 +138,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1050 | query design §6 | The tool's command line: the store, the live commands' end, and a tail from a time (decided by the lead) |
 | Q-1051 | query design §6; `format.md` A.15, A.18 | What `health` and `info` read besides the reader (decided by the lead) |
 | Q-1052 | query design §1 | How S1 to S3 and S13 are measured on a year of seals (decided by the lead) |
-| Q-1053 | query design §1 S3 | S3, the one-shot `kvik latest`, misses its target on a year of seals (OWNER) |
-| Q-1054 | query design §1 S13; Q-1017 | The empty poll of a reader process misses S13's 50 µs (OWNER) |
-| Q-1055 | query design §1 S1; Q-1007 | S1 after a write misses its desktop target (OWNER) |
-| Q-1056 | query design §6 | Outputs of the tool the design gives to 9.0e that wait for later steps (OWNER) |
+| Q-1053 | query design §1 S3, 9.0b1 | S3 on a year of seals: a reader's start no longer lists the log directory (decided by the lead) |
+| Q-1054 | query design §1 S13, §3.1; Q-1017 | The empty poll of a reader process against S13: the held mark, and the machine's wake-up cost (decided by the lead) |
+| Q-1055 | query design §1 S1; Q-1007 | S1 after a write misses its desktop target until the hub feeds the writer's reader (decided by the lead) |
+| Q-1056 | query design §6; `format.md` A.18 | Per-series counts in `kvik series` now; `tail --since` and `--once` with 9.0f (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3651,8 +3651,8 @@ five runs of 50 polls 21 ms apart, so one full refresh per run): `Tail` 31 µs (
 once a second, 60 µs here and up to 108 µs for the slowest single poll, and the run disturbed by other work (68 µs).
 These are figures of one shared machine, not of the minimal class, which was not measured; the year of seals the
 design's budget test asks for is roadmap 9.0e's, which measures again.
-**Measured by 9.0e** on a year of seals: 64–111 µs for a reader process's `Tail`, over the target; the owner's
-question is Q-1054.
+**Measured by 9.0e** on a year of seals: 64–111 µs for a reader process's `Tail`, which is this machine's wake-up
+cost rather than work that grows with the log (Q-1054).
 **Pinned by.** `kvik/tests/live_budgets.rs` (a measurement, ignored by default);
 `log/src/reader/tests/parts_and_lookup.rs` `the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch`.
 
@@ -3694,50 +3694,58 @@ grow with age grow with the number of segments, not their bytes, until compactio
 same process stands for a second process (it reads only files); S3 is timed both as a reader opened, read and closed
 and as the `kvik` binary started as a process. Each figure is reported as the median and the worst of its runs over
 three runs, never a best case. A machine is recorded as the class it stands for, or as neither; a class not measured
-is left "not measured here" (`docs/measurements/9.0e-latest-and-tail.md`).
+is left "not measured here" (`docs/measurements/9.0e-latest-and-tail.md`). Neither class was measured by 9.0e, so its
+acceptance "both hardware classes recorded" waits for the hardware run of roadmap 9.2.
 **Pinned by.** `kvik/benches/read.rs`.
 
-## Q-1053 — S3 misses its target on a year of seals
-OWNER: a measured figure worse than a target goes back to the owner (the query design's section 1).
+## Q-1053 — S3 on a year of seals: a reader's start listed the log directory
+Decided by the lead with roadmap 9.0e's fix round: a defect against the design, fixed.
 **Scenario.** S3, 400 latest values as a one-shot command, targets 30 ms on the desktop class and 200 ms on the
-minimal class. On a year of seals the shared four-core machine measured 195–213 ms median, 242–278 ms worst; on 1,469
-sealed segments the same command took 15–21 ms. A one-shot reader's start costs about 1.7 µs per sealed segment here,
-before it reads the series directory and the open segment.
-**Options.** (a) Find and remove the per-segment work of a reader's start (the listing of `log/` and what is done per
-listed segment) so that it reads the log directory files of roadmap 9.0a instead; a follow-up of about 300 lines,
-measured again; the targets stand. (b) Accept S3 as linear in the sealed segments until compaction retires them
-(6.3e), restating the target per segment count. (c) Both: (a) now, with (b)'s wording for a store whose log directory
-cannot be used. The lead's recommendation is (a); nothing is changed until the owner decides.
+minimal class. On a year of seals it measured 195–213 ms median: a reader starting after the series directory's
+`through` (`LogReader::start_after`) listed `log/` to find the segment holding the next position, one directory
+entry and its metadata per sealed segment, about 1.7 µs a segment here. The design says a reader's system calls per
+call do not depend on the sealed-segment count (9.0b1) and that a reader starts from recorded positions.
+**Decided.** `start_after` tries the mark's segment and the two before it by name, then a binary search over headers
+opened by name (`segment_holding`, about 17 header reads at a year); it lists no directory. Measured again on 41,299
+sealed segments: 22.0 ms median in process and 25.5 ms as a process with the built tail, rising to 40.3 and 55.0 ms
+as the runs' own writes doubled the tail read after the series directory (`docs/measurements/9.0e-latest-and-tail.md`).
+**Pinned by.** `log/tests/reader_start.rs` `a_start_after_lists_no_directory_and_opens_few_headers`.
 
-## Q-1054 — The empty poll of a reader process misses S13's 50 µs
-OWNER: a measured figure worse than a target, which Q-1017 left to 9.0e's measurement.
+## Q-1054 — The empty poll of a reader process against S13's 50 µs
+Decided by the lead with roadmap 9.0e's fix round; the desktop-class figure waits for roadmap 9.2.
 **Scenario.** S13 targets an empty poll of 50 µs on the desktop class (200 µs on the minimal class). On a year of
-seals a reader handle's `Tail` measured 64–111 µs (median of fifteen means of 50 polls about 74 µs), with a `Latest`
-of 400 series beside it 91–114 µs; the writer's process 11–17 µs. On about 1,100 sealed segments Q-1017 measured
-31–40 µs, and its re-check 46–62 µs on a busier moment.
-**Options.** (a) Find what in a mark-only poll grows with the log's age and remove it (the poll should not depend on
-the segment count), measured again; the target stands. (b) Accept 100 µs for a reader process on the desktop class,
-keeping 50 µs in the writer's process. (c) Leave the target and record the figure until the desktop-class run of
-roadmap 9.2. The lead's recommendation is (a), then (c).
+seals the harness measured 64–111 µs for a reader handle's `Tail`, against 31–40 µs on about 1,100 sealed segments
+(Q-1017). No part of a poll depends on the number of sealed segments: a mark-only poll is one open and one read of
+4,224 bytes at both 10,669 and 43,026 sealed segments, under 2 µs back to back. The harness polls after a 21 ms
+sleep, and on this machine the first system calls after a wake cost 32–47 µs whatever they do: a bare read of a small
+file after the same sleep costs that much. The rise between the two figures is the machine's load on two days.
+**Decided.** The engineering is done: a mark-only poll reads the mark through the handle the last full refresh
+opened by path (the query design's section 3.1), one positioned read and no open; the full refresh once a second
+opens it by path again. The harness prints the reference read beside each poll figure. Measured again on 41,299 sealed
+segments: 41.4–45.4 µs median for a reader handle's `Tail`, beside 56.3–59.7 µs for the reference read.
+What remains over 50 µs is this machine's wake-up cost, not engine work; the desktop-class figure waits for the
+hardware run of roadmap 9.2.
+**Pinned by.** `log/tests/reader_calls.rs` `a_mark_only_poll_reads_the_held_mark_with_no_open_and_sees_it_move`;
+`kvik/benches/read.rs`.
 
 ## Q-1055 — S1 after a write misses its desktop target
-OWNER: Q-1007 decided how S1 stands; this records the figure on a year of seals for the owner's decision.
+Decided by the lead with roadmap 9.0e's fix round: a known miss, scheduled.
 **Scenario.** S1 targets 0.2 ms on the desktop class. With nothing written since, the writer's process measured
-0.16–0.18 ms median (worst of 50: 0.34 ms); after a round of 400 readings 0.55–0.67 ms median, worst 1.0–3.7 ms. The
-refresh after a write remains (Q-1007): the writer's reader does not yet take its new batches from the shared tail in
-memory.
-**Options.** (a) Feed the writer's own reader from the shared tail hub in memory (Q-1007's named follow-up), measured
-again; the target stands. (b) Accept 1 ms for S1 after a write on the desktop class. The lead's recommendation is (a).
+0.16–0.18 ms median (worst of 50: 0.34 ms); after a round of 400 readings 0.55–0.67 ms median, worst 1.0–3.7 ms, as
+the writer's own reader reads its new batches back from the file rather than from live state in memory.
+**Decided.** The design serves S1 from memory and Q-1007 names the fix, the shared tail hub feeding the writer's
+reader. It lands with roadmap 9.0j (Q-1007) and is measured again there; the target stands.
 
-## Q-1056 — Outputs of the tool the design gives to 9.0e that wait for later steps
-OWNER: the query design's section 6 promises them with 9.0e.
-**Scenario.** `kvik series` is to show counts per series, and `kvik tail` takes `--since` and `--once`. A reader has
-no per-series count (no `series_stats` on a reader, and no count in a series directory entry), and a `Tail` opens at
-its cut only until the as-of time of roadmap 9.0f (Q-1010).
-**Options.** (a) Counts come with 9.0f's sources (a reader that folds the facts it reads), `--since` and `--once`
-with 9.0f's as-of time; until then the tool refuses `--since` and `--once` with the reason and `series` shows no count
-(as built, Q-1050). (b) Add a fact count to the series directory entry (a format change to A.18) so counts come now.
-The lead's recommendation is (a).
+## Q-1056 — Per-series counts in `kvik series`, and `tail --since` and `--once`
+Decided by the lead with roadmap 9.0e's fix round.
+**Scenario.** The query design's section 6 gives `kvik series` counts per series and `kvik tail` `--since` and
+`--once` with 9.0e. A series directory entry holds the facts it folded (`fact_count`, `format.md` A.18), and a
+reader continues that count over the facts it reads after it; a `Tail` opens at its cut only until the as-of time of
+roadmap 9.0f (Q-1010).
+**Decided.** `kvik series` shows a `facts` column from `Snapshot::fact_count` (the fold's count; the fact index's
+when the fold is broken, Q-1006; the model backend's recorded count), no format change. `--since` and `--once` stay
+refused with the reason and follow 9.0f.
+**Pinned by.** `cli/tests/output.rs` (the `series` snapshots).
 
 ## Open at v0.2
 
@@ -3899,10 +3907,10 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017.
 | Q-1050 | 9.0f | Decided by the lead: the tool's store option, `--for`, and `tail --since`/`--once` refused until 9.0f; for review |
 | Q-1051 | 9.0g | Decided by the lead: `health` and `info` read files through `kvik-log`'s decoders, writing only the lease; slots and compaction join with 9.0g and 6.2a2 |
 | Q-1052 | 9.2 | Decided by the lead: a year's count of seals, medians and worst over three runs, the class recorded honestly; both classes measured by 9.2 |
-| Q-1053 | 9.0f | OWNER. S3 at about 200 ms on a year of seals against 30 ms; (a) remove the start's per-segment work recommended |
-| Q-1054 | 9.0f | OWNER. A reader process's empty poll 64–111 µs against 50 µs; (a) then (c) recommended |
-| Q-1055 | 9.0j | OWNER. S1 after a write 0.55–0.67 ms against 0.2 ms; (a) the hub feed for the writer's reader recommended |
-| Q-1056 | 9.0f | OWNER. Series counts and `tail --since`/`--once` wait for 9.0f; (a) recommended |
+| Q-1053 | 9.0e | Decided by the lead: a defect, fixed; a reader's start lists no directory; S3 measured again |
+| Q-1054 | 9.2 | Decided by the lead: the mark read through a held handle; the rest is this machine's wake-up cost; the desktop-class figure waits for 9.2 |
+| Q-1055 | 9.0j | Decided by the lead: a known miss; the hub feed for the writer's reader lands with 9.0j (Q-1007) |
+| Q-1056 | 9.0f | Decided by the lead: `kvik series` counts from `fact_count` now; `tail --since`/`--once` follow 9.0f |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
