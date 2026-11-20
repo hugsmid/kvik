@@ -2,14 +2,10 @@
 //! length, its file identity where the platform gives one and the bytes of the last record the reader holds; a longer
 //! manifest is parsed from the offset last parsed to, a shorter or changed one from its start.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::files::read_at_full;
 use super::{LogReader, ReaderError, io_err};
 use crate::fs::{FileIdentity, FsFile, OpenMode};
-use crate::manifest::{
-    LostRange, ManifestRead, Record, listed_segments, read_manifest, read_records,
-};
+use crate::manifest::{LostRange, Record, read_manifest, read_records};
 use crate::store::MANIFEST;
 
 /// What the reader parsed of the manifest. `valid_end` is 0 before the first read.
@@ -22,17 +18,6 @@ pub(super) struct HeldManifest {
     /// The last record's epoch.
     pub(super) epoch: u64,
     pub(super) lost: Vec<LostRange>,
-    /// The lowest file id the records name in each generation (`format.md` A.14).
-    pub(super) firsts: BTreeMap<u32, u64>,
-}
-
-impl HeldManifest {
-    fn name(&mut self, listed: BTreeSet<(u32, u64)>) {
-        for (g, id) in listed {
-            let e = self.firsts.entry(g).or_insert(id);
-            *e = (*e).min(id);
-        }
-    }
 }
 
 impl LogReader {
@@ -73,7 +58,6 @@ impl LogReader {
             let bytes = read_whole(&*f, len).map_err(io_err(&path))?;
             let m = read_manifest(&bytes, &self.store_id).map_err(ReaderError::Manifest)?;
             next.lost = m.lost_ranges().cloned().collect();
-            next.name(listed_segments(&bytes, &m));
             next.epoch = m.last_epoch();
             next.valid_end = m.valid_end;
             next.last = m
@@ -88,19 +72,6 @@ impl LogReader {
             tail.truncate(got);
             let (records, end) =
                 read_records(&tail, held.valid_end, held.epoch).map_err(ReaderError::Manifest)?;
-            let shifted = ManifestRead {
-                records: records
-                    .iter()
-                    .map(|r| Record {
-                        offset: r.offset - held.valid_end,
-                        end: r.end - held.valid_end,
-                        ..r.clone()
-                    })
-                    .collect(),
-                valid_end: end - held.valid_end,
-                torn: false,
-            };
-            next.name(listed_segments(&tail, &shifted));
             if let Some(r) = records.last() {
                 next.last = Some((r.offset, record_bytes(&tail, held.valid_end, r)));
                 next.epoch = r.epoch;

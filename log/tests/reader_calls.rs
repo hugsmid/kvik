@@ -803,7 +803,7 @@ fn replace_mark(r: &Rig, ahead: u64) -> impl Fn(u64) -> Vec<u8> + use<> {
         .unwrap()
         .unwrap();
     let with = move |n: u64| {
-        let mut s = slot.clone();
+        let mut s = slot;
         s.counter += n;
         encode_mark_file([Some(s), None])
     };
@@ -831,7 +831,7 @@ fn a_held_mark_that_reads_no_valid_mark_is_read_again_by_path() {
     let mut r = Rig::with_sealed(2);
     r.reader.refresh().unwrap();
     let old = Fs::open(&r.fs, &dir().join("log").join("MARK"), OpenMode::ReadWrite).unwrap();
-    replace_mark(&r, 1);
+    let _ = replace_mark(&r, 1);
     old.write_at(&[0; kvik_log::mark::MARK_LEN], 0).unwrap();
     assert!(r.reader.mark_moved().unwrap());
 }

@@ -3708,13 +3708,14 @@ minimal class. On a year of seals it measured 195–213 ms median: a reader star
 entry and its metadata per sealed segment, about 1.7 µs a segment here. The design says a reader's system calls per
 call do not depend on the sealed-segment count (9.0b1) and that a reader starts from recorded positions.
 **Decided.** `start_after` tries the mark's segment and the two before it by name, then a binary search over headers
-opened by name (`segment_holding`); it lists no directory. The search starts at the lowest file id the manifest's
-records name in the mark's generation, so it costs about 17 header reads at a year whatever ids earlier generations
-used (file ids are never reused, `format.md` A.12). Measured again on 41,299 sealed segments: 22.0 ms median in
+opened by name (`segment_holding`); it lists no directory. The search runs from file id 1, so it costs about 17
+header reads at a year while the mark's generation holds the low file ids. A restored generation's ids start above
+every earlier one's (`format.md` A.12), and the search then passes over each absent id with two failed opens; no
+record the reader holds yet names a generation's first segment (no writer appends sealed-segment or restore records
+today). To settle before the restore step. Measured again on 41,299 sealed segments: 22.0 ms median in
 process and 25.5 ms as a process after the run's own first rounds, rising to 40.3 and 55.0 ms
 as the runs' own writes doubled the tail read after the series directory (`docs/measurements/9.0e-latest-and-tail.md`).
-**Pinned by.** `log/tests/reader_start.rs` `a_start_after_lists_no_directory_and_opens_few_headers`,
-`a_start_in_a_later_generation_searches_from_its_first_segment_not_file_id_1`.
+**Pinned by.** `log/tests/reader_start.rs` `a_start_after_lists_no_directory_and_opens_few_headers`.
 
 ## Q-1054 — The empty poll of a reader process against S13's 50 µs
 Decided by the lead with roadmap 9.0e's fix round; the desktop-class figure waits for roadmap 9.2.
