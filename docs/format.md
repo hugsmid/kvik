@@ -816,6 +816,10 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   counts matching, and no entry above `through`. A file that fails a check is **invalid**: it is passed over, never
   repaired, and removed by the next write. A newer `format_major`, an unknown critical block type, entry type or
   field is a version refusal (common rules): the writer refuses to open and never removes the file.
+- **Kept recovery entries.** Every write keeps the recovery entries of the latest valid file of the same generation
+  that its content lacks, up to its `through`, so a recovery entry stays in the file after its batch leaves the kept
+  log (`spec.md` §11 Health, Q-1033). A recovery entry in the file is a reset point (`spec.md` §4 Resync) unless a
+  recorded lost range holds it.
 - **Writing.** The whole file is written under the next `file_id` of kind 5 (A.12), synced, and the directory
   synced (on the first write the `registry/` directory is created and the store directory synced); only then are the
   older registry files removed and the directory synced again. A crash at any point leaves the previous file, the new
@@ -826,15 +830,17 @@ hot tier: `registry/<generation>-<file_id>.reg`.
 - **Reading.** The valid file with the highest `file_id`; with none, the registry comes from the log alone.
 - **At a start** (`spec.md` §3 Order of a start), the file is a derived file: its `through` is a source of F (Recovery
   rule 3), and `max_series_id` and every id it defines count toward the id floor (`spec.md` §2.1), as do its
-  definitions' interval lengths toward the segment index's reach (A.8). Once the log is recovered, the writer
-  rebuilds the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must
-  hold exactly the kept log's registry entries other than label changes up to the last synced mark, with an id floor at least the writer's;
-  if it does not, it is written again from the kept log, with the writer's id floor, so the id of a lost definition
-  stays assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
+  definitions' interval lengths toward the segment index's reach (A.8). Once the log is recovered, the writer rebuilds
+  the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must hold exactly
+  the kept log's registry entries other than label changes up to the last synced mark, and the recovery entries the
+  file read holds that the kept log does not, with an id floor at least the writer's; if it does not, it is written
+  again from the kept log and those recovery entries, with the writer's id floor, so the id of a lost definition stays
+  assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
   a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
-  (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log segments can leave
-  the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry, so the file is checked,
-  never trusted over the log.
+  (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log
+  segments can leave the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry but a
+  recovery entry in a segment that cannot be read, so the file is checked, never trusted over the log, apart from
+  those.
 
 ## A.17 Deep tier: object keys, uploaded forms, claim marker, envelope
 Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below), with two exceptions: claim

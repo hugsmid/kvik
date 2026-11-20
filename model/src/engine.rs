@@ -2193,7 +2193,14 @@ impl Model {
         // The next position continues the current generation; a generation
         // started by a restore begins at its first position (§8).
         let generation = self.disk.generation;
-        // Positions of a lost range are not reused (§3 Recovery rule 2).
+        // Positions of a lost range are not reused (§3 Recovery rule 2), nor
+        // those of a published segment that cannot be read now (Q-1032).
+        let published = self.disk.published().into_iter().filter_map(|f| {
+            let file = self.disk.files.get(&f)?;
+            (file.class == FileClass::Segment)
+                .then(|| file.entries().map(|e| e.position).max())
+                .flatten()
+        });
         let next_position = d
             .entries
             .keys()
@@ -2201,6 +2208,7 @@ impl Model {
             .copied()
             .into_iter()
             .chain(self.disk.lost_ranges().into_iter().map(|(_, to)| to))
+            .chain(published)
             .filter(|p| p.generation == generation)
             .max()
             .map_or(Position::first(generation), Position::next);

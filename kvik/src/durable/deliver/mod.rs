@@ -292,6 +292,36 @@ pub(crate) struct Deliverer {
     records: u64,
 }
 
+/// The reset points the registry file's recovery entries give at a start in `generation`, with the consumers each
+/// names as having no cursor file: every entry of that generation that no recorded lost range holds (`spec.md` §4
+/// Resync, §11 Health; Q-1033).
+fn kept_resets<'a>(
+    file: &'a kvik_log::registry::RegistryFile,
+    generation: u32,
+    lost: &'a [kvik_log::manifest::LostRange],
+) -> impl Iterator<Item = (LogPos, LogPos, &'a [String])> + 'a {
+    file.entries
+        .iter()
+        .filter(move |_| file.generation == generation)
+        .filter_map(move |(seq, _, e)| {
+            let Entry::Recovery(r) = e else {
+                return None;
+            };
+            let at = (file.generation, *seq);
+            if lost
+                .iter()
+                .any(|l| (l.first.0, l.first.1) <= at && at <= (l.last.0, l.last.1))
+            {
+                return None;
+            }
+            let pos = |sequence| LogPos {
+                generation: file.generation,
+                sequence,
+            };
+            Some((pos(*seq), pos(r.after), r.consumers.as_slice()))
+        })
+}
+
 impl Deliverer {
     /// Opens the deliverer on the kept log, before the writer's threads take calls: reads the whole log, the
     /// manifest's lost ranges and every cursor file, and sets each known consumer up to resume (`spec.md` §3 Order of
@@ -307,6 +337,7 @@ impl Deliverer {
         window_budget: usize,
         latch: Arc<LossLatch>,
         fold: Option<Arc<super::derived::SeriesFold>>,
+        generation: u32,
     ) -> io::Result<Deliverer> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
@@ -397,6 +428,15 @@ impl Deliverer {
             .as_ref()
             .map(|r| r.lost_ranges().to_vec())
             .unwrap_or_default();
+        if let Ok(Some((_, file))) = kvik_log::registry::read_latest(&*env.fs, dir, &store_id) {
+            for (p, after, consumers) in kept_resets(&file, generation, &lost) {
+                d.resets.entry(p).or_insert(after);
+                for c in consumers {
+                    let l = d.lost.entry(c.clone()).or_insert(after);
+                    *l = (*l).min(after);
+                }
+            }
+        }
         for l in lost {
             let first = LogPos {
                 generation: l.first.0,

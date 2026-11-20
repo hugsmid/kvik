@@ -509,3 +509,39 @@ fn s8_self_repair_history_coverage() {
     assert!(cover.second_findings > 30 && cover.late_copies > 20);
     assert!(cover.copying_acknowledged > 10 && cover.suspect > 500);
 }
+
+#[test]
+fn self_repair_history_a_segment_found_and_lost_again_after_a_start_keeps_the_rulings() {
+    let ops = [
+        Op::Reachable(false),
+        Op::LoseEvicted(2),
+        Op::Restart,
+        Op::Reachable(true),
+        Op::Segment,
+        Op::LoseEvicted(0),
+        Op::Find(2),
+        Op::Upload,
+        Op::LoseEvicted(3),
+        Op::LoseEvicted(2),
+    ];
+    run(&ops, &mut Cover::default()).unwrap();
+}
+
+#[test]
+fn a_start_does_not_assign_again_the_positions_of_a_segment_awaiting_its_copy() {
+    let mut w = World::new();
+    let awaiting = w.seg(2);
+    for op in [Op::Reachable(false), Op::LoseEvicted(2), Op::Restart] {
+        w.apply(&op, &mut Cover::default()).unwrap();
+    }
+    let last = w.m.disk.files[&awaiting]
+        .entries()
+        .map(|e| e.position)
+        .max()
+        .unwrap();
+    let (_, positions) = sealed_facts(&mut w.m, w.s);
+    assert!(
+        positions.iter().all(|p| *p > last),
+        "{positions:?} after {last:?}"
+    );
+}

@@ -68,6 +68,31 @@ impl RegistryFile {
             })
             .fold(self.max_series_id, u32::max)
     }
+
+    /// Adds the recovery entries of `previous`, a registry file of the same generation, that this one lacks, up to
+    /// `through`: a rewrite keeps every recovery entry, also one whose batch the kept log no longer holds (`spec.md`
+    /// §11 Health, Q-1033).
+    pub fn carry_recovery(&mut self, previous: &RegistryFile) {
+        if previous.generation != self.generation {
+            return;
+        }
+        let mut added = false;
+        for (seq, t, e) in &previous.entries {
+            if e.is_recovery()
+                && *seq <= self.through
+                && self
+                    .entries
+                    .binary_search_by_key(seq, |(s, _, _)| *s)
+                    .is_err()
+            {
+                self.entries.push((*seq, *t, e.clone()));
+                added = true;
+            }
+        }
+        if added {
+            self.entries.sort_by_key(|(s, _, _)| *s);
+        }
+    }
 }
 
 /// Why a registry file cannot be read.
@@ -314,8 +339,9 @@ pub fn read_latest_where(
     Ok(None)
 }
 
-/// Writes `file` as the store's registry file (A.16): under the next `file_id`, synced with its directory, then
-/// every other registry file removed and the directory synced again. Returns the new file's id.
+/// Writes `file` as the store's registry file (A.16): under the next `file_id`, with the recovery entries of the
+/// latest valid file it lacks ([`RegistryFile::carry_recovery`]), synced with its directory, then every other
+/// registry file removed and the directory synced again. Returns the new file's id.
 ///
 /// The caller makes sure `file.through` names no position above the last synced mark (`spec.md` §3 Durable mark).
 pub fn write(
@@ -325,6 +351,11 @@ pub fn write(
     created_at: i64,
     file: &RegistryFile,
 ) -> io::Result<u64> {
+    let mut file = file.clone();
+    if let Ok(Some((_, previous))) = read_latest(fs, store_dir, &store_id) {
+        file.carry_recovery(&previous);
+    }
+    let file = &file;
     let dir = store_dir.join(REGISTRY_DIR);
     let created = fs.read_dir(&dir).is_err();
     fs.create_dir_all(&dir)?;
@@ -484,6 +515,58 @@ mod tests {
         assert_eq!(read_latest(&fs, dir, &[3; 16]).unwrap().unwrap().0, 2);
         assert_eq!(write(&fs, dir, [3; 16], 4, &f).unwrap(), 4);
         assert_eq!(names(&fs, &dir.join(REGISTRY_DIR)).unwrap().len(), 1);
+    }
+
+    fn recovery(after: u64) -> Entry {
+        Entry::Recovery(crate::entries::Recovery {
+            after,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: crate::entries::MarkState::Readable,
+            id_floor: 0,
+            consumers: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_rewrite_keeps_recovery_entries_the_kept_log_no_longer_holds() {
+        let mut previous = sample();
+        previous.entries.insert(2, (5, 150, recovery(4)));
+        previous.entries.push((45, 500, recovery(44)));
+        let mut kept = sample();
+        kept.through = 44;
+        kept.entries.retain(|(s, _, _)| *s != 7);
+        kept.carry_recovery(&previous);
+        let mut want = sample();
+        want.through = 44;
+        want.entries.retain(|(s, _, _)| *s != 7);
+        want.entries.insert(2, (5, 150, recovery(4)));
+        assert_eq!(kept, want, "only recovery entries, once, up to through");
+        let mut again = kept.clone();
+        again.carry_recovery(&previous);
+        assert_eq!(again, want);
+        let mut other = sample();
+        other.generation = 1;
+        other.carry_recovery(&previous);
+        assert_eq!(
+            other.entries,
+            sample().entries,
+            "nothing from another generation"
+        );
+    }
+
+    #[test]
+    fn write_carries_the_recovery_entries_of_the_latest_file() {
+        let fs = MemFs::new();
+        let dir = Path::new("store");
+        fs.create_dir_all(dir).unwrap();
+        let mut f = sample();
+        f.entries.insert(2, (5, 150, recovery(4)));
+        write(&fs, dir, [3; 16], 1, &f).unwrap();
+        write(&fs, dir, [3; 16], 2, &sample()).unwrap();
+        assert_eq!(read_latest(&fs, dir, &[3; 16]).unwrap().unwrap().1, f);
     }
 
     #[test]

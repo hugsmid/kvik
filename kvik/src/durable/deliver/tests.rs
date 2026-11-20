@@ -269,6 +269,7 @@ mod bounded {
             usize::MAX,
             Arc::default(),
             None,
+            0,
         )
         .unwrap()
     }
@@ -564,4 +565,68 @@ mod bounded {
         assert_eq!(triggers, vec![(cond, ConditionState::True)]);
         w.shutdown().unwrap();
     }
+}
+
+fn recovery_file(generation: u32) -> kvik_log::registry::RegistryFile {
+    let entry = |after| {
+        Entry::Recovery(kvik_log::entries::Recovery {
+            after,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: kvik_log::entries::MarkState::Readable,
+            id_floor: 0,
+            consumers: vec!["c".into()],
+        })
+    };
+    kvik_log::registry::RegistryFile {
+        generation,
+        through: 20,
+        max_series_id: 0,
+        entries: vec![(5, 0, entry(4)), (12, 0, entry(9))],
+    }
+}
+
+fn lost_range(first: u64, last: u64) -> kvik_log::manifest::LostRange {
+    kvik_log::manifest::LostRange {
+        identity: (1, first),
+        first: (1, first),
+        last: (1, last),
+        file_id: 0,
+        offset: 0,
+        length: 0,
+        cause: LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: false,
+        stamp: None,
+    }
+}
+
+#[test]
+fn kept_resets_are_the_registry_files_recovery_entries_of_the_writers_generation_outside_lost_ranges()
+ {
+    let p = |s| LogPos {
+        generation: 1,
+        sequence: s,
+    };
+    let file = recovery_file(1);
+    let all: Vec<_> = kept_resets(&file, 1, &[])
+        .map(|(id, fa, c)| (id, fa, c.to_vec()))
+        .collect();
+    let c = vec!["c".to_string()];
+    assert_eq!(all, vec![(p(5), p(4), c.clone()), (p(12), p(9), c.clone())]);
+    assert_eq!(
+        kept_resets(&file, 0, &[]).count(),
+        0,
+        "another generation's file"
+    );
+    assert_eq!(kept_resets(&recovery_file(0), 1, &[]).count(), 0);
+    let held: Vec<_> = kept_resets(&file, 1, &[lost_range(10, 14)])
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(held, vec![p(5)], "an entry a recorded lost range holds");
 }
