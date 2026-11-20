@@ -53,10 +53,7 @@ impl LogReader {
             }
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
-        if self.caches.keep_listed(&listed) {
-            out.complete = false;
-            return Ok(out);
-        }
+        self.caches.keep_listed(&listed);
         let none = Budget::new(0);
         for name in names.into_iter().rev() {
             if name.sealed

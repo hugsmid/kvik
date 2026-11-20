@@ -3736,10 +3736,7 @@ one) on the lookups' log reader of Q-1004, at the view's cut: regions the manife
 are passed over, positions above the cut are dropped. A pass that meets other damage first has the process's scanning
 read find it, as a reader holding every fact did before (it builds the fact index once, which the reader then keeps,
 Q-1006's cost), and reads once more: a region that read reports lost is passed over, and the losses reach every read
-and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. A segment a lookup listed once and that is gone since, above the lowest
-segment listed now (retention removes from the lowest), makes every later lookup of that log reader incomplete, so a
-query fails as `NotAvailable` at every call rather than reading on (Q-951), as the fact index's reader did; a reader
-opened after the removal passes it over as before. `facts` and `at` no longer
+and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. `facts` and `at` no longer
 build the fact index; windows, `buckets` and calendar results still do until roadmap 9.0h folds them from the stream,
 and a broken state's latest values still answer from it (Q-1006). The merge drops a position two sources hold, for the
 recent window when it becomes a source. No new lease: the lookups' log reader already holds one, so a reader keeps up

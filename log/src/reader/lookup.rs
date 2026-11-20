@@ -163,10 +163,6 @@ struct Cached<T> {
 pub(super) struct Caches {
     index: HashMap<u64, Cached<SealIndex>>,
     maps: HashMap<u64, Cached<SegmentMap>>,
-    /// The last listing's file ids, as runs of consecutive ids.
-    listed: Vec<(u64, u64)>,
-    /// Ids listed once and gone since above the lowest id listed now: removed with no record this reader can see.
-    gone: std::collections::BTreeSet<u64>,
     tick: u64,
     bytes: usize,
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
@@ -182,8 +178,6 @@ impl Default for Caches {
         Caches {
             index: HashMap::new(),
             maps: HashMap::new(),
-            listed: Vec::new(),
-            gone: std::collections::BTreeSet::new(),
             tick: 0,
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
@@ -195,32 +189,7 @@ impl Default for Caches {
 }
 
 impl Caches {
-    /// Keeps the caches of listed segments only, and notes ids listed before that are gone above the lowest listed
-    /// now (retention removes from the lowest); returns whether any such id is gone.
-    pub(super) fn keep_listed(&mut self, listed: &HashSet<u64>) -> bool {
-        let mut ids: Vec<u64> = listed.iter().copied().collect();
-        ids.sort_unstable();
-        let least = ids.first().copied().unwrap_or(u64::MAX);
-        for &(a, z) in &self.listed {
-            for id in a.max(least)..=z {
-                if !listed.contains(&id) {
-                    self.gone.insert(id);
-                }
-            }
-        }
-        self.gone.retain(|id| *id > least);
-        self.listed.clear();
-        for id in ids {
-            match self.listed.last_mut() {
-                Some((_, z)) if *z + 1 == id => *z = id,
-                _ => self.listed.push((id, id)),
-            }
-        }
-        self.drop_unlisted(listed);
-        !self.gone.is_empty()
-    }
-
-    fn drop_unlisted(&mut self, listed: &HashSet<u64>) {
+    pub(super) fn keep_listed(&mut self, listed: &HashSet<u64>) {
         let mut freed = 0;
         self.index.retain(|id, c| {
             let keep = listed.contains(id);
@@ -502,10 +471,7 @@ impl LogReader {
             }
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
-        if self.caches.keep_listed(&listed) {
-            out.complete.fill(false);
-            return Ok(out);
-        }
+        self.caches.keep_listed(&listed);
         for name in names {
             if name.sealed && !self.caches.index.contains_key(&name.file_id) {
                 let index = self.read_seal_index(name);
