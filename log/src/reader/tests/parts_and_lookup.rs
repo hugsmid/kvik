@@ -789,6 +789,45 @@ fn the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch() {
     assert!(!r.mark_moved().unwrap());
 }
 
+#[test]
+fn a_position_at_a_time_passes_over_positions_a_later_recovery_entry_voids() {
+    let (fs, log) = store(10);
+    let before = log.stats().durable.sequence;
+    log.submit(vec![fact(4, 1_000, 1), fact(4, 1_001, 1)])
+        .unwrap()
+        .wait()
+        .unwrap();
+    let (voided, at) = *commits(&fs).last().unwrap();
+    assert!(voided.sequence > before);
+    std::thread::sleep(Duration::from_millis(5));
+    let r = crate::entries::Recovery {
+        after: before,
+        stamp: None,
+        boot_id: [0; 16],
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: crate::entries::MarkState::Readable,
+        id_floor: 0,
+        consumers: Vec::new(),
+    };
+    log.submit(vec![Item::from(crate::entries::Entry::Recovery(r))])
+        .unwrap()
+        .wait()
+        .unwrap();
+    log.submit(vec![
+        fact(4, 1_000, 2),
+        fact(4, 1_001, 2),
+        fact(4, 1_002, 2),
+    ])
+    .unwrap()
+    .wait()
+    .unwrap();
+    let got = reader(&fs, 93).position_at(at, &|_, _, _| false).unwrap();
+    assert!(got.complete);
+    assert_eq!(got.position.map(|p| p.sequence), Some(before));
+    log.shutdown().unwrap();
+}
+
 /// Each batch's last position and commit time, as a refresh reads them.
 fn commits(fs: &Arc<MemFs>) -> Vec<(Position, i64)> {
     reader(fs, 92)
@@ -853,7 +892,8 @@ fn a_position_at_a_time_inside_a_damaged_segment_is_incomplete_never_an_earlier_
 }
 
 #[test]
-fn a_lookup_within_a_budget_says_it_overflowed_and_one_above_it_finds_everything() {
+fn a_lookup_within_a_budget_below_what_it_keeps_overflows_and_one_with_room_to_grow_finds_everything()
+ {
     let (fs, log) = store(40);
     let wanted = [Wanted {
         series_id: 3,
@@ -881,8 +921,9 @@ fn a_lookup_within_a_budget_says_it_overflowed_and_one_above_it_finds_everything
         .unwrap();
     assert!(short.overflowed);
     assert!(short.facts.len() < whole.facts.len());
+    // Room for the vector's last move too: its old buffer and its new one.
     let exact = r
-        .lookup_within(&wanted, &|_, _, _| false, within(bytes))
+        .lookup_within(&wanted, &|_, _, _| false, within(bytes * 3 / 2))
         .unwrap();
     assert!(!exact.overflowed);
     assert_eq!(exact.facts, whole.facts);

@@ -122,11 +122,16 @@ impl Budget {
         true
     }
 
-    /// Pushes `f` if the budget has room for it, and for the vector's growth first when it is full.
+    /// Pushes `f` if the budget has room for it, and for the vector's growth first when it is full: room for the old
+    /// buffer again and the new one, as both are held while it moves.
     fn push(&self, facts: &mut Vec<FoundFact>, f: FoundFact) {
         if facts.len() == facts.capacity() {
-            let more = facts.capacity().max(16);
-            if !self.charge((more * std::mem::size_of::<FoundFact>()) as u64) {
+            let record = std::mem::size_of::<FoundFact>() as u64;
+            let (old, more) = (facts.capacity() as u64, facts.capacity().max(1));
+            if (old + more as u64).saturating_mul(record) > self.room.get() {
+                self.over.set(true);
+            }
+            if !self.charge(more as u64 * record) {
                 return;
             }
             facts.reserve_exact(more);
@@ -294,20 +299,29 @@ impl Caches {
         );
     }
 
-    /// The last position of the mapped batches of a segment, up to the mark, whose commit time is at or before `at`.
+    /// The last position of the mapped batches of a segment, up to the mark, whose commit time is at or before `at`;
+    /// positions a later recovery entry of the segment voids are passed over, as they are given again to batches
+    /// committed after it (Q-1064).
     pub(super) fn last_committed(&self, file_id: u64, at: i64, q: &Query<'_>) -> Option<Position> {
-        self.maps
-            .get(&file_id)?
-            .value
-            .batches
+        let m = &self.maps.get(&file_id)?.value;
+        m.batches
             .iter()
-            .take_while(|s| !(s.generation == q.generation && s.last > q.last_sequence))
-            .filter(|s| s.commit_time <= at)
-            .last()
-            .map(|s| Position {
-                generation: s.generation,
-                sequence: s.last,
+            .enumerate()
+            .take_while(|(_, s)| !(s.generation == q.generation && s.last > q.last_sequence))
+            .filter(|(_, s)| s.commit_time <= at)
+            .filter_map(|(j, s)| {
+                let kept = m
+                    .recoveries
+                    .iter()
+                    .filter(|(k, after)| *k > j && after.generation == s.generation)
+                    .map(|(_, after)| after.sequence)
+                    .fold(s.last, u64::min);
+                (kept >= s.first).then_some(Position {
+                    generation: s.generation,
+                    sequence: kept,
+                })
             })
+            .last()
     }
 
     /// Drops the least recently used entries until the caches hold at most [`LOOKUP_CACHE_BYTES`].
@@ -400,7 +414,9 @@ fn read_batch_at<R>(
         Refusal::AtOnce,
         false,
     ) {
-        BatchRead::Complete(b, _) if b.end() == s.end && b.commit.first_sequence == s.first => take(&b),
+        BatchRead::Complete(b, _) if b.end() == s.end && b.commit.first_sequence == s.first => {
+            take(&b)
+        }
         _ => None,
     }
 }
