@@ -49,5 +49,10 @@ stats_alloc = "0.1.10"
 [target.'cfg(kvik_loom)'.dev-dependencies]
 loom = "0.7.2"
 
+# The budgets S1 to S3 and S13 on a year of seals (roadmap 9.0e): `cargo bench -p kvik --bench read`.
+[[bench]]
+name = "read"
+harness = false
+
 [lints]
 workspace = true
