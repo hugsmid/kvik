@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use kvik_log::writer::Position as LogPos;
 
-use super::cache::PassKey;
 use super::log_source::LogTail;
 use super::merge;
 use super::view::View;
@@ -57,8 +56,9 @@ impl Plan {
     }
 }
 
-/// The facts of one pass over `series` of `plan` at `v`'s cut, merged from every source; `None` when they would
-/// pass the pass's grant.
+/// The facts of one pass over `series` at `v`'s cut, merged from every source; `None` when they would pass the pass's
+/// grant. A pass is read again rather than kept: a lookup verifies every batch it reads, so damage after an earlier
+/// read is found (Q-1063).
 pub(crate) fn pass(
     r: &DurableReader,
     v: &View,
@@ -66,20 +66,25 @@ pub(crate) fn pass(
     from: i64,
     to: i64,
     bound: LogPos,
-) -> Result<Option<Arc<[Stored]>>, QueryError> {
-    let key = PassKey {
-        series: series.to_vec(),
-        from,
-        to,
-        bound,
-        stamp: v.cut().stamp,
-        losses: (v.lost_ranges().len(), r.found_lost()),
-    };
-    let memory = r.memory();
-    if let Some(rows) = memory.cached(&key) {
-        return Ok(Some(rows));
+) -> Result<Option<Vec<Stored>>, QueryError> {
+    match pass_once(r, v, series, from, to, bound) {
+        Err(QueryError::NotAvailable { .. }) => {
+            r.find_losses()?;
+            pass_once(r, v, series, from, to, bound)
+        }
+        other => other,
     }
-    let grant = memory.admit();
+}
+
+fn pass_once(
+    r: &DurableReader,
+    v: &View,
+    series: &[u32],
+    from: i64,
+    to: i64,
+    bound: LogPos,
+) -> Result<Option<Vec<Stored>>, QueryError> {
+    let grant = r.memory().admit();
     let p = Pass {
         series,
         from,
@@ -90,29 +95,12 @@ pub(crate) fn pass(
     let budget = grant.rows() / sources.len() as u64;
     let mut parts = Vec::with_capacity(sources.len());
     for s in &mut sources {
-        match s.read(&p, budget) {
-            Ok(Read::Rows(rows)) => parts.push(rows),
-            Ok(Read::TooMany) => return Ok(None),
-            Err(QueryError::NotAvailable { reason }) => {
-                drop((grant, sources, parts));
-                let known = r.found_lost();
-                r.find_losses()?;
-                if r.found_lost() == known {
-                    return Err(QueryError::NotAvailable { reason });
-                }
-                return pass(r, v, series, from, to, bound);
-            }
-            Err(e) => return Err(e),
+        match s.read(&p, budget)? {
+            Read::Rows(rows) => parts.push(rows),
+            Read::TooMany => return Ok(None),
         }
     }
-    let rows: Arc<[Stored]> = merge::merge(parts).into();
-    let bytes = rows
-        .iter()
-        .map(|s| kvik_log::reader::fact_bytes(&s.row))
-        .sum();
-    drop(grant);
-    memory.keep(key, rows.clone(), bytes);
-    Ok(Some(rows))
+    Ok(Some(merge::merge(parts)))
 }
 
 /// A part of a read: an inclusive event-time range over the plan's series from `lo` to `hi`, exclusive.

@@ -3736,7 +3736,10 @@ one) on the lookups' log reader of Q-1004, at the view's cut: regions the manife
 are passed over, positions above the cut are dropped. A pass that meets other damage first has the process's scanning
 read find it, as a reader holding every fact did before (it builds the fact index once, which the reader then keeps,
 Q-1006's cost), and reads once more: a region that read reports lost is passed over, and the losses reach every read
-and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. `facts` and `at` no longer
+and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. A segment a lookup listed once and that is gone since, above the lowest
+segment listed now (retention removes from the lowest), makes every later lookup of that log reader incomplete, so a
+query fails as `NotAvailable` at every call rather than reading on (Q-951), as the fact index's reader did; a reader
+opened after the removal passes it over as before. `facts` and `at` no longer
 build the fact index; windows, `buckets` and calendar results still do until roadmap 9.0h folds them from the stream,
 and a broken state's latest values still answer from it (Q-1006). The merge drops a position two sources hold, for the
 recent window when it becomes a source. No new lease: the lookups' log reader already holds one, so a reader keeps up
@@ -3745,7 +3748,9 @@ stream, so passes of concurrent calls on one reader run one at a time.
 **Pinned by.** `kvik/src/durable/read/source/tests.rs`
 `facts_and_at_equal_the_fact_index_and_the_model_at_every_cap` (generated histories of late facts, revisions of a
 versioned series, restarts, power losses, damaged batches and seals; every view, `AsOf` and `AsOfTime` among them,
-against a fresh reader's fact index and the model); `kvik/tests/durable_differential.rs`.
+against a fresh reader's fact index and the model); `kvik/tests/durable_differential.rs`; `kvik/tests/durable_losses.rs`
+`damage_to_a_batch_read_after_a_found_loss_extends_it_in_every_process`,
+`a_watch_whose_segment_is_removed_reports_losses_unknown`.
 
 ## Q-1061 — An iteration whose cut ends or whose reset stamp changes
 Decided by the lead with roadmap 9.0f, for review; settles Q-850.
@@ -3781,9 +3786,10 @@ hard; §3.5: a minimum grant at admission, the cache giving way down to a quarte
 log block.
 **Decided.** A pass, not a stream, holds a grant: it reserves 16 MiB for a log block (the largest body, flat until the
 A.8 index names block sizes) plus at least 1 MiB of rows, taking everything free when that is under two such grants and
-half of it otherwise. The cache's share is a quarter of the cap and at least the lookups' log reader's 8 MiB, which it
-counts; decoded passes, keyed by series, range, bound, reset stamp and the losses known, fill what grants leave and give
-way to a grant down to that share. A lookup counts the facts it keeps (`kvik_log::reader::fact_bytes`: the record and
+half of it otherwise. The cache's share is a quarter of the cap and at least the lookups' log reader's 8 MiB (segment
+indexes and batch maps), which no pass takes. Decoded passes are not kept: a lookup verifies every batch it reads, so
+damage after an earlier read is found at the next read, as the fact index's re-check of the last batch found it, where
+a kept pass would show the damaged fact. A lookup counts the facts it keeps (`kvik_log::reader::fact_bytes`: the record and
 its text, at decode, a voided fact still counted) and stops once past the pass's rows; the pass then halves its event
 time window (series at one time) and reads again, so results are equal at any cap. With 32 MiB one pass runs at a
 time with 8 MiB of rows; with 64 MiB two run at once. A stream's rows awaiting delivery are the caller's result, outside
@@ -3793,10 +3799,11 @@ waits on another caller's iteration. One event time of one series holding more f
 `OpenError::Config`. Not built: growth past the admission grant, and the cap of the writer's own reader, which takes the
 default.
 **Pinned by.** `kvik/src/durable/read/cache.rs` `the_default_cap_admits_two_passes_and_the_least_one`,
-`a_pass_waits_until_a_grant_is_given_back`, `the_cache_gives_way_to_a_pass_down_to_its_share`;
+`a_pass_waits_until_a_grant_is_given_back`;
 `kvik/src/durable/read/source/tests.rs`
 `a_maximal_batch_reads_in_several_passes_at_the_least_cap_with_the_fact_indexs_result`,
-`a_reader_below_the_least_memory_cap_is_refused`, and the generated histories at caps of a few facts a pass;
+`a_reader_below_the_least_memory_cap_is_refused`, `reads_in_many_passes_equal_one_pass_in_every_view_and_at_every_time`,
+and the generated histories at caps of a few facts a pass;
 `log/src/reader/tests/parts_and_lookup.rs`
 `a_lookup_within_a_budget_says_it_overflowed_and_one_above_it_finds_everything`.
 

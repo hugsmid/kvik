@@ -1,15 +1,10 @@
 //! One memory cap for everything a reader's queries allocate (`ReaderConfig::memory`, the query design's §1 Memory
-//! and §3.5): grants for running passes, a log block's reserve within each, and a cache of decoded passes that gives
-//! way down to a quarter of the cap before any pass is squeezed (Q-1063).
+//! and §3.5): grants for running passes, a log block's reserve within each, and the cache's share, a quarter of the
+//! cap and at least what the lookups' log reader keeps (Q-1063).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use kvik_log::mark::ResetStamp as LogStamp;
 use kvik_log::reader::LOOKUP_CACHE_BYTES;
-use kvik_log::writer::Position as LogPos;
-
-use crate::durable::index::Stored;
 
 /// The default cap (`ReaderConfig::memory`).
 pub(crate) const DEFAULT_MEMORY: u64 = 64 << 20;
@@ -46,52 +41,12 @@ impl Sizes {
     }
 }
 
-/// What a decoded pass is keyed by: its series, inclusive event-time range and position bound, under one reset stamp
-/// and the losses known when it was read (a fact found lost later is never shown, Q-1006).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PassKey {
-    pub(crate) series: Vec<u32>,
-    pub(crate) from: i64,
-    pub(crate) to: i64,
-    pub(crate) bound: LogPos,
-    pub(crate) stamp: LogStamp,
-    pub(crate) losses: (usize, usize),
-}
-
-#[derive(Debug)]
-struct Entry {
-    rows: Arc<[Stored]>,
-    bytes: u64,
-    used: u64,
-}
-
 #[derive(Debug, Default)]
 struct State {
     granted: u64,
     grants: usize,
-    cache: HashMap<PassKey, Entry>,
-    cached: u64,
-    tick: u64,
     #[cfg(test)]
     peak: u64,
-}
-
-impl State {
-    /// Drops the least recently used entries until the cache holds at most `room`.
-    fn trim(&mut self, room: u64) {
-        while self.cached > room {
-            let Some(k) = self
-                .cache
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            let e = self.cache.remove(&k).expect("just found");
-            self.cached -= e.bytes;
-        }
-    }
 }
 
 /// See the module documentation.
@@ -148,8 +103,7 @@ impl Accountant {
         self.sizes.block + self.sizes.min_rows
     }
 
-    /// Admits a pass: waits until the least grant is free, the cache trimmed to its share first, and takes all that
-    /// is free when that is under two least grants, else half of it. Only running passes hold grants, and a pass
+    /// Admits a pass: waits until the least grant is free, and takes all that is free when that is under two least grants, else half of it. Only running passes hold grants, and a pass
     /// waits on nothing while it holds one, so the wait ends (Q-1063).
     pub(crate) fn admit(self: &Arc<Self>) -> Grant {
         let least = self.least();
@@ -164,11 +118,9 @@ impl Accountant {
                 };
                 s.granted += bytes;
                 s.grants += 1;
-                let room = self.sizes.cap - s.granted - self.sizes.lookups;
-                s.trim(room);
                 #[cfg(test)]
                 {
-                    s.peak = s.peak.max(s.granted + s.cached + self.sizes.lookups);
+                    s.peak = s.peak.max(s.granted + self.sizes.floor());
                 }
                 return Grant {
                     acc: self.clone(),
@@ -179,37 +131,7 @@ impl Accountant {
         }
     }
 
-    /// The rows of a decoded pass, if cached.
-    pub(crate) fn cached(&self, key: &PassKey) -> Option<Arc<[Stored]>> {
-        let mut s = self.lock();
-        s.tick += 1;
-        let tick = s.tick;
-        let e = s.cache.get_mut(key)?;
-        e.used = tick;
-        Some(e.rows.clone())
-    }
-
-    /// Keeps a decoded pass of `bytes` if it fits beside what passes hold.
-    pub(crate) fn keep(&self, key: PassKey, rows: Arc<[Stored]>, bytes: u64) {
-        let mut s = self.lock();
-        let room = self.sizes.cap - s.granted - self.sizes.lookups;
-        if bytes > room {
-            return;
-        }
-        s.tick += 1;
-        let used = s.tick;
-        if let Some(old) = s.cache.insert(key, Entry { rows, bytes, used }) {
-            s.cached -= old.bytes;
-        }
-        s.cached += bytes;
-        s.trim(room);
-        #[cfg(test)]
-        {
-            s.peak = s.peak.max(s.granted + s.cached + self.sizes.lookups);
-        }
-    }
-
-    /// The most bytes grants, the cache and the lookups' cache held together.
+    /// The most bytes grants and the cache's share held together.
     #[cfg(test)]
     pub(crate) fn peak(&self) -> u64 {
         self.lock().peak
@@ -221,17 +143,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    fn key(n: i64) -> PassKey {
-        PassKey {
-            series: vec![1],
-            from: n,
-            to: n,
-            bound: LogPos::default(),
-            stamp: LogStamp::default(),
-            losses: (0, 0),
-        }
-    }
 
     #[test]
     fn the_default_cap_admits_two_passes_and_the_least_one() {
@@ -254,34 +165,5 @@ mod tests {
         assert!(!t.is_finished(), "a second pass waits under the least cap");
         drop(g);
         assert!(t.join().unwrap() > 0);
-    }
-
-    #[test]
-    fn the_cache_gives_way_to_a_pass_down_to_its_share() {
-        let sizes = Sizes {
-            cap: 1_000,
-            block: 100,
-            min_rows: 100,
-            lookups: 100,
-        };
-        let a = Accountant::new(sizes);
-        for n in 0..9 {
-            a.keep(key(n), Arc::from(Vec::new()), 100);
-        }
-        assert!(a.cached(&key(8)).is_some());
-        let g = a.admit();
-        assert_eq!(g.bytes, 750 / 2);
-        assert!(a.peak() <= 1_000);
-        assert!(
-            a.cached(&key(0)).is_none(),
-            "the least recently used went first"
-        );
-        assert!(a.cached(&key(8)).is_some());
-        drop(g);
-        a.keep(key(20), Arc::from(Vec::new()), 901);
-        assert!(
-            a.cached(&key(20)).is_none(),
-            "an entry above the cap is not kept"
-        );
     }
 }

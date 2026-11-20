@@ -346,3 +346,43 @@ fn a_stream_held_past_its_cuts_age_ends_with_cut_expired() {
     assert!(s.next().is_none());
     rig.shut();
 }
+
+#[test]
+fn reads_in_many_passes_equal_one_pass_in_every_view_and_at_every_time() {
+    let mut rig = Rig::new("passes");
+    let now = rig.clock.wall().0;
+    let id = rig.ids[3];
+    let rs: Vec<Reading> = (0..60i64)
+        .map(|k| {
+            let mut r = Reading::new(
+                id,
+                Timestamp(now - 600 + (k * 7) % 40),
+                Value::F64(k as f64),
+            );
+            r.changed_at = Some((k % 3) as u64);
+            r
+        })
+        .collect();
+    for chunk in rs.chunks(6) {
+        rig.emit_readings(chunk, Intent::Normal);
+    }
+    let one = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let many = reader_with(&rig.env, &rig.dir, tiny(8));
+    for view in [View::History, View::Current] {
+        let want = collect(facts(one.clone(), id, all(), view).unwrap()).unwrap();
+        assert!(want.len() > 10);
+        assert_eq!(
+            collect(facts(many.clone(), id, all(), view).unwrap()).unwrap(),
+            want
+        );
+        for t in (-605..-555).map(|s| now + s) {
+            assert_eq!(
+                at(&many, id, Timestamp(t), view).unwrap(),
+                at(&one, id, Timestamp(t), view).unwrap(),
+                "{view:?} at {}",
+                t - now
+            );
+        }
+    }
+    rig.shut();
+}
