@@ -24,7 +24,7 @@ pub fn walk(fs: &dyn Fs, root: &Path) -> Vec<(String, u64)> {
             } else {
                 format!("{rel}/{}", e.name)
             };
-            if e.dir {
+            if e.is_dir {
                 if depth < 4 {
                     go(fs, root, &path, out, depth + 1);
                 }

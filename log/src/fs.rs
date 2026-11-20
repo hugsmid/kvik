@@ -38,7 +38,7 @@ pub struct DirEntry {
     /// Length in bytes.
     pub len: u64,
     /// Whether the entry is a directory.
-    pub dir: bool,
+    pub is_dir: bool,
 }
 
 impl DirEntry {
@@ -47,14 +47,14 @@ impl DirEntry {
         DirEntry {
             name: name.into(),
             len,
-            dir: false,
+            is_dir: false,
         }
     }
 
     /// A directory's entry.
     pub fn directory(name: impl Into<String>) -> Self {
         DirEntry {
-            dir: true,
+            is_dir: true,
             ..DirEntry::new(name, 0)
         }
     }
@@ -156,7 +156,7 @@ impl Fs for StdFs {
             out.push(DirEntry {
                 name: e.file_name().to_string_lossy().into_owned(),
                 len: if meta.is_file() { meta.len() } else { 0 },
-                dir: meta.is_dir(),
+                is_dir: meta.is_dir(),
             });
         }
         out.sort();
@@ -791,12 +791,9 @@ impl Fs for MemFs {
             } else {
                 lock(d).bytes.len() as u64
             };
-            let e = out.entry(name.clone()).or_insert(DirEntry {
-                name,
-                len,
-                dir: deeper,
-            });
-            e.dir |= deeper;
+            out.entry(name.clone())
+                .or_insert_with(|| DirEntry::new(name, len))
+                .is_dir |= deeper;
         }
         Ok(out.into_values().collect())
     }
