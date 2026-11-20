@@ -106,7 +106,7 @@ fn ids_of(store: &Store) -> Vec<SeriesId> {
 fn year(dir: &Path, seals: usize) -> (Store, Vec<SeriesId>) {
     let marker = dir.with_extension("built");
     if !marker.exists() {
-        let _ = std::fs::remove_dir_all(dir);
+        // A build that was stopped continues where it stopped.
         let store = block_on(Store::open(config(dir, Duration::from_millis(1)))).unwrap();
         let ids = ids_of(&store);
         let began = Instant::now();

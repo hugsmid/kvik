@@ -135,6 +135,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1015 | query design §1 S13, §3.6 | Waking, pacing and due times of a live session (decided by the lead) |
 | Q-1016 | query design §2.1; roadmap 8.1g | A live read and an unavailable segment or tier (decided by the lead) |
 | Q-1017 | query design §1 S13 | The empty poll of a reader process against S13 (decided by the lead) |
+| Q-1050 | query design §6 | The tool's command line: the store, the live commands' end, and a tail from a time (decided by the lead) |
+| Q-1051 | query design §6; `format.md` A.15, A.18 | What `health` and `info` read besides the reader (decided by the lead) |
+| Q-1052 | query design §1 | How S1 to S3 and S13 are measured on a year of seals (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3646,6 +3649,33 @@ These are figures of one shared machine, not of the minimal class, which was not
 design's budget test asks for is roadmap 9.0e's, which measures again.
 **Pinned by.** `kvik/tests/live_budgets.rs` (a measurement, ignored by default);
 `log/src/reader/tests/parts_and_lookup.rs` `the_mark_alone_shows_whether_a_refresh_would_find_a_new_batch`.
+
+## Q-1050 — The tool's command line
+Decided by the lead with roadmap 9.0e, for review.
+**Scenario.** The query design's section 6 gives the commands and `--format` and `--zone`, and leaves open how the
+store is named, how a live command ends, and `tail --since` and `--once`, while a `Tail` opens at its cut only until
+the as-of time of roadmap 9.0f (Q-1010).
+**Decided.** `--store <dir>`, or `KVIK_STORE`; patterns are the `Select::Names` patterns. A live command runs until
+stopped, or for `--for <duration>`; `--interval` (default 200 ms, at least 20 ms) is the session's least batch
+interval, and its poll interval is half of it (at least 10 ms). `tail --since` and `--once` are refused with the
+reason until 9.0f gives a tail from a time; without them `--once` would have no recent facts to stop after. A
+usage error exits with status 2 and the usage text, any other error with status 1; an error is never printed as an
+empty answer. `series` shows every name of a series (the defining name first) in place of a separate alias column.
+Tables, CSV with a header line, and JSON lines with numbers bare; times in RFC 3339.
+**Pinned by.** `cli/src/args.rs` tests; `cli/tests/output.rs`.
+
+## Q-1051 — What `health` and `info` read besides the reader
+Decided by the lead with roadmap 9.0e, for review.
+**Scenario.** The design builds the tool "on `Reader` alone", but `health` shows segments, leases, the series
+directory and the writer's status file, and `info` the descriptor and files by kind, none of which `Reader` gives.
+**Decided.** Facts, latest values, losses and the reader's position come from `Reader`; the file inventory comes from
+listing the store directory, and the descriptor, leases (A.15), newest series directory and status file (A.18) and
+the newest registry file (A.16) from `kvik-log`'s read-only decoders. None opens a file for writing; the tool's only
+write is the reader's lease (Q-727). A missing or invalid status file is shown as such, the file's age beside it.
+The site zone and tzdata version in force are the newest registry file's last entries of each, else the
+descriptor's. Query slots and compaction join `health` with roadmaps 9.0g and 6.2a2.
+**Pinned by.** `cli/tests/writes.rs` `the_tool_writes_only_under_leases_with_the_writer_running_and_shut` (every
+file-system call that can change a file or take a lock names a path under `leases/`); `cli/tests/output.rs`.
 
 ## Open at v0.2
 
