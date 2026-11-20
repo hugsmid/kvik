@@ -78,7 +78,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
 
     /// What the latest readable marker of `g` at or below `latest` names, scanning down past those that do not open,
     /// decode or match their key, or that the bucket no longer holds (Q-614 (c)); one of a version this build does not
-    /// read stops uploads (Q-960). The scan has no bound (Q-1020).
+    /// read stops uploads (Q-960). The scan has no bound (Q-1030).
     async fn latest_readable(&mut self, g: u32, latest: u64) -> Out<Summary> {
         for sequence in (1..=latest).rev() {
             match marker::read(&self.sink, &self.envelope, &self.keys, g, sequence).await {
