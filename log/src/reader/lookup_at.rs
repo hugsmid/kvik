@@ -103,7 +103,7 @@ impl LogReader {
 
     /// The file id, at most `last`, of the segment of `generation` that holds `sequence`: a binary search over file
     /// ids by header base sequence, passing over ids with no readable segment.
-    fn segment_holding(
+    pub(super) fn segment_holding(
         &self,
         sequence: u64,
         generation: u32,
@@ -137,7 +137,7 @@ impl LogReader {
 
     /// The base sequence of segment `file_id` from its header, remembered for the call; `None` when it has no
     /// readable header.
-    fn base_of(
+    pub(super) fn base_of(
         &self,
         generation: u32,
         file_id: u64,
