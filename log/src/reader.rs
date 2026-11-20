@@ -86,7 +86,6 @@ use crate::content_error::BodyError;
 use crate::crc::crc32c;
 use crate::error::FormatError;
 use crate::fs::Fs;
-use crate::header::HEADER_LEN;
 use crate::lease::{CutEnd, Cuts, LEASE_EXPIRY, LEASE_LEN, LEASE_REFRESH, LeaseSlot, lease_name};
 use crate::manifest::{LostRange, ManifestError};
 use crate::mark::{MarkSlot, ResetStamp};

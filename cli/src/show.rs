@@ -100,7 +100,11 @@ pub fn kind(k: &Kind) -> String {
 
 /// A lower-case name from a `Debug` form.
 pub fn lower(d: impl std::fmt::Debug) -> String {
-    let s = format!("{d:?}");
+    snake(&format!("{d:?}"))
+}
+
+/// `CamelCase` as `camel_case`.
+pub fn snake(s: &str) -> String {
     let mut out = String::new();
     for (k, c) in s.chars().enumerate() {
         if c.is_ascii_uppercase() {

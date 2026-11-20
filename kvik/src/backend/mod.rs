@@ -1804,8 +1804,12 @@ impl Slot {
         let ids: Vec<SeriesId> = self.specs.keys().copied().collect();
         let mut live = BTreeMap::new();
         let mut series = BTreeMap::new();
+        let mut counts = BTreeMap::new();
         let mut names = BTreeSet::new();
         for id in ids {
+            if let Some(st) = self.series_stats(id) {
+                counts.insert(id, st.recorded);
+            }
             live.insert(id, self.live(id).map_err(Error::query));
             let info = self.series(SeriesKey::Id(id)).map_err(Error::query);
             if let Ok(i) = &info {
@@ -1825,6 +1829,7 @@ impl Slot {
             now,
             live,
             series,
+            counts,
             names,
             losses: self.losses(),
         })

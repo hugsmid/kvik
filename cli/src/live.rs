@@ -101,11 +101,22 @@ fn run(
             }
             out.flush()?;
             headed = true;
+            if let Some(r) = closed(&b) {
+                return Err(Error::Closed(r));
+            }
         }
         if left.is_some_and(|l| l.is_zero()) {
             return Ok(());
         }
     }
+}
+
+/// Why a batch closed the live read, if it did.
+fn closed(b: &UpdateBatch) -> Option<String> {
+    b.events.iter().find_map(|(_, e)| match e {
+        LiveEvent::Closed(r) => Some(show::lower(r)),
+        _ => None,
+    })
 }
 
 fn batch(
@@ -183,4 +194,42 @@ pub fn tail(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
         }
         _ => Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvik::{CloseReason, Position};
+
+    #[test]
+    fn markers_name_each_lifecycle_event() {
+        let mut names = Names(BTreeMap::new());
+        let p = |s| Position::new(0, s);
+        let events = [
+            LiveEvent::Reset { above: p(7) },
+            LiveEvent::Gap {
+                first: p(8),
+                last: p(9),
+            },
+            LiveEvent::Lagged {
+                from: p(10),
+                to: p(12),
+            },
+            LiveEvent::Left {
+                series: SeriesId(3),
+            },
+            LiveEvent::Closed(CloseReason::Idle),
+        ];
+        let mut out = Vec::new();
+        for head in [LATEST, TAIL] {
+            let mut t = Table::new(head);
+            for e in &events {
+                for r in common(head, "0:12", e, &mut names).unwrap() {
+                    t.row(r);
+                }
+            }
+            t.write(Format::Csv, true, &mut out).unwrap();
+        }
+        insta::assert_snapshot!(String::from_utf8(out).unwrap());
+    }
 }

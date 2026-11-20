@@ -12,8 +12,7 @@ use kvik_log::entries::Entry;
 use kvik_log::lease::{LeaseSlot, read_leases};
 use kvik_log::store::StoreDescriptor;
 
-/// Every file under the store directory with its length, by path relative to it. A directory is told from a file by
-/// having entries.
+/// Every file under the store directory with its length, by path relative to it.
 pub fn walk(fs: &dyn Fs, root: &Path) -> Vec<(String, u64)> {
     fn go(fs: &dyn Fs, root: &Path, rel: &str, out: &mut Vec<(String, u64)>, depth: u32) {
         let Ok(entries) = fs.read_dir(&root.join(rel)) else {
@@ -25,9 +24,10 @@ pub fn walk(fs: &dyn Fs, root: &Path) -> Vec<(String, u64)> {
             } else {
                 format!("{rel}/{}", e.name)
             };
-            let below = depth < 4 && fs.read_dir(&root.join(&path)).is_ok_and(|v| !v.is_empty());
-            if below {
-                go(fs, root, &path, out, depth + 1);
+            if e.dir {
+                if depth < 4 {
+                    go(fs, root, &path, out, depth + 1);
+                }
             } else {
                 out.push((path, e.len));
             }

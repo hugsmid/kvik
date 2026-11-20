@@ -32,6 +32,10 @@ pub enum Error {
     Query(kvik::QueryError),
     /// Writing the output failed.
     Output(std::io::Error),
+    /// The answer was written, but the reader knows of lost data it may lack (the query design's section 6).
+    Losses(Vec<String>),
+    /// A live read was closed; its row was written.
+    Closed(String),
 }
 
 impl std::fmt::Display for Error {
@@ -41,6 +45,14 @@ impl std::fmt::Display for Error {
             Error::Open(e) => write!(f, "cannot read the store: {e}"),
             Error::Query(e) => write!(f, "{e}"),
             Error::Output(e) => write!(f, "output: {e}"),
+            Error::Losses(l) => write!(
+                f,
+                "the answer may be incomplete: {} loss{} ({}); see `kvik health`",
+                l.len(),
+                if l.len() == 1 { "" } else { "es" },
+                l.join(", ")
+            ),
+            Error::Closed(r) => write!(f, "the live read was closed: {r}"),
         }
     }
 }

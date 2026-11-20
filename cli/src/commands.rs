@@ -9,7 +9,7 @@ use crate::Error;
 use crate::args::Args;
 use crate::files;
 use crate::out::{Cell, Table, num};
-use crate::show::{self, Clock, lower, position};
+use crate::show::{self, Clock, lower, position, snake};
 
 /// What every command works with.
 pub struct Ctx<'a> {
@@ -33,6 +33,22 @@ impl Ctx<'_> {
         t.write(self.args.format, true, out)?;
         Ok(())
     }
+
+    /// [`Ctx::table`] for an answer from the reader's snapshot: an error after it when the reader knows of a loss.
+    fn answer(&self, t: &Table, out: &mut dyn Write) -> Result<(), Error> {
+        self.table(t, out)?;
+        let losses: Vec<String> = self
+            .reader
+            .losses()
+            .iter()
+            .map(|l| format!("{} {}", lower(l.kind), lower(l.cause)))
+            .collect();
+        if losses.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Losses(losses))
+        }
+    }
 }
 
 /// The selected series of `snap`, in id order.
@@ -50,6 +66,7 @@ pub fn series(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
         "kind",
         "unit",
         "latest_t",
+        "facts",
         "names",
         "retired_at",
     ]);
@@ -61,11 +78,12 @@ pub fn series(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
             show::kind(&i.spec.kind).into(),
             i.spec.unit.clone().into(),
             c.clock.cell(i.latest_t),
+            num(snap.fact_count(id)?),
             Cell::Text(i.names.join(" ")),
             c.clock.cell(i.retired_at),
         ]);
     }
-    c.table(&t, out)
+    c.answer(&t, out)
 }
 
 pub fn latest(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
@@ -76,7 +94,7 @@ pub fn latest(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
         let live: Live = snap.live(id)?;
         t.row(show::latest(Some(&info), id, &live, c.clock));
     }
-    c.table(&t, out)
+    c.answer(&t, out)
 }
 
 const SECTIONED: &[&str] = &["section", "item", "value"];
@@ -89,7 +107,7 @@ fn add(t: &mut Table, section: &str, item: impl Into<Cell>, value: impl Into<Cel
 fn variant(d: impl std::fmt::Debug) -> String {
     let s = format!("{d:?}");
     let end = s.find(['(', ' ', '{']).unwrap_or(s.len());
-    lower(&s[..end]).trim_matches('"').to_owned()
+    snake(&s[..end])
 }
 
 pub fn health(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
