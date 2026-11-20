@@ -216,3 +216,14 @@ fn latest_live_writes_updates_new_series_and_retired_ones_under_one_header() {
         .collect();
     insta::assert_snapshot!(rows.join("\n"));
 }
+
+#[test]
+fn info_takes_the_zone_in_force_from_the_newest_registry_file() {
+    let mut f = Fixture::new();
+    let store = f.store.as_ref().unwrap();
+    block_on(store.set_site_zone(&kvik::ZoneName::new("Etc/GMT-2"), Timestamp(T0))).unwrap();
+    f.shut();
+    let out = f.run("info").unwrap();
+    let zones: Vec<&str> = out.lines().filter(|l| l.contains("site_zone")).collect();
+    insta::assert_snapshot!(zones.join("\n"));
+}
