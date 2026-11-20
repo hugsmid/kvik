@@ -160,10 +160,13 @@ mod tests {
         let a = Accountant::new(Sizes::of(LEAST_MEMORY));
         let g = a.admit();
         let b = a.clone();
-        let t = std::thread::spawn(move || b.admit().rows());
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!t.is_finished(), "a second pass waits under the least cap");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(b.admit().rows()));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a second pass waits under the least cap"
+        );
         drop(g);
-        assert!(t.join().unwrap() > 0);
+        assert!(rx.recv_timeout(Duration::from_secs(10)).expect("admitted once given back") > 0);
     }
 }
