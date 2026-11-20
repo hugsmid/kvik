@@ -175,35 +175,33 @@ impl Part {
                 return None;
             }
             let mid = position(lo + (hi - lo) / 2);
-            (
-                Part {
-                    upto: mid,
-                    last: false,
-                    ..self
-                },
+            let (a, b) = (
+                Part { upto: mid, ..self },
                 Part {
                     above: Some(mid),
                     ..self
                 },
-            )
+            );
+            // The key's fold ends at the half read last.
+            return Some(if later_first {
+                (
+                    Part { last: false, ..b },
+                    Part {
+                        last: self.last,
+                        ..a
+                    },
+                )
+            } else {
+                (
+                    Part { last: false, ..a },
+                    Part {
+                        last: self.last,
+                        ..b
+                    },
+                )
+            });
         };
-        Some(if later_first {
-            (
-                Part {
-                    last: self.last,
-                    ..b
-                },
-                Part { last: false, ..a },
-            )
-        } else {
-            (
-                Part { last: false, ..a },
-                Part {
-                    last: self.last,
-                    ..b
-                },
-            )
-        })
+        Some(if later_first { (b, a) } else { (a, b) })
     }
 }
 

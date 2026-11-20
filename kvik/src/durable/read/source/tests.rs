@@ -385,3 +385,221 @@ fn reads_in_many_passes_equal_one_pass_in_every_view_and_at_every_time() {
     }
     rig.shut();
 }
+
+/// The sealed segment that holds `text`, once the seal has run.
+fn sealed_holding(rig: &Rig, text: &[u8]) -> std::path::PathBuf {
+    for _ in 0..4_000 {
+        let held: Vec<_> = rig
+            .fs
+            .paths()
+            .into_iter()
+            .filter(|p| p.starts_with(rig.dir.join("log")))
+            .filter(|p| p.extension().is_some_and(|e| e == "kvl" || e == "open"))
+            .filter_map(|p| rig.fs.read(&p).map(|b| (p, b)))
+            .filter(|(_, b)| b.windows(text.len()).any(|x| x == text))
+            .collect();
+        if let [(p, _)] = held.as_slice()
+            && p.extension().is_some_and(|e| e == "kvl")
+        {
+            return p.clone();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("no sealed segment holds the text");
+}
+
+fn seals(every: Duration) -> LogConfig {
+    LogConfig {
+        seal_interval: every,
+        ..LogConfig::default()
+    }
+}
+
+#[test]
+fn a_stream_ends_not_available_when_a_segment_its_passes_listed_is_gone() {
+    let mut rig = Rig::with_log("listed-gone", seals(Duration::from_millis(20)));
+    let id = rig.ids[2];
+    let now = rig.clock.wall().0;
+    let mut second = None;
+    for b in 0..3i64 {
+        let rs: Vec<Reading> = (0..30i64)
+            .map(|k| {
+                let text = format!("LG{b}-{k:03}");
+                Reading::new(id, Timestamp(now - 10_000 + b * 100 + k), Value::Text(text))
+            })
+            .collect();
+        rig.emit_readings(&rs, Intent::Normal);
+        let p = sealed_holding(&rig, format!("LG{b}-000").as_bytes());
+        if b == 1 {
+            second = Some(p);
+        }
+    }
+    let reader = reader_with(&rig.env, &rig.dir, tiny(4));
+    let mut s = facts(reader, id, all(), View::History).unwrap();
+    for _ in 0..5 {
+        s.next().unwrap().unwrap();
+    }
+    crate::env::Fs::remove_file(&rig.fs, &second.unwrap()).unwrap();
+    let rest: Vec<_> = s.collect();
+    assert!(
+        matches!(rest.last(), Some(Err(QueryError::NotAvailable { .. }))),
+        "{rest:?}"
+    );
+    rig.shut();
+}
+
+#[test]
+fn one_event_time_with_more_versions_than_a_pass_holds_reads_in_passes_at_the_least_cap() {
+    let log = LogConfig {
+        max_batch_bytes: 8 << 20,
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("crowded", log);
+    let id = rig.ids[2];
+    let t = Timestamp(rig.clock.wall().0 - 1_000_000_000);
+    for b in 0..2 {
+        let rs: Vec<Reading> = (0..20_000)
+            .map(|k| Reading::new(id, t, Value::Text(format!("{b}{k:0>254}"))))
+            .collect();
+        rig.emit_readings(&rs, Intent::Normal);
+    }
+    let reader = Reader::open(
+        crate::ReaderConfig::new(&rig.dir)
+            .env(rig.env.clone())
+            .memory(LEAST_MEMORY),
+    )
+    .unwrap();
+    let d = reader.durable().unwrap().unwrap();
+    for view in [View::History, View::Current] {
+        let want = d.with(|i, _| i.facts(id, all(), view)).unwrap();
+        let got = collect(reader.facts(id, all(), view).unwrap()).unwrap();
+        assert_eq!(got.len(), want.len());
+        assert!(got == want, "{view:?}");
+        if view == View::History {
+            assert_eq!(want.len(), 40_000);
+        } else {
+            assert_eq!(reader.at(id, t, view).unwrap(), want.last().cloned());
+        }
+    }
+    rig.shut();
+}
+
+#[test]
+fn a_versioned_key_read_in_passes_by_position_keeps_its_highest_version() {
+    let mut rig = Rig::new("versions");
+    let id = rig.ids[3];
+    let t = Timestamp(rig.clock.wall().0 - 1_000_000_000);
+    let rs: Vec<Reading> = (0..60u64)
+        .map(|k| {
+            let mut r = Reading::new(id, t, Value::F64(k as f64));
+            r.changed_at = Some((k * 37) % 60);
+            r
+        })
+        .collect();
+    for chunk in rs.chunks(7) {
+        rig.emit_readings(chunk, Intent::Normal);
+    }
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let history = oracle
+        .with(|i, _| i.facts(id, all(), View::History))
+        .unwrap();
+    let many = reader_with(&rig.env, &rig.dir, tiny(4));
+    for view in [
+        View::History,
+        View::Current,
+        View::AsOf(history[30].position),
+    ] {
+        let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
+        assert_eq!(
+            collect(facts(many.clone(), id, all(), view).unwrap()).unwrap(),
+            want,
+            "{view:?}"
+        );
+        assert_eq!(at(&many, id, t, view).unwrap(), at_from(&want, t.0));
+    }
+    rig.shut();
+}
+
+#[test]
+fn as_of_a_time_over_damage_its_trailer_does_not_decide_reads_from_a_reader_that_has_not_scanned() {
+    let mut rig = Rig::with_log("as-of-damage", seals(Duration::from_millis(300)));
+    let id = rig.ids[2];
+    let now = rig.clock.wall().0;
+    let note = |s: i64| {
+        [Reading::new(
+            id,
+            Timestamp(now + s),
+            Value::Text(format!("AD-{s}")),
+        )]
+    };
+    rig.emit_readings(&note(0), Intent::Normal);
+    rig.clock.advance(Duration::from_secs(10));
+    rig.emit_readings(&note(1), Intent::Normal);
+    let t = rig.clock.wall();
+    rig.clock.advance(Duration::from_secs(10));
+    rig.emit_readings(&note(2), Intent::Normal);
+    let sealed = sealed_holding(&rig, b"AD-2");
+    assert_eq!(sealed, sealed_holding(&rig, b"AD-0"));
+    rig.emit_readings(&note(3), Intent::Normal);
+    assert!(rig.damage_batch(1));
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let view = View::AsOfTime(t);
+    let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
+    assert_eq!(want.len(), 1);
+    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    assert_eq!(
+        collect(facts(fresh, id, all(), view).unwrap()).unwrap(),
+        want
+    );
+    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    assert_eq!(
+        at(&fresh, id, Timestamp(now + 5), view).unwrap(),
+        want.last().cloned()
+    );
+    rig.shut();
+}
+
+#[test]
+fn at_reads_once_more_under_a_new_cut_when_the_first_ends_and_not_twice() {
+    let mut rig = Rig::new("at-expired");
+    let id = rig.ids[0];
+    let t = Timestamp(rig.clock.wall().0 - 1_000);
+    rig.emit_readings(&[Reading::new(id, t, Value::F64(1.0))], Intent::Normal);
+    let r = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let want = at(&r, id, t, View::Current).unwrap();
+    assert!(want.is_some());
+    r.expire_lookups.store(1, Ordering::Relaxed);
+    assert_eq!(at(&r, id, t, View::Current).unwrap(), want);
+    r.expire_lookups.store(2, Ordering::Relaxed);
+    assert!(matches!(
+        at(&r, id, t, View::Current),
+        Err(QueryError::CutExpired)
+    ));
+    rig.shut();
+}
+
+#[test]
+fn at_before_a_series_first_fact_ends_after_one_probe_and_finds_a_fact_far_back() {
+    let mut rig = Rig::new("at-empty");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    let day = 86_400_000_000_000i64;
+    rig.emit_readings(
+        &[Reading::new(id, Timestamp(now - 1_000), Value::F64(1.0))],
+        Intent::Normal,
+    );
+    let r = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let before = r.lookups();
+    assert_eq!(
+        at(&r, id, Timestamp(now - 400 * day), View::Current).unwrap(),
+        None
+    );
+    assert!(
+        r.lookups() - before <= 2,
+        "{} lookups",
+        r.lookups() - before
+    );
+    let far = at(&r, id, Timestamp(now + 300 * day), View::Current).unwrap();
+    assert_eq!(far.map(|f| f.t), Some(Timestamp(now - 1_000)));
+    rig.shut();
+}

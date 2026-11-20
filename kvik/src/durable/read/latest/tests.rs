@@ -300,7 +300,7 @@ impl Rig {
     }
 
     /// Damages the batch holding a fact chosen by `k`, in a cycle; `false` with none.
-    fn damage_batch(&self, k: usize) -> bool {
+    pub(in crate::durable::read) fn damage_batch(&self, k: usize) -> bool {
         let clock = Arc::new(kvik_log::writer::SystemClock::default());
         let mut log = LogReader::open(LogReaderConfig::new(
             &self.dir,

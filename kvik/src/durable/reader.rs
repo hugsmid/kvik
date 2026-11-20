@@ -136,6 +136,9 @@ pub(crate) struct DurableReader {
     memory: Arc<Accountant>,
     #[cfg(test)]
     lookups_made: AtomicU64,
+    /// Lookups still to end with `CutExpired`, as a reset between the cut and the read ends them.
+    #[cfg(test)]
+    pub(crate) expire_lookups: AtomicU64,
 }
 
 /// A log reader configuration on the store in `dir` with this process's boot id and a fresh reader id.
@@ -273,6 +276,8 @@ impl DurableReader {
             searches: AtomicU64::new(0),
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
+            #[cfg(test)]
+            expire_lookups: AtomicU64::new(0),
             seeded: AtomicBool::new(false),
             hub: Hub::default(),
             memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),

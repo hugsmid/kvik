@@ -104,6 +104,14 @@ impl DurableReader {
         let l = read(reader, &skip).map_err(|e| query_error(&self.dir, e))?;
         let cut = v.cut();
         let (stamp, durable) = mark(&l);
+        #[cfg(test)]
+        if self
+            .expire_lookups
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(QueryError::CutExpired);
+        }
         if stamp != cut.stamp
             || durable.generation != cut.durable.generation
             || durable < cut.durable
