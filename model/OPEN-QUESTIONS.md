@@ -3869,6 +3869,7 @@ never took a fact from B passes over it, as Q-951's limit says. Within one read,
 its first pass listed and ends with `NotAvailable` when one is gone at a later pass, so no read yields part of a
 segment silently.
 **Pinned by.** `kvik/tests/durable_losses.rs` `a_watch_whose_segment_is_removed_reports_losses_unknown`,
+`a_reader_that_took_facts_from_a_removed_segment_fails_every_read_after_reading_past_it`,
 `a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found`;
 `kvik/src/durable/read/source/tests.rs` `a_stream_ends_not_available_when_a_segment_its_passes_listed_is_gone`.
 

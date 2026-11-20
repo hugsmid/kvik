@@ -522,7 +522,8 @@ fn a_versioned_key_read_in_passes_by_position_keeps_its_highest_version() {
 
 #[test]
 fn as_of_a_time_over_damage_its_trailer_does_not_decide_reads_from_a_reader_that_has_not_scanned() {
-    let mut rig = Rig::with_log("as-of-damage", seals(Duration::from_millis(300)));
+    // Seals run on the host's clock: the three batches go in one segment well within it.
+    let mut rig = Rig::with_log("as-of-damage", seals(Duration::from_secs(3)));
     let id = rig.ids[2];
     let now = rig.clock.wall().0;
     let note = |s: i64| {
@@ -542,20 +543,17 @@ fn as_of_a_time_over_damage_its_trailer_does_not_decide_reads_from_a_reader_that
     assert_eq!(sealed, sealed_holding(&rig, b"AD-0"));
     rig.emit_readings(&note(3), Intent::Normal);
     assert!(rig.damage_batch(1));
-    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    // The fresh readers read first: a scanning read finds the damage for every reader of the process (Q-938).
     let view = View::AsOfTime(t);
+    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let got = collect(facts(fresh, id, all(), view).unwrap()).unwrap();
+    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let last = at(&fresh, id, Timestamp(now + 5), view).unwrap();
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
     let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
     assert_eq!(want.len(), 1);
-    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
-    assert_eq!(
-        collect(facts(fresh, id, all(), view).unwrap()).unwrap(),
-        want
-    );
-    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
-    assert_eq!(
-        at(&fresh, id, Timestamp(now + 5), view).unwrap(),
-        want.last().cloned()
-    );
+    assert_eq!(got, want);
+    assert_eq!(last, want.last().cloned());
     rig.shut();
 }
 
