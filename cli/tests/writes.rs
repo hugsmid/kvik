@@ -36,8 +36,14 @@ fn only_leases_written(f: &Fixture, writer_running: bool) {
         f.run_in(cmd, env).unwrap();
         let after = f.files();
         let log = rec.log.lock().unwrap().clone();
-        assert!(log.iter().any(|(_, p)| p.starts_with(&leases)), "{cmd}: no lease written");
-        let outside: Vec<_> = log.iter().filter(|(_, p)| !p.starts_with(&leases)).collect();
+        assert!(
+            log.iter().any(|(_, p)| p.starts_with(&leases)),
+            "{cmd}: no lease written"
+        );
+        let outside: Vec<_> = log
+            .iter()
+            .filter(|(_, p)| !p.starts_with(&leases))
+            .collect();
         assert!(outside.is_empty(), "{cmd}: {outside:?}");
         // The writer rewrites its own files while it runs (its status file, A.18).
         if !writer_running {
@@ -50,7 +56,11 @@ fn only_leases_written(f: &Fixture, writer_running: bool) {
                 .collect();
             assert!(changed.is_empty(), "{cmd}: {changed:?}");
         }
-        assert_eq!(leases_of(f, &before), leases_of(f, &after), "{cmd}: its lease is left");
+        assert_eq!(
+            leases_of(f, &before),
+            leases_of(f, &after),
+            "{cmd}: its lease is left"
+        );
     }
 }
 

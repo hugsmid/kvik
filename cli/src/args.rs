@@ -153,7 +153,8 @@ impl Args {
                 p => a.patterns.push(p.to_owned()),
             }
         }
-        a.store = store.ok_or_else(|| usage("no store directory: give --store or set KVIK_STORE"))?;
+        a.store =
+            store.ok_or_else(|| usage("no store directory: give --store or set KVIK_STORE"))?;
         let live = matches!(a.command, Command::Tail | Command::Latest { live: true });
         if !live && a.run_for.is_some() {
             return Err(usage("--for is an option of the live commands"));
@@ -189,7 +190,8 @@ mod tests {
 
     #[test]
     fn a_command_line_parses_its_options_and_patterns() {
-        let a = parse("latest --store s --live --format csv a/*/c --interval 50ms --for 2s").unwrap();
+        let a =
+            parse("latest --store s --live --format csv a/*/c --interval 50ms --for 2s").unwrap();
         assert_eq!(a.command, Command::Latest { live: true });
         assert_eq!(a.patterns, ["a/*/c"]);
         assert_eq!(a.format, Format::Csv);

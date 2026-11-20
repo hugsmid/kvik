@@ -103,7 +103,12 @@ fn a_range_recorded_in_a_later_round_breaks_a_state_seeded_with_one_held() {
     let r = rig.reader();
     assert_eq!(lost(&r), 1);
     let d = durable(&r);
-    assert!(d.seeded() && !d.footprint().1, "{} {:?}", d.seeded(), d.footprint());
+    assert!(
+        d.seeded() && !d.footprint().1,
+        "{} {:?}",
+        d.seeded(),
+        d.footprint()
+    );
     note(&mut rig, -20, "NOTE-BBB");
     note(&mut rig, -10, "NOTE-CCC");
     rig.emit(&[(0, -4, 1, 0, 0)], false);

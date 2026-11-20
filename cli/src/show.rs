@@ -28,7 +28,10 @@ impl Clock {
         };
         match &self.zone {
             None => ts.to_string(),
-            Some(z) => ts.to_zoned(z.clone()).strftime("%Y-%m-%dT%H:%M:%S%.f%:z").to_string(),
+            Some(z) => ts
+                .to_zoned(z.clone())
+                .strftime("%Y-%m-%dT%H:%M:%S%.f%:z")
+                .to_string(),
         }
     }
 
@@ -113,11 +116,20 @@ pub fn lower(d: impl std::fmt::Debug) -> String {
 }
 
 /// The latest-value columns.
-pub const LATEST: &[&str] = &["id", "name", "state", "t", "value", "quality", "stale", "position"];
+pub const LATEST: &[&str] = &[
+    "id", "name", "state", "t", "value", "quality", "stale", "position",
+];
 
 /// A row of [`LATEST`].
-pub fn latest(info: Option<&SeriesInfo>, id: kvik::SeriesId, live: &Live, clock: &Clock) -> Vec<Cell> {
-    let name = info.map(|i| Cell::Text(i.name.clone())).unwrap_or(Cell::Null);
+pub fn latest(
+    info: Option<&SeriesInfo>,
+    id: kvik::SeriesId,
+    live: &Live,
+    clock: &Clock,
+) -> Vec<Cell> {
+    let name = info
+        .map(|i| Cell::Text(i.name.clone()))
+        .unwrap_or(Cell::Null);
     let kind = info.map(|i| &i.spec.kind);
     match live {
         Live::Value(v) => vec![
@@ -151,7 +163,8 @@ pub fn fact(f: &Fact, info: Option<&SeriesInfo>, clock: &Clock) -> Vec<Cell> {
     vec![
         Cell::Text(position(f.position)),
         num(f.series.0),
-        info.map(|i| Cell::Text(i.name.clone())).unwrap_or(Cell::Null),
+        info.map(|i| Cell::Text(i.name.clone()))
+            .unwrap_or(Cell::Null),
         Cell::Text(clock.time(f.t)),
         value(&f.value, info.map(|i| &i.spec.kind)),
         Cell::Text(lower(f.quality)),

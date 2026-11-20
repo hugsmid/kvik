@@ -74,10 +74,16 @@ pub fn leases(fs: &dyn Fs, dir: &Path, store_id: &[u8; 16]) -> Vec<([u8; 16], Op
 }
 
 /// The newest valid series directory.
-pub fn series_directory(fs: &dyn Fs, dir: &Path, store_id: &[u8; 16]) -> Option<(Frame, SeriesDirectory)> {
-    directory::read_latest(fs, dir, Family::Series, |b| SeriesDirectory::decode(b, store_id))
-        .ok()
-        .flatten()
+pub fn series_directory(
+    fs: &dyn Fs,
+    dir: &Path,
+    store_id: &[u8; 16],
+) -> Option<(Frame, SeriesDirectory)> {
+    directory::read_latest(fs, dir, Family::Series, |b| {
+        SeriesDirectory::decode(b, store_id)
+    })
+    .ok()
+    .flatten()
 }
 
 /// The newest valid status file.

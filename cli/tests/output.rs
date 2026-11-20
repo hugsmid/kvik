@@ -11,7 +11,10 @@ use kvik::{Reading, Value};
 fn series_lists_names_kinds_units_aliases_and_latest_times() {
     let f = Fixture::new();
     insta::assert_snapshot!(f.run("series").unwrap());
-    insta::assert_snapshot!("series_pattern_csv", f.run("series site/hall/* --format csv").unwrap());
+    insta::assert_snapshot!(
+        "series_pattern_csv",
+        f.run("series site/hall/* --format csv").unwrap()
+    );
 }
 
 #[test]
@@ -20,7 +23,10 @@ fn latest_shows_each_series_live_fact_at_one_cut_in_every_format() {
     insta::assert_snapshot!(f.run("latest").unwrap());
     insta::assert_snapshot!("latest_csv", f.run("latest --format csv").unwrap());
     insta::assert_snapshot!("latest_jsonl", f.run("latest --format jsonl").unwrap());
-    insta::assert_snapshot!("latest_zone", f.run("latest site/meter/* --zone Etc/GMT-2").unwrap());
+    insta::assert_snapshot!(
+        "latest_zone",
+        f.run("latest site/meter/* --zone Etc/GMT-2").unwrap()
+    );
 }
 
 #[test]
@@ -59,18 +65,24 @@ fn tail_shows_facts_as_they_become_durable() {
         .map(|l| l.split_once(',').map(|(_, rest)| rest.to_owned()).unwrap())
         .collect();
     insta::assert_snapshot!(facts.join("\n"));
-    assert!(out.lines().next().unwrap().contains("\"event\":\"opened\""), "{out}");
+    assert!(
+        out.lines().next().unwrap().contains("\"event\":\"opened\""),
+        "{out}"
+    );
 }
 
 /// Output without what the writer's own timing decides: its status file's content and size, and the bytes held.
 fn steady(out: &str) -> String {
     assert!(
-        out.lines().any(|l| l.starts_with("status ") && l.contains(" health "))
+        out.lines()
+            .any(|l| l.starts_with("status ") && l.contains(" health "))
             || out.lines().any(|l| l.contains("derived/*.stat")),
         "{out}"
     );
     out.lines()
-        .filter(|l| !l.starts_with("status ") && !l.contains("local_bytes") && !l.contains("*.stat"))
+        .filter(|l| {
+            !l.starts_with("status ") && !l.contains("local_bytes") && !l.contains("*.stat")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

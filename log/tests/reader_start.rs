@@ -434,7 +434,9 @@ fn a_lookup_at_the_last_position_of_a_segment_reads_that_segment() {
     for w in &wanted {
         assert!(whole.iter().any(|b| b.last == w.position));
     }
-    let at = reader(&fs, 10).lookup_at(&wanted, &|_, _, _| false).unwrap();
+    let at = reader(&fs, 10)
+        .lookup_at(&wanted, &|_, _, _| false)
+        .unwrap();
     assert!(at.complete.iter().all(|c| *c));
     for w in &wanted {
         assert!(at.facts.iter().any(|f| f.position == w.position), "{w:?}");

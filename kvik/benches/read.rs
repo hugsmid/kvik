@@ -14,8 +14,8 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -215,7 +215,10 @@ fn one_shot(dir: &Path, ids: &[SeriesId]) {
                 .unwrap();
             let took = began.elapsed();
             assert!(out.status.success(), "{out:?}");
-            assert_eq!(out.stdout.iter().filter(|b| **b == b'\n').count(), SERIES + 1);
+            assert_eq!(
+                out.stdout.iter().filter(|b| **b == b'\n').count(),
+                SERIES + 1
+            );
             took
         })
         .collect();
@@ -244,8 +247,18 @@ fn empty_polls(what: &str, reader: &Reader, queries: &[Query]) {
         }
         means.push(total / POLLS as u32);
     }
-    report(&format!("S13 empty poll, {what}, mean of {POLLS}"), 1e6, "µs", means);
-    report(&format!("S13 empty poll, {what}, single polls"), 1e6, "µs", singles);
+    report(
+        &format!("S13 empty poll, {what}, mean of {POLLS}"),
+        1e6,
+        "µs",
+        means,
+    );
+    report(
+        &format!("S13 empty poll, {what}, single polls"),
+        1e6,
+        "µs",
+        singles,
+    );
 }
 
 fn visibility(store: &Store, id: SeriesId, dir: &Path, poll: Duration) {
@@ -253,7 +266,9 @@ fn visibility(store: &Store, id: SeriesId, dir: &Path, poll: Duration) {
     let reader = Reader::open(ReaderConfig::new(dir)).unwrap();
     let least = poll.max(Duration::from_millis(20));
     let watcher = thread::spawn(move || {
-        let mut session = reader.session_with(SessionOptions::new(least, poll)).unwrap();
+        let mut session = reader
+            .session_with(SessionOptions::new(least, poll))
+            .unwrap();
         let sel = kvik::Select::Ids(vec![id]).into();
         session
             .open(Query::Tail { sel }, LiveOptions::default())
@@ -325,16 +340,46 @@ fn main() {
     let own = store.reader();
     let began = Instant::now();
     own.snapshot().unwrap();
-    eprintln!("S1, first snapshot of the writer's reader: {:.3} ms", ms(began.elapsed()));
-    timed_latest("S1, the writer's process, nothing since", &store, &ids, &own, false);
-    timed_latest("S1, the writer's process, a round since", &store, &ids, &own, true);
+    eprintln!(
+        "S1, first snapshot of the writer's reader: {:.3} ms",
+        ms(began.elapsed())
+    );
+    timed_latest(
+        "S1, the writer's process, nothing since",
+        &store,
+        &ids,
+        &own,
+        false,
+    );
+    timed_latest(
+        "S1, the writer's process, a round since",
+        &store,
+        &ids,
+        &own,
+        true,
+    );
 
     let began = Instant::now();
     let other = Reader::open(ReaderConfig::new(dir)).unwrap();
     latest_400(&other, &ids);
-    eprintln!("S2, first snapshot of a reader just opened: {:.3} ms", ms(began.elapsed()));
-    timed_latest("S2, another handle, nothing since", &store, &ids, &other, false);
-    timed_latest("S2, another handle, a round since", &store, &ids, &other, true);
+    eprintln!(
+        "S2, first snapshot of a reader just opened: {:.3} ms",
+        ms(began.elapsed())
+    );
+    timed_latest(
+        "S2, another handle, nothing since",
+        &store,
+        &ids,
+        &other,
+        false,
+    );
+    timed_latest(
+        "S2, another handle, a round since",
+        &store,
+        &ids,
+        &other,
+        true,
+    );
 
     one_shot(dir, &ids);
 

@@ -6,7 +6,10 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), None | Some("-h" | "--help" | "help")) {
+    if matches!(
+        args.first().map(String::as_str),
+        None | Some("-h" | "--help" | "help")
+    ) {
         print!("{}", kvik_cli::USAGE);
         return ExitCode::SUCCESS;
     }

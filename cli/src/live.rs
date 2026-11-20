@@ -9,16 +9,18 @@ use kvik::{
     UpdateBatch, Updated,
 };
 
+use crate::Error;
 use crate::args::Format;
 use crate::commands::{Ctx, selected};
 use crate::out::{Cell, Table};
 use crate::show::{self, position};
-use crate::Error;
 
 const LATEST: &[&str] = &[
     "cut", "event", "id", "name", "state", "t", "value", "quality", "stale", "position",
 ];
-const TAIL: &[&str] = &["cut", "event", "position", "id", "name", "t", "value", "quality"];
+const TAIL: &[&str] = &[
+    "cut", "event", "position", "id", "name", "t", "value", "quality",
+];
 
 /// What a live command knows of the series it shows.
 struct Names(BTreeMap<SeriesId, SeriesInfo>);
@@ -83,7 +85,9 @@ fn run(
     let mut headed = false;
     loop {
         let left = until.map(|u| u.saturating_duration_since(Instant::now()));
-        let wait = left.unwrap_or(Duration::from_secs(1)).min(Duration::from_secs(1));
+        let wait = left
+            .unwrap_or(Duration::from_secs(1))
+            .min(Duration::from_secs(1));
         if let Some(b) = session.next(wait)? {
             let t = batch(&b, head, &mut names, &mut rows);
             let head_now = match c.args.format {
@@ -127,34 +131,42 @@ pub fn latest(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
         r.extend(cells);
         r
     };
-    run(c, Query::Latest(c.selection()), LATEST, out, |cut, e, names| match e {
-        LiveEvent::Opened(Answer::Latest(v)) => v
-            .iter()
-            .map(|(id, l)| with(cut, "opened", show::latest(names.0.get(id), *id, l, &clock)))
-            .collect(),
-        LiveEvent::Updated(Updated::Live { series, live }) => vec![with(
-            cut,
-            "updated",
-            show::latest(names.0.get(series), *series, live, &clock),
-        )],
-        LiveEvent::Joined {
-            series,
-            info,
-            part: Part::Live(l),
-            ..
-        } => {
-            names.0.insert(*series, (**info).clone());
-            vec![with(cut, "joined", show::latest(Some(info), *series, l, &clock))]
-        }
-        _ => Vec::new(),
-    })
+    run(
+        c,
+        Query::Latest(c.selection()),
+        LATEST,
+        out,
+        |cut, e, names| match e {
+            LiveEvent::Opened(Answer::Latest(v)) => v
+                .iter()
+                .map(|(id, l)| with(cut, "opened", show::latest(names.0.get(id), *id, l, &clock)))
+                .collect(),
+            LiveEvent::Updated(Updated::Live { series, live }) => vec![with(
+                cut,
+                "updated",
+                show::latest(names.0.get(series), *series, live, &clock),
+            )],
+            LiveEvent::Joined {
+                series,
+                info,
+                part: Part::Live(l),
+                ..
+            } => {
+                names.0.insert(*series, (**info).clone());
+                vec![with(
+                    cut,
+                    "joined",
+                    show::latest(Some(info), *series, l, &clock),
+                )]
+            }
+            _ => Vec::new(),
+        },
+    )
 }
 
 pub fn tail(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
     let clock = c.clock.clone();
-    let query = Query::Tail {
-        sel: c.selection(),
-    };
+    let query = Query::Tail { sel: c.selection() };
     run(c, query, TAIL, out, |cut, e, names| match e {
         LiveEvent::Opened(_) => vec![marker(TAIL, cut, "opened", String::new())],
         LiveEvent::Appended(Appended::Facts(facts)) => facts

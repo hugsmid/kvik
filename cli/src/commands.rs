@@ -5,11 +5,11 @@ use std::io::Write;
 use kvik::env::Env;
 use kvik::{Health, Live, Reader, Select, Selection, SeriesId, Snapshot};
 
+use crate::Error;
 use crate::args::Args;
 use crate::files;
 use crate::out::{Cell, Table, num};
 use crate::show::{self, Clock, lower, position};
-use crate::Error;
 
 /// What every command works with.
 pub struct Ctx<'a> {
@@ -44,7 +44,15 @@ pub fn selected(c: &Ctx<'_>, snap: &Snapshot) -> Result<Vec<SeriesId>, Error> {
 
 pub fn series(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
     let snap = c.reader.snapshot()?;
-    let mut t = Table::new(&["id", "name", "kind", "unit", "latest_t", "names", "retired_at"]);
+    let mut t = Table::new(&[
+        "id",
+        "name",
+        "kind",
+        "unit",
+        "latest_t",
+        "names",
+        "retired_at",
+    ]);
     for id in selected(c, &snap)? {
         let i = snap.series(id)?;
         t.row(vec![
@@ -213,7 +221,12 @@ pub fn info(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
             "created_at",
             c.clock.time(kvik::Timestamp(d.created_at)),
         );
-        add(&mut t, "store", "site_zone_at_creation", d.site_zone.clone());
+        add(
+            &mut t,
+            "store",
+            "site_zone_at_creation",
+            d.site_zone.clone(),
+        );
         add(&mut t, "store", "tzdata_at_creation", d.tzdata.clone());
         add(&mut t, "store", "software", d.software.clone());
         let (zone, tzdata) = files::in_force(fs, dir, &d);
