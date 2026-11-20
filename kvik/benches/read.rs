@@ -225,7 +225,9 @@ fn one_shot(dir: &Path, ids: &[SeriesId]) {
     report("S3, `kvik latest` as a process", 1e3, "ms", runs);
 }
 
-fn empty_polls(what: &str, reader: &Reader, queries: &[Query]) {
+/// Each poll after a 21 ms sleep, beside a reference: a read of the small file `reference` after the same sleep, the
+/// machine's cost of the first system calls after a wake, which no engine work is part of.
+fn empty_polls(what: &str, reader: &Reader, queries: &[Query], reference: &Path) {
     let opts = SessionOptions::new(Duration::from_millis(20), Duration::from_millis(10));
     let mut session = reader.session_with(opts).unwrap();
     for q in queries {
@@ -234,8 +236,9 @@ fn empty_polls(what: &str, reader: &Reader, queries: &[Query]) {
     assert!(session.next(Duration::ZERO).unwrap().is_some());
     let mut means = Vec::new();
     let mut singles = Vec::new();
+    let mut references = Vec::new();
     for _ in 0..5 {
-        let mut total = Duration::ZERO;
+        let (mut total, mut read) = (Duration::ZERO, Duration::ZERO);
         for _ in 0..POLLS {
             thread::sleep(Duration::from_millis(21));
             let began = Instant::now();
@@ -244,9 +247,22 @@ fn empty_polls(what: &str, reader: &Reader, queries: &[Query]) {
             assert!(b.is_none(), "{b:?}");
             total += took;
             singles.push(took);
+            thread::sleep(Duration::from_millis(21));
+            let began = Instant::now();
+            std::fs::read(reference).unwrap();
+            read += began.elapsed();
         }
         means.push(total / POLLS as u32);
+        references.push(read / POLLS as u32);
     }
+    report(
+        &format!(
+            "S13 reference beside {what}: a small file read after the same sleep, mean of {POLLS}"
+        ),
+        1e6,
+        "µs",
+        references,
+    );
     report(
         &format!("S13 empty poll, {what}, mean of {POLLS}"),
         1e6,
@@ -385,13 +401,25 @@ fn main() {
 
     let all = kvik::Selection::all;
     let tail = Query::Tail { sel: all() };
-    empty_polls("another handle, Tail", &other, std::slice::from_ref(&tail));
+    let reference = dir.join("STORE");
+    empty_polls(
+        "another handle, Tail",
+        &other,
+        std::slice::from_ref(&tail),
+        &reference,
+    );
     empty_polls(
         "another handle, Tail and Latest of 400",
         &other,
         &[tail.clone(), Query::Latest(all())],
+        &reference,
     );
-    empty_polls("the writer's process, Tail", &store.reader(), &[tail]);
+    empty_polls(
+        "the writer's process, Tail",
+        &store.reader(),
+        &[tail],
+        &reference,
+    );
     for poll in [Duration::from_millis(10), Duration::from_millis(100)] {
         visibility(&store, ids[0], dir, poll);
     }
