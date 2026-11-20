@@ -62,19 +62,32 @@ fn tail_shows_facts_as_they_become_durable() {
     assert!(out.lines().next().unwrap().contains("\"event\":\"opened\""), "{out}");
 }
 
+/// Output without what the writer's own timing decides: its status file's content and size, and the bytes held.
+fn steady(out: &str) -> String {
+    assert!(
+        out.lines().any(|l| l.starts_with("status ") && l.contains(" health "))
+            || out.lines().any(|l| l.contains("derived/*.stat")),
+        "{out}"
+    );
+    out.lines()
+        .filter(|l| !l.starts_with("status ") && !l.contains("local_bytes") && !l.contains("*.stat"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn health_reports_position_losses_segments_leases_and_derived_files() {
     let mut f = Fixture::new();
-    insta::assert_snapshot!("health_open", f.run("health").unwrap());
+    insta::assert_snapshot!("health_open", steady(&f.run("health").unwrap()));
     f.shut();
-    insta::assert_snapshot!("health_shut", f.run("health").unwrap());
+    insta::assert_snapshot!("health_shut", steady(&f.run("health").unwrap()));
 }
 
 #[test]
 fn info_reports_the_descriptor_zone_tzdata_and_files_by_kind() {
     let mut f = Fixture::new();
     f.shut();
-    insta::assert_snapshot!(f.run("info").unwrap());
+    insta::assert_snapshot!(steady(&f.run("info").unwrap()));
 }
 
 #[test]

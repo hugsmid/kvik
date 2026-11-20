@@ -1,6 +1,6 @@
 ---
 source: cli/tests/output.rs
-expression: "f.run(\"info\").unwrap()"
+expression: "steady(&f.run(\"info\").unwrap())"
 ---
 section  item                   value
 store    store_id               01000000000000000200000000000000
@@ -15,7 +15,6 @@ files    LOCK                   1 files, 0 bytes
 files    MANIFEST               1 files, 104 bytes
 files    STORE                  1 files, 120 bytes
 files    derived/*.root         1 files, 184 bytes
-files    derived/*.stat         1 files, 312 bytes
 files    leases/*.lease         1 files, 128 bytes
 files    log/*.open             2 files, 134217728 bytes
 files    log/MARK               1 files, 4224 bytes
