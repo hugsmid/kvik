@@ -90,9 +90,19 @@ pub(crate) fn pass(
     let budget = grant.rows() / sources.len() as u64;
     let mut parts = Vec::with_capacity(sources.len());
     for s in &mut sources {
-        match s.read(&p, budget)? {
-            Read::Rows(rows) => parts.push(rows),
-            Read::TooMany => return Ok(None),
+        match s.read(&p, budget) {
+            Ok(Read::Rows(rows)) => parts.push(rows),
+            Ok(Read::TooMany) => return Ok(None),
+            Err(QueryError::NotAvailable { reason }) => {
+                drop((grant, sources, parts));
+                let known = r.found_lost();
+                r.find_losses()?;
+                if r.found_lost() == known {
+                    return Err(QueryError::NotAvailable { reason });
+                }
+                return pass(r, v, series, from, to, bound);
+            }
+            Err(e) => return Err(e),
         }
     }
     let rows: Arc<[Stored]> = merge::merge(parts).into();
@@ -282,7 +292,7 @@ pub(crate) fn search_back(
     v: &View,
     plan: &Plan,
     t: i64,
-    pick: &dyn Fn(&Stored) -> bool,
+    pick: &dyn Fn(&Fact) -> bool,
 ) -> Result<Option<Fact>, QueryError> {
     let mut to = t;
     let mut span = FIRST_SPAN;
@@ -297,9 +307,9 @@ pub(crate) fn search_back(
         };
         read_parts(r, v, plan, part, true, &mut |rows| {
             found = merge::select(rows, plan.history, |id| plan.versioned(id))
-                .filter(|s| pick(s))
-                .max_by_key(|s| (s.row.t, s.position))
-                .map(fact_out);
+                .map(fact_out)
+                .filter(|f| pick(f))
+                .max_by_key(|f| (f.t, f.position));
             found.is_some()
         })?;
         if found.is_some() || from == i64::MIN {

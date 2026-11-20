@@ -100,7 +100,7 @@ fn check(rig: &Rig, times: &[Timestamp], small: u64) -> Result<(), TestCaseError
         for view in &views {
             let want = oracle.with(|i, _| i.facts(*id, all(), *view)).unwrap();
             if !rig.faulted && !matches!(view, View::AsOf(_)) {
-                let m = collect(model.facts(*id, all(), *view).unwrap()).unwrap();
+                let m = unpositioned(collect(model.facts(*id, all(), *view).unwrap()).unwrap());
                 prop_assert_eq!(unpositioned(want.clone()), m, "{:?} {:?}", id, view);
             }
             for (k, r) in readers.iter().enumerate() {
@@ -142,7 +142,7 @@ fn sealed_segments(rig: &Rig) -> u64 {
     rig.fs
         .paths()
         .iter()
-        .filter(|p| p.starts_with(rig.dir.join("log")) && p.to_string_lossy().ends_with(".sealed"))
+        .filter(|p| p.starts_with(rig.dir.join("log")) && p.to_string_lossy().ends_with(".kvl"))
         .count() as u64
 }
 
@@ -155,7 +155,7 @@ fn facts_and_at_equal_the_fact_index_and_the_model_at_every_cap() {
         ..ProptestConfig::default()
     });
     let log = LogConfig {
-        seal_interval: Duration::from_secs(30),
+        seal_interval: Duration::from_millis(20),
         ..LogConfig::default()
     };
     runner
@@ -281,11 +281,12 @@ fn as_of_a_time_in_two_generations_is_the_later_position_committed_by_then() {
     emit(&mut rig, 0, 1.0);
     rig.clock.advance(Duration::from_secs(10));
     emit(&mut rig, 1, 2.0);
-    let t = rig.clock.wall();
     rig.clock.advance(Duration::from_secs(10));
     emit(&mut rig, 2, 3.0);
+    let t = rig.clock.wall();
     rig.shut();
-    // The clock goes back across the restart: the next generation commits at times the first already passed.
+    // The clock goes back across the restart: the writer keeps commit times from going back, so the next generation's
+    // first batches commit at the time the first generation's last did.
     rig.clock.jump_wall(Span(-15_000_000_000));
     rig.reopen();
     emit(&mut rig, 3, 4.0);

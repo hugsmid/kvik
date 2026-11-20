@@ -351,6 +351,13 @@ impl DurableReader {
         Ok(v)
     }
 
+    /// Has this process's scanning read find the damage in the kept log, as a reader that holds every fact does
+    /// (Q-1060): the regions it finds go to the latch, which lookups then pass over as lost.
+    pub(crate) fn find_losses(&self) -> Result<(), QueryError> {
+        let v = self.view_with_facts()?;
+        self.end(v)
+    }
+
     /// Takes a view read after this call began that holds every fact, then runs `f` on it with no lock under its cut:
     /// a materialised call that reads facts ([`cut`]).
     pub(crate) fn with<R>(

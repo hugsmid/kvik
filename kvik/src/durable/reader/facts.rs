@@ -82,8 +82,8 @@ pub(crate) fn at(
     let once = || {
         r.with_latest(|v| {
             let plan = plan(r, v, &[id], view)?;
-            search_back(r, v, &plan, t.0, &|s| {
-                s.row.quality != kvik_log::facts::Quality::Bad
+            search_back(r, v, &plan, t.0, &|f| {
+                f.quality != crate::types::Quality::Bad
             })
         })
     };
