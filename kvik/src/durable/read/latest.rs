@@ -628,6 +628,8 @@ pub(crate) fn rows_for(
 #[cfg(test)]
 mod cases;
 #[cfg(test)]
+mod rounds;
+#[cfg(test)]
 mod snapshots;
 #[cfg(test)]
 pub(super) mod tests;
