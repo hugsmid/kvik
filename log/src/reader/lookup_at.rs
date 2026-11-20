@@ -46,7 +46,9 @@ impl LogReader {
             },
             stamp: mark.stamp,
             segments_read: 0,
+            overflowed: false,
         };
+        let unbounded = super::lookup::Budget::new(u64::MAX);
         let mut bases = HashMap::new();
         let mut by_segment: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, w) in wanted.iter().enumerate() {
@@ -88,6 +90,7 @@ impl LogReader {
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,
                 lost,
+                budget: &unbounded,
             };
             let read = self.lookup_segment(name, limit, &query, &mut out.facts);
             out.segments_read += 1;

@@ -227,6 +227,7 @@ fn take_found(
         last: b.commit.last_sequence,
         min_t,
         max_t,
+        commit_time: b.commit.commit_time,
     });
     if let Some(r) = content.recovery() {
         let after = Position {

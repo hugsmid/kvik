@@ -707,6 +707,7 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
         || (b.file_id, b.offset) < (a.file_id, a.offset)
 }
 
+mod commits;
 mod files;
 mod lease;
 mod lookup;
@@ -716,5 +717,6 @@ mod pass;
 #[cfg(test)]
 mod tests;
 
-pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted};
+pub use commits::CommitFind;
+pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted, fact_bytes};
 pub use lookup_at::WantedAt;
