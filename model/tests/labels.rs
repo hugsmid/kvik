@@ -279,6 +279,27 @@ fn s2_1_labels_a_duplicate_counts_earlier_entries_of_the_same_batch() {
 }
 
 #[test]
+fn s2_1_labels_a_duplicate_waits_for_the_current_version_not_an_earlier_equal_one() {
+    let mut st = Store::new(1);
+    for v in ["1", "2", "1"] {
+        st.set(S1, Effective::Always, LabelChange::new().set("a", v))
+            .unwrap();
+    }
+    let o = st
+        .set(S1, Effective::Always, LabelChange::new().set("a", "1"))
+        .unwrap();
+    assert_eq!(
+        (o.position, o.resolves_at),
+        (None, Some(Position::new(0, 3)))
+    );
+    let o = st.declare(S1, &[("a", "1")], 10).unwrap();
+    assert_eq!(
+        (o.position, o.resolves_at),
+        (None, Some(Position::new(0, 3)))
+    );
+}
+
+#[test]
 fn s2_1_labels_a_call_resolves_at_its_last_entry_or_the_versions_it_duplicates() {
     let mut st = Store::new(2);
     st.set(S1, Effective::Always, LabelChange::new().set("a", "1"))

@@ -3504,8 +3504,14 @@ key with other content, where the bucket creates a key only when absent and the 
 any rebuild record's floor of kind 18. (2) A part is removed locally, whatever the reason (invalid, merged, set
 aside), only once a part with a higher `file_id` is durable (synced, its directory synced). So the highest local id
 never falls and no local name is used twice; with a backup, every uploaded id is named by the manifest, so no key
-is taken twice, and a restore starts a new generation, which is in every name. A directory emptied by hand on a
-store without a backup may start the ids again, which no name outside the store can meet.
+is taken twice, and a restore starts a new generation, which is in every name. When nothing replaces a removed part
+(every label change of its range lost, or an in-place restore to a position below every label change), a part with
+no entries is written to carry the higher id first; the layout allows zero entries blocks. A directory emptied by
+hand on a store without a backup may start the ids again, which no name outside the store can meet. **Residual, a
+double fault:** a part uploaded, its copy-verified record (`format.md` A.14 `0x27`) not yet synced, and the
+`registry/labels/` directory then lost or emptied while the store stays in its generation: the id can be taken
+again. Rebuilt from the same kept log the bytes are the same and the upload matches; where they differ the bucket
+refuses the second create (it creates a key only where absent), so the fault is loud, never silent.
 
 ## Q-1043 — A label part's `through` at a start
 Recorded with the fix round of the labels spec-and-model step (L1). Open, for the labels engine step (L2).
@@ -3513,8 +3519,13 @@ Recorded with the fix round of the labels spec-and-model step (L1). Open, for th
 position above the last synced mark, so one that does shows a loss. A label part obeys the same bound, but A.19
 said nothing about it at a start.
 **Proposal.** Treat it as the registry file is treated: a part's `through` is a source of F, and a part above the
-recovered log is then invalid and rebuilt from what is kept. Until L2 decides, nothing depends on it: the model has
-no parts.
+recovered log is then invalid and rebuilt from what is kept. Three conditions for the engine step, or the evidence
+can be false: (1) only parts of the current generation count, since a part of an older generation above its
+restored end is set aside, not lost; (2) a part that waits for its replacement under Q-1042 and overlaps a recorded
+lost range names positions already reported, and must not report them again; (3) the start opens no part, and a
+`through` read from a file name alone is unauthenticated, where the registry file's is read from a checked file:
+either open and check the highest part of the generation at a start (one open), or do not use the name as
+evidence. Until L2 decides, nothing depends on it: the model has no parts.
 
 ## Open at v0.2
 
