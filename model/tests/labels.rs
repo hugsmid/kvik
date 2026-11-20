@@ -311,6 +311,11 @@ fn s2_1_labels_a_call_resolves_at_its_last_entry_or_the_versions_it_duplicates()
         (o.position, o.resolves_at),
         (None, Some(Position::new(0, 3)))
     );
+    let o = st.declare(S1, &[("a", "2"), ("b", "1")], 10).unwrap();
+    assert_eq!(
+        (o.position, o.resolves_at),
+        (None, Some(Position::new(0, 4)))
+    );
     let o = st.declare(S2, &[("a", "1"), ("c", "1")], 10).unwrap();
     assert_eq!(o.resolves_at, Some(Position::new(0, 5)));
     let o = st.set(S1, Effective::At(9), LabelChange::new()).unwrap();
