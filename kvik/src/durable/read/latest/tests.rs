@@ -422,12 +422,35 @@ impl Rig {
         let want = reference.losses();
         prop_assert!(!want.is_empty(), "the damage is reported");
         for r in &readers {
-            prop_assert_eq!(r.losses(), want.clone());
+            let (got, want) = known_alike(r.losses(), want.clone());
+            prop_assert_eq!(got, want);
         }
-        prop_assert_eq!(snap.losses().unwrap(), want);
+        let (got, want) = known_alike(snap.losses().unwrap(), want);
+        prop_assert_eq!(got, want);
         self.after_damage += 1;
         Ok(())
     }
+}
+
+/// Two readers' loss reports with the commit time before an unrecorded loss set aside where either does not know
+/// it: a reader that continues a series directory reads only above it (spec §11 Health "what is known"; Q-1071).
+fn known_alike(
+    mut a: Vec<crate::health::LossReport>,
+    mut b: Vec<crate::health::LossReport>,
+) -> (
+    Vec<crate::health::LossReport>,
+    Vec<crate::health::LossReport>,
+) {
+    for (x, y) in a.iter_mut().zip(b.iter_mut()) {
+        if !x.recorded
+            && x.identity == y.identity
+            && (x.commit_time_before.is_none() || y.commit_time_before.is_none())
+        {
+            x.commit_time_before = None;
+            y.commit_time_before = None;
+        }
+    }
+    (a, b)
 }
 
 /// A live state as the backends agree on it: the fact's position and the staleness set aside.
@@ -601,4 +624,57 @@ fn latest_values_equal_the_models_at_every_check() {
         damaged.into_inner() > 0,
         "some history compares losses after damage"
     );
+}
+
+#[test]
+fn a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it() {
+    let mut rig = Rig::new("seeded-loss");
+    let id = rig.ids[2];
+    let note = |rig: &Rig, secs: i64, text: &str| {
+        Reading::new(
+            rig.ids[2],
+            Timestamp(rig.clock.wall().0 + secs * S),
+            Value::Text(text.into()),
+        )
+    };
+    rig.emit_readings(&[note(&rig, -30, "NOTE-AAA")], Intent::Normal);
+    rig.long.live(id).unwrap();
+    rig.shut();
+    write_directory(&rig.env, &rig.dir, usize::MAX).expect("a batch");
+    rig.reopen();
+    rig.clock.advance(Duration::from_secs(5));
+    rig.emit_readings(&[note(&rig, -4, "NOTE-BBB")], Intent::Normal);
+    rig.emit(&[(0, -2, 0, 0, 0)], false);
+    rig.shut();
+    for p in rig.fs.paths() {
+        if p.starts_with(rig.dir.join("log"))
+            && let Some(bytes) = rig.fs.read(&p)
+            && let Some(at) = bytes.windows(8).position(|w| w == b"NOTE-BBB")
+        {
+            rig.fs.poke(&p, at, b"X");
+        }
+    }
+    let seeded = rig.reader();
+    seeded.live(id).unwrap();
+    assert!(seeded.durable().unwrap().unwrap().seeded());
+    let whole = &rig.long;
+    assert!(!whole.durable().unwrap().unwrap().seeded());
+    let strip = |mut l: Vec<crate::health::LossReport>| {
+        for r in &mut l {
+            r.commit_time_before = None;
+        }
+        l
+    };
+    let (known, unknown) = (whole.losses(), seeded.losses());
+    assert_eq!(known.len(), 1);
+    assert!(!known[0].recorded);
+    assert_eq!(known[0].commit_time_before, Some(Timestamp(T0)));
+    assert_eq!(unknown[0].commit_time_before, None);
+    assert_eq!(
+        strip(unknown.clone()),
+        strip(known.clone()),
+        "the same loss otherwise"
+    );
+    let (a, b) = known_alike(unknown, known);
+    assert_eq!(a, b);
 }

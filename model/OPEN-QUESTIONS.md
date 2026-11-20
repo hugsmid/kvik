@@ -3960,6 +3960,24 @@ in the as-of-time view found it after a power loss and restart; the timing, not 
 `a_call_queued_after_the_writer_read_the_clock_commits_no_earlier_than_it_was_queued` (holds the writer between its
 read of the clock and its take).
 
+## Q-1071 — The commit time before a loss, as a reader that continues a series directory knows it
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** A reader folded the log through batch A before a series directory through A was written; batch B,
+just above A, is then damaged, and nothing records it (no start has met it). That reader reports the loss with A's
+commit time before it; a reader opened after the directory continues it, reads the log only above A (Q-1001) and
+reports the same loss with no commit time before it. The latest values' property found it when segments seal between
+steps, and compared every reader's `losses` with a fresh reader's whole (Q-1006).
+**Decided.** The engine keeps what §11 Health promises: each report carries what is known of its range. A continuing
+reader knows no commit time at the directory's `through`, as a finder after a void past its kept commits knows none
+(Q-941); a start's record, once written, gives every reader the same times. The property now sets aside the commit
+time before an unrecorded loss where either reader lacks it, and compares everything else, recorded reports whole.
+For every reader to know it, the series directory would carry its `through`'s commit time (a `format.md` change);
+not proposed. With segments sealing between steps the property also meets Q-937 (an unrecorded loss's `last` read at
+different marks), which stays with that question's own item.
+**Tests.** `kvik/src/durable/read/latest/tests.rs`
+`a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it` and
+`latest_values_equal_the_models_at_every_check`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
