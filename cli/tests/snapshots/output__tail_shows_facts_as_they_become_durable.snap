@@ -1,0 +1,7 @@
+---
+source: cli/tests/output.rs
+expression: "facts.join(\"\\n\")"
+---
+"event":"fact","position":"0:10","id":1,"name":"site/meter/watts","t":"2026-01-01T00:00:00Z","value":430,"quality":"good"}
+"event":"fact","position":"0:12","id":1,"name":"site/meter/watts","t":"2026-01-01T00:00:00.5Z","value":431,"quality":"good"}
+"event":"fact","position":"0:14","id":1,"name":"site/meter/watts","t":"2026-01-01T00:00:01Z","value":432,"quality":"good"}

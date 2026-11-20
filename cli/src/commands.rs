@@ -44,7 +44,7 @@ pub fn selected(c: &Ctx<'_>, snap: &Snapshot) -> Result<Vec<SeriesId>, Error> {
 
 pub fn series(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
     let snap = c.reader.snapshot()?;
-    let mut t = Table::new(&["id", "name", "kind", "unit", "latest_t", "aliases", "retired_at"]);
+    let mut t = Table::new(&["id", "name", "kind", "unit", "latest_t", "names", "retired_at"]);
     for id in selected(c, &snap)? {
         let i = snap.series(id)?;
         t.row(vec![
@@ -53,7 +53,7 @@ pub fn series(c: &Ctx<'_>, out: &mut dyn Write) -> Result<(), Error> {
             show::kind(&i.spec.kind).into(),
             i.spec.unit.clone().into(),
             c.clock.cell(i.latest_t),
-            Cell::from((i.names.len() > 1).then(|| i.names[1..].join(" "))),
+            Cell::Text(i.names.join(" ")),
             c.clock.cell(i.retired_at),
         ]);
     }

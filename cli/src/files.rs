@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use kvik::Fs;
+use kvik::env::Fs;
 use kvik_log::directory::series::SeriesDirectory;
 use kvik_log::directory::status::{StatusFile, counter, health, reason};
 use kvik_log::directory::{self, Family, Frame};
@@ -45,7 +45,7 @@ pub fn kind_of(path: &str) -> String {
     let ext = name.rsplit_once('.').map_or("", |(_, e)| e);
     match (dir, ext) {
         ("", _) => name.to_owned(),
-        (d, "") => format!("{d}/"),
+        (d, "") => format!("{d}/{name}"),
         (d, e) => format!("{d}/*.{e}"),
     }
 }
@@ -158,7 +158,7 @@ mod tests {
     fn a_files_kind_is_its_directory_and_extension() {
         assert_eq!(kind_of("log/0000000000000001.kvl"), "log/*.kvl");
         assert_eq!(kind_of("MARK"), "MARK");
-        assert_eq!(kind_of("leases/abc"), "leases/");
+        assert_eq!(kind_of("log/MARK"), "log/MARK");
         let k = by_kind(&[("a/x.y".into(), 3), ("a/z.y".into(), u64::MAX)]);
         assert_eq!(k["a/*.y"], (2, u64::MAX));
     }

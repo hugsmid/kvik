@@ -1,0 +1,9 @@
+---
+source: cli/tests/output.rs
+expression: "f.run(\"series\").unwrap()"
+---
+id  name               kind         unit  latest_t              names                              retired_at
+1   site/meter/watts   gauge f64    W     2025-12-31T23:59:50Z  site/meter/power site/meter/watts
+2   site/meter/energy  counter f64  kWh   2025-12-31T23:59:00Z  site/meter/energy
+3   site/hall/mode     state              2025-12-31T23:59:30Z  site/hall/mode
+4   site/hall/note     text                                     site/hall/note

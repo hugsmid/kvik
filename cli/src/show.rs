@@ -146,10 +146,7 @@ pub fn latest(info: Option<&SeriesInfo>, id: kvik::SeriesId, live: &Live, clock:
     }
 }
 
-/// The fact columns of a tail.
-pub const FACT: &[&str] = &["position", "id", "name", "t", "value", "quality"];
-
-/// A row of [`FACT`].
+/// The fact cells of a tail row: position, id, name, t, value, quality.
 pub fn fact(f: &Fact, info: Option<&SeriesInfo>, clock: &Clock) -> Vec<Cell> {
     vec![
         Cell::Text(position(f.position)),

@@ -1,0 +1,35 @@
+---
+source: cli/tests/output.rs
+expression: "f.run(\"health\").unwrap()"
+---
+section           item                              value
+reader            health                            ok
+reader            durable                           0:9
+reader            generation                        0
+reader            epoch                             1
+reader            reset_stamp                       0/0000000000000000
+log               sealed_segments                   0
+log               open_segments                     2
+log               bytes                             134221952
+tier              local_bytes                       134223280
+tier              cold                              not configured
+leases            count                             4
+lease             03000000000000000400000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             05000000000000000600000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             07000000000000000800000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             09000000000000000a00000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+series_directory  state                             none
+status            age_ms                            0
+status            health                            ok
+status            pressure                          false
+status            queue_depth                       1
+status            waited_ns                         0
+status            batches                           0
+status            syncs                             0
+status            commit_p50_ns                     0
+status            commit_p99_ns                     0
+status            commit_max_ns                     0
+status            sealed_segments                   0
+status            disk_free                         1099511622656
+status            derived_failed                    0
+status            unlisted                          0

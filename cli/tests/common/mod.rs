@@ -2,13 +2,14 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-use kvik::env::{Env, ManualClock, MemFs};
+use kvik::env::{DirEntry, Env, Fs, FsFile, ManualClock, MemFs, OpenMode};
 use kvik::{
     Kind, Quality, Reading, SeriesId, SeriesSpec, StateValues, Store, StoreConfig, Timestamp,
     Value, ValueType,
@@ -114,9 +115,14 @@ impl Fixture {
 
     /// The tool's output for `args`, split at spaces; `--store` is the fixture's.
     pub fn run(&self, args: &str) -> Result<String, kvik_cli::Error> {
+        self.run_in(args, self.env.clone())
+    }
+
+    /// [`Fixture::run`] in `env`.
+    pub fn run_in(&self, args: &str, env: Env) -> Result<String, kvik_cli::Error> {
         let v: Vec<String> = args.split_whitespace().map(String::from).collect();
         let mut out = Vec::new();
-        kvik_cli::run(&v, Some(self.dir.clone()), self.env.clone(), &mut out)?;
+        kvik_cli::run(&v, Some(self.dir.clone()), env, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -134,5 +140,104 @@ impl Fixture {
             .collect();
         v.sort();
         v
+    }
+}
+
+/// A file system that records every call that could change a file or take a lock, with its path.
+#[derive(Debug, Clone)]
+pub struct Recording {
+    inner: Arc<dyn Fs>,
+    pub log: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+#[derive(Debug)]
+struct RecordingFile {
+    inner: Box<dyn FsFile>,
+    path: PathBuf,
+    log: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+impl Recording {
+    pub fn new(inner: Arc<dyn Fs>) -> Self {
+        Recording {
+            inner,
+            log: Arc::default(),
+        }
+    }
+
+    fn note(&self, what: &'static str, p: &Path) {
+        self.log.lock().unwrap().push((what, p.to_path_buf()));
+    }
+}
+
+impl Fs for Recording {
+    fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>> {
+        if mode != OpenMode::Read {
+            self.note("open for writing", path);
+        }
+        let inner = self.inner.open(path, mode)?;
+        Ok(Box::new(RecordingFile {
+            inner,
+            path: path.to_path_buf(),
+            log: self.log.clone(),
+        }))
+    }
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.note("create_dir_all", path);
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.note("rename from", from);
+        self.note("rename to", to);
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.note("remove_file", path);
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn free_space(&self, path: &Path) -> io::Result<u64> {
+        self.inner.free_space(path)
+    }
+}
+
+impl RecordingFile {
+    fn note(&self, what: &'static str) {
+        self.log.lock().unwrap().push((what, self.path.clone()));
+    }
+}
+
+impl FsFile for RecordingFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.note("write_at");
+        self.inner.write_at(buf, offset)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.note("set_len");
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        self.note("try_lock_exclusive");
+        self.inner.try_lock_exclusive()
+    }
+    fn identity(&self) -> io::Result<Option<kvik_log::fs::FileIdentity>> {
+        self.inner.identity()
     }
 }
