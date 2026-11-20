@@ -535,17 +535,16 @@ impl Model {
         out
     }
 
-    /// The reset points of the log (§4 Resync): the kept recovery entries and
-    /// the lost ranges not described by one.
+    /// The reset points of the log (§4 Resync): the recovery entries outside
+    /// recorded lost ranges and the lost ranges not described by one.
     pub fn reset_points(&self) -> Vec<ResetPoint> {
+        // An entry whose segment cannot be read while a copy may still come
+        // is still a reset point: the registry file keeps every recovery
+        // entry (§11 Health, Q-1031).
         let kept: Vec<(Position, RecoveryEntry)> = self
-            .disk
-            .live_entries()
+            .recovery_entries()
             .into_iter()
-            .filter_map(|(p, e)| match e.body {
-                EntryBody::Recovery(r) => Some((p, r)),
-                _ => None,
-            })
+            .filter(|(p, _)| !self.disk.is_hidden(*p) && !self.disk.set_aside(*p))
             .collect();
         crate::recovery::reset_points(&kept, &self.disk.lost_ranges())
     }

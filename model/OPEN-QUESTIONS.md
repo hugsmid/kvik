@@ -3303,6 +3303,23 @@ the NVMe target) before the rate applies; and a closed-loop writer above the rat
 `the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the_next_for_its_refill`, and the window
 properties.
 
+## Q-1031 — A recovery entry in a segment that cannot be read while a copy may still come
+Recorded and decided by the recovery-history fix, for the lead's acceptance.
+**Scenario.** A power loss truncates acknowledged facts at positions 3 and 4 that a consumer has received; the start
+writes a recovery entry at 3 (`after` = 2) and assigns 4 again. The segment holding the entry is sealed and uploaded,
+the bucket stops answering for its object, and a scrub finds the hot copy damaged. The segment is quarantined, and
+no lost range is recorded, since the lost-object rule has not judged the object lost (§8 Corrupt block, Self-repair
+stage 1). The model built reset points from readable entries only, so the entry's reset point vanished, and the
+consumer was given a different fact at 4 with no `forget_above` below it, against principle 5 and §4 Resync.
+**Decided.** A recovery entry is a reset point unless a recorded lost range holds it (that range is then the reset
+point) or a restore sets it aside; whether its segment can be read does not matter, since the registry file and
+each tree checkpoint keep every recovery entry (§11 Health). No promise changes: the model now does what §4 Resync
+already says. The durable backend keeps reset points read at its start for the whole run; whether a start that
+cannot read the segment still finds the entry is not checked here and is left to the durable comparison.
+**Tests.** `tests/recovery_histories.rs`
+`a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point`, and the reuse property
+`s4_a_position_is_given_again_only_after_a_forget_above_below_it`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

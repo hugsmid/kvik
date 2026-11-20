@@ -1697,10 +1697,15 @@ impl Disk {
     /// (§8 Restore step 1).
     pub fn live_entries(&self) -> BTreeMap<Position, Entry> {
         let mut entries = self.all_entries();
-        if let Some(end) = self.restored_end {
-            entries.retain(|p, _| p.generation >= self.generation || *p <= end);
-        }
+        entries.retain(|p, _| !self.set_aside(*p));
         entries
+    }
+
+    /// Whether `p` is of an older generation beyond the restored end (§8
+    /// Restore step 1).
+    pub fn set_aside(&self, p: Position) -> bool {
+        self.restored_end
+            .is_some_and(|end| p.generation < self.generation && p > end)
     }
 
     /// Every distinct entry readable from any tier, by position.

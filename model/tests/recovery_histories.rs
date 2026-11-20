@@ -944,6 +944,30 @@ fn recovery_history_a_compacted_object_lost_while_read_only_waits_for_the_lost_o
     run_recovery(&ops, &mut Seen::default(), ALL).unwrap();
 }
 
+#[test]
+fn a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point() {
+    let ops = [
+        ROp::Ingest(2, None),
+        ROp::Take { c: 0, n: 4 },
+        ROp::PowerLoss(1),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Upload,
+        ROp::LoseObject(0),
+        ROp::CorruptSealed(0),
+        ROp::Take { c: 0, n: 4 },
+    ];
+    run_recovery(
+        &ops,
+        &mut Seen::default(),
+        Checks {
+            reuse: true,
+            ..NONE
+        },
+    )
+    .unwrap();
+}
+
 /// Guards the recovery-history properties (invariants 25–27 and reuse):
 /// positions delivered and then assigned again after a reset (flagged ones
 /// among them), `resync`s carrying `forget_above`, confirmations that forced
