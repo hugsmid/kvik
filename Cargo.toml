@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["model", "kvik", "log", "chunk", "sinkapi", "sink", "backup", "export", "files", "spikes/encodings", "spikes/commit", "tree"]
+members = ["model", "kvik", "log", "chunk", "sinkapi", "sink", "backup", "export", "files", "spikes/encodings", "spikes/commit", "tree", "cli"]
 # The fuzz targets build with nightly cargo-fuzz in their own workspaces (`log/fuzz/README.md`, `chunk/fuzz/README.md`,
 # `files/fuzz/README.md`, `backup/fuzz/README.md`).
 exclude = ["log/fuzz", "chunk/fuzz", "files/fuzz", "tree/fuzz", "backup/fuzz"]
 # The spikes and the export crate are built and tested in their own CI jobs (`cargo test -p encodings`,
 # `cargo test -p commit`, `cargo test -p kvik-export`).
-default-members = ["model", "kvik", "log", "chunk", "sinkapi", "sink", "backup", "files", "tree"]
+default-members = ["model", "kvik", "log", "chunk", "sinkapi", "sink", "backup", "files", "tree", "cli"]
 
 [workspace.package]
 edition = "2024"
