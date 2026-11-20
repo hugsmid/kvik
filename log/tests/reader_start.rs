@@ -414,3 +414,61 @@ fn a_start_after_the_second_last_position_of_a_segment_reads_from_that_segment()
     assert_eq!(got.first(), Some(&whole[k + 1]));
     assert_eq!(got.len(), whole.len() - k - 1);
 }
+
+#[test]
+fn a_lookup_at_the_last_position_of_a_segment_reads_that_segment() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let wanted: Vec<WantedAt> = whole
+        .windows(2)
+        .filter(|w| w[0].file_id != w[1].file_id)
+        .filter_map(|w| facts_of(&w[0]).last().copied())
+        .map(|(s, t, p)| WantedAt {
+            series_id: s,
+            t,
+            position: p,
+        })
+        .collect();
+    assert!(wanted.len() >= 3, "{wanted:?}");
+    for w in &wanted {
+        assert!(whole.iter().any(|b| b.last == w.position));
+    }
+    let at = reader(&fs, 10).lookup_at(&wanted, &|_, _, _| false).unwrap();
+    assert!(at.complete.iter().all(|c| *c));
+    for w in &wanted {
+        assert!(at.facts.iter().any(|f| f.position == w.position), "{w:?}");
+    }
+}
+
+#[test]
+fn a_lookup_at_a_position_in_a_damaged_segment_is_not_complete() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let b = &whole[whole.len() / 2];
+    let (s, t, p) = facts_of(b)[0];
+    let path = fs
+        .paths()
+        .into_iter()
+        .find(|x| {
+            x.to_string_lossy()
+                .contains(&format!("{:016x}.kvl", b.file_id))
+        })
+        .unwrap();
+    let at = usize::try_from(b.offset).unwrap() + 40;
+    let byte = fs.read(&path).unwrap()[at];
+    fs.poke(&path, at, &[!byte]);
+    let got = reader(&fs, 10)
+        .lookup_at(
+            &[WantedAt {
+                series_id: s,
+                t,
+                position: p,
+            }],
+            &|_, _, _| false,
+        )
+        .unwrap();
+    assert_eq!(got.complete, [false]);
+    assert!(got.facts.iter().all(|f| f.position != p));
+}

@@ -3484,6 +3484,10 @@ segments; `kvik/tests/latest_budgets.rs`): S1 with nothing written since 0.127 m
 400 readings 0.406 ms (spread 0.031), of which the refresh is about 0.3 ms; S2 0.202 ms and 0.406 ms. The first
 snapshot of a reader just opened is about 0.1 s here, folding the log since the only directory. The figures on the
 two hardware classes are roadmap 9.0e's.
+**Known effect.** A round that reads no file does not re-check the last batch its log reader returned, so a segment
+removed under an idle writer (Q-951) reaches a call that reads only latest values at the next durable write or once
+the view is half a lease old, not at the next call; the loss watch and every call that reads facts check at once, and
+no fact is shown that the view did not hold (`reader.rs` `view_latest`).
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
 `the_writers_own_reader_reads_no_file_while_the_writer_has_made_nothing_durable_since`.
 
