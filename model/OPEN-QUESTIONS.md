@@ -3321,6 +3321,21 @@ cannot read the segment still finds the entry is not checked here and is left to
 `a_recovery_entry_in_a_recorded_lost_range_gives_only_the_range_reset_point`, and the reuse property
 `s4_a_position_is_given_again_only_after_a_forget_above_below_it`.
 
+## Q-1032 — The next position after a start that cannot read a published segment
+Recorded and decided by the self-repair history fix, for the lead's acceptance.
+**Scenario.** A sealed segment holding positions 8 to 10 leaves the fast disk and the bucket stops answering for its
+object while it cannot be reached, so no lookup counts and the lost-object rule has not spoken. The engine restarts.
+The model took the next position from the readable entries and the lost ranges only, so the next batch was given
+8 to 10 again; the segment then answered, so two files held different facts at the same positions, against §3
+(positions are assigned once, except above K after a truncation, rule 3) and principle 5.
+**Decided.** A start never assigns a position that a published segment holds, whether or not it can be read now: the
+manifest lists the segment and its range. No promise changes; the model now does what §3 already says. The durable
+log takes its next position from the log's own tail and the mark, so this is a defect of the model alone; the
+durable comparison has not been run on this history.
+**Tests.** `tests/self_repair/properties.rs`
+`a_start_does_not_assign_again_the_positions_of_a_segment_awaiting_its_copy`, and
+`s8_self_repair_histories_keep_the_rulings`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
