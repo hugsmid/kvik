@@ -99,6 +99,7 @@ impl Writer {
         // mark, is written again whenever it does not. Its id floor is the writer's, which recovery folded in from
         // the mark, the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
         let mut start_fault = start_fault;
+        let registry_written: derived::RegistryWritten = Arc::default();
         if start_fault.is_none() {
             let stats = writer.stats();
             let expected = index.registry_file(stats.mark_synced, stats.max_series_id);
@@ -110,6 +111,8 @@ impl Writer {
                     kvik_log::registry::write(&*env.fs, &dir, descriptor.store_id, wall, &expected)
             {
                 start_fault = Some(registry_fault(&dir, &e));
+            } else {
+                *lock(&registry_written) = Some(stats.mark_synced);
             }
         }
         let hook = derived::hook(
@@ -161,6 +164,14 @@ impl Writer {
             &dir,
         );
         if let Some(h) = &hub {
+            hook.registry(cover_registry(
+                h.clone(),
+                log.watch(),
+                env.clone(),
+                &dir,
+                descriptor.store_id,
+                registry_written.clone(),
+            ));
             h.start(log.watch()).map_err(|source| OpenError::Io {
                 path: dir.clone(),
                 source,
@@ -185,6 +196,7 @@ impl Writer {
             latch,
             watch: Mutex::new(watch),
             start_losses,
+            registry_written,
             bucket_warning: config.log.bucket_warning(),
             env,
         });
@@ -226,6 +238,7 @@ impl Writer {
             if lock(&self.own_fault).is_some() || hub_fault().is_some() {
                 return Ok(());
             }
+            let _written = lock(&self.registry_written);
             let floor = w.stats().max_series_id;
             let mut file = None;
             if let Some(h) = &self.hub {
@@ -315,6 +328,37 @@ pub(super) fn registry_fault(dir: &Path, e: &io::Error) -> LogFault {
         path: dir.join(kvik_log::registry::REGISTRY_DIR),
         kind: e.kind(),
         message: e.to_string(),
+    }
+}
+
+/// What makes the registry file cover every entry a series directory covers (Q-1001): written up to the
+/// directory's `through` from the deliverer's index when an entry was taken above the file's `through`, under the
+/// lock every write of the file takes. A failed write is no fault: that directory is not written.
+fn cover_registry(
+    hub: Arc<deliver::Hub>,
+    watch: kvik_log::writer::Watch,
+    env: Env,
+    dir: &Path,
+    store_id: [u8; 16],
+    written: derived::RegistryWritten,
+) -> impl Fn(kvik_log::writer::Position, kvik_log::writer::Position) -> bool + Send + Sync + 'static
+{
+    let dir = dir.to_path_buf();
+    move |through, entry| {
+        let mut w = lock(&written);
+        if w.is_some_and(|w| w >= entry) {
+            return true;
+        }
+        let floor = watch.stats().max_series_id;
+        let Some(file) = hub.run_quiet(|d, c| d.routing_registry_file(c, through, floor)) else {
+            return false;
+        };
+        let wall = env.clock.wall().0;
+        let ok = kvik_log::registry::write(&*env.fs, &dir, store_id, wall, &file).is_ok();
+        if ok {
+            *w = Some(through);
+        }
+        ok
     }
 }
 

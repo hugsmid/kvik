@@ -88,6 +88,11 @@ impl Latch {
         new
     }
 
+    /// How many closed ranges were taken.
+    pub(crate) fn closed_count(&self) -> usize {
+        self.lock().closed.len()
+    }
+
     /// Whether the regions found hold the whole span `start..end` of segment `file_id` (Q-922).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn covers(&self, file_id: u64, start: u64, end: u64) -> bool {

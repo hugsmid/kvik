@@ -67,6 +67,7 @@ impl Writer {
     /// moved past it. From the deliverer's index once it has taken the log that far; the store's own reader
     /// otherwise.
     fn write_registry_file(&self) -> Result<(), Error> {
+        let mut written = lock(&self.registry_written);
         let Some(st) = self.log().as_ref().map(kvik_log::writer::Log::stats) else {
             return Err(Error::Closed);
         };
@@ -78,7 +79,9 @@ impl Writer {
             None => self
                 .reader()
                 .map_err(|e| Error::Internal(e.to_string()))?
-                .with_again(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+                .with_latest_again(|v| {
+                    Ok(v.latest().registry_file(st.mark_synced, st.max_series_id))
+                })
                 .map_err(|e| Error::Internal(e.to_string()))?,
         };
         let wall = self.env.clock.wall().0;
@@ -89,6 +92,7 @@ impl Writer {
                 Error::ReadOnly(e.to_string())
             },
         )?;
+        *written = Some(st.mark_synced);
         Ok(())
     }
 

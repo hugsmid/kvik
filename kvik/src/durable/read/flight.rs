@@ -87,7 +87,6 @@ impl<V, E: Clone> Flight<V, E> {
     }
 
     /// The view of the last round that succeeded.
-    #[cfg(test)]
     pub(crate) fn current(&self) -> Option<Arc<V>> {
         self.lock().current.as_ref().map(|(_, v)| v.clone())
     }

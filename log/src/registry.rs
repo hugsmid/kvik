@@ -283,6 +283,16 @@ pub fn read_latest(
     store_dir: &Path,
     store_id: &[u8; 16],
 ) -> Result<Option<(u64, RegistryFile)>, FormatError> {
+    read_latest_where(fs, store_dir, store_id, |_| true)
+}
+
+/// [`read_latest`] among the files `accept` takes: the newest valid one it takes, older generations tried in turn.
+pub fn read_latest_where(
+    fs: &dyn Fs,
+    store_dir: &Path,
+    store_id: &[u8; 16],
+    accept: impl Fn(&RegistryFile) -> bool,
+) -> Result<Option<(u64, RegistryFile)>, FormatError> {
     let mut found = names(fs, &store_dir.join(REGISTRY_DIR)).unwrap_or_default();
     found.sort_by_key(|(_, id, _)| std::cmp::Reverse(*id));
     for (generation, id, path) in found {
@@ -292,7 +302,8 @@ pub fn read_latest(
         match decode(&bytes, store_id) {
             Ok(f)
                 if f.generation == generation
-                    && FileHeader::decode(&bytes).is_some_and(|h| h.file_id == id) =>
+                    && FileHeader::decode(&bytes).is_some_and(|h| h.file_id == id)
+                    && accept(&f) =>
             {
                 return Ok(Some((id, f)));
             }

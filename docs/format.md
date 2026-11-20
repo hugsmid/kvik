@@ -825,7 +825,9 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   rebuilds the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must
   hold exactly the kept log's registry entries up to the last synced mark, with an id floor at least the writer's;
   if it does not, it is written again from the kept log, with the writer's id floor, so the id of a lost definition
-  stays assigned. The writer writes it again at clean shutdown, after the last mark sync. Until log segments can leave
+  stays assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
+  a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
+  (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log segments can leave
   the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry, so the file is checked,
   never trusted over the log.
 
@@ -1114,7 +1116,8 @@ largest of the last 16 seals, would pass 32 MiB, and otherwise at least every 15
 at most 32 MiB, and while a due write waits for the mark sync (or for the deliverer to take the batches) at most 32
 MiB plus the seals since. Segments that seal by size (the default 64 MiB) are covered at every seal; small timed
 seals at the 15-minute rule. A reader whose uncovered sealed bytes pass its 64 MiB allowance waits one mark-sync
-interval and tries again before `DirectoryUnavailable` (Q-773). The cadence holds while one seal (its read, CRC32C
+interval and tries again before `DirectoryUnavailable` (Q-773; built with roadmap 9.0e: until then a reader
+reads whatever lies above the directory it continues, Q-1003). The cadence holds while one seal (its read, CRC32C
 and SHA-256) takes less time than a segment takes to fill. The status file: every 60 s and at once on a change of
 health or pressure (looked at once a second).
 

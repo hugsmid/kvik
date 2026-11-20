@@ -21,7 +21,7 @@ impl LogReader {
         mark: &MarkSlot,
         events: &mut Vec<ReadEvent>,
         scratch: &mut Scratch,
-        budget: Option<usize>,
+        (budget, upto): (Option<usize>, Option<Position>),
     ) -> Result<bool, ReaderError> {
         let mut items = 0usize;
         // A new generation: everything taken is void and the log is read again from its start (Q-118 (c)).
@@ -145,14 +145,21 @@ impl LogReader {
                         }
                     }
                     Found::Batch(b) if set_aside(&b, &self.cfg.set_aside) => {}
+                    Found::Batch(b)
+                        if Position {
+                            generation: b.commit.generation,
+                            sequence: b.commit.last_sequence,
+                        } <= view.floor => {}
                     Found::Batch(b) => {
                         let g = b.commit.generation;
                         let last = Position {
                             generation: g,
                             sequence: b.commit.last_sequence,
                         };
-                        // Never above the mark's last position, from any segment.
-                        if g == mark.generation && last.sequence > mark.last_sequence {
+                        // Never above the mark's last position, from any segment, nor above `upto`.
+                        if (g == mark.generation && last.sequence > mark.last_sequence)
+                            || upto.is_some_and(|u| last > u)
+                        {
                             view.resume = Some(before);
                             fingerprint(&mut view.recent, bytes);
                             return Ok(false);

@@ -401,6 +401,11 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
   staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
+- From roadmap 9.0c a reader process holds per series the bounded latest-value state of the series directory
+  (`format.md` A.18) and the registry, not every fact: it continues the newest valid directory and reads the log above
+  it, and serves `live`, `series` and `losses` from that, looking a fact up in the log where the state cannot tell
+  (Q-1003, Q-1004). A call that reads facts (windows, `facts`, `at`, `buckets`, calendar results) builds the full fact
+  index at its first use and keeps it, until roadmap 9.0f (Q-1000).
 - Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
   what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
   segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at
@@ -423,7 +428,13 @@ pub enum View { Current, AsOf(Position), AsOfTime(Timestamp), History }
 pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value, pub quality,
                      pub supplied_quality, pub flags: FactFlags, pub changed_at: Option<u64> }
 pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRow>, QueryError>;   // the fact in force at t
+pub fn snapshot(&self) -> Result<Snapshot, QueryError>;   // roadmap 9.0c: static reads at one cut and one `now`
+pub struct Snapshot;   // live(id), series(key), losses(), state(), now(); owned, Send + 'static, cheap to clone
 ```
+- `snapshot` answers `live`, `series` and `losses` at one cut, with `now` taken when it is made (Q-1005). Like any
+  read under a cut it ends with `CutExpired` once the cut is `cut_max_age` old or its lease was found gone, and the
+  caller takes another. Windows and facts join it with roadmap 9.0f. On the model backend it holds the results taken
+  when it was made.
 - `at` returns the fact with the greatest event time ≤ `t` that a window can credit (not bad quality, not displaced),
   as `view` selects it (for a versioned series, the version the view selects), with its `changed_at`; `None` if there
   is none. It lets a client show, for example, the issue time of the value a window's leading stretch carries in.
@@ -451,6 +462,50 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
   kept for later use is kept with `ReaderState.stamp` as a `SavedPoint`; `reader.check(point)` judges it against the
   resets since (spec §7 Readers): kept, void above a position, or unknown (start again). Built with roadmap 5.3.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
+
+### Live reads (roadmap 9.0d)
+
+```rust
+pub fn session(&self) -> LiveSession;                                            // default pacing
+pub fn session_with(&self, o: SessionOptions) -> Result<LiveSession, QueryError>;
+pub struct SessionOptions { pub min_batch_interval: Duration, pub poll_interval: Duration }  // 200 ms ≥ 20; 100 ms ≥ 10
+pub enum Query { Latest(Selection), Tail { sel: Selection } }                     // #[non_exhaustive]
+pub struct Selection { pub select: Vec<Select> }                                  // #[non_exhaustive]
+pub struct LiveOptions { pub max_rows: usize, pub max_backlog_rows: u64, pub max_backlog_bytes: u64 }  // 10,000; 1,000,000; 64 MiB
+impl LiveSession { pub fn open(&mut self, q: Query, o: LiveOptions) -> Result<LiveId, QueryError>;
+                   pub fn cancel(&mut self, id: LiveId) -> bool;
+                   pub fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError>; }
+pub struct UpdateBatch { pub durable: Position, pub now: Timestamp, pub events: Vec<(LiveId, LiveEvent)> }
+pub enum LiveEvent { Opened(Answer), Appended(Appended), Updated(Updated), Reset { above }, Gap { first, last },
+                     Lagged { from, to }, Joined { series, info, index, part }, Left { series }, Closed(CloseReason) }
+pub fn select(&self, s: &Selection) -> Result<Vec<SeriesId>, QueryError>;      // on Snapshot: the static members
+```
+- A live read is a query opened in a session: its `Opened` is the result at the cut of the next batch, then each
+  batch brings every live read of the session to one durable position and one `now`. `next` computes the batch when
+  called (no thread, no queue) and returns one only when an event changed; batches are at least `min_batch_interval`
+  apart, and `next` sleeps rather than turns while it waits. The writer's process is woken when the writer publishes;
+  a reader process reads the mark once a poll interval, and refreshes in full when it moved and at least once a
+  second (Q-1010, Q-1015). Within a batch a live read's events come `Reset`, `Gap` or `Lagged`, `Opened`, `Joined`
+  and `Left`, then `Updated` and `Appended`, then `Closed`.
+- `Latest` holds each selected series' live state, as `Snapshot::live` gives it at the batch's cut and `now`:
+  `Updated` replaces one, `Joined` inserts a series at `index` of the selection's order and `Left` removes one (a
+  definition, a name given, a retirement; Q-1012). A result that changes with `now` alone (a value falling due,
+  staleness passing) is updated at its due time with no new fact.
+- `Tail` delivers the facts of the selected series in position order as they become durable, chosen by what was
+  known at each fact's position (Q-895), from the cut of its `Opened`; it has no static read and opens at that cut
+  only (from a time with roadmap 9.0f, from a saved point with 5.3). At most `max_rows` facts per batch: the batch's
+  cut stops there for every live read of the session (Q-1014). A consumer more than `max_backlog_*` behind the mark
+  gets `Lagged { from, to }` and continues at the mark; the facts between may be read statically (Q-1013).
+- Nothing is silently wrong (Q-1011): a reset is `Reset { above }` (drop what is held above it) and a fresh `Opened`
+  (a `Latest`'s whole result; a `Tail`'s says it goes on from `above`); positions found lost, by the session's read,
+  by another read of the process or recorded by a start, are `Gap { first, last }` (drop what is held between them;
+  a `Latest` is opened again), in the batch that first could carry a fact inside them, a batch the row limit stops
+  included. An error of the shared read, such as `NotAvailable` for a segment that cannot be read (Q-951), is
+  returned by every `next` it lasts (Q-1016).
+- A session whose `next` was not called for `cut_max_age` is closed: its next call returns `Closed(Idle)` for each
+  live read. Dropping
+  the session cancels them all. The model backend computes each batch again from its head; it has no resets or
+  losses and no pacing.
 
 ## Health and statistics (types accepted at gate 3.3)
 ```rust

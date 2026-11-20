@@ -32,7 +32,7 @@ mod loss;
 mod open;
 #[cfg(test)]
 mod pause;
-mod read;
+pub(crate) mod read;
 pub(crate) mod reader;
 #[cfg(test)]
 mod registering;
@@ -79,7 +79,10 @@ use entries::Decided;
 use index::{Index, cause_out, fact_out, mark_state_out, pos};
 use ingest::{Decider, Decision};
 use loss::Latch;
+pub(crate) use read::latest::{live as live_at, series as series_at};
+pub(crate) use read::view::View as SnapshotView;
 pub(crate) use reader::DurableReader;
+pub(crate) use reader::{copy as copy_error, losses_of as losses_at};
 pub(crate) use windows::{buckets, live, window};
 
 /// The most readings in one call, whatever the ingest queue (`docs/api.md` Writing).
@@ -232,6 +235,8 @@ pub(crate) struct Writer {
     watch: Mutex<loss::Watch>,
     /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
     start_losses: Vec<LossReport>,
+    /// The registry file's `through` as last written, and the lock of every write of the file (Q-1001).
+    registry_written: derived::RegistryWritten,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,
 }
@@ -289,6 +294,7 @@ impl Writer {
                 (READER_LEASE, READER_LEASE),
                 self.clocks.clone(),
                 self.latch.clone(),
+                self.log().as_ref().map(Log::watch),
             )
             .map_err(|e| QueryError::NotAvailable {
                 reason: e.to_string(),
@@ -298,13 +304,19 @@ impl Writer {
         Ok(opened)
     }
 
+    /// A handle woken at every turn of the writer that published something, the durable mark's moves among them:
+    /// what the live sessions of this process wait on (the query design's section 3.6).
+    pub(crate) fn progress(&self) -> Option<kvik_log::writer::Watch> {
+        self.log().as_ref().map(Log::watch)
+    }
+
     /// From the deliverer's held state; the reader of the process only when there is no deliverer or its
     /// summaries could not be made exact.
     pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, QueryError> {
         if let Some(r) = self.held(|d| d.series(key)) {
             return r.map_err(Error::query);
         }
-        self.reader()?.with(|i, _| i.series(key))
+        self.reader()?.with_latest(|v| read::latest::series(v, key))
     }
 }
 
@@ -353,29 +365,36 @@ pub(crate) fn interval(
     id: SeriesId,
     t: Timestamp,
 ) -> Result<(Timestamp, Timestamp), QueryError> {
-    r.with(|i, _| {
-        let info = i.series(&SeriesKey::Id(id))?;
-        match info.spec.kind {
-            Kind::Interval {
-                length: IntervalLength::Fixed { d, phase },
-                ..
-            } => {
-                let (d, phase) = (
-                    i128::from(convert::dur_nanos(d)?),
-                    i128::from(convert::dur_nanos(phase)?),
-                );
-                let start = (i128::from(t.0) - phase).div_euclid(d) * d + phase;
-                let outside = || Error::InvalidQuery("interval outside the time range".into());
-                let end = i64::try_from(start + d).map_err(|_| outside())?;
-                let start = i64::try_from(start).map_err(|_| outside())?;
-                Ok((Timestamp(start), Timestamp(end)))
-            }
-            Kind::Interval { .. } => Err(Error::NotSupportedYet(
-                "calendar-length interval series (a local day or month)",
-            )),
-            _ => Err(Error::InvalidQuery("not an interval series".into())),
+    let info = r.with_latest(|v| read::latest::series(v, &SeriesKey::Id(id)))?;
+    interval_of(&info, t).map_err(Error::query)
+}
+
+fn interval_of(info: &SeriesInfo, t: Timestamp) -> Result<(Timestamp, Timestamp), Error> {
+    match info.spec.kind {
+        Kind::Interval {
+            length: IntervalLength::Fixed { d, phase },
+            ..
+        } => {
+            let (d, phase) = (
+                i128::from(convert::dur_nanos(d)?),
+                i128::from(convert::dur_nanos(phase)?),
+            );
+            let start = (i128::from(t.0) - phase).div_euclid(d) * d + phase;
+            let outside = || Error::InvalidQuery("interval outside the time range".into());
+            let end = i64::try_from(start + d).map_err(|_| outside())?;
+            let start = i64::try_from(start).map_err(|_| outside())?;
+            Ok((Timestamp(start), Timestamp(end)))
         }
-    })
+        Kind::Interval { .. } => Err(Error::NotSupportedYet(
+            "calendar-length interval series (a local day or month)",
+        )),
+        _ => Err(Error::InvalidQuery("not an interval series".into())),
+    }
+}
+
+/// What the reader held at a view's cut.
+pub(crate) fn state_at(v: &SnapshotView) -> ReaderState {
+    reader::state_of(v)
 }
 
 /// The reader state of a durable reader.

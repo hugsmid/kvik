@@ -86,6 +86,16 @@ pub(crate) fn reading_of(series: &Series, s: &Stored) -> Option<Reading> {
     Some((r.t, v))
 }
 
+/// Whether [`reading_of`] gives a reading, without building it.
+pub(crate) fn has_reading(series: &Series, s: &Stored) -> bool {
+    s.row.quality != LogQuality::Bad
+        && match &s.row.value {
+            LogValue::F64(_) | LogValue::Bool(_) | LogValue::Text(_) => true,
+            LogValue::State(i) => series.def.state_names.get(usize::from(*i)).is_some(),
+            LogValue::Decimal { .. } | LogValue::Absent { .. } => false,
+        }
+}
+
 /// Whether a current fact can be a series' live-state fact at `now` (spec §2.3): not bad quality, and for an
 /// observed interval series ended (`t + d ≤ now`).
 pub(crate) fn may_be_live(series: &Series, p: &Params, s: &Stored, now: i64) -> bool {
@@ -225,10 +235,12 @@ pub(crate) fn live_in(
     Ok(live_with(&p, clocks, id, s, now))
 }
 
-/// Live state (spec §2.3, §5.4) at the reader's `now` ([`live_in`]).
+/// Live state (spec §2.3, §5.4) at the reader's `now`, from the series directory and the log tail
+/// ([`super::read::latest::live`]).
 pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> {
     let now = r.now();
-    r.with(|i, _| live_in(i, r.clocks(), id, now))
+    // A lookup under another reset stamp than the view's is computed once more under a new cut (query design 3.2).
+    r.with_latest_again(|v| super::read::latest::live(r, v, id, now))
 }
 
 /// A window result (spec §6), a calendar result among them (spec §5.7: a window over its span, in the site zone or

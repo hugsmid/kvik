@@ -10,6 +10,7 @@ use kvik_log::manifest::LostRange;
 use kvik_log::reader::ReaderState;
 
 use super::cut::Cut;
+use super::latest::Latest;
 use crate::durable::index::Index;
 
 /// What the views of one reader tell it about their cuts.
@@ -36,10 +37,14 @@ impl Cuts {
 /// See the module documentation.
 #[derive(Debug)]
 pub(crate) struct View {
-    index: Index,
+    latest: Latest,
+    /// Every fact, for the calls that read facts until roadmap 9.0f (Q-1000).
+    facts: Option<Index>,
     state: ReaderState,
     lost_ranges: Arc<[LostRange]>,
     cut: Cut,
+    /// The number of the refresh's round in the reader's shared tail ([`super::hub`]).
+    round: u64,
     /// When the refresh that took the cut began, on the reader's monotonic clock: the cut's epoch was current from
     /// then on.
     current_at: Duration,
@@ -59,21 +64,23 @@ impl Drop for View {
 }
 
 impl View {
-    /// A view of `index` under `cut`, taken by a refresh that began at `current_at`.
+    /// A view of `latest` and `facts` under `cut`, taken by a refresh that began at `current_at`.
     pub(crate) fn new(
-        index: Index,
+        (latest, facts): (Latest, Option<Index>),
         state: ReaderState,
         lost_ranges: Arc<[LostRange]>,
-        cut: Cut,
+        (cut, round): (Cut, u64),
         current_at: Duration,
         cuts: Arc<Cuts>,
     ) -> Self {
         let lost_seen = cuts.lost.load(Ordering::SeqCst);
         View {
-            index,
+            latest,
+            facts,
             state,
             lost_ranges,
             cut,
+            round,
             current_at,
             lost_seen,
             cuts,
@@ -90,14 +97,24 @@ impl View {
         &self.lost_ranges
     }
 
-    /// The index as of the cut.
-    pub(crate) fn index(&self) -> &Index {
-        &self.index
+    /// The latest values, the registry and the losses as of the cut.
+    pub(crate) fn latest(&self) -> &Latest {
+        &self.latest
+    }
+
+    /// Every fact as of the cut, if the reader holds them (Q-1000).
+    pub(crate) fn index(&self) -> Option<&Index> {
+        self.facts.as_ref()
     }
 
     /// The cut.
     pub(crate) fn cut(&self) -> &Cut {
         &self.cut
+    }
+
+    /// The number of the refresh's round in the reader's shared tail.
+    pub(crate) fn round(&self) -> u64 {
+        self.round
     }
 
     /// How long the cut has been live at `now`.

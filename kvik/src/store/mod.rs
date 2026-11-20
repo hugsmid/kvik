@@ -27,8 +27,11 @@ use crate::series::{ExcessPrecision, ParameterChange, SeriesInfo, SeriesKey, Ser
 use crate::time::{TimeRange, Timestamp, ZoneName};
 use crate::types::{Ack, Fact, FactRow, Intent, Pending, Position, Reading, SeriesId};
 
+mod live;
 mod reader;
 
+pub use live::LiveSession;
+pub(crate) use live::check as live_check;
 pub use reader::Reader;
 use reader::ReaderInner;
 
