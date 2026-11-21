@@ -329,7 +329,7 @@ fn positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position()
         "a possible loss inside a bridge is compared whole"
     );
     assert_eq!(
-        positions_lost(&[outside.clone()], &[]),
+        positions_lost(std::slice::from_ref(&outside), &[]),
         (vec![outside], vec![]),
         "without a bridge every report is compared whole"
     );
