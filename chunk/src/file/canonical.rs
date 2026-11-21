@@ -105,6 +105,10 @@ pub fn check_canonical(
         let key = |s: &Series| (s.name.is_none(), s.name.clone(), s.series_id);
         key(a).cmp(&key(b))
     });
+    #[allow(
+        clippy::needless_update,
+        reason = "the other fields exist only with the `tweaks` feature"
+    )]
     let tweaks = Tweaks {
         bodies,
         ..Tweaks::default()
