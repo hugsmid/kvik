@@ -1,7 +1,8 @@
 //! A reader's queries allocate within its memory cap (`ReaderConfig::memory`, Q-1063): the peak of the heap while
 //! `facts` streams 104,000 text facts from four maximal batches whose event times interleave, and while `at` reads.
-//! Measured above the heap before each call against what one pass alone is granted, the first call with the lookups'
-//! cache it fills. Alone in its binary, so that the allocator counts this test only.
+//! Measured above the heap before each call against what one pass alone is granted; the first call also runs the
+//! reader's first refresh, which keeps the bytes of the segment it follows (Q-1069). Alone in its binary, so that the
+//! allocator counts this test only.
 
 #![forbid(unsafe_code)]
 
@@ -20,8 +21,11 @@ const PER_BATCH: i64 = 26_000;
 /// What a query allocates outside the cap's accounting: the stream, its plan and cut, a key's fold, the error and
 /// iterator state.
 const OVERHEAD: usize = 1 << 20;
-/// What the lookups' log reader keeps (`kvik_log::reader::LOOKUP_CACHE_BYTES`), in the cache's share.
+/// What the lookups' log reader keeps at most (`kvik_log::reader::LOOKUP_CACHE_BYTES`), in the cache's share.
 const LOOKUPS: usize = 8 << 20;
+/// What the first refresh takes above the segment bytes it keeps, measured at 9.9 MiB with 8 MiB batches; over before
+/// the first pass is admitted.
+const REFRESH: usize = 12 << 20;
 
 /// The grant one pass takes alone at `cap` (Q-1063): the cap less the cache's share, all of it under two least
 /// grants of 17 MiB, else half.
@@ -63,6 +67,15 @@ fn facts_and_at_allocate_within_the_memory_cap() {
         block_on(s.emit(&readings)).unwrap();
     }
     block_on(s.shutdown()).unwrap();
+    // The log reader keeps the bytes of the last segment it read between refreshes, so that a refresh reads only
+    // what is new: here the sealed segment holding the four batches; the open ones after it are preallocated.
+    let followed = w
+        .segments()
+        .iter()
+        .filter(|(p, _)| p.extension().is_some_and(|e| e == "kvl"))
+        .map(|(_, b)| b.len())
+        .max()
+        .unwrap();
     let all = Timestamp(i64::MIN)..Timestamp(i64::MAX);
     let last = Timestamp(first + (PER_BATCH * BATCHES - 1) * 1_000_000);
     for cap in [32u64 << 20, 64 << 20] {
@@ -77,9 +90,10 @@ fn facts_and_at_allocate_within_the_memory_cap() {
             assert_eq!(n, (BATCHES * PER_BATCH) as usize);
         });
         eprintln!("first facts at {} MiB: peak {first} bytes", cap >> 20);
+        // The lookups' cache fills in this call, within the cap's share: two segments' maps, a few KiB here.
         assert!(
-            first <= grant + LOOKUPS + OVERHEAD,
-            "first facts at {} MiB: {first} bytes",
+            first <= followed + (grant + OVERHEAD).max(REFRESH),
+            "first facts at {} MiB: {first} bytes, the followed segment {followed}",
             cap >> 20
         );
         for view in [View::History, View::Current] {

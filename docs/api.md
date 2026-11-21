@@ -461,11 +461,12 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
   `OpenError::Config`), a stream's rows not yet taken by the caller included: a read that needs more works in more
   passes over narrower event-time ranges, down to one key's positions, with equal results at any cap (Q-1063,
-  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, and the fact index a reader builds once, and then
-  keeps, to find damage a read met (Q-1060, Q-1069). Rows a stream holds give way to another read that needs the
-  room, and the stream reads that part again: at 32 MiB a held part above about 7 MiB leaves too little for any other
-  read on the reader, an `at` included, so interleaving such reads with a stream row by row costs work that grows
-  with the square of a part's rows. Results are unchanged (Q-1067, Q-1096).
+  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
+  keeps, to find damage a read met (Q-1060, Q-1069), and the bytes of the last segment the reader's refresh read, up to
+  `log.segment_size`, kept so that the next refresh reads only what is new (Q-1069). Rows a stream holds give way to
+  another read that needs the room, and the stream reads that part again: at 32 MiB a held part above about 7 MiB
+  leaves too little for any other read on the reader, an `at` included, so interleaving such reads with a stream row
+  by row costs work that grows with the square of a part's rows. Results are unchanged (Q-1067, Q-1096).
 - A reader whose `facts` or `at` took facts from a sealed segment that is then removed with no record naming the
   removal fails those calls with `NotAvailable` until it is opened again; a stream or `at` ends with `NotAvailable`
   when a segment its first pass listed is gone (Q-951, Q-1066).

@@ -3935,9 +3935,15 @@ moves into the fact yielded. Outside the cap, measured as a fixed 1 MiB allowanc
 key's fold, and an `at` probe's own state. Also outside it, and said in `api.md`: the fact index a reader builds once
 to find damage (Q-1060). Measured with a counting allocator (`peak_alloc`) over four 8 MiB batches whose times
 interleave: 19.1 MiB above the baseline for `facts` in history and the current view and for `at`, at 32 MiB and at
-64 MiB. The test bounds each later call by the grant one pass takes alone (24 MiB at both caps) plus the allowance,
-and the reader's first `facts`, which fills the lookups' cache, by that plus the cache's 8 MiB, so another 8 MiB copy
-of the rows fails at either cap. A batch larger than the reserve, which this writer does not write, is read above the
+64 MiB. The test bounds each later call by the grant one pass takes alone (24 MiB at both caps) plus the allowance.
+The reader's first `facts` measured 32.7 MiB: its 13.7 MiB above the later calls is not the lookups' cache (a few KiB
+here: two segments' maps) but the reader's first refresh, whose log reader keeps the bytes of the last segment it read
+between refreshes so that the next reads only what is new: 13.6 MiB, the sealed segment holding the four batches. It
+is kept while the reader follows that segment, is outside the cap like the rest of the reader's own state, and is up
+to `log.segment_size` (64 MiB by default); the refresh's peak above it (9.9 MiB) is over before the first pass is
+admitted. So the first call is bounded by that segment's bytes plus the later calls' bound, and another 8 MiB copy of
+the rows fails at either cap. Not built: giving those bytes back after a refresh, which costs the next refresh a read
+of the segment from its start. A batch larger than the reserve, which this writer does not write, is read above the
 cap.
 **Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
