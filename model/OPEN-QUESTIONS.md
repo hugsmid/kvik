@@ -4339,7 +4339,8 @@ the reach. The damage always lies above any directory the rig writes; a director
 it where segments seal within a run, which the latest values' rig does not do and the sources property does, and the
 check then skips (Q-1104). A reader continuing a directory that lies over unrecorded damage, before any start meets
 it, need not know of the loss or its commit time before; that window is a consequence of Q-1002 as built (the next
-start removes the directories), not something Q-1002 states, and nothing is promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
+start removes the directories), not something Q-1002 states, and nothing is promised for it. Damage in a sealed
+segment would also meet Q-937, which stays with that question's own item.
 **Tests.** `kvik/src/durable/read/latest/histories.rs`
 `a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
 `a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
@@ -4490,12 +4491,17 @@ always lie below the damage.
 damage, only where the series directories through that position are the store's own (at least one, none the rig
 wrote); otherwise it fails. That is the window Q-1071 leaves to Q-1002 as built: nothing is promised for a reader
 continuing a directory over damage before a start meets it. Everything else is compared as before, and the latest
-values' fixed history still pins the set-aside.
+values' fixed history still pins the set-aside. The fixed test pauses for two seal intervals before the clean stop,
+so a seal runs however fast the host is: its first history then reached the skip at every attempt seen, its second
+at about half; a pause of ten intervals stopped the second reaching it, as its directory then lay below the damage,
+so the pause is kept short and the attempts stay.
 **Tests.** `kvik/src/durable/read/source/tests.rs`
 `a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start` (the shrunk history, and one whose newest
 batch holds one reading so that the directory's `through` can equal the damaged position; seals run on real time, so
-each repeats until an attempt reaches the skip, and every attempt must pass) and
-`kvik/src/durable/read/latest/histories.rs` `only_a_directory_the_store_wrote_counts_as_the_store_s_own`.
+each pauses past the seal interval before the clean stop and repeats until an attempt reaches the skip, and every
+attempt must pass), `kvik/src/durable/read/latest/histories.rs`
+`only_a_directory_the_store_wrote_counts_as_the_store_s_own`, and `latest_values_equal_the_models_at_every_check`,
+whose histories must never skip.
 
 ## Open at v0.2
 

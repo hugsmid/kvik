@@ -685,8 +685,9 @@ mod shelves;
 
 /// The shrunk history of the property (Q-1104): with timed seals the clean stop before the damage can leave the
 /// store's own series directory through the damaged batch, and a fresh reader continues it before the start meets
-/// the damage (Q-1002); the check before the start then skips. Seals run on real time, so the history repeats until
-/// one attempt reaches it; every attempt passes.
+/// the damage (Q-1002); the check before the start then skips. Seals run on real time: a pause past the seal interval
+/// before the clean stop lets the seal run however fast the host is, and the history repeats until one attempt reaches
+/// the skip; every attempt passes.
 #[test]
 fn a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start() {
     let log = LogConfig {
@@ -722,6 +723,9 @@ fn a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start() 
         let reached = (0..64).any(|_| {
             let mut rig = Rig::with_log("sources-over-damage", log.clone());
             for s in &history {
+                if matches!(s, Step::Damage(..)) {
+                    std::thread::sleep(2 * log.seal_interval);
+                }
                 rig.step(s).unwrap();
             }
             rig.shut();
