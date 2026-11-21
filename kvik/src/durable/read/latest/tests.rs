@@ -148,7 +148,8 @@ pub(super) struct Rig {
     pub(super) after_damage: u64,
     /// Loss reports compared with the commit time before set aside (Q-1071).
     pub(super) set_aside: u64,
-    /// The `through` of the last series directory written.
+    /// The `through` of the last series directory the rig wrote; kept when a run removes the directories, where it
+    /// only narrows the choice of batch to damage.
     directory: Option<kvik_log::writer::Position>,
 }
 
@@ -278,9 +279,9 @@ impl Rig {
                 // A clean stop keeps the series directory a reader continues (Q-1003); the power loss after the
                 // check makes the start find the damage.
                 self.shut();
-                if let Some(at) = self.damage_batch(usize::from(*k), self.directory) {
+                if self.damage_batch(usize::from(*k), self.directory).is_some() {
                     self.faulted = true;
-                    self.check_unmet_damage(at)?;
+                    self.check_unmet_damage()?;
                 }
                 self.power_loss();
                 self.reopen();
@@ -378,6 +379,7 @@ impl Rig {
             fs.rename(from, to).unwrap();
         }
         let r = self.reader();
+        // The reader seeds at its first call, while the directories are away.
         r.live(self.ids[0]).unwrap();
         for (from, to) in &moved {
             fs.rename(from, to).unwrap();
@@ -385,18 +387,14 @@ impl Rig {
         r
     }
 
-    /// Before any start meets the damage at `damaged`: a reader that continues a series directory below it reports
-    /// the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules. A directory
-    /// at or above it covers damage no record names (Q-1002), so nothing is compared.
-    fn check_unmet_damage(&mut self, damaged: Position) -> Result<(), TestCaseError> {
+    /// Before any start meets the damage: a reader that continues a series directory, which lies below the damage,
+    /// reports the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules.
+    fn check_unmet_damage(&mut self) -> Result<(), TestCaseError> {
         let whole = self.whole_reader();
         prop_assert_eq!(seed(&whole), None);
         let fresh = self.reader();
         let snap = fresh.snapshot().unwrap();
         let at = seed(&fresh);
-        if at.is_some_and(|t| t >= damaged) {
-            return Ok(());
-        }
         let want = (whole.losses(), None);
         prop_assert!(!want.0.is_empty(), "the damage is reported");
         for got in [fresh.losses(), snap.losses().unwrap()] {
@@ -694,14 +692,31 @@ fn latest_values_equal_the_models_at_every_check() {
             Ok(())
         })
         .unwrap();
-    let [seeded, searches, damaged, set_aside] = counts.map(AtomicU64::into_inner);
+    // The set-aside of Q-1071 is reached by about three histories in 256, too few to assert here: the history
+    // below pins it.
+    let [seeded, searches, damaged, _] = counts.map(AtomicU64::into_inner);
     assert!(seeded > 0, "some reader continues a series directory");
     assert!(searches > 0, "some live value is found in the log");
     assert!(damaged > 0, "some history compares losses after damage");
-    // About one history in thirty meets it; checked only at enough cases not to fail by chance.
+}
+
+#[test]
+fn a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before() {
+    let emit = |t| Step::Emit(vec![(0, t, 1, 0, 0), (1, t, 2, 0, 0)], false);
+    // The directory is through the last definition and the first emit's batch lies just above it; an even draw
+    // aims there, where the cycle would take the third batch above.
+    let history = [
+        emit(-30),
+        Step::Directory(6),
+        emit(-4),
+        emit(-2),
+        Step::Damage(2, true),
+    ];
+    let [seeded, _, damaged, set_aside] = run(&history).unwrap();
+    assert!(seeded > 0 && damaged > 0);
     assert!(
-        cases < 256 || set_aside > 0,
-        "some history compares a continuing reader's loss just above its directory (Q-1071)"
+        set_aside > 0,
+        "the continuing reader's loss just above its directory is reached"
     );
 }
 
@@ -758,6 +773,17 @@ fn a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_abov
     assert!(at.is_some());
     let (a, b) = known_alike((unknown.clone(), at), (known.clone(), None));
     assert_eq!(a, b);
+    let recorded = |mut l: Losses| {
+        for r in &mut l {
+            r.recorded = true;
+        }
+        l
+    };
+    let (a, b) = known_alike(
+        (recorded(unknown.clone()), at),
+        (recorded(known.clone()), None),
+    );
+    assert_ne!(a, b, "a recorded report keeps the commit time compared");
     let below = at.map(|t| Position {
         sequence: t.sequence - 1,
         ..t

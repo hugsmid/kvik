@@ -3984,13 +3984,18 @@ position is just above that directory's `through`; everything else is compared, 
 that read the whole log keeps the time compared. Until a start records the loss, readers may differ in it. For every
 reader to know it, either the series directory carries its `through`'s commit time (a `format.md` change, not
 proposed) or a continuing reader reads the one batch at `through` when it first reports such a loss (Q-1090). The
-property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half
-the draws, and checking before the start meets it: a reader of the whole log (the series
-directories moved out of its way while it seeds) against a fresh reader and its snapshot; where the continued
-directory lies at or above the damage, it covers damage no record names (Q-1002) and nothing is compared. Damage
-in a sealed segment would also meet Q-937, which stays with that question's own item.
+property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half the
+draws, and checking before the start meets it: a reader of the whole log (the series directories moved out of its way
+while it seeds) against a fresh reader and its snapshot. About three histories in 256 reach the set-aside, so a fixed
+history pins it. Aiming at the batch just above the directory whatever it holds would add nothing: the only batch there
+without a fact is the recovery entry of a start after a power loss, and a fresh reader then continues no directory. The
+damage always lies above the directory a fresh reader continues, so every such check compares. A reader continuing a
+directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that window is a
+consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and nothing is
+promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
 **Tests.** `kvik/src/durable/read/latest/tests.rs`
-`a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it` and
+`a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
+`a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
 `latest_values_equal_the_models_at_every_check`.
 
 ## Q-1090 — A continuing reader that reads the batch at its directory's `through` for a loss just above it
@@ -4000,7 +4005,7 @@ A, with no commit time before it, where a reader of the whole log reports A's.
 **Proposed.** When a continuing reader first reports a loss whose first position is just above its directory and it
 knows no commit time before it, it reads the one batch at `through` and takes its commit time; one lookup, only on
 damage, and still unknown where that segment is gone. No format change; readers then agree before a start records the
-loss, and the property's set-aside (Q-1071) narrows to a missing segment.
+loss, and the property's set-aside (Q-1071) narrows to a missing segment, which the latest values' property shows.
 **Now.** Not built; the report carries what is known (§11 Health).
 
 ## Open at v0.2
