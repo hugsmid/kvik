@@ -663,3 +663,63 @@ fn a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_r
     rig.step(&Damage(103)).unwrap();
     rig.poll().unwrap();
 }
+
+/// Q-1101 as built: a reader holding a fact index never reads a batch again, so damage below what it read is
+/// `NotAvailable` to it and unknown to its process until a start records the range; a fresh reader finds it at once.
+#[test]
+fn an_indexed_reader_meets_damage_below_what_it_read_as_not_available_until_a_start_records_it() {
+    use Step::*;
+    let mut rig = Rig::new((0, 0));
+    rig.poll().unwrap();
+    for s in [
+        Note,
+        Emit(vec![(0, -60, 0, 0)]),
+        Damage(0),
+        Restart,
+        Note,
+        Emit(vec![(0, -60, 0, 34)]),
+        Poll,
+    ] {
+        rig.step(&s).unwrap();
+    }
+    assert!(rig.indexed());
+    let (text, p) = rig.notes.last().cloned().unwrap();
+    assert!(
+        p <= rig.read && p < rig.newest,
+        "{p:?} read and not the newest"
+    );
+    assert!(rig.w.damage_any(text.as_bytes()));
+    let note = rig.note;
+    let facts = |r: &Reader| {
+        let all = Timestamp(i64::MIN)..Timestamp(i64::MAX);
+        r.facts(note, all, crate::read::View::History)
+            .and_then(|f| f.collect::<Result<Vec<_>, _>>())
+    };
+    let at = |r: &Reader| r.at(note, Timestamp(i64::MAX), crate::read::View::History);
+    let names = |r: &Reader| {
+        r.losses()
+            .iter()
+            .any(|l| l.first.is_some_and(|a| a <= p) && l.last.is_some_and(|b| p <= b))
+    };
+    let far = &rig.far.0;
+    let got = facts(far);
+    assert!(
+        matches!(got, Err(crate::QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
+    let got = at(far);
+    assert!(
+        matches!(got, Err(crate::QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
+    assert!(!names(far), "its process never finds the loss");
+    let fresh = rig.w.reader();
+    assert!(names(&fresh), "a fresh reader finds it");
+    drop(fresh);
+    rig.step(&Restart).unwrap();
+    let far = &rig.far.0;
+    facts(far).unwrap();
+    at(far).unwrap();
+    assert!(names(far), "the start's record reaches it");
+    assert_eq!(far.losses(), rig.w.reader().losses());
+}

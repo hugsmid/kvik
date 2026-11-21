@@ -4426,8 +4426,10 @@ above what that reader read. Not changed: such a reader's `facts` and `at` over 
 until a start records the range; finding it would need `find_losses` to scan again when an index is held, a new read
 not proposed here.
 **Pinned by.** `kvik/src/durable/read/live/differential.rs`
-`a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read` (fails with the rig's old check)
-and `every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
+`a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read` (fails with the rig's old check),
+`an_indexed_reader_meets_damage_below_what_it_read_as_not_available_until_a_start_records_it` (the limit as built:
+`NotAvailable` and no loss in its process, the loss from a fresh reader, agreement once a start records it) and
+`every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
 
 ## Q-1102 — A start's lost range across two recorded losses (OWNER)
 Recorded by the loss-reports item. For the owner: it decides what `losses()` reports and under which identity.
