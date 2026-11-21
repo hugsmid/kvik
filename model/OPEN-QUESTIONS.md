@@ -4330,12 +4330,12 @@ proposed) or a continuing reader reads the one batch at `through` when it first 
 property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half the
 draws, and checking before the start meets it: a reader of the whole log (the series directories moved out of its way
 while it seeds) against a fresh reader and its snapshot. About three histories in 256 reach the set-aside, so a fixed
-history pins it. Aiming at the batch just above the directory whatever it holds would add nothing: the only batch there
-without a fact is the recovery entry of a start after a power loss, and a fresh reader then continues no directory. The
-damage always lies above the directory a fresh reader continues, so every such check compares. A reader continuing a
-directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that window is a
-consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and nothing is
-promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
+history pins it. Aiming at the batch just above the directory whatever it holds is not done: a batch there without a
+fact is a definition or a recovery entry, whose loss is a different scenario from this one, and the fixed history gives
+the reach. The damage always lies above the directory a fresh reader continues, so every such check compares. A reader
+continuing a directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that
+window is a consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and
+nothing is promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
 **Tests.** `kvik/src/durable/read/latest/histories.rs`
 `a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
 `a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
