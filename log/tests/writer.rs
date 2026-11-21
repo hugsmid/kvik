@@ -1309,6 +1309,43 @@ fn calls_that_do_not_encode_together_are_committed_one_by_one() {
     assert_eq!(b[1].2.items, vec![recovery()]);
 }
 
+/// A source that hands over its calls with a time of taking set by the test.
+struct Stamped(Vec<Call>, i64);
+
+impl CallSource for Stamped {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn take(&mut self, _: u64) -> Vec<Call> {
+        std::mem::take(&mut self.0)
+    }
+    fn put_back(&mut self, mut calls: Vec<Call>) {
+        calls.append(&mut self.0);
+        self.0 = calls;
+    }
+    fn taken_at(&self) -> Option<i64> {
+        Some(self.1)
+    }
+}
+
+#[test]
+fn a_batch_is_received_at_the_later_of_the_steps_wall_clock_and_its_taking() {
+    let mut h = H::new(WriterConfig {
+        min_sync_interval: Duration::ZERO,
+        ..cfg()
+    });
+    let limit = h.w.config().call_limit();
+    let one = |t| vec![Call::new(vec![fact(1, T0 + t, 0)], limit).unwrap()];
+    let w0 = h.wall;
+    let mut src = Stamped(one(0), w0 + 5);
+    h.w.step(h.now, w0, &mut src);
+    let mut src = Stamped(one(1), w0 + 7);
+    h.w.step(h.now, w0 + 10, &mut src);
+    let b = batches(&h.fs, true);
+    let received: Vec<i64> = b.iter().map(|b| b.2.received_at).collect();
+    assert_eq!(received, [w0 + 5, w0 + 10]);
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     Submit {

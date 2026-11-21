@@ -4058,6 +4058,68 @@ refused with the reason and follow 9.0f.
 **Pinned by.** `cli/tests/output.rs` (the `series` snapshots); `kvik/tests/api.rs` `define_emit_and_read` (both
 backends' counts agree, and an unknown series is refused).
 
+## Q-1070 — A batch's commit time read before its calls were taken
+Decided by the lead (a technical decision: it keeps the promise of §2.2 `received_at` and §2.3 As-of time).
+**Scenario.** The writer thread read the wall clock for a turn, at 52 s, then took the queued calls for that turn's
+batch. A call queued between the two, at 157 s by the same clock, was committed with `received_at` and `commit_time`
+52 s. As of a time between 52 s and 157 s, the durable fact index then held a fact whose `emit` had not begun by that
+time, where the model (whose receive time is the call's) did not. A property comparing the fact index with the model
+in the as-of-time view found it after a power loss and restart; the timing, not the damage, was the cause.
+**Decided.** The batch's `received_at` is at least the wall clock read after its calls are taken
+(`CallSource::taken_at`), so no call is stamped earlier than it was queued; `commit_time` stays
+`max(received_at, previous commit_time)`. The read follows the take and is not made under the queue's lock: any read
+after the take is after every taken call was queued, and a caller's clock must not stall submitters. A source fed
+from other threads must give `taken_at`; one that does not keeps the step's own read, the old gap. No promise
+changes: §2.2 says `received_at` is the host clock at commit.
+**Remaining gaps, one-sided.** `emit` decides the `future` and lateness flags against its own read, so a fact within
+the gap of the 60 s bound can carry a flag its stored, later times do not show. Between a call's read and the take,
+the model, whose receive time is the call's, holds a fact the durable index does not as of a time in that gap; the
+rigs move the clock only between calls, so no property meets it, and a later one that does should set it aside.
+**Tests.** `log/src/writer/threads.rs`
+`a_call_queued_after_the_writer_read_the_clock_commits_no_earlier_than_it_was_queued` (holds the writer between its
+read of the clock and its take); `log/tests/writer.rs`
+`a_batch_is_received_at_the_later_of_the_steps_wall_clock_and_its_taking` (a source's time of taking above, then
+below, the step's read).
+
+## Q-1071 — The commit time before a loss, as a reader that continues a series directory knows it
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** A reader folded the log through batch A before a series directory through A was written; batch B,
+just above A, is then damaged, and nothing records it (no start has met it). That reader reports the loss with A's
+commit time before it; a reader opened after the directory continues it, reads the log only above A (Q-1001) and
+reports the same loss with no commit time before it. The latest values' property found it in another item's rig,
+comparing every reader's `losses` with a fresh reader's whole (Q-1006).
+**Decided.** The engine keeps what §11 Health promises: each report carries what is known of its range. A continuing
+reader knows no commit time at the directory's `through`, as a finder after a void past its kept commits knows none
+(Q-941); a start's record, once written, gives every reader the same times. The property sets aside the commit time
+before an unrecorded loss only where the side that lacks it continues a series directory and the loss's first
+position is just above that directory's `through`; everything else is compared, recorded reports whole, and a reader
+that read the whole log keeps the time compared. Until a start records the loss, readers may differ in it. For every
+reader to know it, either the series directory carries its `through`'s commit time (a `format.md` change, not
+proposed) or a continuing reader reads the one batch at `through` when it first reports such a loss (Q-1090). The
+property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half the
+draws, and checking before the start meets it: a reader of the whole log (the series directories moved out of its way
+while it seeds) against a fresh reader and its snapshot. About three histories in 256 reach the set-aside, so a fixed
+history pins it. Aiming at the batch just above the directory whatever it holds would add nothing: the only batch there
+without a fact is the recovery entry of a start after a power loss, and a fresh reader then continues no directory. The
+damage always lies above the directory a fresh reader continues, so every such check compares. A reader continuing a
+directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that window is a
+consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and nothing is
+promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
+**Tests.** `kvik/src/durable/read/latest/tests.rs`
+`a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
+`a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
+`latest_values_equal_the_models_at_every_check`.
+
+## Q-1090 — A continuing reader that reads the batch at its directory's `through` for a loss just above it
+Recorded at the review of Q-1071 (by reading, not run). Open, for the lead.
+**Scenario.** As Q-1071: a reader continuing a series directory through A reports an unrecorded loss of B, just above
+A, with no commit time before it, where a reader of the whole log reports A's.
+**Proposed.** When a continuing reader first reports a loss whose first position is just above its directory and it
+knows no commit time before it, it reads the one batch at `through` and takes its commit time; one lookup, only on
+damage, and still unknown where that segment is gone. No format change; readers then agree before a start records the
+loss, and the property's set-aside (Q-1071) narrows to a missing segment, which the latest values' property shows.
+**Now.** Not built; the report carries what is known (§11 Health).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4243,6 +4305,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-1054 | 9.2 | Decided by the lead: the mark read through a held handle; the rest is this machine's wake-up cost; the desktop-class figure waits for 9.2 |
 | Q-1055 | 9.0j | Decided by the lead: a known miss; the hub feed for the writer's reader lands with 9.0j (Q-1007) |
 | Q-1056 | 9.0f | Decided by the lead: `kvik series` counts from `fact_count` now; `tail --since`/`--once` follow 9.0f |
+| Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

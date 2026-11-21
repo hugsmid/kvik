@@ -590,6 +590,7 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
 pub enum LossState { Found, Copying, AwaitingResend { until: Timestamp }, AwaitingOperator, Closed(Closed) }
 pub enum Closed { Restored { positions: u64 }, ResendEnded, Operator }
 pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for ever; Store and Reader
+    // a commit time is what the reader knows: until a start records a loss, readers may differ in it (Q-1071)
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
 pub struct ResendRequest { pub identity: Position, pub first: Position, pub last: Position,
     pub received_after: Option<Timestamp>, pub received_before: Option<Timestamp>,

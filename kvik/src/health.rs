@@ -314,7 +314,8 @@ pub struct LossReport {
     pub mark_state: MarkState,
     /// The boot identity of the mark.
     pub boot_id: Option<[u8; 16]>,
-    /// Commit time of the batch before.
+    /// Commit time of the batch before, if this reader knows it; until a start records the loss, readers may differ
+    /// (Q-1071).
     pub commit_time_before: Option<Timestamp>,
     /// Commit time of the batch after.
     pub commit_time_after: Option<Timestamp>,
