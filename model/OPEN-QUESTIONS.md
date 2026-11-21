@@ -155,6 +155,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
 | Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
 | Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
+| Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4391,6 +4392,25 @@ an accounting fault and panics; in a release build the admission waits on. Not a
 would turn an internal fault into a failure every caller must handle, for a state no caller can cause.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `two_admissions_with_nothing_to_empty_wait_without_waking_each_other`.
+
+## Q-1101 — A far reader that built its fact index for a broken state, and damage below what it read
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** The live differential's shrunk case: a note is damaged before a clean restart, whose start records it
+(position 5). The far reader's next refresh meets the recorded range, its latest values break (Q-1006) and it builds
+its fact index, reading positions 6 to 8 whole. The note at 7 is then damaged. The far reader's `facts` call meets it
+in a lookup, but `find_losses` has nothing left to scan, since the index read those batches before the damage, so the
+call ends `NotAvailable` and the far process never finds the loss; a fresh reader does. The property asserted that
+the far session names every loss a fresh reader reports, and failed on every replay, before 9.0f too.
+**Decided.** The engine keeps Q-1011 and Q-1071: a session names the losses its process found, a scanning read never
+reads a batch again (Q-1060), and until a start records a loss, readers may differ in it (§11 Health, "what is
+known"). The test's expectation was wrong: its rig knew only the fact index it made the far reader build, not one
+the engine builds for a broken state. It now asks the far reader whether it holds one, and while it does damages only
+above what that reader read. Not changed: such a reader's `facts` and `at` over the damaged batch end `NotAvailable`
+until a start records the range; finding it would need `find_losses` to scan again when an index is held, a new read
+not proposed here.
+**Pinned by.** `kvik/src/durable/read/live/differential.rs`
+`a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read` (fails with the rig's old check)
+and `every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
 
 ## Open at v0.2
 
