@@ -308,6 +308,9 @@ pub struct ReaderConfig {
     /// Readers; default 30 minutes, at most an hour, zero refused): a read held longer ends with
     /// [`QueryError::CutExpired`](crate::QueryError::CutExpired).
     pub cut_max_age: Duration,
+    /// The cap on what the reader's queries allocate together (the query design's §1 Memory; default 64 MiB, at least
+    /// 32 MiB): a read that needs more works in more passes, with equal results (Q-1063).
+    pub memory: u64,
 }
 
 impl ReaderConfig {
@@ -319,6 +322,7 @@ impl ReaderConfig {
             env: Env::system(),
             lease_refresh: Duration::from_secs(30 * 60),
             cut_max_age: Duration::from_secs(30 * 60),
+            memory: 64 << 20,
         }
     }
 
@@ -343,6 +347,12 @@ impl ReaderConfig {
     /// Sets the longest a read holds its cut.
     pub fn cut_max_age(mut self, d: Duration) -> Self {
         self.cut_max_age = d;
+        self
+    }
+
+    /// Sets the memory cap of the reader's queries.
+    pub fn memory(mut self, bytes: u64) -> Self {
+        self.memory = bytes;
         self
     }
 }

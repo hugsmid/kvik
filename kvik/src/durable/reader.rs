@@ -23,6 +23,7 @@ use kvik_log::writer::Position as LogPos;
 use super::clock::Clocks;
 use super::index::{Index, Stored, pos};
 use super::loss::{Find, Latch};
+use super::read::cache::{Accountant, DEFAULT_MEMORY, Sizes};
 use super::read::cut;
 use super::read::flight::Flight;
 use super::read::hub::{Collector, Hub};
@@ -131,8 +132,27 @@ pub(crate) struct DurableReader {
     seeded: AtomicBool,
     /// What each round read, for the live sessions on this reader.
     hub: Hub,
+    /// The memory cap of its queries (Q-1063).
+    memory: Arc<Accountant>,
     #[cfg(test)]
     lookups_made: AtomicU64,
+    /// Lookups still to end with `CutExpired`, as a reset between the cut and the read ends them.
+    #[cfg(test)]
+    pub(crate) expire_lookups: AtomicU64,
+    #[cfg(test)]
+    pub(crate) after_lookup: AfterLookup,
+}
+
+/// Run after each lookup of the reader's `facts` and `at`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AfterLookup(pub(crate) Mutex<Option<Box<dyn FnMut() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AfterLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterLookup")
+    }
 }
 
 /// A log reader configuration on the store in `dir` with this process's boot id and a fresh reader id.
@@ -270,9 +290,25 @@ impl DurableReader {
             searches: AtomicU64::new(0),
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
+            #[cfg(test)]
+            expire_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            after_lookup: AfterLookup::default(),
             seeded: AtomicBool::new(false),
             hub: Hub::default(),
+            memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),
         })
+    }
+
+    /// The reader with a memory cap of `sizes` (`ReaderConfig::memory`).
+    pub(crate) fn with_memory(mut self, sizes: Sizes) -> Self {
+        self.memory = Accountant::new(sizes);
+        self
+    }
+
+    /// The memory cap of its queries.
+    pub(crate) fn memory(&self) -> &Arc<Accountant> {
+        &self.memory
     }
 
     /// The window clock now (spec §6 `now`).
@@ -334,6 +370,13 @@ impl DurableReader {
             return Err(QueryError::CutExpired);
         }
         Ok(v)
+    }
+
+    /// Has this process's scanning read find the damage in the kept log, as a reader that holds every fact does
+    /// (Q-1060): the regions it finds go to the latch, which lookups then pass over as lost.
+    pub(crate) fn find_losses(&self) -> Result<(), QueryError> {
+        let v = self.view_with_facts()?;
+        self.end(v)
     }
 
     /// Takes a view read after this call began that holds every fact, then runs `f` on it with no lock under its cut:
@@ -742,5 +785,6 @@ pub(crate) fn losses_of(v: &View) -> Vec<LossReport> {
 
 mod at_cut;
 mod errors;
+pub(crate) mod facts;
 #[cfg(test)]
 mod tests;

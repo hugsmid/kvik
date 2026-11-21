@@ -21,7 +21,7 @@ use crate::block::{BLOCK_HEADER_LEN, block_type, read_block};
 use crate::body::{
     END_MARKER_LEN, IndexRecord, SegmentIndex, TRAILER_LEN, Trailer, decode_end_marker,
 };
-use crate::content::{BatchContent, Item};
+use crate::content::{BatchContent, Taken};
 use crate::facts::FactRow;
 use crate::header::HEADER_LEN;
 use crate::name::SegmentName;
@@ -37,6 +37,28 @@ pub struct Wanted {
     pub from: i64,
     /// The greatest event time wanted.
     pub to: i64,
+}
+
+/// What [`LogReader::lookup_within`] keeps: at most `budget` bytes of facts (the records their vector has room for and
+/// their texts), at positions above `above` and at or below `upto` only.
+#[derive(Clone, Copy, Debug)]
+pub struct Within {
+    /// The bytes the facts may take.
+    pub budget: u64,
+    /// The position facts are kept above.
+    pub above: Option<Position>,
+    /// The position facts are kept at or below.
+    pub upto: Option<Position>,
+}
+
+impl Default for Within {
+    fn default() -> Self {
+        Within {
+            budget: u64::MAX,
+            above: None,
+            upto: None,
+        }
+    }
 }
 
 /// A fact a lookup found.
@@ -65,6 +87,63 @@ pub struct Lookup {
     pub segments_read: u64,
     /// Whether the lease was renewed when due ([`LogReader::keep_alive`]).
     pub lease_kept: bool,
+    /// The facts found would have passed the byte budget ([`LogReader::lookup_within`]): `facts` is partial.
+    pub overflowed: bool,
+    /// The file ids of the segments listed up to the mark, ascending ([`LogReader::lookup_within`] only).
+    pub listed: Vec<u64>,
+}
+
+/// What the facts of one lookup may take: the records the facts' vector has room for and each kept text, so that
+/// its growth is counted before it happens; once passed, no further fact is kept.
+#[derive(Debug)]
+pub(super) struct Budget {
+    room: std::cell::Cell<u64>,
+    over: std::cell::Cell<bool>,
+}
+
+impl Budget {
+    pub(super) fn new(bytes: u64) -> Self {
+        Budget {
+            room: std::cell::Cell::new(bytes),
+            over: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(super) fn over(&self) -> bool {
+        self.over.get()
+    }
+
+    fn charge(&self, b: u64) -> bool {
+        if self.over.get() || b > self.room.get() {
+            self.over.set(true);
+            return false;
+        }
+        self.room.set(self.room.get() - b);
+        true
+    }
+
+    /// Pushes `f` if the budget has room for it, and for the vector's growth first when it is full: room for the old
+    /// buffer again and the new one, as both are held while it moves.
+    fn push(&self, facts: &mut Vec<FoundFact>, f: FoundFact) {
+        if facts.len() == facts.capacity() {
+            let record = std::mem::size_of::<FoundFact>() as u64;
+            let (old, more) = (facts.capacity() as u64, facts.capacity().max(1));
+            if (old + more as u64).saturating_mul(record) > self.room.get() {
+                self.over.set(true);
+            }
+            if !self.charge(more as u64 * record) {
+                return;
+            }
+            facts.reserve_exact(more);
+        }
+        let text = match &f.row.value {
+            crate::facts::Value::Text(s) => s.len() as u64,
+            _ => 0,
+        };
+        if self.charge(text) {
+            facts.push(f);
+        }
+    }
 }
 
 /// The most bytes a reader keeps for sealed segments' indexes and the maps of segments' batches together.
@@ -107,6 +186,7 @@ struct Span {
     /// The least and greatest event time of its facts; `(i64::MAX, i64::MIN)` without one.
     min_t: i64,
     max_t: i64,
+    commit_time: i64,
 }
 
 #[derive(Debug)]
@@ -121,6 +201,9 @@ struct Cached<T> {
 pub(super) struct Caches {
     index: HashMap<u64, Cached<SealIndex>>,
     maps: HashMap<u64, Cached<SegmentMap>>,
+    /// Segments a lookup took a fact from: one gone with no record naming its removal makes every later lookup of
+    /// this reader incomplete (Q-951, Q-1066).
+    stood: std::collections::BTreeSet<u64>,
     tick: u64,
     bytes: usize,
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
@@ -136,6 +219,7 @@ impl Default for Caches {
         Caches {
             index: HashMap::new(),
             maps: HashMap::new(),
+            stood: std::collections::BTreeSet::new(),
             tick: 0,
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
@@ -147,7 +231,8 @@ impl Default for Caches {
 }
 
 impl Caches {
-    fn keep_listed(&mut self, listed: &HashSet<u64>) {
+    /// Keeps the caches of listed segments only; returns whether a segment a lookup took a fact from is unlisted.
+    pub(super) fn keep_listed(&mut self, listed: &HashSet<u64>) -> bool {
         let mut freed = 0;
         self.index.retain(|id, c| {
             let keep = listed.contains(id);
@@ -164,6 +249,7 @@ impl Caches {
             keep
         });
         self.bytes -= freed;
+        !self.stood.iter().all(|id| listed.contains(id))
     }
 
     fn put_index(&mut self, file_id: u64, value: SealIndex) {
@@ -211,6 +297,31 @@ impl Caches {
                 bytes,
             },
         );
+    }
+
+    /// The last position of the mapped batches of a segment, up to the mark, whose commit time is at or before `at`;
+    /// positions a later recovery entry of the segment voids are passed over, as they are given again to batches
+    /// committed after it (Q-1064).
+    pub(super) fn last_committed(&self, file_id: u64, at: i64, q: &Query<'_>) -> Option<Position> {
+        let m = &self.maps.get(&file_id)?.value;
+        m.batches
+            .iter()
+            .enumerate()
+            .take_while(|(_, s)| !(s.generation == q.generation && s.last > q.last_sequence))
+            .filter(|(_, s)| s.commit_time <= at)
+            .filter_map(|(j, s)| {
+                let kept = m
+                    .recoveries
+                    .iter()
+                    .filter(|(k, after)| *k > j && after.generation == s.generation)
+                    .map(|(_, after)| after.sequence)
+                    .fold(s.last, u64::min);
+                (kept >= s.first).then_some(Position {
+                    generation: s.generation,
+                    sequence: kept,
+                })
+            })
+            .last()
     }
 
     /// Drops the least recently used entries until the caches hold at most [`LOOKUP_CACHE_BYTES`].
@@ -281,13 +392,14 @@ fn part(f: &dyn crate::fs::FsFile, len: u64, from: u64, to: u64) -> Option<Vec<u
     Some(buf)
 }
 
-/// The batch at `s`, read into a buffer of its own length and checked again alone; `None` if it no longer reads as
-/// the same complete batch.
-fn read_batch_at(
+/// `take` of the batch at `s`, read into a buffer of its own length and checked again alone; `None` if it no longer
+/// reads as the same complete batch.
+fn read_batch_at<R>(
     f: &dyn crate::fs::FsFile,
     id: &SegmentIdentity,
     s: &Span,
-) -> Option<BatchContent> {
+    take: impl FnOnce(&crate::batch::Batch<'_>) -> Option<R>,
+) -> Option<R> {
     let mut buf = buffer(usize::try_from(s.end - s.offset).ok()?);
     if read_at_full(f, &mut buf, s.offset).ok()? != buf.len() {
         return None;
@@ -300,12 +412,10 @@ fn read_batch_at(
         s.end,
         s.first,
         Refusal::AtOnce,
-        true,
+        false,
     ) {
-        BatchRead::Complete(b, bodies)
-            if b.end() == s.end && b.commit.first_sequence == s.first =>
-        {
-            BatchContent::from_bodies(s.first, bodies).ok()
+        BatchRead::Complete(b, _) if b.end() == s.end && b.commit.first_sequence == s.first => {
+            take(&b)
         }
         _ => None,
     }
@@ -326,36 +436,51 @@ pub(super) struct Query<'a> {
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
     pub(super) lost: &'a dyn Fn(u64, u64, u64) -> bool,
+    pub(super) budget: &'a Budget,
+    /// Facts are kept above this position and at or below `upto` only.
+    pub(super) above: Option<Position>,
+    pub(super) upto: Option<Position>,
 }
 
 impl Query<'_> {
     fn may_hold(&self, s: &Span) -> bool {
+        let pos = |sequence| Position {
+            generation: s.generation,
+            sequence,
+        };
         self.ranges
             .iter()
             .any(|(a, z)| *a <= s.max_t && s.min_t <= *z)
+            && self.above.is_none_or(|a| pos(s.last) > a)
+            && self.upto.is_none_or(|u| pos(s.first) <= u)
     }
 
-    fn take(&self, content: BatchContent, g: u32, first_sequence: u64, facts: &mut Vec<FoundFact>) {
-        let mut sequence = first_sequence;
-        for item in content.items {
-            let p = Position {
+    /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget; `None` if a body does
+    /// not decode.
+    fn take(&self, b: &crate::batch::Batch<'_>, facts: &mut Vec<FoundFact>) -> Option<Taken> {
+        let g = b.commit.generation;
+        let wants = |series: u32, t: i64| {
+            self.by_series
+                .get(&series)
+                .is_some_and(|rs| rs.iter().any(|(a, z)| (*a..=*z).contains(&t)))
+        };
+        let mut keep = |sequence: u64, received_at: i64, row: FactRow| {
+            let position = Position {
                 generation: g,
                 sequence,
             };
-            sequence += item.sequences();
-            if let Item::Fact(row) = item
-                && self
-                    .by_series
-                    .get(&row.series_id)
-                    .is_some_and(|rs| rs.iter().any(|(a, z)| (*a..=*z).contains(&row.t)))
-            {
-                facts.push(FoundFact {
-                    position: p,
-                    received_at: content.received_at,
-                    row,
-                });
+            if self.above.is_none_or(|a| position > a) && self.upto.is_none_or(|u| position <= u) {
+                self.budget.push(
+                    facts,
+                    FoundFact {
+                        position,
+                        received_at,
+                        row,
+                    },
+                );
             }
-        }
+        };
+        BatchContent::take_wanted(b, &wants, &mut keep).ok()
     }
 }
 
@@ -369,6 +494,18 @@ impl LogReader {
         wanted: &[Wanted],
         lost: &dyn Fn(u64, u64, u64) -> bool,
     ) -> Result<Lookup, ReaderError> {
+        self.lookup_within(wanted, lost, Within::default())
+    }
+
+    /// [`LogReader::lookup`] within `within`: a lookup that would keep more than its budget stops and says so in
+    /// [`Lookup::overflowed`], its facts partial.
+    pub fn lookup_within(
+        &mut self,
+        wanted: &[Wanted],
+        lost: &dyn Fn(u64, u64, u64) -> bool,
+        within: Within,
+    ) -> Result<Lookup, ReaderError> {
+        let budget = Budget::new(within.budget);
         let mark = self.read_mark()?;
         // The lease's renewal is apart from the read: a failure to write it makes no range incomplete.
         let lease_kept = self.keep_alive().is_ok();
@@ -382,6 +519,8 @@ impl LogReader {
             },
             stamp: mark.stamp,
             segments_read: 0,
+            overflowed: false,
+            listed: Vec::new(),
         };
         if wanted.is_empty() {
             return Ok(out);
@@ -398,7 +537,11 @@ impl LogReader {
             }
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
-        self.caches.keep_listed(&listed);
+        out.listed = names.iter().map(|n| n.file_id).collect();
+        if self.caches.keep_listed(&listed) {
+            out.complete.fill(false);
+            return Ok(out);
+        }
         for name in names {
             if name.sealed && !self.caches.index.contains_key(&name.file_id) {
                 let index = self.read_seal_index(name);
@@ -445,13 +588,25 @@ impl LogReader {
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,
                 lost,
+                budget: &budget,
+                above: within.above,
+                upto: within.upto,
             };
+            let before = out.facts.len();
             let read = self.lookup_segment(name, limit, &query, &mut out.facts);
             out.segments_read += 1;
+            if out.facts.len() > before {
+                self.caches.stood.insert(name.file_id);
+            }
             if !read {
                 for i in candidates {
                     out.complete[i] = false;
                 }
+            }
+            if budget.over() {
+                out.overflowed = true;
+                self.caches.trim();
+                break;
             }
             // After each segment, so that a lookup over many segments holds at most the bound too.
             self.caches.trim();
@@ -507,9 +662,10 @@ impl LogReader {
             if !query.may_hold(s) {
                 continue;
             }
-            match read_batch_at(&*f, &id, s) {
-                Some(content) => query.take(content, s.generation, s.first, facts),
-                None => stale = true,
+            let at = facts.len();
+            if read_batch_at(&*f, &id, s, |b| query.take(b, facts)).is_none() {
+                facts.truncate(at);
+                stale = true;
             }
         }
         if stale {
@@ -538,6 +694,29 @@ impl LogReader {
 
     /// A sealed segment's index, read from its seal blocks.
     fn read_seal_index(&self, name: SegmentName) -> SealIndex {
+        let (f, trailer, trailer_offset) = self.read_trailer(name)?;
+        let at = trailer.index_offset;
+        if at < HEADER_LEN as u64 || at >= trailer_offset {
+            return None;
+        }
+        let mut b = vec![0u8; usize::try_from(trailer_offset - at).ok()?];
+        if read_at_full(&*f, &mut b, at).ok()? != b.len() {
+            return None;
+        }
+        let block = read_block(&b, 0, b.len() as u64).ok()?;
+        if block.header.block_type != block_type::SEGMENT_INDEX {
+            return None;
+        }
+        let mut records = SegmentIndex::decode(block.body).ok()?.records;
+        records.sort_by_key(|r| r.series_id);
+        Some(records)
+    }
+
+    /// A sealed segment's trailer with the open file and the trailer's offset; `None` if it does not read.
+    pub(super) fn read_trailer(
+        &self,
+        name: SegmentName,
+    ) -> Option<(Box<dyn crate::fs::FsFile>, Trailer, u64)> {
         let (n, f) = self.open_segment(name).ok().flatten()?;
         if !n.sealed {
             return None;
@@ -558,21 +737,7 @@ impl LogReader {
             return None;
         }
         let trailer = Trailer::decode(block.body).ok()?;
-        let at = trailer.index_offset;
-        if at < HEADER_LEN as u64 || at >= trailer_offset {
-            return None;
-        }
-        let mut b = vec![0u8; usize::try_from(trailer_offset - at).ok()?];
-        if read_at_full(&*f, &mut b, at).ok()? != b.len() {
-            return None;
-        }
-        let block = read_block(&b, 0, b.len() as u64).ok()?;
-        if block.header.block_type != block_type::SEGMENT_INDEX {
-            return None;
-        }
-        let mut records = SegmentIndex::decode(block.body).ok()?.records;
-        records.sort_by_key(|r| r.series_id);
-        Some(records)
+        Some((f, trailer, trailer_offset))
     }
 }
 

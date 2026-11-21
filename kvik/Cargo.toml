@@ -44,6 +44,8 @@ kvik-log = { path = "../log", features = ["unmapped-reason"] }
 proptest = "1"
 # Counts the heap a reader holds in `tests/latest_memory.rs`, with no unsafe code of ours.
 stats_alloc = "0.1.10"
+# The peak a query allocates in `tests/query_memory.rs`, with no unsafe code of ours.
+peak_alloc = "0.3.0"
 
 # The model checker for the single-flight refresh, built only with `--cfg kvik_loom` (Q-901).
 [target.'cfg(kvik_loom)'.dev-dependencies]

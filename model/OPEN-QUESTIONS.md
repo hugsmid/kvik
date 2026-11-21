@@ -89,7 +89,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-776 | §7 Derived files, Reset stamp and saved points | When the writer keeps a series directory across a reset |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
 | Q-780 | §8 Generations, Restore; `format.md` A.18 Contiguity | The log directory across a generation change |
-| Q-850 | §7 Readers; `api.md` Reader processes | The error of a second reset stamp change during one materialised call |
+| Q-850 | §7 Readers; `api.md` Reader processes | The error of a second reset stamp change during one materialised call (settled by the lead with roadmap 9.0f, Q-1061) |
 | Q-851 | §7 Readers | The second read of the mark after a pass that took something (decided, awaiting review) |
 | Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
 | Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
@@ -142,6 +142,19 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1054 | query design §1 S13, §3.1; Q-1017 | The empty poll of a reader process against S13: the held mark, and the machine's wake-up cost (decided by the lead) |
 | Q-1055 | query design §1 S1; Q-1007 | S1 after a write misses its desktop target until the hub feeds the writer's reader (decided by the lead) |
 | Q-1056 | query design §6; `format.md` A.18 | Per-series counts in `kvik series` now; `tail --since` and `--once` with 9.0f (decided by the lead) |
+| Q-1060 | §7 Readers; query design §2.2, §4 | The log tail as the one source of `facts` and `at` (decided by the lead) |
+| Q-1061 | §7 Readers; `api.md` Reader processes | An iteration whose cut ends or whose reset stamp changes (decided by the lead) |
+| Q-1062 | query design §2.2 | The order of several series read in one pass (decided by the lead) |
+| Q-1063 | query design §1 Memory, §2.2, §3.5; `api.md` `ReaderConfig` | The memory accountant and the cap with multi-pass (decided by the lead) |
+| Q-1064 | §2.3 As-of time; query design §3.2, §4 | As of a time from the log's commit times (decided by the lead; across a restore, open) |
+| Q-1065 | `api.md` Reading | `at` searched back from its time (decided by the lead) |
+| Q-1066 | Q-951; §7 Readers | A segment gone from under the sources' reads (decided by the lead) |
+| Q-1067 | query design §1 Memory; `api.md` `ReaderConfig` | Rows waiting for delivery are held under their grant (decided by the lead) |
+| Q-1068 | query design §2.2; `api.md` `ReaderConfig` | One event time holding more than a pass (decided by the lead) |
+| Q-1069 | query design §1 Memory; `api.md` `ReaderConfig` | What the memory cap counts, measured (decided by the lead) |
+| Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
+| Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
+| Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -2700,8 +2713,7 @@ Corrupt block describes for a sealed segment, with the quarantine and copy), so 
 (`kvik/tests/slow_path.rs`).
 
 ## Q-850 — The error of a second reset during one materialised call
-Recorded by roadmap 9.0b1. To be settled by roadmap 9.0f with the iteration's reset error item (moved from 9.0c at
-9.0b1's review).
+Recorded by roadmap 9.0b1. **Settled by the lead with roadmap 9.0f: `CutExpired`, as built** (Q-1061).
 **Scenario.** The query design §3.2 rule 3: a materialised result whose reset stamp changed during the read "is
 computed once more under the new cut and returned with the new state; a second change is an error". It does not name
 the error. Two starts that each reset the store within one call (two page-cache losses on the same boot, or a reset
@@ -4058,6 +4070,223 @@ refused with the reason and follow 9.0f.
 **Pinned by.** `cli/tests/output.rs` (the `series` snapshots); `kvik/tests/api.rs` `define_emit_and_read` (both
 backends' counts agree, and an unknown series is refused).
 
+## Q-1060 — The log tail as the one source of `facts` and `at`
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** The query design §2.2 runs every read over sources behind one trait: the recent window (the writer's
+process), the log tail above C(E), compacted chunks below it. No compacted file exists yet (6.2b, 6.3e), and the
+reader of the writer's process reads durable data only.
+**Decided.** One source is built, the log tail, with C(E) the origin, so the tail is the whole kept log. It reads
+through the key-history lookup of roadmap 11.0 (`LogReader::lookup_within`, A.8 indexes and a scan of segments without
+one) on the lookups' log reader of Q-1004, at the view's cut: regions the manifest records or the process found lost
+are passed over, positions above the cut are dropped. A pass that meets other damage first has the process's scanning
+read find it, as a reader holding every fact did before (it builds the fact index once, which the reader then keeps,
+Q-1006's cost), and reads once more: a region that read reports lost is passed over, and the losses reach every read
+and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. A segment gone from
+under the sources' reads follows Q-951 as Q-1066 applies it. Finding the damage builds the fact index, and the reader
+keeps it, outside the memory cap of Q-1063 (`api.md` says so). `facts` and `at` no longer
+build the fact index; windows, `buckets` and calendar results still do until roadmap 9.0h folds them from the stream,
+and a broken state's latest values still answer from it (Q-1006). The merge drops a position two sources hold, for the
+recent window when it becomes a source. No new lease: the lookups' log reader already holds one, so a reader keeps up
+to three leases until 9.0h removes the fact index's. The lookups' mutex is held for one pass's lookup, not across a
+stream, so passes of concurrent calls on one reader run one at a time.
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`facts_and_at_equal_the_fact_index_and_the_model_at_every_cap` (generated histories of late facts, revisions of a
+versioned series, restarts, power losses, damaged batches and seals; every view, `AsOf` and `AsOfTime` among them,
+against a fresh reader's fact index and the model); `kvik/tests/durable_differential.rs`; `kvik/tests/durable_losses.rs`
+`damage_to_a_batch_read_after_a_found_loss_extends_it_in_every_process`,
+`a_watch_whose_segment_is_removed_reports_losses_unknown` (Q-1066).
+
+## Q-1061 — An iteration whose cut ends or whose reset stamp changes
+Decided by the lead with roadmap 9.0f, for review; settles Q-850.
+**Scenario.** The query design §3.2 rule 3: an iteration ends with an error item carrying the reset (`after`, stamp)
+once the stamp changes; Q-850 left the error of a second change in a materialised call to this item.
+**Decided.** One error for both, `QueryError::CutExpired`, with no new variant: the caller's remedy is the same (start
+the read again), and `api.md` already says that nothing of the read is to be kept. A stream checks its cut before
+each pass (age and lease, Q-853) and each pass's lookup compares the mark's reset stamp and its positions' generation
+with the cut's, so a new reset stamp (a reset, which a recovery starts), a restore (the only step that starts a new
+generation, which the store does not support yet) or an aged cut ends it with that item, the last it yields; a
+writer's restart that starts neither does not end it. A materialised `at` is computed once more under a new cut, and a
+second `CutExpired` is returned. Cost: a reset storm reads as an aged cut, which the review of 9.0b1 noted. Options left for later: a `Reset { after, stamp }` variant (additive, `#[non_exhaustive]`).
+**Pinned by.** `kvik/src/durable/read/source/tests.rs` `a_stream_held_past_its_cuts_age_ends_with_cut_expired`,
+`at_reads_once_more_under_a_new_cut_when_the_first_ends_and_not_twice`;
+`kvik/src/durable/read/cut.rs` `a_reset_during_a_call_is_read_again_under_the_new_cut_and_a_second_is_cut_expired`.
+
+## Q-1062 — The order of several series read in one pass
+Decided by the lead with roadmap 9.0f, for review.
+**Scenario.** "Several series in one pass" (query design §2.2) reads each file once for all of them. A read that does
+not fit the cap narrows its event-time window, so a stream in `(series, t)` order would read every file again for each
+series.
+**Decided.** Sources and the merge order rows by `(t, series, position)`: for one series that is the `facts` order of
+spec §2.3; for several, event time first, so that passes partition the range and each file is read once per pass for
+all of them. At one event time that holds more than a pass's grant, the series are split, then one key's positions
+(Q-1068). The call is crate-internal
+(`reader::facts::facts_of`); it becomes public with the `Query` read of §2.1 (`Query::Facts { sel, .. }`).
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`several_series_read_in_one_pass_come_in_event_time_order_then_series`;
+`kvik/src/durable/read/merge.rs` `a_merge_of_overlapping_sources_equals_one_sorted_run_of_their_union`.
+
+## Q-1063 — The memory accountant and the cap with multi-pass
+Decided by the lead with roadmap 9.0f, for review; its fix round changed what a grant holds (Q-1067, Q-1069).
+**Scenario.** The query design §1 Memory: one cap per reader (`ReaderConfig::memory`, 64 MiB default, 32 MiB least),
+hard; §3.5: a minimum grant at admission, the cache giving way down to a quarter of the cap, a reserve for the largest
+log block.
+**Decided.** A pass holds a grant: it reserves 16 MiB for a log batch read and checked (the largest body, flat until
+the A.8 index names block sizes) plus at least 1 MiB of rows, taking everything free when that is under two such grants
+and half of it otherwise; once read, its rows keep the grant, shrunk to what they take, until the caller has taken
+them (Q-1067). The cache's share is a quarter of the cap and at least the lookups' log reader's 8 MiB (segment indexes
+and batch maps), which no pass takes. Decoded passes are not kept: a lookup verifies every batch it reads, so damage
+after an earlier read is found at the next read, as the fact index's re-check of the last batch found it, where a kept
+pass would show the damaged fact. A lookup decodes only the rows it keeps and counts them as they are kept: the records
+its vector has room for, its growth before it happens (the old buffer and the new), and each text (Q-1069); past the
+pass's rows it stops, and the pass halves its event-time window, then the series at one time, then one key's positions
+(Q-1068), so results are equal at any cap from 32 MiB. With 32 MiB one pass runs at a time with 8 MiB of rows; with
+64 MiB two run at once. A cap under 32 MiB is refused with `OpenError::Config`. Not built: growth past the admission
+grant, and the cap of the writer's own reader, which takes the default.
+**Pinned by.** `kvik/src/durable/read/cache.rs` `the_default_cap_admits_two_passes_and_the_least_one`,
+`a_pass_waits_until_a_grant_is_given_back`,
+`rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf`;
+`kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap` (Q-1069);
+`kvik/src/durable/read/source/tests.rs`
+`a_maximal_batch_reads_in_several_passes_at_the_least_cap_with_the_fact_indexs_result`,
+`a_reader_below_the_least_memory_cap_is_refused`, `reads_in_many_passes_equal_one_pass_in_every_view_and_at_every_time`,
+and the generated histories at caps of a few facts a pass;
+`log/src/reader/tests/parts_and_lookup.rs`
+`a_lookup_within_a_budget_below_what_it_keeps_overflows_and_one_with_room_to_grow_finds_everything`,
+`a_lookup_within_positions_keeps_only_the_facts_between_them`.
+
+## Q-1064 — As of a time from the log's commit times
+Decided by the lead with roadmap 9.0f, for review; the restore row stays open (settle-by 6.2b).
+**Scenario.** Spec §2.3: as of time T is as of P, the last position whose batch's commit time is at or before T. Commit
+times are non-decreasing within a generation only (query design §3.2); the fact index held every batch's commit time.
+**Decided.** `LogReader::position_at` takes segments newest first up to the mark: a sealed segment's trailer passes it
+over when its first commit time is after T and answers its last sequence when its last commit time is at or before T;
+otherwise the segment's batches, mapped as a lookup maps them, answer the last one committed by T. The first segment
+that holds such a batch decides. Lost batches are counted with their commit times: they hold no fact, so the facts as
+of their position equal those as of the last batch the fact index kept. Voided batches are not: spec §3's recovery
+entry keeps positions up to its `after` and writing goes on from there, so a voided batch's positions may be given
+again to batches committed after T; a batch a later recovery entry of its segment voids answers at most that `after`,
+and one it voids whole answers nothing. Batch maps a reader cached before such a reset are not re-read
+(`may_hold` is false with no ranges), so the recovery entry, which the next read of the segment maps, is what the
+cached map is checked against. A segment that may hold the answer and cannot be read is met as a pass meets damage:
+the process's scanning read finds it and the search runs once more (Q-1060); damage it does not report is
+`NotAvailable`. A position above the cut is taken as the cut. The log directory's commit-time ranges, and the
+compacted files' tables for segments removed locally, are not used yet. Open: a T that falls in two generations,
+which only a restore makes and the store does not support yet; the newest-first order takes the later generation's
+position, and no test can make two generations at the store's level until restore exists. The test named for a
+restart pins one generation whose commit times the writer keeps from going back across a restart with the clock set
+back.
+**Pinned by.** `log/src/reader/tests/parts_and_lookup.rs`
+`a_position_at_a_time_is_the_last_batch_committed_by_then_in_every_segment`,
+`a_position_at_a_time_inside_a_damaged_segment_is_incomplete_never_an_earlier_one`,
+`a_position_at_a_time_passes_over_positions_a_later_recovery_entry_voids`;
+`kvik/src/durable/read/source/tests.rs`
+`as_of_a_time_across_a_restart_with_the_clock_set_back_is_the_last_position_committed_by_then`,
+`as_of_a_time_over_damage_its_trailer_does_not_decide_reads_from_a_reader_that_has_not_scanned`.
+
+## Q-1065 — `at` searched back from its time
+Decided by the lead with roadmap 9.0f, for review.
+**Decided.** `at` reads back from `t` in spans that double from one hour, each in passes that fit the cap, later first,
+and stops at the first span holding a fact of the view not of bad quality; the later position wins a tie in time.
+After the first span that holds none, one lookup that keeps at most 4 KiB of facts tells whether the series holds any
+fact at or before the span; when it holds none, `at` answers none at once. A series quiet for a long time, or whose
+earlier facts are all of bad quality, costs about log₂ of the quiet span in lookups, each pruned by the A.8 indexes;
+6.2b's chunk index gives it one block. `at(i64::MAX)` reads up to the last time and answers its fact, where the fact
+index's `at` returned none (it took the end of the range as exclusive and could not add one).
+**Pinned by.** `kvik/src/durable/read/source/tests.rs` `facts_and_at_equal_the_fact_index_and_the_model_at_every_cap`
+(`at` at several times in every view), `at_before_a_series_first_fact_ends_after_one_probe_and_finds_a_fact_far_back`.
+
+## Q-1066 — A segment gone from under the sources' reads
+Decided by the lead with roadmap 9.0f's fix round, applying the owner's ruling on Q-951.
+**Scenario.** Sealed segments A, B and C; a reader's `facts` or `at` has read facts of B; B disappears with no
+manifest record naming its removal. Since 9.0f these calls read through the lookups' log reader, not the scanning read
+that Q-951's check sits in, so they read on and return the other segments' facts with no error; within one stream at a
+small cap, part of B's facts can be yielded before it goes and the rest silently missed.
+**Decided.** Q-951 holds on the new read path. The lookups' log reader notes each segment a lookup took a fact from;
+once one of them is unlisted, every later lookup of that reader is incomplete, so `facts` and `at` fail with
+`NotAvailable` at every call until the reader is opened again (the store or the reader process restarted), as Q-951
+rules, until the removal records of roadmap 6.3b. A segment only listed, or one a lookup read and took nothing from,
+does not count: recovery deletes segments that hold no batch in use, which a reader may have listed. A reader that
+never took a fact from B passes over it, as Q-951's limit says. Within one read, a stream or `at` keeps the segments
+its first pass listed and ends with `NotAvailable` when one is gone at a later pass, so no read yields part of a
+segment silently. For `at` the first listing holds for the whole call: every span it searches back over and the
+probe for earlier facts are checked against it (a second attempt under a new cut lists afresh).
+**Pinned by.** `kvik/tests/durable_losses.rs` `a_watch_whose_segment_is_removed_reports_losses_unknown`,
+`a_reader_that_took_facts_from_a_removed_segment_fails_every_read_after_reading_past_it`,
+`a_segment_a_read_took_nothing_from_is_passed_over_once_removed`,
+`a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found`;
+`kvik/src/durable/read/source/tests.rs` `a_stream_ends_not_available_when_a_segment_its_passes_listed_is_gone`,
+`at_ends_not_available_when_a_segment_its_first_span_listed_is_gone_before_the_probe`,
+`at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_later_span`.
+
+## Q-1067 — Rows waiting for delivery are held under their grant
+Decided by the lead with roadmap 9.0f's fix round.
+**Scenario.** The cap is hard (query design §1) and `api.md` says it caps what queries allocate; a pass's rows wait in
+the stream until the caller takes them. Holding the grant until then makes a caller that holds one stream and starts
+another read on the same thread wait on itself.
+**Decided.** A pass's rows go onto a shelf with their grant, shrunk to what they take; the grant is given back as the
+last row is taken or the stream is dropped. An admission that finds less than the least grant free waits for running
+passes when their grants would make room (they wait on nothing), and otherwise empties shelves, freeing their grants.
+A stream whose shelf was emptied reads that part again at the same cut and passes over every row up to the last it
+yielded (Q-1096), so its results are unchanged; one key's fold and the stream's own state stay outside the cap
+(Q-1069). One admission empties at a time (Q-1095).
+**Cost.** At the least cap the passes share 24 MiB and the least grant is 17 MiB, so a held shelf above about 7 MiB
+leaves too little free for any other read on the reader: a second stream, an `at` or a probe. Each such read empties
+the shelf, and the stream then reads its part again from its start and passes over what it yielded; a caller that
+takes one row and then reads once more, row after row, does work that grows with the square of a part's rows. Two
+threads each holding a stream deliver only what each takes before the other is admitted. Progress is certain with any
+number of threads: a stream takes the first row it has not yielded off a part it has read before it shelves the rest,
+so every read of a part yields a new row or ends the part, whatever other admissions empty; that one row is held in
+the stream's own state until it is yielded (Q-1069). The last row taken gives the shelf's grant back. At the default
+cap one held pass (at most 8 MiB of rows) leaves a least grant free. Not built: capping a pass's rows at the passes'
+share less the least grant, which would let one held stream and point reads live together at the least cap at the
+price of more passes.
+**Pinned by.** `kvik/src/durable/read/cache.rs`
+`rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf`;
+`kvik/src/durable/read/source/tests/shelves.rs`
+`a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once`,
+`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`,
+`a_stream_whose_every_shelf_is_emptied_as_it_is_made_yields_every_row_once_in_both_views`,
+`two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end_with_every_row`,
+`a_stream_gives_its_shelf_back_with_its_last_row`;
+`kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
+## Q-1068 — One event time holding more than a pass
+Decided by the lead with roadmap 9.0f's fix round; replaces the `NotAvailable` of 9.0f.
+**Scenario.** About 24,000 versions of 255-byte text (90,000 of numbers) at one `(series, t)` fill a pass's rows at
+32 MiB and at 64 MiB; narrowing the event-time window cannot split them, and `api.md` promises equal results at any
+cap from 32 MiB.
+**Decided.** A part of one key that does not fit is halved by position, lower positions first (`at`: upper first);
+history yields each half's rows in turn. The current view folds the halves: each half's fact of highest rank (spec
+§2.2) against the best so far, the key's fact delivered after its last half. So any number of versions at one time
+reads in passes; only one fact larger than a pass's rows is `NotAvailable`, which no cap from 32 MiB can meet.
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`one_event_time_with_more_versions_than_a_pass_holds_reads_in_passes_at_the_least_cap` (40,000 texts at one time,
+against the fact index), `a_versioned_key_read_in_passes_by_position_keeps_its_highest_version`.
+
+## Q-1069 — What the memory cap counts, measured
+Decided by the lead with roadmap 9.0f's fix round.
+**Scenario.** The review measured 45.9 MiB above the baseline while `facts` read 104,000 text facts at a 32 MiB cap:
+the grant was given back while the pass's rows were held, rows existed as three copies, and a batch decoded every row
+whatever the read wanted.
+**Decided.** A lookup checks a batch's bodies keeping no row, then walks them again building only the rows the pass
+wants (A.5's checks run in both), so the 16 MiB reserve holds the batch's bytes and the checks' working space, and
+rows are counted as kept; the facts' vector becomes the pass's rows in place, the view is kept in place, and each row
+moves into the fact yielded. Outside the cap, measured as a fixed 1 MiB allowance: the stream, its plan and cut, one
+key's fold, and an `at` probe's own state. Also outside it, and said in `api.md`: the fact index a reader builds once
+to find damage (Q-1060). Measured with a counting allocator (`peak_alloc`) over four 8 MiB batches whose times
+interleave: 19.1 MiB above the baseline for `facts` in history and the current view and for `at`, at 32 MiB and at
+64 MiB. The test bounds each later call by the grant one pass takes alone (24 MiB at both caps) plus the allowance.
+The reader's first `facts` measured 32.7 MiB: its 13.7 MiB above the later calls is not the lookups' cache (a few KiB
+here: two segments' maps) but the reader's first refresh, whose log reader keeps the bytes of the last segment it read
+between refreshes so that the next reads only what is new: 13.6 MiB, the sealed segment holding the four batches. It
+is kept while the reader follows that segment, is outside the cap like the rest of the reader's own state, and is up
+to `log.segment_size` (64 MiB by default); the refresh's peak above it (9.9 MiB) is over before the first pass is
+admitted. So the first call is bounded by that segment's bytes plus the later calls' bound, and another 8 MiB copy of
+the rows fails at either cap. Not built: giving those bytes back after a refresh, which costs the next refresh a read
+of the segment from its start. A batch larger than the reserve, which this writer does not write, is read above the
+cap.
+**Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
 ## Q-1070 — A batch's commit time read before its calls were taken
 Decided by the lead (a technical decision: it keeps the promise of §2.2 `received_at` and §2.3 As-of time).
 **Scenario.** The writer thread read the wall clock for a turn, at 52 s, then took the queued calls for that turn's
@@ -4120,6 +4349,49 @@ damage, and still unknown where that segment is gone. No format change; readers 
 loss, and the property's set-aside (Q-1071) narrows to a missing segment, which the latest values' property shows.
 **Now.** Not built; the report carries what is known (§11 Health).
 
+## Q-1095 — Admissions that empty shelves at once
+Decided by the lead with roadmap 9.0f's second fix round.
+**Scenario.** Two threads call `at` or advance streams on one reader at the least cap while two idle streams hold
+4 MiB each. The first admission took the list of shelves out of the shared state and released the lock to empty one;
+the second, in that window, saw shelved bytes, no running pass and no listed shelf, and its check that shelved rows
+are on a shelf panicked (44 times in 30,000 rounds).
+**Decided.** Shelves stay listed while one is emptied, and one admission empties at a time: another that needs room
+meanwhile waits until the emptying ends and looks again, so no shelf is emptied that one admission's room did not
+need. An admission that finds nothing to empty and nothing given back since waits for the next grant given back
+rather than spinning (a stream dropping its shelf gives its grant back just after the shelf is gone); what that wait
+counts as a change, and the check that shelved rows are on a shelf, are Q-1097.
+**Pinned by.** `kvik/src/durable/read/cache.rs` `two_admissions_emptying_shelves_at_once_are_both_admitted`,
+`an_admission_empties_as_many_listed_shelves_as_its_room_needs`.
+
+## Q-1096 — Where a stream resumes after its shelf is emptied
+Decided by the lead with roadmap 9.0f's second fix round.
+**Scenario.** A stream whose shelf was emptied read the part again and passed over as many rows as it had yielded.
+Damage found between the two reads makes the second shorter, so the count ran into rows not yet yielded: 300 facts,
+15 yielded, the first batch then damaged and found by an `at` that empties the shelf, and rows 15 to 24 were silently
+missing.
+**Decided.** A stream yields rows in strictly ascending keys and remembers the last key it yielded: `(t, series,
+position)` in history, `(t, series)` in the current view, where a part read again may give a key's fact at another
+position. Every row not beyond it is passed over, whatever the second read returns; the count is gone.
+**Pinned by.** `kvik/src/durable/read/source/tests/shelves.rs`
+`a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last`,
+`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`,
+`a_versioned_key_whose_yielded_fact_is_lost_before_its_part_is_read_again_is_not_yielded_twice` (the current view's
+key).
+
+## Q-1097 — An admission with nothing to empty, and shelved rows no shelf holds
+Decided by the lead with roadmap 9.0f's follow-up.
+**Scenario.** Two admissions need room that only shelved bytes no listed shelf holds could give. Each emptying pass
+that took nothing counted as a change and woke the others, so two such admissions woke each other for ever and
+neither waited. The check that shelved rows are on a shelf panicked after 60 seconds of no change: library code that
+panics on a clock, though a caller's pace cannot reach it (a held or leaked stream's shelf is listed and full).
+**Decided.** A change is a grant given back, a shelf made or a shelf emptied; a pass that empties nothing still wakes
+admissions waiting for the emptying to end, but one waiting for a change waits on until a change comes. The check is
+a `debug_assert!`: in a build with debug assertions, 60 seconds with no change, no running pass and shelved bytes is
+an accounting fault and panics; in a release build the admission waits on. Not an error returned to the caller: it
+would turn an internal fault into a failure every caller must handle, for a state no caller can cause.
+**Pinned by.** `kvik/src/durable/read/cache.rs`
+`two_admissions_with_nothing_to_empty_wait_without_waking_each_other`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4133,7 +4405,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -4272,7 +4544,6 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-836 | 6.3b | Facts a damaged recovery entry voided read again as live; with Q-755; recorded at the re-check of the first profiling sweep |
 | Q-871 | 8.3 | Decided with the Q-630 work and widened at its review and re-check: opening a store syncs its directory; creation and a restore sync its parent |
 | Q-937 | 5.1 | A suspected defect of the durable fixes' loss range, by reading; to be reproduced and ruled as its own item |
-| Q-850 | 9.0f | The error of a second reset stamp change during a materialised call: `CutExpired` proposed and built by roadmap 9.0b1; settled with the iteration's reset item |
 | Q-851 | 9.0b2 | The second read of the mark kept after a pass that took something; decided by roadmap 9.0b1, awaiting review |
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
@@ -4284,11 +4555,11 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-961 | 8.3d | The marker errors, switches and reports at `Store::restore`, and pacing the retries; recorded when the owner's ruling on Q-614 was applied |
 | Q-1001 | 9.0c | Decided by the lead: the registry file written before a series directory that covers an entry it lacks; for review |
 | Q-1002 | 6.3b | OWNER. No series directory in a run over a loss no lost range records, so that readers keep reporting it; (a) as built |
-| Q-1000 | 9.0f | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; replaced by 9.0f's sources |
+| Q-1000 | 9.0h | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; since 9.0f only windows, `buckets` and calendar results build it (Q-1060) |
 | Q-1003 | 9.0c | Decided by the lead: which series directory and registry file a reader continues; for review |
 | Q-1004 | 9.0c | Decided by the lead: what the reader finds by lookup at the cut, and a named fact not found reported unavailable; for review |
-| Q-1005 | 9.0f | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; windows and facts join with 9.0f's sources |
-| Q-1006 | 9.0f | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; replaced by 9.0f's sources |
+| Q-1005 | 9.0h | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; facts and windows join it once 9.0h folds windows from the sources (Q-1060) |
+| Q-1006 | 9.0h | Decided by the lead with 9.0c: a broken state answers from the fact index until reopened; its facts and `at` read the sources since 9.0f (Q-1060) |
 | Q-1007 | 9.0d | Decided by the lead at 9.0c's review: no file read while the writer has made nothing durable since; the in-memory feed from 9.0d's hub; figures per class with 9.0e |
 | Q-1010 | 9.0d | Decided by the lead: a batch only with events, `Opened` at the next batch's cut, `Tail` from its cut only, one `durable` position while there is one log; for review |
 | Q-1011 | 9.0d | Decided by the lead: `Reset` and `Gap` for every reset and every loss found, a `Latest` opened again after either; for review |
@@ -4305,6 +4576,16 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-1054 | 9.2 | Decided by the lead: the mark read through a held handle; the rest is this machine's wake-up cost; the desktop-class figure waits for 9.2 |
 | Q-1055 | 9.0j | Decided by the lead: a known miss; the hub feed for the writer's reader lands with 9.0j (Q-1007) |
 | Q-1056 | 9.0f | Decided by the lead: `kvik series` counts from `fact_count` now; `tail --since`/`--once` follow 9.0f |
+| Q-1060 | 9.0h | Decided by the lead with 9.0f: `facts` and `at` from the log tail through the 11.0 lookup at the cut; the fact index left to windows; for review |
+| Q-1061 | 9.0g | Decided by the lead with 9.0f: an iteration ends with `CutExpired` when its cut ends, its reset stamp or generation changes; for review |
+| Q-1062 | 9.0g | Decided by the lead with 9.0f: several series in one pass in event-time order, then series; public with the `Query` read; for review |
+| Q-1063 | 9.0g | Decided by the lead with 9.0f: the accountant's shares, grants held by passes and their rows until taken (Q-1067), the flat block reserve; the envelope's admission builds on it |
+| Q-1064 | 6.2b | Decided by the lead with 9.0f: as of a time newest segment first through trailers and batch commit times, voided positions passed over; compacted files' tables with 6.2b. Open: a time in two generations, testable once restore exists (settle by 6.2b or the restore step, whichever comes first) |
+| Q-1065 | 6.2b | Decided by the lead with 9.0f: `at` searches back in doubling spans, one probe ending it before a series' first fact; the chunk index gives it one block with 6.2b |
+| Q-1066 | 6.3b | Decided by the lead with 9.0f's fix round under Q-951: a reader that took facts from a removed segment fails every call; a read ends when a segment it listed is gone; for review |
+| Q-1067 | 9.0g | Decided by the lead with 9.0f's fix round: rows waiting for delivery hold their grant; an admission empties shelves rather than wait on an iteration; for review |
+| Q-1068 | 9.0g | Decided by the lead with 9.0f's fix round: one key splits by position, the current view folded; for review |
+| Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

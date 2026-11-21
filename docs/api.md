@@ -418,7 +418,7 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 
 ## Reader processes (accepted at gate 3.3)
 ```rust
-pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min, cut_max_age: 30 min }; blocking
+pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min, cut_max_age: 30 min, memory: 64 MiB }; blocking
 pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease when due
 pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id read at open; no file read, no lease renewal
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
@@ -456,8 +456,20 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - From roadmap 9.0c a reader process holds per series the bounded latest-value state of the series directory
   (`format.md` A.18) and the registry, not every fact: it continues the newest valid directory and reads the log above
   it, and serves `live`, `series` and `losses` from that, looking a fact up in the log where the state cannot tell
-  (Q-1003, Q-1004). A call that reads facts (windows, `facts`, `at`, `buckets`, calendar results) builds the full fact
-  index at its first use and keeps it, until roadmap 9.0f (Q-1000).
+  (Q-1003, Q-1004). `facts` and `at` read the log at the call's cut through the segment indexes (Q-1060); windows,
+  `buckets` and calendar results build the full fact index at their first use and keep it, until roadmap 9.0h (Q-1000).
+- `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
+  `OpenError::Config`), a stream's rows not yet taken by the caller included: a read that needs more works in more
+  passes over narrower event-time ranges, down to one key's positions, with equal results at any cap (Q-1063,
+  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
+  keeps, to find damage a read met (Q-1060, Q-1069), and the bytes of the last segment the reader's refresh read, up to
+  `log.segment_size`, kept so that the next refresh reads only what is new (Q-1069). Rows a stream holds give way to
+  another read that needs the room, and the stream reads that part again: at 32 MiB a held part above about 7 MiB
+  leaves too little for any other read on the reader, an `at` included, so interleaving such reads with a stream row
+  by row costs work that grows with the square of a part's rows. Results are unchanged (Q-1067, Q-1096).
+- A reader whose `facts` or `at` took facts from a sealed segment that is then removed with no record naming the
+  removal fails those calls with `NotAvailable` until it is opened again; a stream or `at` ends with `NotAvailable`
+  when a segment its first pass listed is gone (Q-951, Q-1066).
 - Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
   what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
   segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at
@@ -475,7 +487,7 @@ let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named
 let (start, end) = reader.interval(id, t)?;                 // the interval of an interval series' reading at t
 
 pub fn facts(&self, id: SeriesId, range: TimeRange, view: View) -> Result<Facts, QueryError>;   // accepted at gate 3.3
-pub struct Facts;   /* impl Iterator<Item = Result<FactRow, QueryError>> */   // streams block by block, bounded memory
+pub struct Facts;   /* impl Iterator<Item = Result<FactRow, QueryError>> */   // streams pass by pass at one cut, bounded memory
 pub enum View { Current, AsOf(Position), AsOfTime(Timestamp), History }
 pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value, pub quality,
                      pub supplied_quality, pub flags: FactFlags, pub changed_at: Option<u64> }
@@ -483,6 +495,10 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
 pub fn snapshot(&self) -> Result<Snapshot, QueryError>;   // roadmap 9.0c: static reads at one cut and one `now`
 pub struct Snapshot;   // live(id), series(key), fact_count(id), losses(), state(), now(); owned, Send + 'static, cheap to clone
 ```
+- `facts` streams at the cut taken when it is called. An error item is the last: `CutExpired` once the cut is
+  `cut_max_age` old, its lease was found gone, or the mark's reset stamp or generation changed (Q-1061); rows already
+  yielded are to be dropped and the read started again. As of a time it reads as of the last position whose batch was
+  committed by then, newest generation first (Q-1064).
 - `snapshot` answers `live`, `series` and `losses` at one cut, with `now` taken when it is made (Q-1005). Like any
   read under a cut it ends with `CutExpired` once the cut is `cut_max_age` old or its lease was found gone, and the
   caller takes another. Windows and facts join it with roadmap 9.0f. On the model backend it holds the results taken
