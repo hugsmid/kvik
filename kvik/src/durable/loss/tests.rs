@@ -422,7 +422,12 @@ fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() 
     let armed = Arc::new(AtomicBool::new(true));
     let hook_armed = armed.clone();
     fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
-        if p.extension().is_some_and(|e| e == "open") && hook_armed.swap(false, Ordering::SeqCst) {
+        // The writer's batch sync only: `kvik-maint` syncs the segment it creates ahead whenever it finishes it.
+        let writer = std::thread::current().name() == Some("kvik-writer");
+        if writer
+            && p.extension().is_some_and(|e| e == "open")
+            && hook_armed.swap(false, Ordering::SeqCst)
+        {
             entered_tx.send(()).unwrap();
             release_rx.lock().unwrap().recv().unwrap();
         }
