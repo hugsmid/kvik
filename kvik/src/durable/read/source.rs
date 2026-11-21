@@ -82,14 +82,20 @@ fn pass(
         }
         other => other?,
     };
-    match listed {
-        Some(first) if first.iter().any(|id| now.binary_search(id).is_err()) => {
-            return Err(segment_gone());
-        }
-        Some(_) => {}
-        None => *listed = Some(now),
-    }
+    still_listed(listed, now)?;
     Ok(rows)
+}
+
+/// Fails when a segment of `listed` is not in `now`; notes `now` as the first listing (Q-1066).
+fn still_listed(listed: &mut Option<Vec<u64>>, now: Vec<u64>) -> Result<(), QueryError> {
+    match listed {
+        Some(first) if first.iter().any(|id| now.binary_search(id).is_err()) => Err(segment_gone()),
+        Some(_) => Ok(()),
+        None => {
+            *listed = Some(now);
+            Ok(())
+        }
+    }
 }
 
 type Once = (Option<(Vec<Stored>, Grant)>, Vec<u64>);
@@ -229,11 +235,11 @@ enum Unit {
 }
 
 impl Parts {
-    fn new(part: Option<Part>, later_first: bool) -> Self {
+    fn new(part: Option<Part>, later_first: bool, listed: Option<Vec<u64>>) -> Self {
         Parts {
             stack: part.into_iter().collect(),
             later_first,
-            listed: None,
+            listed,
             fold: None,
         }
     }
@@ -290,7 +296,7 @@ impl Parts {
 
 /// Static `facts` (spec §2.3), streamed pass by pass at one cut: event-time order, then series, then position. The
 /// rows of a pass wait for delivery on a shelf under their grant; an admission that empties the shelf has the stream
-/// read that part again and pass over what it delivered (Q-1067).
+/// read that part again and pass over every row up to the last it yielded (Q-1067, Q-1096).
 #[derive(Debug)]
 pub(crate) struct FactStream {
     reader: Arc<DurableReader>,
@@ -298,10 +304,8 @@ pub(crate) struct FactStream {
     plan: Plan,
     parts: Parts,
     shelf: Option<(Arc<Shelf>, Part)>,
-    /// Rows taken from the shelf.
-    popped: u64,
-    /// Rows still to pass over, delivered before the shelf was emptied.
-    skip: u64,
+    /// The key of the last row yielded: the stream's rows come in strictly ascending keys.
+    yielded: Option<(i64, u32, LogPos)>,
     folded: Option<Stored>,
 }
 
@@ -318,11 +322,10 @@ impl FactStream {
         FactStream {
             reader,
             view: Some(view),
-            parts: Parts::new(whole, false),
+            parts: Parts::new(whole, false, None),
             plan,
             shelf: None,
-            popped: 0,
-            skip: 0,
+            yielded: None,
             folded: None,
         }
     }
@@ -344,17 +347,28 @@ impl FactStream {
             drop(g);
             self.shelf = None;
             self.parts.stack.push(part);
-            self.skip += self.popped;
             return None;
         };
         if let Some(s) = rows.next() {
-            self.popped += 1;
             return Some(s);
         }
         *g = None;
         drop(g);
         self.shelf = None;
         None
+    }
+
+    /// Whether `s` comes after the last row yielded: by `(t, series, position)` in history, by `(t, series)` in the
+    /// current view, whose fact at a key a part read again may hold at another position (Q-1096).
+    fn beyond_yielded(&self, s: &Stored) -> bool {
+        let Some((t, series, position)) = self.yielded else {
+            return true;
+        };
+        if self.plan.history {
+            (s.row.t, s.row.series_id, s.position) > (t, series, position)
+        } else {
+            (s.row.t, s.row.series_id) > (t, series)
+        }
     }
 
     fn step(&mut self) -> Result<bool, QueryError> {
@@ -369,7 +383,6 @@ impl FactStream {
                 let bytes = held(&rows);
                 let shelf = self.reader.memory().shelve(rows, grant, bytes);
                 self.shelf = Some((shelf, part));
-                self.popped = 0;
                 Ok(true)
             }
         }
@@ -382,10 +395,10 @@ impl Iterator for FactStream {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(s) = self.pop().or_else(|| self.folded.take()) {
-                if self.skip > 0 {
-                    self.skip -= 1;
+                if !self.beyond_yielded(&s) {
                     continue;
                 }
+                self.yielded = Some((s.row.t, s.row.series_id, s.position));
                 return Some(Ok(fact_into(s)));
             }
             if self.shelf.is_some() {
@@ -420,12 +433,13 @@ const FIRST_SPAN: i64 = 3_600_000_000_000;
 const PROBE: u64 = 4 << 10;
 
 /// Whether the plan's series hold no fact at or before `to`, from one lookup that keeps a few facts at most; `false`
-/// when it cannot tell.
+/// when it cannot tell. Its listing is checked against the call's (Q-1066).
 fn nothing_at_or_before(
     r: &DurableReader,
     v: &View,
     plan: &Plan,
     to: i64,
+    listed: &mut Option<Vec<u64>>,
 ) -> Result<bool, QueryError> {
     let grant = r.memory().admit();
     let wanted: Vec<kvik_log::reader::Wanted> = plan
@@ -443,15 +457,18 @@ fn nothing_at_or_before(
         upto: Some(plan.bound),
     };
     match r.lookup_within(v, &wanted, within) {
-        Ok((Some(found), _)) => Ok(found.is_empty()),
-        Ok((None, _)) | Err(QueryError::NotAvailable { .. }) => Ok(false),
+        Ok((found, now)) => {
+            still_listed(listed, now)?;
+            Ok(found.is_some_and(|f| f.is_empty()))
+        }
+        Err(QueryError::NotAvailable { .. }) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
 /// The fact `pick` chooses among the view's facts at or before `t`, searching back from `t` in spans that double,
 /// each read in passes that fit, later first; the first span holding one decides. After the first empty span one
-/// probe ends the search when the series hold no earlier fact (Q-1065).
+/// probe ends the search when the series hold no earlier fact (Q-1065). One listing holds for the whole call (Q-1066).
 pub(crate) fn search_back(
     r: &DurableReader,
     v: &View,
@@ -465,9 +482,10 @@ pub(crate) fn search_back(
     let mut to = t;
     let mut span = FIRST_SPAN;
     let mut probed = false;
+    let mut listed = None;
     loop {
         let from = to.saturating_sub(span - 1);
-        let mut parts = Parts::new(Some(Part::whole(plan, from, to)), true);
+        let mut parts = Parts::new(Some(Part::whole(plan, from, to)), true, listed.take());
         while let Some(unit) = parts.next(r, v, plan)? {
             let found = match &unit {
                 Unit::Rows(rows, _, _) => rows
@@ -481,12 +499,13 @@ pub(crate) fn search_back(
                 return Ok(found);
             }
         }
+        listed = parts.listed;
         if from == i64::MIN {
             return Ok(None);
         }
         if !probed {
             probed = true;
-            if nothing_at_or_before(r, v, plan, from - 1)? {
+            if nothing_at_or_before(r, v, plan, from - 1, &mut listed)? {
                 return Ok(None);
             }
         }

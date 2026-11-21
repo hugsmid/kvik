@@ -139,6 +139,20 @@ pub(crate) struct DurableReader {
     /// Lookups still to end with `CutExpired`, as a reset between the cut and the read ends them.
     #[cfg(test)]
     pub(crate) expire_lookups: AtomicU64,
+    #[cfg(test)]
+    pub(crate) after_lookup: AfterLookup,
+}
+
+/// Run after each lookup of the reader's `facts` and `at`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AfterLookup(pub(crate) Mutex<Option<Box<dyn FnMut() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AfterLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterLookup")
+    }
 }
 
 /// A log reader configuration on the store in `dir` with this process's boot id and a fresh reader id.
@@ -278,6 +292,8 @@ impl DurableReader {
             lookups_made: AtomicU64::new(0),
             #[cfg(test)]
             expire_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            after_lookup: AfterLookup::default(),
             seeded: AtomicBool::new(false),
             hub: Hub::default(),
             memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),

@@ -37,6 +37,16 @@ impl DurableReader {
             |r, lost| r.lookup_within(wanted, lost, within),
             |l| (l.stamp, l.durable),
         )?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_lookup
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            hook();
+        }
         let listed = std::mem::take(&mut l.listed);
         if l.overflowed {
             return Ok((None, listed));

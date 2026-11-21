@@ -602,6 +602,16 @@ fn at_before_a_series_first_fact_ends_after_one_probe_and_finds_a_fact_far_back(
     rig.shut();
 }
 
+/// One pass at a time keeping `rows` bytes, and a shelf of more than a byte leaves less than the least grant free.
+fn one_pass_of(rows: u64) -> Sizes {
+    Sizes {
+        cap: 400_000,
+        block: 300_000 - rows,
+        min_rows: rows - 1,
+        lookups: 0,
+    }
+}
+
 #[test]
 fn a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once() {
     let mut rig = Rig::new("shelf-emptied");
@@ -611,23 +621,169 @@ fn a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once
         .map(|k| Reading::new(id, Timestamp(now - 1_000 + k), Value::F64(k as f64)))
         .collect();
     rig.emit_readings(&rs, Intent::Normal);
-    // One pass at a time, and a shelf of any size leaves less than the least grant free.
-    let sizes = Sizes {
-        cap: 400_000,
-        block: 250_000,
-        min_rows: 49_000,
-        lookups: 0,
-    };
     let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
     let want = oracle
         .with(|i, _| i.facts(id, all(), View::History))
         .unwrap();
-    let r = reader_with(&rig.env, &rig.dir, sizes);
+    let r = reader_with(&rig.env, &rig.dir, one_pass_of(50_000));
     let mut s = facts(r.clone(), id, all(), View::History).unwrap();
     let mut got: Vec<Fact> = s.by_ref().take(10).collect::<Result<_, _>>().unwrap();
     let t = Timestamp(now - 1_000 + 150);
     assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
+    assert_eq!(r.memory().emptied(), 1);
     got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
     assert_eq!(got, want);
+    rig.shut();
+}
+
+/// A shelf holds at most 60 rows here, so the 201st row taken is on the fourth shelf or later; each time holds two
+/// facts, and in history the 201st is the first of its time's two.
+#[test]
+fn a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views() {
+    let mut rig = Rig::new("later-shelf-emptied");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    for round in 0..2 {
+        let rs: Vec<Reading> = (0..300)
+            .map(|k| {
+                Reading::new(
+                    id,
+                    Timestamp(now - 1_000 + k),
+                    Value::F64((k + round) as f64),
+                )
+            })
+            .collect();
+        rig.emit_readings(&rs, Intent::Normal);
+    }
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    for (view, len) in [(View::History, 600), (View::Current, 300)] {
+        let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
+        assert_eq!(want.len(), len);
+        let r = reader_with(&rig.env, &rig.dir, one_pass_of(60 * fact_bytes()));
+        let mut s = facts(r.clone(), id, all(), view).unwrap();
+        let mut got: Vec<Fact> = s.by_ref().take(201).collect::<Result<_, _>>().unwrap();
+        let t = Timestamp(now - 1_000 + 20);
+        assert_eq!(at(&r, id, t, view).unwrap().map(|f| f.t), Some(t));
+        assert_eq!(r.memory().emptied(), 1);
+        got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
+        assert_eq!(got, want, "{view:?}");
+    }
+    rig.shut();
+}
+
+/// Damage found between a stream's two reads of a part makes the second shorter; the stream passes over rows by the
+/// last it yielded, so none after it is lost (Q-1096).
+#[test]
+fn a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last() {
+    let mut rig = Rig::new("shelf-damaged");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    for b in 0..30i64 {
+        let rs: Vec<Reading> = (0..10)
+            .map(|k| {
+                let i = b * 10 + k;
+                Reading::new(id, Timestamp(now - 1_000 + i), Value::F64(i as f64))
+            })
+            .collect();
+        rig.emit_readings(&rs, Intent::Normal);
+    }
+    let r = reader_with(&rig.env, &rig.dir, one_pass_of(50_000));
+    let mut s = facts(r.clone(), id, all(), View::History).unwrap();
+    let got: Vec<Fact> = s.by_ref().take(15).collect::<Result<_, _>>().unwrap();
+    assert!(rig.damage_batch(0));
+    let t = Timestamp(now - 1_000 + 150);
+    assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
+    assert_eq!(r.memory().emptied(), 1);
+    let rest = s.collect::<Result<Vec<_>, _>>().unwrap();
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let want = oracle
+        .with(|i, _| i.facts(id, all(), View::History))
+        .unwrap();
+    assert_eq!(want.len(), 290);
+    let last = got.last().unwrap().t;
+    assert_eq!(last, Timestamp(now - 1_000 + 14));
+    assert_eq!(
+        rest,
+        want.into_iter().filter(|f| f.t > last).collect::<Vec<_>>()
+    );
+    rig.shut();
+}
+
+/// One `at` keeps the listing of its first pass through every span and the probe: a segment it listed and took
+/// nothing from, gone before the probe, ends it rather than letting the probe find no earlier fact (Q-1066).
+#[test]
+fn at_ends_not_available_when_a_segment_its_first_span_listed_is_gone_before_the_probe() {
+    let mut rig = Rig::with_log("at-listed-gone", seals(Duration::from_millis(20)));
+    let id = rig.ids[2];
+    let now = rig.clock.wall().0;
+    let hour = 3_600_000_000_000i64;
+    let note = |t: i64, text: &str| [Reading::new(id, Timestamp(t), Value::Text(text.into()))];
+    rig.emit_readings(&note(now - 3 * hour, "AL-OLD"), Intent::Normal);
+    let old = sealed_holding(&rig, b"AL-OLD");
+    rig.emit_readings(&note(now - 10_000, "AL-NEW"), Intent::Normal);
+    sealed_holding(&rig, b"AL-NEW");
+    let r = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let (fs, mut old) = (rig.fs.clone(), Some(old));
+    *r.after_lookup.0.lock().unwrap() = Some(Box::new(move || {
+        if let Some(p) = old.take() {
+            crate::env::Fs::remove_file(&fs, &p).unwrap();
+        }
+    }));
+    let got = at(&r, id, Timestamp(now - hour / 2), View::Current);
+    assert!(
+        matches!(got, Err(QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
+    rig.shut();
+}
+
+/// Spans searched after the probe keep the call's listing too: the probe stops at an older segment's facts before it
+/// reaches the next, which a later span lists and takes nothing from, and which is gone before the span holding its
+/// fact (Q-1066).
+#[test]
+fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_later_span() {
+    let mut rig = Rig::with_log("at-span-gone", seals(Duration::from_millis(20)));
+    let id = rig.ids[2];
+    let now = rig.clock.wall().0;
+    let hour = 3_600_000_000_000i64;
+    let old: Vec<Reading> = (0..20i64)
+        .map(|k| {
+            let text = format!("AS-OLD-{k:02}-{}", "o".repeat(240));
+            Reading::new(id, Timestamp(now - 100 * hour + k), Value::Text(text))
+        })
+        .collect();
+    rig.emit_readings(&old, Intent::Normal);
+    sealed_holding(&rig, b"AS-OLD-00-");
+    let five = [Reading::new(
+        id,
+        Timestamp(now - 5 * hour),
+        Value::Text("AS-FIVE".into()),
+    )];
+    rig.emit_readings(&five, Intent::Normal);
+    let gone = sealed_holding(&rig, b"AS-FIVE");
+    // The mark moves on to a later segment, so the removed one is not the segment the mark names.
+    rig.emit_readings(
+        &[Reading::new(rig.ids[0], Timestamp(now), Value::F64(1.0))],
+        Intent::Normal,
+    );
+    let fresh = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let want = at(&fresh, id, Timestamp(now), View::Current).unwrap();
+    assert_eq!(want.map(|f| f.t), Some(Timestamp(now - 5 * hour)));
+    let r = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let (fs, mut gone, mut n) = (rig.fs.clone(), Some(gone), 0);
+    // The first span, the probe, the second span.
+    *r.after_lookup.0.lock().unwrap() = Some(Box::new(move || {
+        n += 1;
+        if n == 3
+            && let Some(p) = gone.take()
+        {
+            crate::env::Fs::remove_file(&fs, &p).unwrap();
+        }
+    }));
+    let got = at(&r, id, Timestamp(now), View::Current);
+    assert!(
+        matches!(got, Err(QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
     rig.shut();
 }
