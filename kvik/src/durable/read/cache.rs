@@ -17,8 +17,8 @@ pub(crate) const LEAST_MEMORY: u64 = 32 << 20;
 const BLOCK_RESERVE: u64 = 16 << 20;
 /// The least row budget a pass is admitted with.
 const MIN_ROWS: u64 = 1 << 20;
-/// How long an admission waits for shelved bytes no listed shelf holds before it calls them lost: a grant on its way
-/// back gives them back at once (Q-1095).
+/// How long an admission waits for shelved bytes no listed shelf holds before a build with debug assertions calls them
+/// lost: a grant on its way back gives them back at once (Q-1095, Q-1097).
 const GIVE_BACK: Duration = Duration::from_secs(60);
 
 /// The sizes the accountant works with; other values in tests only, to force multi-pass reads on small histories.
@@ -60,10 +60,12 @@ struct State {
     shelves: Vec<Weak<Shelf>>,
     /// An admission is emptying a shelf; others wait for it (Q-1095).
     emptying: bool,
-    /// Counts every change that can free room, so that an admission waits only when nothing changed.
+    /// Counts grants given back, shelves made and shelves emptied: what can free room (Q-1097).
     changes: u64,
     #[cfg(test)]
     emptied: u64,
+    #[cfg(test)]
+    passes: u64,
 }
 
 /// See the module documentation.
@@ -176,23 +178,29 @@ impl Accountant {
             }
             s = self.lock();
             s.emptying = false;
-            s.changes += 1;
             s.shelves.retain(|w| w.strong_count() > 0);
             #[cfg(test)]
+            {
+                s.passes += 1;
+            }
             if emptied {
-                s.emptied += 1;
+                s.changes += 1;
+                #[cfg(test)]
+                {
+                    s.emptied += 1;
+                }
             }
             self.freed.notify_all();
-            if !emptied && s.changes == seen + 1 {
-                // Nothing to empty and nothing given back since: a grant whose shelf was dropped is on its way.
-                let idle = s.running == 0;
+            // A pass that emptied nothing is no change, so admissions with nothing to empty do not wake each other
+            // (Q-1097); a grant whose shelf was dropped is on its way back.
+            while !emptied && s.changes == seen {
                 let (g, w) = self
                     .freed
                     .wait_timeout(s, GIVE_BACK)
                     .unwrap_or_else(PoisonError::into_inner);
                 s = g;
-                assert!(
-                    !(idle && w.timed_out() && s.changes == seen + 1 && s.shelved > 0),
+                debug_assert!(
+                    !(w.timed_out() && s.changes == seen && s.running == 0 && s.shelved > 0),
                     "shelved rows are on a shelf"
                 );
             }
@@ -222,6 +230,11 @@ impl Accountant {
     /// Shelves admissions have emptied.
     pub(crate) fn emptied(&self) -> u64 {
         self.lock().emptied
+    }
+
+    /// Passes over the listed shelves admissions have made, emptying or not.
+    pub(crate) fn passes(&self) -> u64 {
+        self.lock().passes
     }
 }
 
@@ -311,6 +324,30 @@ mod tests {
         assert!(first.lock().unwrap().is_none() && second.lock().unwrap().is_none());
         assert_eq!(a.emptied(), 2);
         assert_eq!(g.rows(), LEAST_MEMORY - LEAST_MEMORY / 4 - BLOCK_RESERVE);
+    }
+
+    /// An 8 MiB grant held off its listed shelf: two admissions find nothing to empty and wait for it to be given back,
+    /// neither waking the other with its pass that emptied nothing (Q-1097).
+    #[test]
+    fn two_admissions_with_nothing_to_empty_wait_without_waking_each_other() {
+        let a = Accountant::new(Sizes::of(LEAST_MEMORY));
+        let shelf = a.shelve(Vec::new(), a.admit(), 8 << 20);
+        let held = shelf.lock().unwrap().take();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let (b, tx) = (a.clone(), tx.clone());
+            std::thread::spawn(move || tx.send(b.admit()));
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+        assert!(a.passes() <= 4, "{} passes", a.passes());
+        drop(held);
+        for _ in 0..2 {
+            drop(
+                rx.recv_timeout(Duration::from_secs(10))
+                    .expect("admitted once given back"),
+            );
+        }
+        assert_eq!(a.emptied(), 0);
     }
 
     /// Two shelves of 4 MiB at the least cap leave less than the least grant free; two admissions at once each

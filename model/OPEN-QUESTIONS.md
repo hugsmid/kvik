@@ -147,6 +147,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1069 | query design §1 Memory; `api.md` `ReaderConfig` | What the memory cap counts, measured (decided by the lead) |
 | Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
 | Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
+| Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3944,8 +3945,8 @@ are on a shelf panicked (44 times in 30,000 rounds).
 **Decided.** Shelves stay listed while one is emptied, and one admission empties at a time: another that needs room
 meanwhile waits until the emptying ends and looks again, so no shelf is emptied that one admission's room did not
 need. An admission that finds nothing to empty and nothing given back since waits for the next grant given back
-rather than spinning (a stream dropping its shelf gives its grant back just after the shelf is gone); the check
-stands, now as a 60-second wait with no running pass and no change before it calls shelved rows lost.
+rather than spinning (a stream dropping its shelf gives its grant back just after the shelf is gone); what that wait
+counts as a change, and the check that shelved rows are on a shelf, are Q-1097.
 **Pinned by.** `kvik/src/durable/read/cache.rs` `two_admissions_emptying_shelves_at_once_are_both_admitted`,
 `an_admission_empties_as_many_listed_shelves_as_its_room_needs`.
 
@@ -3961,6 +3962,20 @@ position. Every row not beyond it is passed over, whatever the second read retur
 **Pinned by.** `kvik/src/durable/read/source/tests.rs`
 `a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last`,
 `a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`.
+
+## Q-1097 — An admission with nothing to empty, and shelved rows no shelf holds
+Decided by the lead with roadmap 9.0f's follow-up.
+**Scenario.** Two admissions need room that only shelved bytes no listed shelf holds could give. Each emptying pass
+that took nothing counted as a change and woke the others, so two such admissions woke each other for ever and
+neither waited. The check that shelved rows are on a shelf panicked after 60 seconds of no change: library code that
+panics on a clock, though a caller's pace cannot reach it (a held or leaked stream's shelf is listed and full).
+**Decided.** A change is a grant given back, a shelf made or a shelf emptied; a pass that empties nothing still wakes
+admissions waiting for the emptying to end, but one waiting for a change waits on until a change comes. The check is
+a `debug_assert!`: in a build with debug assertions, 60 seconds with no change, no running pass and shelved bytes is
+an accounting fault and panics; in a release build the admission waits on. Not an error returned to the caller: it
+would turn an internal fault into a failure every caller must handle, for a state no caller can cause.
+**Pinned by.** `kvik/src/durable/read/cache.rs`
+`two_admissions_with_nothing_to_empty_wait_without_waking_each_other`.
 
 ## Q-1020 — Label entries in the model kept apart from registry events
 Recorded and decided by the lead with the labels spec-and-model step (L1).
