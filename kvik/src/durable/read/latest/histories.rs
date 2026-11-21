@@ -5,7 +5,8 @@ use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
 
 use super::tests::{
-    Losses, Rig, S, Step, T0, bridged, known_alike, recorded_ranges, seed, steps, write_directory,
+    Losses, Rig, S, Step, T0, bridged, known_alike, positions_lost, recorded_ranges, seed, steps,
+    write_directory,
 };
 use crate::Store;
 use crate::time::Timestamp;
@@ -199,6 +200,13 @@ fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_an
             (at(10), Some(at(8)), Some(at(10)), true)
         ]
     );
+    for l in [own.losses(), whole.losses()] {
+        assert_eq!(
+            positions_lost(&l).1,
+            [(at(8), at(10))],
+            "what the property compares"
+        );
+    }
     rig.check().unwrap();
     assert_eq!(
         rig.bridged, 1,

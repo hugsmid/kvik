@@ -548,7 +548,7 @@ pub(super) fn bridged(records: &[(Position, Position, Position)]) -> bool {
 }
 
 /// The possible losses whole and the positions lost data covers, as merged intervals: what Q-1102 leaves compared.
-fn positions_lost(l: &Losses) -> (Losses, Vec<(Position, Position)>) {
+pub(super) fn positions_lost(l: &Losses) -> (Losses, Vec<(Position, Position)>) {
     use crate::health::LossKind;
     let (data, possible): (Losses, Losses) = l
         .iter()
