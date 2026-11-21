@@ -226,7 +226,7 @@ fn two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end
 }
 
 /// The last row taken gives the shelf's grant back: an `at` after it empties nothing, and the stream then ends with
-/// the lookups of a stream no other read met, not reading its part again (Q-1067).
+/// the lookups of a stream no other read met; a part's last row ends it with no read again (Q-1067).
 #[test]
 fn a_stream_gives_its_shelf_back_with_its_last_row() {
     let mut rig = Rig::new("shelf-last-row");
@@ -252,5 +252,11 @@ fn a_stream_gives_its_shelf_back_with_its_last_row() {
     };
     let alone = drained(false).0;
     assert_eq!(drained(true), (alone, 0));
+    let whole = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let mut s = facts(whole.clone(), id, all(), View::History).unwrap();
+    assert_eq!(s.by_ref().take(300).count(), 300);
+    let lookups = whole.lookups();
+    assert!(s.next().is_none());
+    assert_eq!(whole.lookups(), lookups, "one part, ended by its last row");
     rig.shut();
 }
