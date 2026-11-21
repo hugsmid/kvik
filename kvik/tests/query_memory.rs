@@ -24,7 +24,7 @@ const OVERHEAD: usize = 1 << 20;
 /// What the lookups' log reader keeps at most (`kvik_log::reader::LOOKUP_CACHE_BYTES`), in the cache's share.
 const LOOKUPS: usize = 8 << 20;
 /// What the first refresh takes above the segment bytes it keeps, measured at 9.9 MiB with 8 MiB batches; over before
-/// the first pass is admitted.
+/// the first pass is admitted, and under the grant of one pass at either cap.
 const REFRESH: usize = 12 << 20;
 
 /// The grant one pass takes alone at `cap` (Q-1063): the cap less the cache's share, all of it under two least
@@ -80,6 +80,19 @@ fn facts_and_at_allocate_within_the_memory_cap() {
     let last = Timestamp(first + (PER_BATCH * BATCHES - 1) * 1_000_000);
     for cap in [32u64 << 20, 64 << 20] {
         let grant = lone_pass(cap as usize);
+        assert!(REFRESH <= grant + OVERHEAD);
+        let alone = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(cap)).unwrap();
+        let refresh = peak_of(|| drop(alone.live(id).unwrap()));
+        eprintln!(
+            "first refresh at {} MiB: peak {refresh} bytes, followed {followed}",
+            cap >> 20
+        );
+        assert!(
+            refresh <= followed + REFRESH,
+            "first refresh at {} MiB: {refresh} bytes, the followed segment {followed}",
+            cap >> 20
+        );
+        drop(alone);
         let r = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(cap)).unwrap();
         let first = peak_of(|| {
             let n = r
@@ -92,7 +105,7 @@ fn facts_and_at_allocate_within_the_memory_cap() {
         eprintln!("first facts at {} MiB: peak {first} bytes", cap >> 20);
         // The lookups' cache fills in this call, within the cap's share: two segments' maps, a few KiB here.
         assert!(
-            first <= followed + (grant + OVERHEAD).max(REFRESH),
+            first <= followed + grant + OVERHEAD,
             "first facts at {} MiB: {first} bytes, the followed segment {followed}",
             cap >> 20
         );

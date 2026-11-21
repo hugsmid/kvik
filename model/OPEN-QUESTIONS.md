@@ -158,6 +158,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1100 | query design §3.5; Q-1097 | A shelf made counts as a change (decided by the lead) |
 | Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
 | Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
+| Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4454,6 +4455,17 @@ positions lost data covers only; other checks are compared whole.
 **Pinned by.** `kvik/src/durable/read/latest/histories.rs`
 `a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader` (the records, both
 reports as built, and the property's set-aside reached).
+
+## Q-1103 — The first call's memory bound and the refresh within it
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** `kvik/tests/query_memory.rs` bounded a reader's first `facts` call by the followed segment plus the
+larger of one pass's grant with its overhead (25 MiB at both caps measured) and the first refresh's 12 MiB, so the
+refresh's term was never the larger and its 9.9 MiB figure (Q-1069) was not tested.
+**Decided.** A second reader's first `live` call, which runs the first refresh and the latest values' fold and no
+pass, is measured alone against the followed segment plus 12 MiB at both caps: 10,404,672 bytes above a 14,300,808-byte
+segment, the 9.9 MiB figure. The first `facts` bound is the followed segment plus the grant and its overhead, which
+holds since the refresh is over before the first pass is admitted and its allowance is under the grant (asserted).
+**Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
 ## Open at v0.2
 
