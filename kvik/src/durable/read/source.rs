@@ -306,7 +306,8 @@ pub(crate) struct FactStream {
     shelf: Option<(Arc<Shelf>, Part)>,
     /// The key of the last row yielded: the stream's rows come in strictly ascending keys.
     yielded: Option<(i64, u32, LogPos)>,
-    folded: Option<Stored>,
+    /// The next row, taken off its part before the rest is shelved, or a key's fold.
+    ready: Option<Stored>,
 }
 
 impl FactStream {
@@ -326,7 +327,7 @@ impl FactStream {
             plan,
             shelf: None,
             yielded: None,
-            folded: None,
+            ready: None,
         }
     }
 
@@ -350,6 +351,11 @@ impl FactStream {
             return None;
         };
         if let Some(s) = rows.next() {
+            if rows.as_slice().is_empty() {
+                *g = None;
+                drop(g);
+                self.shelf = None;
+            }
             return Some(s);
         }
         *g = None;
@@ -358,17 +364,9 @@ impl FactStream {
         None
     }
 
-    /// Whether `s` comes after the last row yielded: by `(t, series, position)` in history, by `(t, series)` in the
-    /// current view, whose fact at a key a part read again may hold at another position (Q-1096).
+    /// Whether `s` comes after the last row yielded ([`beyond`]).
     fn beyond_yielded(&self, s: &Stored) -> bool {
-        let Some((t, series, position)) = self.yielded else {
-            return true;
-        };
-        if self.plan.history {
-            (s.row.t, s.row.series_id, s.position) > (t, series, position)
-        } else {
-            (s.row.t, s.row.series_id) > (t, series)
-        }
+        beyond(self.plan.history, self.yielded, s)
     }
 
     fn step(&mut self) -> Result<bool, QueryError> {
@@ -376,13 +374,23 @@ impl FactStream {
         match self.parts.next(&self.reader, &v, &self.plan)? {
             None => Ok(false),
             Some(Unit::Folded(s)) => {
-                self.folded = Some(s);
+                self.ready = Some(s);
                 Ok(true)
             }
             Some(Unit::Rows(rows, grant, part)) => {
                 let bytes = held(&rows);
-                let shelf = self.reader.memory().shelve(rows, grant, bytes);
-                self.shelf = Some((shelf, part));
+                let mut rows = rows.into_iter();
+                // The first new row is taken before the rest is shelved, so every read of a part yields one or ends
+                // it, whatever other threads' admissions empty (Q-1067).
+                let (history, yielded) = (self.plan.history, self.yielded);
+                let old = rows
+                    .as_slice()
+                    .partition_point(|s| !beyond(history, yielded, s));
+                self.ready = rows.nth(old);
+                if self.ready.is_some() && !rows.as_slice().is_empty() {
+                    let shelf = self.reader.memory().shelve(rows, grant, bytes);
+                    self.shelf = Some((shelf, part));
+                }
                 Ok(true)
             }
         }
@@ -394,7 +402,7 @@ impl Iterator for FactStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(s) = self.pop().or_else(|| self.folded.take()) {
+            if let Some(s) = self.ready.take().or_else(|| self.pop()) {
                 if !self.beyond_yielded(&s) {
                     continue;
                 }
@@ -423,6 +431,19 @@ impl Iterator for FactStream {
 impl Drop for FactStream {
     fn drop(&mut self) {
         self.end();
+    }
+}
+
+/// Whether `s` comes after the last row yielded, `yielded`: by `(t, series, position)` in history, by `(t, series)` in
+/// the current view, whose fact at a key a part read again may hold at another position (Q-1096).
+fn beyond(history: bool, yielded: Option<(i64, u32, LogPos)>, s: &Stored) -> bool {
+    let Some((t, series, position)) = yielded else {
+        return true;
+    };
+    if history {
+        (s.row.t, s.row.series_id, s.position) > (t, series, position)
+    } else {
+        (s.row.t, s.row.series_id) > (t, series)
     }
 }
 

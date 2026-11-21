@@ -74,6 +74,20 @@ pub(crate) struct Accountant {
     sizes: Sizes,
     state: Mutex<State>,
     freed: Condvar,
+    #[cfg(test)]
+    pub(crate) after_shelve: AfterShelve,
+}
+
+/// Run on each shelf as it is made, with no lock held: another thread's admission in the window before its first row.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AfterShelve(pub(crate) Mutex<Option<Box<dyn FnMut(&Shelf) + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AfterShelve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterShelve")
+    }
 }
 
 /// Memory granted to one pass, or to the rows a stream holds, given back when dropped.
@@ -115,6 +129,8 @@ impl Accountant {
             sizes,
             state: Mutex::new(State::default()),
             freed: Condvar::new(),
+            #[cfg(test)]
+            after_shelve: AfterShelve::default(),
         })
     }
 
@@ -208,19 +224,34 @@ impl Accountant {
     }
 
     /// Puts `rows` on a shelf, the grant shrunk to the `held` bytes they take.
-    pub(crate) fn shelve(&self, rows: Vec<Stored>, mut grant: Grant, held: u64) -> Arc<Shelf> {
+    pub(crate) fn shelve(
+        &self,
+        rows: std::vec::IntoIter<Stored>,
+        mut grant: Grant,
+        held: u64,
+    ) -> Arc<Shelf> {
         let mut s = self.lock();
         let held = held.min(grant.bytes);
         s.running -= grant.bytes;
         s.shelved += held;
         grant.bytes = held;
         grant.shelved = true;
-        let shelf = Arc::new(Mutex::new(Some((rows.into_iter(), grant))));
+        let shelf = Arc::new(Mutex::new(Some((rows, grant))));
         s.shelves.retain(|w| w.strong_count() > 0);
         s.shelves.push(Arc::downgrade(&shelf));
         s.changes += 1;
         drop(s);
         self.freed.notify_all();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_shelve
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            hook(&shelf);
+        }
         shelf
     }
 }
@@ -297,7 +328,7 @@ mod tests {
     fn rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf() {
         let a = Accountant::new(Sizes::of(LEAST_MEMORY));
         let g = a.admit();
-        let small = a.shelve(Vec::new(), g, 1 << 20);
+        let small = a.shelve(Vec::new().into_iter(), g, 1 << 20);
         let g = admitted_within(&a, Duration::from_secs(10)).expect("room beside a small shelf");
         assert!(
             small.lock().unwrap().is_some(),
@@ -305,7 +336,7 @@ mod tests {
         );
         drop(small);
         let all = g.bytes;
-        let full = a.shelve(Vec::new(), g, all);
+        let full = a.shelve(Vec::new().into_iter(), g, all);
         let g =
             admitted_within(&a, Duration::from_secs(10)).expect("no wait on a caller's iteration");
         assert!(full.lock().unwrap().is_none());
@@ -318,8 +349,8 @@ mod tests {
     #[test]
     fn an_admission_empties_as_many_listed_shelves_as_its_room_needs() {
         let a = Accountant::new(Sizes::of(LEAST_MEMORY));
-        let first = a.shelve(Vec::new(), a.admit(), 7 << 20);
-        let second = a.shelve(Vec::new(), a.admit(), 8 << 20);
+        let first = a.shelve(Vec::new().into_iter(), a.admit(), 7 << 20);
+        let second = a.shelve(Vec::new().into_iter(), a.admit(), 8 << 20);
         let g = admitted_within(&a, Duration::from_secs(10)).expect("both shelves emptied");
         assert!(first.lock().unwrap().is_none() && second.lock().unwrap().is_none());
         assert_eq!(a.emptied(), 2);
@@ -331,7 +362,7 @@ mod tests {
     #[test]
     fn two_admissions_with_nothing_to_empty_wait_without_waking_each_other() {
         let a = Accountant::new(Sizes::of(LEAST_MEMORY));
-        let shelf = a.shelve(Vec::new(), a.admit(), 8 << 20);
+        let shelf = a.shelve(Vec::new().into_iter(), a.admit(), 8 << 20);
         let held = shelf.lock().unwrap().take();
         let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
@@ -381,7 +412,7 @@ mod tests {
             let mut emptied = Vec::new();
             for _ in 0..ROUNDS {
                 let shelves: Vec<_> = (0..2)
-                    .map(|_| b.shelve(Vec::new(), b.admit(), 4 << 20))
+                    .map(|_| b.shelve(Vec::new().into_iter(), b.admit(), 4 << 20))
                     .collect();
                 gate.wait();
                 gate.wait();

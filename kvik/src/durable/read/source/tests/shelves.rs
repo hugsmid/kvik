@@ -1,5 +1,6 @@
 //! Streams whose shelves are emptied: where they resume and that they progress (Q-1067, Q-1096).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{all, fact_bytes, reader_with};
@@ -154,3 +155,72 @@ fn a_versioned_key_whose_yielded_fact_is_lost_before_its_part_is_read_again_is_n
     rig.shut();
 }
 
+/// 300 facts in parts of at most 60 rows, every shelf emptied as soon as it is made, as another thread's admission
+/// may: each read of a part still yields its first new row, so the stream ends with every row once (Q-1067).
+#[test]
+fn a_stream_whose_every_shelf_is_emptied_as_it_is_made_yields_every_row_once_in_both_views() {
+    let mut rig = Rig::new("shelf-raced");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    let rs: Vec<Reading> = (0..300)
+        .map(|k| Reading::new(id, Timestamp(now - 1_000 + k), Value::F64(k as f64)))
+        .collect();
+    rig.emit_readings(&rs, Intent::Normal);
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    for view in [View::History, View::Current] {
+        let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
+        let r = reader_with(&rig.env, &rig.dir, one_pass_of(60 * fact_bytes()));
+        *r.memory().after_shelve.0.lock().unwrap() = Some(Box::new(|shelf| {
+            shelf.lock().unwrap().take();
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let s = facts(r, id, all(), view).unwrap();
+            let _ = tx.send(s.collect::<Result<Vec<_>, _>>());
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the stream ends")
+            .unwrap();
+        assert_eq!(got, want, "{view:?}");
+    }
+    rig.shut();
+}
+
+/// Two threads stream 2,000 facts from one reader whose passes cannot run beside a held shelf, so each admission
+/// empties the other's shelf; both end with every row once (Q-1067).
+#[test]
+fn two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end_with_every_row() {
+    let mut rig = Rig::new("shelves-two-threads");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    let rs: Vec<Reading> = (0..2_000)
+        .map(|k| Reading::new(id, Timestamp(now - 10_000 + k), Value::F64(k as f64)))
+        .collect();
+    rig.emit_readings(&rs, Intent::Normal);
+    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
+    let want = oracle
+        .with(|i, _| i.facts(id, all(), View::History))
+        .unwrap();
+    let r = reader_with(&rig.env, &rig.dir, one_pass_of(60 * fact_bytes()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    for _ in 0..2 {
+        let (r, tx, gate) = (r.clone(), tx.clone(), gate.clone());
+        std::thread::spawn(move || {
+            let mut s = facts(r, id, all(), View::History).unwrap();
+            let mut got: Vec<Fact> = s.by_ref().take(1).collect::<Result<_, _>>().unwrap();
+            gate.wait();
+            got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
+            let _ = tx.send(got);
+        });
+    }
+    for _ in 0..2 {
+        let got = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("both streams end");
+        assert_eq!(got, want);
+    }
+    assert!(r.memory().emptied() > 0);
+    rig.shut();
+}
