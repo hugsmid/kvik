@@ -1,0 +1,11 @@
+---
+source: cli/tests/output.rs
+expression: "format!(\"{out}\\nerror: {e}\")"
+---
+id  name               state  t  value  quality  stale  position
+1   site/meter/watts   none
+2   site/meter/energy  none
+3   site/hall/mode     none
+4   site/hall/note     none
+
+error: the answer may be incomplete: 1 loss (data_lost corruption); see `kvik health`

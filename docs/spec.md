@@ -355,7 +355,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    recorded again. Accepted limit: damage to a batch the writer's process has already read is not found by `losses()`
    or `health()` unless it is the newest; it is found when a query of that process reads it (Q-928); until then a
    replay of a fact still in the recent window is dropped, and one outside it is recorded unchecked (Q-750). Other
-   readers and the next start find it (Q-200).
+   readers and the next start find it (Q-200). Likewise a reader process that has already read the damaged bytes
+   keeps what it read and reports no loss until a start records the range; from then on it agrees with a fresh reader.
    Because the first batch in a segment, when unflagged, is acknowledged only once a synced
    mark names it (Commit), such a segment holding acknowledged batches that is damaged, zeroed or missing whole leaves
    a valid mark naming a position in it or in a later segment, while the mark is readable, so its loss is a

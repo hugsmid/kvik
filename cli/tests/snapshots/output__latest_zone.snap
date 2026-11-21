@@ -1,0 +1,7 @@
+---
+source: cli/tests/output.rs
+expression: "f.run(\"latest site/meter/* --zone Etc/GMT-2\").unwrap()"
+---
+id  name               state  t                          value    quality  stale  position
+1   site/meter/watts   value  2026-01-01T01:59:50+02:00  420      suspect  false  0:9
+2   site/meter/energy  value  2026-01-01T01:59:00+02:00  1204.25  good     false  0:7

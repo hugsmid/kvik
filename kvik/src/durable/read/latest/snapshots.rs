@@ -74,3 +74,32 @@ fn a_snapshot_answers_at_its_cut_and_now_while_facts_arrive_and_ends_once_its_cu
     ));
     assert!(matches!(snap.losses(), Err(QueryError::CutExpired)));
 }
+
+#[test]
+fn a_snapshot_whose_now_is_before_a_kept_search_searches_again() {
+    let rig = Rig::new("snapshot-earlier");
+    let mut rig = rig;
+    rig.emit(
+        &[
+            (1, -4, 0, 0, 0),
+            (1, 30, 1, 0, 0),
+            (1, 60, 0, 0, 0),
+            (1, 90, 1, 0, 0),
+        ],
+        false,
+    );
+    rig.clock.advance(Duration::from_secs(31));
+    let r = Reader::open(
+        ReaderConfig::new(&rig.dir)
+            .env(rig.env.clone())
+            .cut_max_age(Duration::from_secs(600)),
+    )
+    .unwrap();
+    let snap = r.snapshot().unwrap();
+    let early = plain(rig.model.reader().live(rig.ids[1]).unwrap());
+    rig.clock.advance(Duration::from_secs(30));
+    let late = plain(rig.model.reader().live(rig.ids[1]).unwrap());
+    assert_ne!(early, late);
+    assert_eq!(plain(r.live(rig.ids[1]).unwrap()), late);
+    assert_eq!(plain(snap.live(rig.ids[1]).unwrap()), early);
+}

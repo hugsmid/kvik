@@ -1,0 +1,8 @@
+---
+source: cli/tests/output.rs
+expression: "f.run(\"latest --format jsonl\").unwrap()"
+---
+{"id":1,"name":"site/meter/watts","state":"value","t":"2025-12-31T23:59:50Z","value":420,"quality":"suspect","stale":false,"position":"0:9"}
+{"id":2,"name":"site/meter/energy","state":"value","t":"2025-12-31T23:59:00Z","value":1204.25,"quality":"good","stale":false,"position":"0:7"}
+{"id":3,"name":"site/hall/mode","state":"value","t":"2025-12-31T23:59:30Z","value":"on, quiet","quality":"good","stale":false,"position":"0:8"}
+{"id":4,"name":"site/hall/note","state":"none","t":null,"value":null,"quality":null,"stale":null,"position":null}

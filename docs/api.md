@@ -481,12 +481,13 @@ pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value
                      pub supplied_quality, pub flags: FactFlags, pub changed_at: Option<u64> }
 pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRow>, QueryError>;   // the fact in force at t
 pub fn snapshot(&self) -> Result<Snapshot, QueryError>;   // roadmap 9.0c: static reads at one cut and one `now`
-pub struct Snapshot;   // live(id), series(key), losses(), state(), now(); owned, Send + 'static, cheap to clone
+pub struct Snapshot;   // live(id), series(key), fact_count(id), losses(), state(), now(); owned, Send + 'static, cheap to clone
 ```
 - `snapshot` answers `live`, `series` and `losses` at one cut, with `now` taken when it is made (Q-1005). Like any
   read under a cut it ends with `CutExpired` once the cut is `cut_max_age` old or its lease was found gone, and the
   caller takes another. Windows and facts join it with roadmap 9.0f. On the model backend it holds the results taken
-  when it was made.
+  when it was made. `fact_count(id)` is the facts recorded for the series at the cut: a series directory entry's
+  `fact_count` (`format.md` A.18) and the facts read after it (Q-1056).
 - `at` returns the fact with the greatest event time ≤ `t` that a window can credit (not bad quality, not displaced),
   as `view` selects it (for a versioned series, the version the view selects), with its `changed_at`; `None` if there
   is none. It lets a client show, for example, the issue time of the value a window's leading stretch carries in.
@@ -813,7 +814,7 @@ pub enum OpenMode { Read, ReadWrite, CreateNew }
 pub trait Fs: Send + Sync {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;               // DirEntry { name: String, len: u64 }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;               // DirEntry { name: String, len: u64, is_dir: bool }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;                 // replaces `to`
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn sync_dir(&self, path: &Path) -> io::Result<()>;

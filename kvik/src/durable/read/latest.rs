@@ -603,6 +603,16 @@ pub(crate) fn series(v: &View, key: &SeriesKey) -> Result<SeriesInfo, QueryError
     v.latest().series(key)
 }
 
+/// The facts of series `id` at `v`'s cut: the fold's count (a series directory entry's `fact_count`, `format.md` A.18,
+/// and the facts read after it), from the fact index when the state is broken (Q-1006).
+pub(crate) fn fact_count(v: &View, id: u32) -> Result<u64, QueryError> {
+    if v.latest().broken() {
+        let facts = v.index().ok_or(QueryError::CutExpired)?;
+        return Ok(facts.series_facts(id).count() as u64);
+    }
+    Ok(v.latest().fact_count(id))
+}
+
 /// The full facts of candidates the fold did not meet: `id`'s from those already read, else read with every other
 /// such candidate of `v` the first time, and alone afterwards.
 pub(crate) fn rows_for(
@@ -627,6 +637,8 @@ pub(crate) fn rows_for(
 
 #[cfg(test)]
 mod cases;
+#[cfg(test)]
+mod rounds;
 #[cfg(test)]
 mod snapshots;
 #[cfg(test)]

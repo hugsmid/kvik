@@ -1,0 +1,8 @@
+---
+source: cli/tests/output.rs
+expression: "rows.join(\"\\n\")"
+---
+event,id,name,state,t,value,quality,stale,position
+updated,2,site/meter/energy,value,2026-01-01T00:00:00Z,1205.5,good,false,0:10
+joined,5,site/meter/voltage,none,,,,,
+left,4,site/hall/note,,,,,,series 4

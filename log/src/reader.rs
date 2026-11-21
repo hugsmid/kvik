@@ -86,7 +86,6 @@ use crate::content_error::BodyError;
 use crate::crc::crc32c;
 use crate::error::FormatError;
 use crate::fs::Fs;
-use crate::header::HEADER_LEN;
 use crate::lease::{CutEnd, Cuts, LEASE_EXPIRY, LEASE_LEN, LEASE_REFRESH, LeaseSlot, lease_name};
 use crate::manifest::{LostRange, ManifestError};
 use crate::mark::{MarkSlot, ResetStamp};
@@ -397,6 +396,7 @@ pub struct LogReader {
     closed: bool,
     /// The update counter of the mark the last refresh read.
     mark_counter: u64,
+    mark_file: std::sync::Mutex<Option<Box<dyn crate::fs::FsFile>>>,
 }
 
 impl LogReader {
@@ -445,6 +445,7 @@ impl LogReader {
             caches: lookup::Caches::default(),
             closed: false,
             mark_counter: 0,
+            mark_file: std::sync::Mutex::default(),
             cfg,
         };
         let mark = r.read_mark()?;
@@ -520,12 +521,12 @@ impl LogReader {
     /// Whether the mark changed since the last refresh read it, reading the mark alone: a refresh that finds it
     /// unchanged reads no new batch. The manifest is not read, so a change to it alone is not seen.
     pub fn mark_moved(&self) -> Result<bool, ReaderError> {
-        Ok(self.read_mark()?.counter != self.mark_counter)
+        Ok(self.read_mark_held()?.counter != self.mark_counter)
     }
 
     /// Before the first refresh: starts the reader in the segment of the mark's generation that holds the position
-    /// after `after` (the newest whose header's `base_sequence` is at most one above it, looked for from the mark's
-    /// segment back), and passes over every batch at or below `after`, so that a reader continuing a series directory
+    /// after `after` (the newest whose header's `base_sequence` is at most one above it: the mark's segment and the two
+    /// before it by name, then a binary search over headers; no listing, query design 9.0b1), and passes over every batch at or below `after`, so that a reader continuing a series directory
     /// (`format.md` A.18) reads only what the file does not cover. Returns whether it found that segment; if not, or
     /// after a refresh, nothing changes and the reader reads from the log's start.
     pub fn start_after(&mut self, after: Position) -> Result<bool, ReaderError> {
@@ -540,28 +541,26 @@ impl LogReader {
         if after.generation != mark.generation || after > marked || mark.file_id == 0 {
             return Ok(false);
         }
-        let mut names = self.segments()?;
-        names.retain(|n| n.generation == mark.generation && n.file_id <= mark.file_id);
-        for name in names.into_iter().rev() {
-            let Some((n, f)) = self.open_segment(name)? else {
-                continue;
-            };
-            let mut head = [0u8; HEADER_LEN];
-            let read = files::read_at_full(&*f, &mut head, 0)
-                .map_err(io_err(&self.log_dir.join(n.to_string())))?;
-            let Some(h) = (read == HEADER_LEN)
-                .then(|| crate::header::FileHeader::decode(&head))
-                .flatten()
-            else {
-                continue;
-            };
-            if h.base_sequence == 0 || h.base_sequence > after.sequence.saturating_add(1) {
-                continue;
+        let next = after.sequence.saturating_add(1);
+        let mut bases = std::collections::HashMap::new();
+        let mut holding = None;
+        for k in (mark.file_id.saturating_sub(2).max(1)..=mark.file_id).rev() {
+            if self
+                .base_of(mark.generation, k, mark.file_id, &mut bases)?
+                .is_some_and(|b| b <= next)
+            {
+                holding = Some(k);
+                break;
             }
+        }
+        if holding.is_none() {
+            holding = self.segment_holding(next, mark.generation, mark.file_id, &mut bases)?;
+        }
+        if let Some(file_id) = holding {
             self.view = View {
                 generation: Some(mark.generation),
-                file_id: n.file_id,
-                segment_generation: n.generation,
+                file_id,
+                segment_generation: mark.generation,
                 taken: after,
                 floor: after,
                 ..View::default()

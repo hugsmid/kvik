@@ -441,6 +441,21 @@ fn an_idle_call_reads_the_mark_once_and_one_that_takes_a_batch_twice() {
     assert_eq!(marks(&r), 2);
 }
 
+#[test]
+fn a_mark_only_poll_reads_the_held_mark_with_no_open_and_sees_it_move() {
+    let mut r = Rig::with_sealed(2);
+    r.reader.refresh().unwrap();
+    r.n.marks.swap(0, Ordering::SeqCst);
+    r.n.take();
+    assert!(!r.reader.mark_moved().unwrap());
+    assert_eq!(r.n.marks.swap(0, Ordering::SeqCst), 0);
+    assert_eq!(r.n.take().calls, 1, "one read through the held handle");
+    r.submit(facts(4, 1 << 40));
+    r.n.marks.swap(0, Ordering::SeqCst);
+    assert!(r.reader.mark_moved().unwrap());
+    assert_eq!(r.n.marks.swap(0, Ordering::SeqCst), 0);
+}
+
 fn lost(epoch_floor: u32) -> LostRange {
     LostRange {
         identity: (0, 1),
@@ -776,4 +791,47 @@ fn a_lease_found_changed_ends_every_cut() {
     r.clock.advance(LEASE_REFRESH / 2);
     assert!(r.reader.keep_alive().unwrap());
     assert_eq!(ended(&mut r.reader, b.id), Ok(()));
+}
+
+/// Replaces `store/log/MARK` by a new file whose mark is the current one with its counter `ahead` higher; returns
+/// the encoder for later writes in place.
+fn replace_mark(r: &Rig, ahead: u64) -> impl Fn(u64) -> Vec<u8> + use<> {
+    use kvik_log::mark::{encode_mark_file, read_mark};
+    let mark = dir().join("log").join("MARK");
+    let tmp = dir().join("log").join("MARK.tmp");
+    let (_, slot) = read_mark(&r.fs.read(&mark).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap();
+    let with = move |n: u64| {
+        let mut s = slot;
+        s.counter += n;
+        encode_mark_file([Some(s), None])
+    };
+    let f = Fs::open(&r.fs, &tmp, OpenMode::CreateNew).unwrap();
+    f.write_at(&with(ahead), 0).unwrap();
+    drop(f);
+    Fs::rename(&r.fs, &tmp, &mark).unwrap();
+    with
+}
+
+#[test]
+fn a_replaced_mark_is_followed_by_the_held_read_after_one_full_refresh() {
+    let mut r = Rig::with_sealed(2);
+    r.reader.refresh().unwrap();
+    let with = replace_mark(&r, 1);
+    r.reader.refresh().unwrap();
+    assert!(!r.reader.mark_moved().unwrap(), "the new file is held");
+    let f = Fs::open(&r.fs, &dir().join("log").join("MARK"), OpenMode::ReadWrite).unwrap();
+    f.write_at(&with(2), 0).unwrap();
+    assert!(r.reader.mark_moved().unwrap());
+}
+
+#[test]
+fn a_held_mark_that_reads_no_valid_mark_is_read_again_by_path() {
+    let mut r = Rig::with_sealed(2);
+    r.reader.refresh().unwrap();
+    let old = Fs::open(&r.fs, &dir().join("log").join("MARK"), OpenMode::ReadWrite).unwrap();
+    let _ = replace_mark(&r, 1);
+    old.write_at(&[0; kvik_log::mark::MARK_LEN], 0).unwrap();
+    assert!(r.reader.mark_moved().unwrap());
 }

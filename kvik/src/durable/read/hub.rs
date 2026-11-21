@@ -53,7 +53,9 @@ pub(crate) struct Round {
     /// The number of the last refresh of the run; `seq` for a round with pieces.
     last: u64,
     pieces: Vec<Piece>,
-    /// Each piece's index in the round as read, once trimmed; a session stopped inside the round counts by it.
+    /// Each piece's index in the round as read, once trimmed; a session stopped inside the round counts by it. Kept
+    /// though every gap is named in the batch that stops and a trimmed round's later pieces change no event (Q-1013):
+    /// it keeps the count right without leaning on that.
     index: Vec<usize>,
     /// Every fact and entry is held; otherwise only the voids and gaps are.
     pub(crate) whole: bool,
@@ -402,5 +404,46 @@ fn trim(s: &mut State) {
             s.rounds[i] = Arc::new(s.rounds[i].trimmed());
         }
         i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kvik_log::facts::{FactFlags, FactRow, Quality};
+
+    use super::*;
+
+    #[test]
+    fn a_run_of_empty_refreshes_a_cursor_stands_inside_is_kept_until_taken() {
+        let hub = Hub::default();
+        let now = Duration::ZERO;
+        let sub = hub.subscribe((100, 1 << 20), now);
+        hub.start(sub, 0, (100, 1 << 20));
+        for _ in 0..3 {
+            hub.finish(hub.collector(), now, Duration::MAX);
+        }
+        hub.advance(sub, 2);
+        let mut c = hub.collector().unwrap();
+        let p = LogPos {
+            generation: 0,
+            sequence: 1,
+        };
+        c.push(Piece::Fact(Stored {
+            position: p,
+            received_at: 0,
+            row: FactRow {
+                series_id: 1,
+                t: 0,
+                quality: Quality::Good,
+                flags: FactFlags::default(),
+                value: LogValue::F64(0),
+                changed_at: None,
+            },
+        }));
+        let seq = hub.finish(Some(c), now, Duration::MAX);
+        assert_eq!(seq, 4);
+        let t = hub.take(sub, seq, now);
+        assert!(!t.lagged, "{t:?}");
+        assert_eq!(t.rounds.len(), 2);
     }
 }

@@ -1,0 +1,22 @@
+---
+source: cli/tests/output.rs
+expression: "steady(&f.run(\"health\").unwrap())"
+---
+section           item                              value
+reader            health                            degraded
+reader            reason                            data_lost
+reader            durable                           0:9
+reader            generation                        0
+reader            epoch                             1
+reader            reset_stamp                       0/0000000000000000
+loss              0:6                               data_lost corruption 0:6..0:9 found
+log               sealed_segments                   0
+log               open_segments                     2
+log               bytes                             134221952
+tier              cold                              not configured
+leases            count                             4
+lease             03000000000000000400000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             05000000000000000600000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             07000000000000000800000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+lease             09000000000000000a00000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z
+series_directory  state                             none

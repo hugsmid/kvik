@@ -1,0 +1,6 @@
+---
+source: cli/tests/output.rs
+expression: "zones.join(\"\\n\")"
+---
+store    site_zone_at_creation  Etc/UTC
+store    site_zone              Etc/GMT-2

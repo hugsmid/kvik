@@ -171,6 +171,13 @@ fn define_emit_and_read_on(b: Backend) {
     let r = s.reader();
     assert_eq!(facts(&r, g, at(0)..at(10), View::Current).len(), 2);
     windows_and_live(&r, g, c);
+    let snap = r.snapshot().unwrap();
+    assert_eq!(snap.fact_count(g).unwrap(), 2, "{b:?}");
+    assert_eq!(snap.fact_count(c).unwrap(), 2, "{b:?}");
+    assert!(matches!(
+        snap.fact_count(SeriesId(99)),
+        Err(QueryError::UnknownSeries)
+    ));
 
     let info = s.series("plant/line-1/power").unwrap();
     assert_eq!(info.id, g);

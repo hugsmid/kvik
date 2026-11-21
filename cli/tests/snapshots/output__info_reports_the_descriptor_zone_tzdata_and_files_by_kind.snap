@@ -1,0 +1,21 @@
+---
+source: cli/tests/output.rs
+expression: "steady(&f.run(\"info\").unwrap())"
+---
+section  item                   value
+store    store_id               01000000000000000200000000000000
+store    created_at             2026-01-01T00:00:00Z
+store    site_zone_at_creation  Etc/UTC
+store    tzdata_at_creation     test
+store    software               kvik 0.1.0
+store    site_zone              Etc/UTC
+store    tzdata                 test
+store    series                 4
+files    LOCK                   1 files, 0 bytes
+files    MANIFEST               1 files, 104 bytes
+files    STORE                  1 files, 120 bytes
+files    derived/*.root         1 files, 184 bytes
+files    leases/*.lease         1 files, 128 bytes
+files    log/*.open             2 files, 134217728 bytes
+files    log/MARK               1 files, 4224 bytes
+files    registry/*.reg         1 files, 736 bytes

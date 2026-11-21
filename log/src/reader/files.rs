@@ -14,11 +14,16 @@ use crate::store::MARK;
 pub(super) type OpenSegment = (SegmentName, Box<dyn FsFile>);
 
 impl LogReader {
+    /// Reads the mark opened by path, and keeps the handle for [`LogReader::read_mark_held`].
     pub(super) fn read_mark(&self) -> Result<MarkSlot, ReaderError> {
         let path = self.log_dir.join(MARK);
         for _ in 0..=MARK_RETRIES {
             let bytes = match self.cfg.fs.open(&path, OpenMode::Read) {
-                Ok(f) => read_upto(&*f, MARK_LEN).map_err(io_err(&path))?,
+                Ok(f) => {
+                    let b = read_upto(&*f, MARK_LEN).map_err(io_err(&path))?;
+                    *self.mark_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+                    b
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => return Err(io_err(&path)(e)),
             };
@@ -29,6 +34,20 @@ impl LogReader {
             }
         }
         Err(ReaderError::MarkUnreadable)
+    }
+
+    /// Reads the mark through the handle the last [`LogReader::read_mark`] opened, one positioned read (the query
+    /// design's section 3.1; the mark is written in place, `format.md` A.10); by path when there is none or it does
+    /// not give a valid mark. A full refresh opens it by path again, so a replaced file is followed within one.
+    pub(super) fn read_mark_held(&self) -> Result<MarkSlot, ReaderError> {
+        let bytes = {
+            let held = self.mark_file.lock().unwrap_or_else(|e| e.into_inner());
+            held.as_deref().and_then(|f| read_upto(f, MARK_LEN).ok())
+        };
+        match bytes.map(|b| read_mark(&b, &self.store_id)) {
+            Some(Ok(Some((_, m)))) => Ok(m),
+            _ => self.read_mark(),
+        }
     }
 
     /// The segments of the log by file id, under either extension; none for a missing directory.

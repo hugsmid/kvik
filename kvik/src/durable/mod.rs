@@ -79,7 +79,7 @@ use entries::Decided;
 use index::{Index, cause_out, fact_out, mark_state_out, pos};
 use ingest::{Decider, Decision};
 use loss::Latch;
-pub(crate) use read::latest::{live as live_at, series as series_at};
+pub(crate) use read::latest::{fact_count as fact_count_at, live as live_at, series as series_at};
 pub(crate) use read::view::View as SnapshotView;
 pub(crate) use reader::DurableReader;
 pub(crate) use reader::{copy as copy_error, losses_of as losses_at};

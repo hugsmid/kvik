@@ -3,11 +3,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kvik_log::content::Item;
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
-use kvik_log::fs::{Fs, MemFs};
+use kvik_log::fs::{DirEntry, Fs, FsFile, MemFs, OpenMode};
 use kvik_log::reader::{LogReader, ReadBatch, ReadEvent, ReaderConfig, Wanted};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{Log, LogWriter, Position, SystemClock, WriterConfig};
@@ -413,4 +414,141 @@ fn a_start_after_the_second_last_position_of_a_segment_reads_from_that_segment()
     let got = batches(&r.refresh().unwrap().events);
     assert_eq!(got.first(), Some(&whole[k + 1]));
     assert_eq!(got.len(), whole.len() - k - 1);
+}
+
+#[test]
+fn a_lookup_at_the_last_position_of_a_segment_reads_that_segment() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let wanted: Vec<WantedAt> = whole
+        .windows(2)
+        .filter(|w| w[0].file_id != w[1].file_id)
+        .filter_map(|w| facts_of(&w[0]).last().copied())
+        .map(|(s, t, p)| WantedAt {
+            series_id: s,
+            t,
+            position: p,
+        })
+        .collect();
+    assert!(wanted.len() >= 3, "{wanted:?}");
+    for w in &wanted {
+        assert!(whole.iter().any(|b| b.last == w.position));
+    }
+    let at = reader(&fs, 10)
+        .lookup_at(&wanted, &|_, _, _| false)
+        .unwrap();
+    assert!(at.complete.iter().all(|c| *c));
+    for w in &wanted {
+        assert!(at.facts.iter().any(|f| f.position == w.position), "{w:?}");
+    }
+}
+
+#[test]
+fn a_lookup_at_a_position_in_a_damaged_segment_is_not_complete() {
+    use kvik_log::reader::WantedAt;
+    let fs = written(400);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let b = &whole[whole.len() / 2];
+    let (s, t, p) = facts_of(b)[0];
+    let path = fs
+        .paths()
+        .into_iter()
+        .find(|x| {
+            x.to_string_lossy()
+                .contains(&format!("{:016x}.kvl", b.file_id))
+        })
+        .unwrap();
+    let at = usize::try_from(b.offset).unwrap() + 40;
+    let byte = fs.read(&path).unwrap()[at];
+    fs.poke(&path, at, &[!byte]);
+    let got = reader(&fs, 10)
+        .lookup_at(
+            &[WantedAt {
+                series_id: s,
+                t,
+                position: p,
+            }],
+            &|_, _, _| false,
+        )
+        .unwrap();
+    assert_eq!(got.complete, [false]);
+    assert!(got.facts.iter().all(|f| f.position != p));
+}
+
+/// Counts listings of a `log/` directory and opens, around a [`MemFs`].
+#[derive(Debug)]
+struct Listings {
+    inner: MemFs,
+    log_listings: Arc<AtomicU64>,
+    opens: Arc<AtomicU64>,
+}
+
+impl Fs for Listings {
+    fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Box<dyn FsFile>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open(path, mode)
+    }
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>> {
+        if path.ends_with("log") {
+            self.log_listings.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.read_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn free_space(&self, path: &Path) -> std::io::Result<u64> {
+        self.inner.free_space(path)
+    }
+}
+
+#[test]
+fn a_start_after_lists_no_directory_and_opens_few_headers() {
+    let fs = written(400);
+    let n = segments(&fs);
+    let whole = batches(&reader(&fs, 9).refresh().unwrap().events);
+    let near = whole[whole.len() - 2].last;
+    let far = whole[3].last;
+    for (k, after) in [near, far].into_iter().enumerate() {
+        let (log_listings, opens) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let seam = Listings {
+            inner: fs.clone(),
+            log_listings: log_listings.clone(),
+            opens: opens.clone(),
+        };
+        let mut r = LogReader::open(ReaderConfig::new(
+            "s",
+            Arc::new(seam),
+            Arc::new(SystemClock::default()),
+            Some([1; 16]),
+            [20 + k as u8; 16],
+        ))
+        .unwrap();
+        opens.store(0, Ordering::SeqCst);
+        log_listings.store(0, Ordering::SeqCst);
+        assert!(r.start_after(after).unwrap(), "{after:?}");
+        assert_eq!(log_listings.load(Ordering::SeqCst), 0, "after {after:?}");
+        let bound = if k == 0 {
+            3
+        } else {
+            3 + 4 * (n.ilog2() as u64 + 1)
+        };
+        assert!(
+            opens.load(Ordering::SeqCst) <= bound,
+            "{} opens for {n} segments after {after:?}",
+            opens.load(Ordering::SeqCst)
+        );
+        let want: Vec<ReadBatch> = whole.iter().filter(|b| b.last > after).cloned().collect();
+        assert_eq!(batches(&r.refresh().unwrap().events), want);
+    }
 }

@@ -354,6 +354,7 @@ pub(crate) struct ModelSnapshot {
     pub(crate) now: crate::time::Timestamp,
     pub(crate) live: BTreeMap<SeriesId, Result<Live, QueryError>>,
     pub(crate) series: BTreeMap<SeriesId, Result<SeriesInfo, QueryError>>,
+    pub(crate) counts: BTreeMap<SeriesId, u64>,
     /// Every name of a series, with what resolving it gives.
     pub(crate) names: BTreeMap<String, SeriesId>,
     pub(crate) losses: Vec<LossReport>,
@@ -418,6 +419,17 @@ impl Snapshot {
                     .map_or(Err(QueryError::UnknownSeries), copied)
             }
             SnapshotInner::Durable(d) => Self::on(d, |v| crate::durable::series_at(v, &key)),
+        }
+    }
+
+    /// The facts recorded for series `id` at the snapshot's cut (`format.md` A.18 `fact_count`).
+    pub fn fact_count(&self, id: SeriesId) -> Result<u64, QueryError> {
+        match &self.inner {
+            SnapshotInner::Model(m) => m.counts.get(&id).copied().ok_or(QueryError::UnknownSeries),
+            SnapshotInner::Durable(d) => Self::on(d, |v| {
+                crate::durable::series_at(v, &SeriesKey::Id(id))?;
+                crate::durable::fact_count_at(v, id.0)
+            }),
         }
     }
 
