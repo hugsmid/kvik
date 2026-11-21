@@ -81,7 +81,10 @@ pub(crate) struct Accountant {
 /// Run on each shelf as it is made, with no lock held: another thread's admission in the window before its first row.
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct AfterShelve(pub(crate) Mutex<Option<Box<dyn FnMut(&Shelf) + Send>>>);
+pub(crate) struct AfterShelve(pub(crate) Mutex<Option<ShelfHook>>);
+
+#[cfg(test)]
+type ShelfHook = Box<dyn FnMut(&Shelf) + Send>;
 
 #[cfg(test)]
 impl std::fmt::Debug for AfterShelve {
