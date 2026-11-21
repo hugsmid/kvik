@@ -3974,18 +3974,34 @@ Decided by the lead (a technical decision on a test: no engine or promise change
 **Scenario.** A reader folded the log through batch A before a series directory through A was written; batch B,
 just above A, is then damaged, and nothing records it (no start has met it). That reader reports the loss with A's
 commit time before it; a reader opened after the directory continues it, reads the log only above A (Q-1001) and
-reports the same loss with no commit time before it. The latest values' property found it when segments seal between
-steps, and compared every reader's `losses` with a fresh reader's whole (Q-1006).
+reports the same loss with no commit time before it. The latest values' property found it in another item's rig,
+comparing every reader's `losses` with a fresh reader's whole (Q-1006).
 **Decided.** The engine keeps what §11 Health promises: each report carries what is known of its range. A continuing
 reader knows no commit time at the directory's `through`, as a finder after a void past its kept commits knows none
-(Q-941); a start's record, once written, gives every reader the same times. The property now sets aside the commit
-time before an unrecorded loss where either reader lacks it, and compares everything else, recorded reports whole.
-For every reader to know it, the series directory would carry its `through`'s commit time (a `format.md` change);
-not proposed. With segments sealing between steps the property also meets Q-937 (an unrecorded loss's `last` read at
-different marks), which stays with that question's own item.
+(Q-941); a start's record, once written, gives every reader the same times. The property sets aside the commit time
+before an unrecorded loss only where the side that lacks it continues a series directory and the loss's first
+position is just above that directory's `through`; everything else is compared, recorded reports whole, and a reader
+that read the whole log keeps the time compared. Until a start records the loss, readers may differ in it. For every
+reader to know it, either the series directory carries its `through`'s commit time (a `format.md` change, not
+proposed) or a continuing reader reads the one batch at `through` when it first reports such a loss (Q-1090). The
+property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half
+the draws, and checking before the start meets it: a reader of the whole log (the series
+directories moved out of its way while it seeds) against a fresh reader and its snapshot; where the continued
+directory lies at or above the damage, it covers damage no record names (Q-1002) and nothing is compared. Damage
+in a sealed segment would also meet Q-937, which stays with that question's own item.
 **Tests.** `kvik/src/durable/read/latest/tests.rs`
 `a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it` and
 `latest_values_equal_the_models_at_every_check`.
+
+## Q-1090 — A continuing reader that reads the batch at its directory's `through` for a loss just above it
+Recorded at the review of Q-1071 (by reading, not run). Open, for the lead.
+**Scenario.** As Q-1071: a reader continuing a series directory through A reports an unrecorded loss of B, just above
+A, with no commit time before it, where a reader of the whole log reports A's.
+**Proposed.** When a continuing reader first reports a loss whose first position is just above its directory and it
+knows no commit time before it, it reads the one batch at `through` and takes its commit time; one lookup, only on
+damage, and still unknown where that segment is gone. No format change; readers then agree before a start records the
+loss, and the property's set-aside (Q-1071) narrows to a missing segment.
+**Now.** Not built; the report carries what is known (§11 Health).
 
 ## Open at v0.2
 
@@ -4165,6 +4181,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. The fo
 | Q-1015 | 9.0d | Decided by the lead: the writer's progress wakes, the poll and batch intervals on the environment's clock, due times per member; for review |
 | Q-1016 | 8.1g | Decided by the lead: a session reads only the shared tail; its errors at every `next`; the tier-unavailable error with cold segments |
 | Q-1017 | 9.0e | Decided by the lead: a reader process's poll reads the mark alone within a second of a full refresh; one shared machine's figures, measured again by 9.0e |
+| Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

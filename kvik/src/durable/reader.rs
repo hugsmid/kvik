@@ -666,6 +666,14 @@ impl DurableReader {
         self.seeded.load(Ordering::Relaxed)
     }
 
+    /// The `through` of the series directory the first round continued, if it continued one.
+    #[cfg(test)]
+    pub(crate) fn seeded_through(&self) -> Option<crate::types::Position> {
+        let w = self.lock();
+        let l = w.latest.as_ref().filter(|_| self.seeded())?;
+        Some(pos(l.seeded_through()))
+    }
+
     /// Refreshes of the log the rounds have run, each of which reads the mark file.
     #[cfg(test)]
     pub(crate) fn parts_taken(&self) -> u64 {

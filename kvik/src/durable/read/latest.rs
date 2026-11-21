@@ -98,6 +98,12 @@ impl Latest {
         }
     }
 
+    /// The position the state was seeded through; the origin when it was not seeded.
+    #[cfg(test)]
+    pub(crate) fn seeded_through(&self) -> LogPos {
+        self.seeded
+    }
+
     /// A state continuing `dir`, judged at `judged_at`, with the registry of `file` (Q-1001, Q-1003).
     pub(crate) fn seeded(file: &RegistryFile, dir: &SeriesDirectory, judged_at: i64) -> Self {
         let mut l = Latest::new();
