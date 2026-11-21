@@ -3897,10 +3897,11 @@ the shelf, and the stream then reads its part again from its start and passes ov
 takes one row and then reads once more, row after row, does work that grows with the square of a part's rows. Two
 threads each holding a stream deliver only what each takes before the other is admitted. Progress is certain with any
 number of threads: a stream takes the first row it has not yielded off a part it has read before it shelves the rest,
-so every read of a part yields a new row or ends the part, whatever other admissions empty. The last row taken gives
-the shelf's grant back. At the default cap one held pass (at most 8 MiB of rows) leaves a least grant free. Not
-built: capping a pass's rows at the passes' share less the least grant, which would let one held stream and point
-reads live together at the least cap at the price of more passes.
+so every read of a part yields a new row or ends the part, whatever other admissions empty; that one row is held in
+the stream's own state until it is yielded (Q-1069). The last row taken gives the shelf's grant back. At the default
+cap one held pass (at most 8 MiB of rows) leaves a least grant free. Not built: capping a pass's rows at the passes'
+share less the least grant, which would let one held stream and point reads live together at the least cap at the
+price of more passes.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf`;
 `kvik/src/durable/read/source/tests/shelves.rs`
