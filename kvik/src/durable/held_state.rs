@@ -151,6 +151,9 @@ fn store(dir: &str, calls: i64) -> (Store, Env, Arc<Io>) {
 fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_the_log() {
     let dir = "held-registry";
     let (s, env, io) = store(dir, 40);
+    // `kvik-deliver` takes acknowledged batches when it gets to them; what it has not taken, shutdown reads.
+    let hub = s.writer().and_then(|w| w.hub.clone()).unwrap();
+    hub.run(|d, c| d.pump(c));
     io.take();
     block_on(s.shutdown()).unwrap();
     let read = io.take();
