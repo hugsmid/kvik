@@ -644,6 +644,8 @@ pub(crate) fn rows_for(
 #[cfg(test)]
 mod cases;
 #[cfg(test)]
+mod histories;
+#[cfg(test)]
 mod rounds;
 #[cfg(test)]
 mod snapshots;

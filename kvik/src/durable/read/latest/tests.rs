@@ -7,7 +7,7 @@ use kvik_log::directory::series::SeriesDirectory;
 use kvik_log::directory::{Family, Frame};
 use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig as LogReaderConfig};
 use proptest::prelude::*;
-use proptest::test_runner::{TestCaseError, TestRunner};
+use proptest::test_runner::TestCaseError;
 
 use crate::config::{Backend, LogConfig, ReaderConfig, StoreConfig};
 use crate::durable::derived::SeriesFold;
@@ -148,6 +148,13 @@ pub(in crate::durable::read) struct Rig {
     pub(in crate::durable::read) after_damage: u64,
     /// Loss reports compared with the commit time before set aside (Q-1071).
     pub(super) set_aside: u64,
+    /// Checks after damage whose lost-range records bridge two identities, compared by positions lost (Q-1102).
+    pub(super) bridged: u64,
+    /// Checks before a start skipped because the fresh reader continues a directory the store wrote at or above the
+    /// damage (Q-1002, Q-1104).
+    pub(in crate::durable::read) over_damage: u64,
+    /// The file identities of the series directories the rig wrote.
+    written: Vec<u64>,
     /// The `through` of the last series directory the rig wrote; kept when a run removes the directories, where it
     /// only narrows the choice of batch to damage.
     directory: Option<kvik_log::writer::Position>,
@@ -206,6 +213,9 @@ impl Rig {
             faulted: false,
             after_damage: 0,
             set_aside: 0,
+            bridged: 0,
+            over_damage: 0,
+            written: Vec::new(),
             directory: None,
         }
     }
@@ -283,9 +293,9 @@ impl Rig {
                 // A clean stop keeps the series directory a reader continues (Q-1003); the power loss after the
                 // check makes the start find the damage.
                 self.shut();
-                if self.damage_batch(usize::from(*k), self.directory).is_some() {
+                if let Some(at) = self.damage_batch(usize::from(*k), self.directory) {
                     self.faulted = true;
-                    self.check_unmet_damage()?;
+                    self.check_unmet_damage(at)?;
                 }
                 self.power_loss();
                 self.reopen();
@@ -294,6 +304,11 @@ impl Rig {
                 self.shut();
                 if let Some(through) = write_directory(&self.env, &self.dir, usize::from(*k)) {
                     self.directory = Some(through);
+                    self.written.extend(
+                        kvik_log::directory::generations(&*self.env.fs, &self.dir, Family::Series)
+                            .first()
+                            .map(|(id, _)| *id),
+                    );
                     let r =
                         Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap();
                     if self.continuing.len() == 3 {
@@ -391,22 +406,49 @@ impl Rig {
         r
     }
 
-    /// Before any start meets the damage: a reader that continues a series directory, which lies below the damage,
-    /// reports the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules.
-    fn check_unmet_damage(&mut self) -> Result<(), TestCaseError> {
+    /// Before any start meets the damage at `damaged`: a reader that continues a series directory below it reports
+    /// the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules. A directory
+    /// at or above it covers damage no record names (Q-1002), which only the store's own directory can (Q-1104).
+    fn check_unmet_damage(&mut self, damaged: Position) -> Result<(), TestCaseError> {
         let whole = self.whole_reader();
         prop_assert_eq!(seed(&whole), None);
+        let want = (whole.losses(), None);
+        prop_assert!(!want.0.is_empty(), "the damage is reported");
         let fresh = self.reader();
         let snap = fresh.snapshot().unwrap();
         let at = seed(&fresh);
-        let want = (whole.losses(), None);
-        prop_assert!(!want.0.is_empty(), "the damage is reported");
+        if let Some(t) = at.filter(|t| *t >= damaged) {
+            prop_assert!(
+                self.store_wrote(t),
+                "{:?} at or above the damage {:?}",
+                t,
+                damaged
+            );
+            self.over_damage += 1;
+            return Ok(());
+        }
         for got in [fresh.losses(), snap.losses().unwrap()] {
             let (alike, wanted) = known_alike((got.clone(), at), want.clone());
             self.set_aside += u64::from(alike != got || wanted != want.0);
             prop_assert_eq!(alike, wanted);
         }
         Ok(())
+    }
+
+    /// Whether the series directories through `t` are the store's own: at least one, and none the rig wrote.
+    pub(in crate::durable::read) fn store_wrote(&self, t: Position) -> bool {
+        let store_id = kvik_log::store::read_descriptor(&*self.env.fs, &self.dir)
+            .unwrap()
+            .store_id;
+        let through: Vec<u64> =
+            kvik_log::directory::generations(&*self.env.fs, &self.dir, Family::Series)
+                .into_iter()
+                .filter_map(|(id, p)| {
+                    let (_, d) = SeriesDirectory::decode(&self.fs.read(&p)?, &store_id).ok()?;
+                    (crate::durable::index::pos(d.through) == t).then_some(id)
+                })
+                .collect();
+        !through.is_empty() && through.iter().all(|id| !self.written.contains(id))
     }
 
     /// Every durable reader's live state, series and losses equal the model's: the facts with positions set aside
@@ -490,10 +532,16 @@ impl Rig {
         }
         let want = (reference.losses(), seed(&reference));
         prop_assert!(!want.0.is_empty(), "the damage is reported");
+        let bridges = bridged(&recorded_ranges(&reference));
+        self.bridged += u64::from(!bridges.is_empty());
+        let (want_whole, want_lost) = positions_lost(&want.0, &bridges);
         let mut set_aside = 0;
         let mut compare = |got: Losses, seed: Option<Position>| {
-            let (alike, wanted) = known_alike((got.clone(), seed), want.clone());
-            set_aside += u64::from(alike != got || wanted != want.0);
+            let (got_whole, got_lost) = positions_lost(&got, &bridges);
+            prop_assert_eq!(got_lost, want_lost.clone());
+            let (alike, wanted) =
+                known_alike((got_whole.clone(), seed), (want_whole.clone(), want.1));
+            set_aside += u64::from(alike != got_whole || wanted != want_whole);
             prop_assert_eq!(alike, wanted);
             Ok(())
         };
@@ -508,16 +556,82 @@ impl Rig {
 }
 
 /// The `through` of the series directory `r` continues, if it continues one.
-fn seed(r: &Reader) -> Option<Position> {
+pub(super) fn seed(r: &Reader) -> Option<Position> {
     r.durable()?.ok()?.seeded_through()
 }
 
-type Losses = Vec<crate::health::LossReport>;
+pub(super) type Losses = Vec<crate::health::LossReport>;
+
+/// `(identity, first, last)` of each lost-range record `r`'s view holds, in the manifest's order.
+pub(super) fn recorded_ranges(r: &Reader) -> Vec<(Position, Position, Position)> {
+    let at = |(generation, sequence)| Position {
+        generation,
+        sequence,
+    };
+    let d = r.durable().unwrap().unwrap();
+    d.with_latest(|v| {
+        Ok(v.lost_ranges()
+            .iter()
+            .map(|l| (at(l.identity), at(l.first), at(l.last)))
+            .collect())
+    })
+    .unwrap()
+}
+
+/// The spans of lost-range records that overlap a record of another identity, joined where they overlap: a start
+/// recorded a range across two losses under one of them, which the writer and a reader of the whole log report apart
+/// (Q-1102).
+pub(super) fn bridged(records: &[(Position, Position, Position)]) -> Vec<(Position, Position)> {
+    let spans = records
+        .iter()
+        .filter(|(i, a, b)| records.iter().any(|(j, c, d)| i != j && a <= d && c <= b))
+        .map(|(_, a, b)| (*a, *b))
+        .collect();
+    joined(spans)
+}
+
+/// Spans joined where they overlap; spans that only touch are separate losses and stay apart.
+fn joined(mut spans: Vec<(Position, Position)>) -> Vec<(Position, Position)> {
+    spans.sort();
+    let mut out: Vec<(Position, Position)> = Vec::new();
+    for (a, b) in spans {
+        match out.last_mut() {
+            Some((_, z)) if a <= *z => *z = (*z).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// The reports compared whole, and the positions lost data overlapping a bridged span covers, joined: all Q-1102
+/// leaves compared there. A report without both positions cannot be placed, so it is compared whole.
+pub(super) fn positions_lost(
+    l: &[crate::health::LossReport],
+    bridges: &[(Position, Position)],
+) -> (Losses, Vec<(Position, Position)>) {
+    let mut whole = Vec::new();
+    let mut spans = Vec::new();
+    for r in l {
+        match (r.first, r.last) {
+            (Some(a), Some(b))
+                if r.kind == crate::health::LossKind::DataLost
+                    && bridges.iter().any(|(c, d)| a <= *d && *c <= b) =>
+            {
+                spans.push((a, b));
+            }
+            _ => whole.push(r.clone()),
+        }
+    }
+    (whole, joined(spans))
+}
 
 /// Two readers' loss reports, each with the directory its reader continues, with the commit time before an
 /// unrecorded loss set aside only where a side that continues a directory lacks it for a loss just above that
 /// directory: such a reader reads only above it (spec §11 Health "what is known"; Q-1071).
-fn known_alike(a: (Losses, Option<Position>), b: (Losses, Option<Position>)) -> (Losses, Losses) {
+pub(super) fn known_alike(
+    a: (Losses, Option<Position>),
+    b: (Losses, Option<Position>),
+) -> (Losses, Losses) {
     let unknown = |r: &crate::health::LossReport, seed: Option<Position>| {
         r.commit_time_before.is_none()
             && seed.is_some_and(|t| {
@@ -665,141 +779,4 @@ pub(in crate::durable::read) fn restamp_directory(env: &Env, dir: &Path, bytes: 
     };
     let bytes = d.encode(frame, store_id).unwrap();
     kvik_log::directory::write_file(fs, dir, Family::Series, id, &bytes).unwrap();
-}
-
-/// Runs a history and checks at its end.
-pub(in crate::durable::read) fn run(history: &[Step]) -> Result<[u64; 4], TestCaseError> {
-    let mut rig = Rig::new("history");
-    for s in history {
-        rig.step(s)?;
-    }
-    rig.check()?;
-    rig.shut();
-    Ok([rig.seeded, rig.searches, rig.after_damage, rig.set_aside])
-}
-
-#[test]
-fn latest_values_equal_the_models_at_every_check() {
-    // Each case opens two stores and several readers: a quarter of the configured cases.
-    let cases = (ProptestConfig::default().cases / 4).max(16);
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    });
-    let counts: [AtomicU64; 4] = Default::default();
-    runner
-        .run(&steps(), |history| {
-            for (c, n) in counts.iter().zip(run(&history)?) {
-                c.fetch_add(n, Ordering::Relaxed);
-            }
-            Ok(())
-        })
-        .unwrap();
-    // The set-aside of Q-1071 is reached by about three histories in 256, too few to assert here: the history
-    // below pins it.
-    let [seeded, searches, damaged, _] = counts.map(AtomicU64::into_inner);
-    assert!(seeded > 0, "some reader continues a series directory");
-    assert!(searches > 0, "some live value is found in the log");
-    assert!(damaged > 0, "some history compares losses after damage");
-}
-
-#[test]
-fn a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before() {
-    let emit = |t| Step::Emit(vec![(0, t, 1, 0, 0), (1, t, 2, 0, 0)], false);
-    // The directory is through the last definition and the first emit's batch lies just above it; an even draw
-    // aims there, where the cycle would take the third batch above.
-    let history = [
-        emit(-30),
-        Step::Directory(6),
-        emit(-4),
-        emit(-2),
-        Step::Damage(2, true),
-    ];
-    let [seeded, _, damaged, set_aside] = run(&history).unwrap();
-    assert!(seeded > 0 && damaged > 0);
-    assert!(
-        set_aside > 0,
-        "the continuing reader's loss just above its directory is reached"
-    );
-}
-
-#[test]
-fn a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it() {
-    let mut rig = Rig::new("seeded-loss");
-    let id = rig.ids[2];
-    let note = |rig: &Rig, secs: i64, text: &str| {
-        Reading::new(
-            rig.ids[2],
-            Timestamp(rig.clock.wall().0 + secs * S),
-            Value::Text(text.into()),
-        )
-    };
-    rig.emit_readings(&[note(&rig, -30, "NOTE-AAA")], Intent::Normal);
-    rig.long.live(id).unwrap();
-    rig.shut();
-    write_directory(&rig.env, &rig.dir, usize::MAX).expect("a batch");
-    rig.reopen();
-    rig.clock.advance(Duration::from_secs(5));
-    rig.emit_readings(&[note(&rig, -4, "NOTE-BBB")], Intent::Normal);
-    rig.emit(&[(0, -2, 0, 0, 0)], false);
-    rig.shut();
-    for p in rig.fs.paths() {
-        if p.starts_with(rig.dir.join("log"))
-            && let Some(bytes) = rig.fs.read(&p)
-            && let Some(at) = bytes.windows(8).position(|w| w == b"NOTE-BBB")
-        {
-            rig.fs.poke(&p, at, b"X");
-        }
-    }
-    let seeded = rig.reader();
-    seeded.live(id).unwrap();
-    assert!(seeded.durable().unwrap().unwrap().seeded());
-    let whole = &rig.long;
-    assert!(!whole.durable().unwrap().unwrap().seeded());
-    let strip = |mut l: Vec<crate::health::LossReport>| {
-        for r in &mut l {
-            r.commit_time_before = None;
-        }
-        l
-    };
-    let (known, unknown) = (whole.losses(), seeded.losses());
-    assert_eq!(known.len(), 1);
-    assert!(!known[0].recorded);
-    assert_eq!(known[0].commit_time_before, Some(Timestamp(T0)));
-    assert_eq!(unknown[0].commit_time_before, None);
-    assert_eq!(
-        strip(unknown.clone()),
-        strip(known.clone()),
-        "the same loss otherwise"
-    );
-    let at = seed(&seeded);
-    assert!(at.is_some());
-    let (a, b) = known_alike((unknown.clone(), at), (known.clone(), None));
-    assert_eq!(a, b);
-    let recorded = |mut l: Losses| {
-        for r in &mut l {
-            r.recorded = true;
-        }
-        l
-    };
-    let (a, b) = known_alike(
-        (recorded(unknown.clone()), at),
-        (recorded(known.clone()), None),
-    );
-    assert_ne!(a, b, "a recorded report keeps the commit time compared");
-    let below = at.map(|t| Position {
-        sequence: t.sequence - 1,
-        ..t
-    });
-    let (a, b) = known_alike((unknown.clone(), below), (known.clone(), None));
-    assert_ne!(
-        a, b,
-        "a loss not just above the directory keeps the commit time compared"
-    );
-    let (a, b) = known_alike((unknown, None), (known, None));
-    assert_ne!(
-        a, b,
-        "a reader that read the whole log keeps the commit time compared"
-    );
 }

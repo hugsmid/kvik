@@ -217,8 +217,6 @@ struct Rig {
     read: Position,
     /// Each series retired, with the newest position when it was.
     retired: Vec<(SeriesId, Position)>,
-    /// The far reader built its fact index, which reads a batch once: damage it read before is then never met.
-    indexed: bool,
     /// Bytes were damaged: the model, which has no faults, is no longer the oracle.
     faulted: bool,
     /// A session failed as the static read does: nothing more is compared.
@@ -270,7 +268,6 @@ impl Rig {
             newest: Position::ORIGIN,
             read: Position::ORIGIN,
             retired: Vec::new(),
-            indexed: false,
             faulted: false,
             ended: false,
         };
@@ -290,6 +287,13 @@ impl Rig {
             Watched::new(&s.reader(), self.sels),
             Watched::new(&self.model.reader(), self.sels),
         )
+    }
+
+    /// Whether the far reader holds a fact index, which reads a batch once: damage it read before is then never met.
+    /// It builds one on its own for a broken latest state, as after a recorded loss (Q-1101).
+    fn indexed(&self) -> bool {
+        let durable = self.far.0.durable().and_then(Result::ok);
+        durable.is_some_and(|d| d.footprint().1)
     }
 
     fn store(&self) -> &Store {
@@ -387,12 +391,13 @@ impl Rig {
                 }
             }
             Step::Damage(k) => {
-                // Never the newest batch, which a start may truncate; once the far reader indexed, only what it has
-                // not read, so that it meets every damage as a fresh reader does.
+                // Never the newest batch, which a start may truncate; while the far reader holds a fact index, only
+                // what it has not read, so that it meets every damage as a fresh reader does.
+                let indexed = self.indexed();
                 let open: Vec<&(String, Position)> = self
                     .notes
                     .iter()
-                    .filter(|(_, p)| *p < self.newest && (!self.indexed || *p > self.read))
+                    .filter(|(_, p)| *p < self.newest && (!indexed || *p > self.read))
                     .collect();
                 if open.is_empty() {
                     return Ok(());
@@ -404,7 +409,6 @@ impl Rig {
                         let all = Timestamp(i64::MIN)..Timestamp(i64::MAX);
                         let read = self.far.0.facts(self.note, all, crate::read::View::History);
                         drop(read.map(Iterator::count));
-                        self.indexed = true;
                         // The call's refresh read on to the mark.
                         self.read = self.far.0.snapshot().unwrap().state().durable;
                     }
@@ -634,4 +638,88 @@ fn every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_mod
             "no {what} event was generated"
         );
     }
+}
+
+#[test]
+fn a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read() {
+    use Step::*;
+    let mut rig = Rig::new((0, 0));
+    rig.poll().unwrap();
+    for s in [
+        Note,
+        Emit(vec![(0, -60, 0, 0)]),
+        Damage(0),
+        Restart,
+        Note,
+        Emit(vec![(0, -60, 0, 34)]),
+        Poll,
+    ] {
+        rig.step(&s).unwrap();
+    }
+    assert!(
+        rig.indexed(),
+        "the far reader holds a fact index after the poll"
+    );
+    rig.step(&Damage(103)).unwrap();
+    rig.poll().unwrap();
+}
+
+/// Q-1101 as built: a reader holding a fact index never reads a batch again, so damage below what it read is
+/// `NotAvailable` to it and unknown to its process until a start records the range; a fresh reader finds it at once.
+#[test]
+fn an_indexed_reader_meets_damage_below_what_it_read_as_not_available_until_a_start_records_it() {
+    use Step::*;
+    let mut rig = Rig::new((0, 0));
+    rig.poll().unwrap();
+    for s in [
+        Note,
+        Emit(vec![(0, -60, 0, 0)]),
+        Damage(0),
+        Restart,
+        Note,
+        Emit(vec![(0, -60, 0, 34)]),
+        Poll,
+    ] {
+        rig.step(&s).unwrap();
+    }
+    assert!(rig.indexed());
+    let (text, p) = rig.notes.last().cloned().unwrap();
+    assert!(
+        p <= rig.read && p < rig.newest,
+        "{p:?} read and not the newest"
+    );
+    assert!(rig.w.damage_any(text.as_bytes()));
+    let note = rig.note;
+    let facts = |r: &Reader| {
+        let all = Timestamp(i64::MIN)..Timestamp(i64::MAX);
+        r.facts(note, all, crate::read::View::History)
+            .and_then(|f| f.collect::<Result<Vec<_>, _>>())
+    };
+    let at = |r: &Reader| r.at(note, Timestamp(i64::MAX), crate::read::View::History);
+    let names = |r: &Reader| {
+        r.losses()
+            .iter()
+            .any(|l| l.first.is_some_and(|a| a <= p) && l.last.is_some_and(|b| p <= b))
+    };
+    let far = &rig.far.0;
+    let got = facts(far);
+    assert!(
+        matches!(got, Err(crate::QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
+    let got = at(far);
+    assert!(
+        matches!(got, Err(crate::QueryError::NotAvailable { .. })),
+        "{got:?}"
+    );
+    assert!(!names(far), "its process never finds the loss");
+    let fresh = rig.w.reader();
+    assert!(names(&fresh), "a fresh reader finds it");
+    drop(fresh);
+    rig.step(&Restart).unwrap();
+    let far = &rig.far.0;
+    facts(far).unwrap();
+    at(far).unwrap();
+    assert!(names(far), "the start's record reaches it");
+    assert_eq!(far.losses(), rig.w.reader().losses());
 }

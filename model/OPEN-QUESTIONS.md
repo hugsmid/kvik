@@ -155,6 +155,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
 | Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
 | Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
+| Q-1100 | query design §3.5; Q-1097 | A shelf made counts as a change (decided by the lead) |
+| Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
+| Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
+| Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
+| Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3418,7 +3423,7 @@ and the first pass breaks the state (Q-1006). This is stricter than the writer's
 until the next directory: conservative, never wrong. No reader allowance (`DirectoryUnavailable`, the query design's
 section 4) is built: a reader reads whatever lies above the directory, in time that grows with it and memory that
 does not; the allowance and its retry (Q-773) wait for the one-shot tool of roadmap 9.0e.
-**Pinned by.** `kvik/src/durable/read/latest/tests.rs` `latest_values_equal_the_models_at_every_check` (readers that
+**Pinned by.** `kvik/src/durable/read/latest/histories.rs` `latest_values_equal_the_models_at_every_check` (readers that
 continue a directory written as the writer's fold gives it at any batch boundary); `log/tests/reader_start.rs`
 `a_reader_started_after_a_position_returns_exactly_the_batches_above_it`,
 `a_started_reader_reads_only_the_segments_from_the_one_holding_the_next_position`,
@@ -3480,7 +3485,7 @@ result computed under a cut that ended and ends with `CutExpired` once the cut i
 found gone; a `live` its state cannot tell is looked
 up at its cut (Q-1004). On the model backend every result is taken when it is made. Windows and facts join it with
 the sources of roadmap 9.0f; until then a dashboard's latest values and its windows do not share one cut.
-**Pinned by.** `kvik/src/durable/read/latest/tests.rs` `latest_values_equal_the_models_at_every_check` (a fresh
+**Pinned by.** `kvik/src/durable/read/latest/histories.rs` `latest_values_equal_the_models_at_every_check` (a fresh
 reader's snapshot against the model at every check); `kvik/src/durable/read/latest/snapshots.rs`
 `a_snapshot_answers_at_its_cut_and_now_while_facts_arrive_and_ends_once_its_cut_is_old`; `kvik/tests/threads.rs`
 `handles_and_results_are_send_and_sync`.
@@ -3501,7 +3506,7 @@ the rule Q-952 sets for the writer's fold. Cost: after such a fault the reader h
 `a_loss_found_in_a_batch_already_folded_breaks_the_state_and_one_the_pass_finds_does_not`,
 `damage_under_a_directorys_candidate_never_shows_the_lost_fact`,
 `a_continuing_reader_never_shows_a_fact_a_start_recorded_lost`; `kvik/src/durable/read/cut.rs`
-`a_reset_between_the_directorys_check_and_the_first_pass_breaks_the_state`; `kvik/src/durable/read/latest/tests.rs`
+`a_reset_between_the_directorys_check_and_the_first_pass_breaks_the_state`; `kvik/src/durable/read/latest/histories.rs`
 `latest_values_equal_the_models_at_every_check` (histories with power losses and damaged batches, every reader's
 `live`, `series` and `losses` against a fresh reader's fact index after damage); `log/tests/reader_start.rs`
 `a_range_a_restart_records_below_what_was_read_reaches_a_started_reader_only_as_a_lost_range`;
@@ -4328,13 +4333,15 @@ proposed) or a continuing reader reads the one batch at `through` when it first 
 property reaches the scenario by damaging a batch after a clean stop, the first above the last directory for half the
 draws, and checking before the start meets it: a reader of the whole log (the series directories moved out of its way
 while it seeds) against a fresh reader and its snapshot. About three histories in 256 reach the set-aside, so a fixed
-history pins it. Aiming at the batch just above the directory whatever it holds would add nothing: the only batch there
-without a fact is the recovery entry of a start after a power loss, and a fresh reader then continues no directory. The
-damage always lies above the directory a fresh reader continues, so every such check compares. A reader continuing a
-directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that window is a
-consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and nothing is
-promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
-**Tests.** `kvik/src/durable/read/latest/tests.rs`
+history pins it. Aiming at the batch just above the directory whatever it holds is not done: a batch there without a
+fact is a definition or a recovery entry, whose loss is a different scenario from this one, and the fixed history gives
+the reach. The damage always lies above any directory the rig writes; a directory the store writes itself can lie over
+it where segments seal within a run, which the latest values' rig does not do and the sources property does, and the
+check then skips (Q-1104). A reader continuing a directory that lies over unrecorded damage, before any start meets
+it, need not know of the loss or its commit time before; that window is a consequence of Q-1002 as built (the next
+start removes the directories), not something Q-1002 states, and nothing is promised for it. Damage in a sealed
+segment would also meet Q-937, which stays with that question's own item.
+**Tests.** `kvik/src/durable/read/latest/histories.rs`
 `a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
 `a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
 `latest_values_equal_the_models_at_every_check`.
@@ -4391,6 +4398,110 @@ an accounting fault and panics; in a release build the admission waits on. Not a
 would turn an internal fault into a failure every caller must handle, for a state no caller can cause.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `two_admissions_with_nothing_to_empty_wait_without_waking_each_other`.
+
+## Q-1100 — A shelf made counts as a change
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** With `changes += 1` taken out of `Accountant::shelve`, every test passed. An admission waits for a change
+only after a pass over the listed shelves emptied nothing, and it makes that pass only with no grant running (with
+one, that grant's return would make room, and it waits for that instead). While it waits, no pass can be admitted to
+make a shelf until a grant is given back, which is a change of its own. So the count for a shelf made is not needed
+today for an admission to wake.
+**Decided.** Kept, as Q-1097 defines a change, so that the wait does not rest on that argument as admission changes,
+and pinned by a test that reads the count after each kind of change.
+**Pinned by.** `kvik/src/durable/read/cache.rs`
+`a_shelf_made_a_grant_given_back_and_a_shelf_emptied_each_count_as_one_change`.
+
+## Q-1101 — A far reader that built its fact index for a broken state, and damage below what it read
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** The live differential's shrunk case: a note is damaged before a clean restart, whose start records it
+(position 5). The far reader's next refresh meets the recorded range, its latest values break (Q-1006) and it builds
+its fact index, reading positions 6 to 8 whole. The note at 7 is then damaged. The far reader's `facts` call meets it
+in a lookup, but `find_losses` has nothing left to scan, since the index read those batches before the damage, so the
+call ends `NotAvailable` and the far process never finds the loss; a fresh reader does. The property asserted that
+the far session names every loss a fresh reader reports, and failed on every replay, before 9.0f too.
+**Decided.** The engine keeps Q-1011 and Q-1071: a session names the losses its process found, a scanning read never
+reads a batch again (Q-1060), and until a start records a loss, readers may differ in it (§11 Health, "what is
+known"). The test's expectation was wrong: its rig knew only the fact index it made the far reader build, not one
+the engine builds for a broken state. It now asks the far reader whether it holds one, and while it does damages only
+above what that reader read. Not changed: such a reader's `facts` and `at` over the damaged batch end `NotAvailable`
+until a start records the range; finding it would need `find_losses` to scan again when an index is held, a new read
+not proposed here.
+**Pinned by.** `kvik/src/durable/read/live/differential.rs`
+`a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read` (fails with the rig's old check),
+`an_indexed_reader_meets_damage_below_what_it_read_as_not_available_until_a_start_records_it` (the limit as built:
+`NotAvailable` and no loss in its process, the loss from a fresh reader, agreement once a start records it) and
+`every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
+
+## Q-1102 — A start's lost range across two recorded losses (OWNER)
+Recorded by the loss-reports item. For the owner: it decides what `losses()` reports and under which identity.
+**Scenario.** The latest values' shrunk history: batches at positions 10, 8 and 9 are damaged in turn, each found by a
+start after a power loss. The first two starts record losses 10 (10..10) and 8 (8..8). The third finds 8..10, across
+both; its step 4 extends the first recorded loss it overlaps, writing a record under identity 10 for 8..10
+(`log/src/writer/recovery.rs` `record_loss`). The manifest then holds two identities whose ranges overlap. The
+writer's process reports one loss: identity 10, 8..10, recorded. A reader of the whole log reports two: identity 10,
+8..10, recorded, and identity 8, grown to 8..10 by its own find and marked not recorded, though records hold every
+position. The property meets it at about one check in 200 of those after damage (2 of 404 in three runs at 1,024
+cases).
+**The gap.** §3 Order of a start step 4 says how a range that extends one recorded loss is recorded (one loss,
+counted once), not one that overlaps two; §11 Health counts each loss once; Q-940 makes a find across two losses not
+yet recorded one loss under the lower identity. Whichever rule is chosen, the writer and readers then agree; a
+reader's report of a recorded range as not recorded is wrong under all three.
+**Options.**
+(a) One loss under the lower identity, as Q-940: the start writes the bridge as an extension of the lowest identity it
+overlaps, and readers and the writer fold records of two identities whose ranges overlap into the lower one
+(records already written under the higher identity are folded the same way). Acknowledgement, re-send requests and
+the corruption count then name 8. About 40 lines with tests. The lead's recommendation.
+(b) One loss under the identity the bridging record names (10 here), the others folded into it: the writer's report
+as now; loss 8 leaves the list though a start recorded it, and its earlier re-send request names an identity no
+report carries.
+(c) Two losses: each recorded identity stays a loss, a find counts against a record that covers it, and the writer
+reports two as well; the positions of loss 8 are then in two losses, against "counted once".
+**Now.** As built. Where records of two identities overlap, the property compares the data losses that overlap those
+records' span by the positions they cover, joining spans that overlap but not spans that only touch; every other
+report, a data loss without both positions among them, is compared whole, as are all reports of a check with no such
+records.
+**Pinned by.** `kvik/src/durable/read/latest/histories.rs`
+`a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader` (the records, both
+reports as built, and the property's set-aside reached), `only_records_of_two_identities_that_overlap_bridge` and
+`positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position`.
+
+## Q-1103 — The first call's memory bound and the refresh within it
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** `kvik/tests/query_memory.rs` bounded a reader's first `facts` call by the followed segment plus the
+larger of one pass's grant with its overhead (25 MiB at both caps measured) and the first refresh's 12 MiB, so the
+refresh's term was never the larger and its 9.9 MiB figure (Q-1069) was not tested.
+**Decided.** A second reader's first `live` call, which runs the first refresh and the latest values' fold and no
+pass, is measured alone against the followed segment plus 12 MiB at both caps: 10,404,672 bytes above a 14,300,808-byte
+segment, the 9.9 MiB figure. The first `facts` bound is the followed segment plus the grant and its overhead, which
+holds since the refresh is over before the first pass is admitted and its allowance is under the grant (asserted).
+**Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
+## Q-1104 — A series directory the store wrote over damage no start has met
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** The sources property (`kvik/src/durable/read/source/tests.rs`
+`facts_and_at_equal_the_fact_index_and_the_model_at_every_cap`) seals segments every 20 ms, so the clean stop of
+`Step::Damage(_, true)` can write the store's own series directory through the newest batch: the first directory of a
+run is due as soon as a sealed segment is uncovered (`format.md` A.18). The batch then damaged lies at or below that
+directory's `through`. A fresh reader continues it and reports the loss with no commit time before (seen: positions
+13 to 16 lost under a directory through 16), a reader of the whole log with one, and the check before the start
+failed on the difference in about two runs of three at 1,024 cases. The latest values' rig keeps the default seal
+interval, so no segment seals within its runs and the store writes no directory there; the rig's own directories
+always lie below the damage.
+**Decided.** The check before the start skips, and counts, a fresh reader that continues a directory at or above the
+damage, only where the series directories through that position are the store's own (at least one, none the rig
+wrote); otherwise it fails. That is the window Q-1071 leaves to Q-1002 as built: nothing is promised for a reader
+continuing a directory over damage before a start meets it. Everything else is compared as before, and the latest
+values' fixed history still pins the set-aside. The fixed test pauses for two seal intervals before the clean stop,
+so a seal runs however fast the host is: its first history then reached the skip at every attempt seen, its second
+at about half; a pause of ten intervals stopped the second reaching it, as its directory then lay below the damage,
+so the pause is kept short and the attempts stay.
+**Tests.** `kvik/src/durable/read/source/tests.rs`
+`a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start` (the shrunk history, and one whose newest
+batch holds one reading so that the directory's `through` can equal the damaged position; seals run on real time, so
+each pauses past the seal interval before the clean stop and repeats until an attempt reaches the skip, and every
+attempt must pass), `kvik/src/durable/read/latest/histories.rs`
+`only_a_directory_the_store_wrote_counts_as_the_store_s_own`, and `latest_values_equal_the_models_at_every_check`,
+whose histories must never skip.
 
 ## Open at v0.2
 
@@ -4587,6 +4698,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1068 | 9.0g | Decided by the lead with 9.0f's fix round: one key splits by position, the current view folded; for review |
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
+| Q-1102 | 6.3b | OWNER. A start's range across two recorded losses: one loss or two, and its identity; (a) recommended. As built until ruled, the property comparing positions lost there |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -4898,7 +5010,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-948 | A query of the writer's process read in parts, under a cut | The store's own reader refreshes in parts of `start::PART` items, so a first read of a long log holds one part beside the index; a part the log reader discarded because the reset stamp changed while it read is read once more, and a second discarded part in the same call is `CutExpired` (Q-850, counted per call, not per part). Parts taken before a discard stay applied: the next part continues from what the reader holds and voids what a reset removed. Every part's finds are noted to the latch (Q-928) and the latch's closed ranges are forgotten (Q-938) before the cut is taken, so a call answers under its cut with no latched fact. The note per entry point is pinned by `every_read_entry_point_notes_a_loss_its_refresh_finds_and_its_replay_is_shown_once` (`kvik/tests/durable_losses_reads.rs`, nine entry points, on the caught-up path; its reader never held the lost fact, so the forgetting is Q-938's tests, through the one refresh all nine share), the read once more by `a_reset_during_a_call_is_read_again_under_the_new_cut_and_a_second_is_cut_expired` (`kvik/src/durable/read/cut.rs`) |
 | Q-949 | The derived files beside the seal's description and the mark sync at a segment's first commit | A seal hands out its description (Q-220: length and SHA-256, taken in the pass that computes `file_crc32c`), and the log directory's record is built from it and the job (`directory_record`), so a segment is read once per seal for both. A sealed segment no record lists that fails its checks or cannot be read (`SegmentDamaged`, `SegmentUnreadable`) is reason `0xffff` (other) in the status file, A.18 having no code for it. A seal by size follows the first commit into the next segment, whose mark sync names a position past it (Q-630), so it never lies above the synced mark. A seal by time takes the next segment into use with no commit, so the sealed segment can lie above the synced mark until the next mark sync, and the derived files hold it back until then (a waiting directory forces that sync); `the_first_read_lists_no_segment_above_the_synced_mark` (`log/tests/directories.rs`) reaches that state with a timed seal. A first start after a lost `derived/` reads each unlisted sealed segment twice, once to describe it for the manifest (Q-221) and once for the log directory |
 | Q-950 | A loss watch not polled across the removal of the segment it stands in | For a removal a manifest record names, as retention and compaction will write (none removes a sealed segment yet; roadmap 6.3b): not `LossesUnknown`; the reader voids what it took from the removed segment and reads on from the segments present, and the records report no loss for the removed positions. That check by record comes with the records. Until then no removal is named, so a reader that stood in the removed segment reports `SegmentMissing` and every other reader passes over it as it does a segment recovery deleted (Q-852): Q-951, where both are pinned |
-| Q-777 | The live candidate's write time and what bounded state cannot tell | §2.3, §7 Derived files; `format.md` A.18 (settled by roadmap 9.0c, as built at 9.0a). The write time is the later of the file's `created_at` and every `received_at` it covers; the state keeps the candidate, the earliest and the latest good fact ahead, and in a versioned series up to 16 bad facts above the candidate; where that cannot tell, the entry sets "candidate unsure" or "more pending", and the counts, latest `t` and lateness reference are always exact. A reader continues the same state (`kvik/src/durable/derived/state.rs`) and judges it at its `now`; what it cannot tell it finds in the log at its cut (Q-1004). The latest fact ahead stays out of the entry: with more pending facts a reader searches once the first falls due, one lookup. `the_fold_equals_a_full_index`, `a_fold_continued_from_a_directory_equals_the_whole_fold` (`kvik/src/durable/derived/tests.rs`); `kvik/src/durable/read/latest/tests.rs` `latest_values_equal_the_models_at_every_check`; `kvik/src/durable/read/latest/cases.rs` `a_pending_fact_falling_due_after_the_directory_is_live_from_its_entry_with_no_search` |
+| Q-777 | The live candidate's write time and what bounded state cannot tell | §2.3, §7 Derived files; `format.md` A.18 (settled by roadmap 9.0c, as built at 9.0a). The write time is the later of the file's `created_at` and every `received_at` it covers; the state keeps the candidate, the earliest and the latest good fact ahead, and in a versioned series up to 16 bad facts above the candidate; where that cannot tell, the entry sets "candidate unsure" or "more pending", and the counts, latest `t` and lateness reference are always exact. A reader continues the same state (`kvik/src/durable/derived/state.rs`) and judges it at its `now`; what it cannot tell it finds in the log at its cut (Q-1004). The latest fact ahead stays out of the entry: with more pending facts a reader searches once the first falls due, one lookup. `the_fold_equals_a_full_index`, `a_fold_continued_from_a_directory_equals_the_whole_fold` (`kvik/src/durable/derived/tests.rs`); `kvik/src/durable/read/latest/histories.rs` `latest_values_equal_the_models_at_every_check`; `kvik/src/durable/read/latest/cases.rs` `a_pending_fact_falling_due_after_the_directory_is_live_from_its_entry_with_no_search` |
 | Q-952 | A series directory and a loss found at or below its `through` | A.18: a derived file is a function of the kept log only while nothing at or below its `through` is lost. The writer's fold (`SeriesFold`) watches the latch: on a closed range the latch takes that starts at or below what the fold has taken (folded or waiting) it stops, the run writes no further series directory, and the writer removes the series directories on disk (`SealHook::series_void`), so no file through the loss stays the newest. A store opening whose start found a loss that no lost range of the manifest holds continues no kept series directory and writes none in that run: it removes the family (Q-1002). The manifest's ranges are exempt for the rebuild's cost only: a file `kept_series` keeps was folded with every recorded range already lost, so continuing it gives the same entries. The latch hands on a region's closed range once, when the region is first met (`Latch::note`): a region met again holds no fact any reader still took, and a re-find after a restart's rebuild no longer stops the fold. Tests: `kvik/tests/derived.rs` `a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_run`, `a_series_directory_counting_a_fact_found_lost_is_removed_while_the_store_idles`, `a_run_over_a_region_the_start_meets_and_no_lost_range_records_writes_no_series_directory`, `a_query_meeting_a_region_the_start_met_adds_no_loss_and_the_run_writes_no_series_directory`; `kvik/src/durable/derived/tests.rs` `a_loss_found_ahead_of_the_fold_leaves_it_whole_and_one_behind_it_stops_it`; `kvik/src/durable/loss/tests.rs` `closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_or_a_region_met_again_never` |
 | Q-925 | `late` when the lateness reference cannot be read | §2.2 `late`, §11 Health; `api.md` Health (settled by the owner's ruling of 2026-11-18, option (a), as built). Scenario: after a loss found while open, a series has no newer reference fact; the read of older facts (Q-924) meets damage no scanning reader has reported, or cannot read the log, and finds no reference fact, so the first clause of `late` cannot be decided: the facts that would decide it are neither in memory nor readable. Ruling: the reading is not late by that clause, so the fact may lack a `late` flag the durable fixes would have set, and it is counted in `LocalDataUnreadable { readings }` (`Plan::reference_unread`), once whichever checks went unmade; that field's meaning widens from "duplicate check unmade" to "a check unmade for want of local data" (spec §2.2, `api.md` Health). `kvik/src/durable/ingest/tests/losses.rs` `a_reading_whose_reference_cannot_be_read_is_not_late_and_is_counted`, `a_reference_fact_an_incomplete_read_finds_proves_lateness_and_none_found_is_not_late_and_counted`; `kvik/tests/durable_losses_open.rs` `a_reading_with_its_key_and_reference_unreadable_is_counted_once` |
 | Q-928 | Damage to a batch of the kept log that the store's own reader finds at a query | §3 Recovery rule 2, §11 Health (Q-200) (settled by the owner's ruling of 2026-11-18, as built). Scenario: a store is opened again and a batch its start read (the kept log) is damaged; the durable fixes kept every fact the start read, so the store went on showing the fact, reported no loss and dropped a replay until the next start; bounded memory cannot show a fact whose bytes are gone. Ruling: a query reads the batch with the store's own reader, which finds the damage as any scanning reader does, and the latch takes it like any other find: `DataLost`, not yet recorded, the fact no longer shown and a replay recorded (Q-200's main rule, sooner). With no query the store does not read the batch again: `losses()` does not find it, and a replay of a fact whose key is in the recent window is dropped until the next start records the loss; outside the window its lookup meets the damage and it is recorded unchecked (Q-750). Q-200's limit says so. `kvik/tests/durable_losses.rs` `damage_to_the_kept_log_is_found_by_the_stores_first_read_of_it`, `a_replay_of_a_fact_of_the_damaged_kept_log_is_dropped_while_its_key_is_in_the_window`; the `Kept` place of `kvik/tests/durable_losses_open.rs` `a_loss_found_while_open_decides_as_a_restart_over_it_does`; `kvik/tests/slow_path.rs` `a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_it`, whose process reports the region by a query of the kept log |
