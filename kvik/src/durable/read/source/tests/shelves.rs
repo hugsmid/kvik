@@ -224,3 +224,27 @@ fn two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end
     assert!(r.memory().emptied() > 0);
     rig.shut();
 }
+
+/// The last row taken gives the shelf's grant back: an `at` after it empties nothing, and the stream then ends without
+/// reading its part again (Q-1067).
+#[test]
+fn a_stream_gives_its_shelf_back_with_its_last_row() {
+    let mut rig = Rig::new("shelf-last-row");
+    let id = rig.ids[0];
+    let now = rig.clock.wall().0;
+    let rs: Vec<Reading> = (0..300)
+        .map(|k| Reading::new(id, Timestamp(now - 1_000 + k), Value::F64(k as f64)))
+        .collect();
+    rig.emit_readings(&rs, Intent::Normal);
+    let r = reader_with(&rig.env, &rig.dir, one_pass_of(50_000));
+    let mut s = facts(r.clone(), id, all(), View::History).unwrap();
+    let got: Vec<Fact> = s.by_ref().take(300).collect::<Result<_, _>>().unwrap();
+    assert_eq!(got.len(), 300);
+    let t = Timestamp(now - 1_000 + 150);
+    assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
+    assert_eq!(r.memory().emptied(), 0);
+    let lookups = r.lookups();
+    assert!(s.next().is_none());
+    assert_eq!(r.lookups(), lookups);
+    rig.shut();
+}

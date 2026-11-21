@@ -3907,7 +3907,8 @@ reads live together at the least cap at the price of more passes.
 `a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once`,
 `a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`,
 `a_stream_whose_every_shelf_is_emptied_as_it_is_made_yields_every_row_once_in_both_views`,
-`two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end_with_every_row`;
+`two_threads_streaming_from_one_reader_that_empty_each_others_shelves_both_end_with_every_row`,
+`a_stream_gives_its_shelf_back_with_its_last_row`;
 `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
 ## Q-1068 — One event time holding more than a pass
