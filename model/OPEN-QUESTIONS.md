@@ -145,6 +145,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1067 | query design §1 Memory; `api.md` `ReaderConfig` | Rows waiting for delivery are held under their grant (decided by the lead) |
 | Q-1068 | query design §2.2; `api.md` `ReaderConfig` | One event time holding more than a pass (decided by the lead) |
 | Q-1069 | query design §1 Memory; `api.md` `ReaderConfig` | What the memory cap counts, measured (decided by the lead) |
+| Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
+| Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3867,11 +3869,15 @@ rules, until the removal records of roadmap 6.3b. A segment only listed, or one 
 does not count: recovery deletes segments that hold no batch in use, which a reader may have listed. A reader that
 never took a fact from B passes over it, as Q-951's limit says. Within one read, a stream or `at` keeps the segments
 its first pass listed and ends with `NotAvailable` when one is gone at a later pass, so no read yields part of a
-segment silently.
+segment silently. For `at` the first listing holds for the whole call: every span it searches back over and the
+probe for earlier facts are checked against it (a second attempt under a new cut lists afresh).
 **Pinned by.** `kvik/tests/durable_losses.rs` `a_watch_whose_segment_is_removed_reports_losses_unknown`,
 `a_reader_that_took_facts_from_a_removed_segment_fails_every_read_after_reading_past_it`,
+`a_segment_a_read_took_nothing_from_is_passed_over_once_removed`,
 `a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found`;
-`kvik/src/durable/read/source/tests.rs` `a_stream_ends_not_available_when_a_segment_its_passes_listed_is_gone`.
+`kvik/src/durable/read/source/tests.rs` `a_stream_ends_not_available_when_a_segment_its_passes_listed_is_gone`,
+`at_ends_not_available_when_a_segment_its_first_span_listed_is_gone_before_the_probe`,
+`at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_later_span`.
 
 ## Q-1067 — Rows waiting for delivery are held under their grant
 Decided by the lead with roadmap 9.0f's fix round.
@@ -3881,11 +3887,21 @@ another read on the same thread wait on itself.
 **Decided.** A pass's rows go onto a shelf with their grant, shrunk to what they take; the grant is given back as the
 last row is taken or the stream is dropped. An admission that finds less than the least grant free waits for running
 passes when their grants would make room (they wait on nothing), and otherwise empties shelves, freeing their grants.
-A stream whose shelf was emptied reads that part again at the same cut and passes over the rows it had yielded, so its
-results are unchanged; one key's fold and the stream's own state stay outside the cap (Q-1069). Cost: two streams
-iterated in turn on one reader at the least cap read each part again at each turn.
+A stream whose shelf was emptied reads that part again at the same cut and passes over every row up to the last it
+yielded (Q-1096), so its results are unchanged; one key's fold and the stream's own state stay outside the cap
+(Q-1069). One admission empties at a time (Q-1095).
+**Cost.** At the least cap the passes share 24 MiB and the least grant is 17 MiB, so a held shelf above about 7 MiB
+leaves too little free for any other read on the reader: a second stream, an `at` or a probe. Each such read empties
+the shelf, and the stream then reads its part again from its start and passes over what it yielded; a caller that
+takes one row and then reads once more, row after row, does work that grows with the square of a part's rows. Two
+threads each holding a stream deliver only what each takes before the other is admitted. Progress is certain: a read
+that returns yields one new row before its shelf can be emptied again. At the default cap one held pass (at most
+8 MiB of rows) leaves a least grant free. Not built: capping a pass's rows at the passes' share less the least grant,
+which would let one held stream and point reads live together at the least cap at the price of more passes.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf`;
+`kvik/src/durable/read/source/tests.rs` `a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once`,
+`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`;
 `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
 ## Q-1068 — One event time holding more than a pass
@@ -3913,8 +3929,38 @@ moves into the fact yielded. Outside the cap, measured as a fixed 1 MiB allowanc
 key's fold, and an `at` probe's own state. Also outside it, and said in `api.md`: the fact index a reader builds once
 to find damage (Q-1060). Measured with a counting allocator (`peak_alloc`) over four 8 MiB batches whose times
 interleave: 19.1 MiB above the baseline for `facts` in history and the current view and for `at`, at 32 MiB and at
-64 MiB. A batch larger than the reserve, which this writer does not write, is read above the cap.
+64 MiB. The test bounds each later call by the grant one pass takes alone (24 MiB at both caps) plus the allowance,
+and the reader's first `facts`, which fills the lookups' cache, by that plus the cache's 8 MiB, so another 8 MiB copy
+of the rows fails at either cap. A batch larger than the reserve, which this writer does not write, is read above the
+cap.
 **Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
+## Q-1095 — Admissions that empty shelves at once
+Decided by the lead with roadmap 9.0f's second fix round.
+**Scenario.** Two threads call `at` or advance streams on one reader at the least cap while two idle streams hold
+4 MiB each. The first admission took the list of shelves out of the shared state and released the lock to empty one;
+the second, in that window, saw shelved bytes, no running pass and no listed shelf, and its check that shelved rows
+are on a shelf panicked (44 times in 30,000 rounds).
+**Decided.** Shelves stay listed while one is emptied, and one admission empties at a time: another that needs room
+meanwhile waits until the emptying ends and looks again, so no shelf is emptied that one admission's room did not
+need. An admission that finds nothing to empty and nothing given back since waits for the next grant given back
+rather than spinning (a stream dropping its shelf gives its grant back just after the shelf is gone); the check
+stands, now as a 60-second wait with no running pass and no change before it calls shelved rows lost.
+**Pinned by.** `kvik/src/durable/read/cache.rs` `two_admissions_emptying_shelves_at_once_are_both_admitted`,
+`an_admission_empties_as_many_listed_shelves_as_its_room_needs`.
+
+## Q-1096 — Where a stream resumes after its shelf is emptied
+Decided by the lead with roadmap 9.0f's second fix round.
+**Scenario.** A stream whose shelf was emptied read the part again and passed over as many rows as it had yielded.
+Damage found between the two reads makes the second shorter, so the count ran into rows not yet yielded: 300 facts,
+15 yielded, the first batch then damaged and found by an `at` that empties the shelf, and rows 15 to 24 were silently
+missing.
+**Decided.** A stream yields rows in strictly ascending keys and remembers the last key it yielded: `(t, series,
+position)` in history, `(t, series)` in the current view, where a part read again may give a key's fact at another
+position. Every row not beyond it is passed over, whatever the second read returns; the count is gone.
+**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+`a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last`,
+`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`.
 
 ## Q-1020 — Label entries in the model kept apart from registry events
 Recorded and decided by the lead with the labels spec-and-model step (L1).
@@ -4155,7 +4201,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
