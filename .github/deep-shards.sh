@@ -33,6 +33,7 @@ open_questions  model open_questions
 durability      model durability
 self_repair     model self_repair
 model           model model
+names           model names
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
