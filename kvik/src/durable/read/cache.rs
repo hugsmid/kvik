@@ -3,6 +3,7 @@
 //! cap and at least what the lookups' log reader keeps (Q-1063).
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::time::Duration;
 
 use kvik_log::reader::LOOKUP_CACHE_BYTES;
 
@@ -16,6 +17,9 @@ pub(crate) const LEAST_MEMORY: u64 = 32 << 20;
 const BLOCK_RESERVE: u64 = 16 << 20;
 /// The least row budget a pass is admitted with.
 const MIN_ROWS: u64 = 1 << 20;
+/// How long an admission waits for shelved bytes no listed shelf holds before it calls them lost: a grant on its way
+/// back gives them back at once (Q-1095).
+const GIVE_BACK: Duration = Duration::from_secs(60);
 
 /// The sizes the accountant works with; other values in tests only, to force multi-pass reads on small histories.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +58,12 @@ struct State {
     /// Granted to rows streams hold for delivery.
     shelved: u64,
     shelves: Vec<Weak<Shelf>>,
+    /// An admission is emptying a shelf; others wait for it (Q-1095).
+    emptying: bool,
+    /// Counts every change that can free room, so that an admission waits only when nothing changed.
+    changes: u64,
+    #[cfg(test)]
+    emptied: u64,
 }
 
 /// See the module documentation.
@@ -87,6 +97,7 @@ impl Drop for Grant {
         } else {
             s.running -= self.bytes;
         }
+        s.changes += 1;
         drop(s);
         self.acc.freed.notify_all();
     }
@@ -120,7 +131,8 @@ impl Accountant {
 
     /// Admits a pass: takes all that is free when that is under two least grants, else half of it. While less than
     /// the least grant is free it waits for running passes, which wait on nothing, when their grants would make
-    /// room, and otherwise empties shelves, so no admission waits on a caller's iteration (Q-1063, Q-1067).
+    /// room, and otherwise empties shelves, one admission at a time, so no admission waits on a caller's iteration
+    /// (Q-1063, Q-1067, Q-1095).
     pub(crate) fn admit(self: &Arc<Self>) -> Grant {
         let least = self.least();
         let mut s = self.lock();
@@ -143,26 +155,47 @@ impl Accountant {
                 s = self.freed.wait(s).unwrap_or_else(PoisonError::into_inner);
                 continue;
             }
-            let shelves = std::mem::take(&mut s.shelves);
+            if s.emptying {
+                s = self.freed.wait(s).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            // The shelves stay listed while one is emptied; one admission empties at a time (Q-1095).
+            let shelves = s.shelves.clone();
+            let seen = s.changes;
+            s.emptying = true;
             drop(s);
-            let mut kept = Vec::new();
             let mut emptied = false;
             for w in shelves {
                 let Some(shelf) = w.upgrade() else { continue };
-                if emptied {
-                    kept.push(w);
-                    continue;
-                }
                 let taken = shelf.lock().unwrap_or_else(PoisonError::into_inner).take();
-                emptied = taken.is_some();
-                drop(taken);
+                if taken.is_some() {
+                    emptied = true;
+                    drop(taken);
+                    break;
+                }
             }
             s = self.lock();
-            s.shelves.extend(kept);
-            assert!(
-                emptied || s.running > 0 || s.shelved == 0,
-                "shelved rows are on a shelf"
-            );
+            s.emptying = false;
+            s.changes += 1;
+            s.shelves.retain(|w| w.strong_count() > 0);
+            #[cfg(test)]
+            if emptied {
+                s.emptied += 1;
+            }
+            self.freed.notify_all();
+            if !emptied && s.changes == seen + 1 {
+                // Nothing to empty and nothing given back since: a grant whose shelf was dropped is on its way.
+                let idle = s.running == 0;
+                let (g, w) = self
+                    .freed
+                    .wait_timeout(s, GIVE_BACK)
+                    .unwrap_or_else(PoisonError::into_inner);
+                s = g;
+                assert!(
+                    !(idle && w.timed_out() && s.changes == seen + 1 && s.shelved > 0),
+                    "shelved rows are on a shelf"
+                );
+            }
         }
     }
 
@@ -177,9 +210,18 @@ impl Accountant {
         let shelf = Arc::new(Mutex::new(Some((rows.into_iter(), grant))));
         s.shelves.retain(|w| w.strong_count() > 0);
         s.shelves.push(Arc::downgrade(&shelf));
+        s.changes += 1;
         drop(s);
         self.freed.notify_all();
         shelf
+    }
+}
+
+#[cfg(test)]
+impl Accountant {
+    /// Shelves admissions have emptied.
+    pub(crate) fn emptied(&self) -> u64 {
+        self.lock().emptied
     }
 }
 
@@ -256,5 +298,74 @@ mod tests {
         assert!(full.lock().unwrap().is_none());
         assert!(all < g.bytes);
         assert_eq!(g.rows(), LEAST_MEMORY - LEAST_MEMORY / 4 - BLOCK_RESERVE);
+    }
+
+    /// Shelves of 7 and 8 MiB at the least cap: an admission needs both emptied, the second found on the list after
+    /// the first is emptied (Q-1095).
+    #[test]
+    fn an_admission_empties_as_many_listed_shelves_as_its_room_needs() {
+        let a = Accountant::new(Sizes::of(LEAST_MEMORY));
+        let first = a.shelve(Vec::new(), a.admit(), 7 << 20);
+        let second = a.shelve(Vec::new(), a.admit(), 8 << 20);
+        let g = admitted_within(&a, Duration::from_secs(10)).expect("both shelves emptied");
+        assert!(first.lock().unwrap().is_none() && second.lock().unwrap().is_none());
+        assert_eq!(a.emptied(), 2);
+        assert_eq!(g.rows(), LEAST_MEMORY - LEAST_MEMORY / 4 - BLOCK_RESERVE);
+    }
+
+    /// Two shelves of 4 MiB at the least cap leave less than the least grant free; two admissions at once each
+    /// need one emptied, and neither may find the other's emptying under way as rows on no shelf (Q-1095).
+    #[test]
+    fn two_admissions_emptying_shelves_at_once_are_both_admitted() {
+        const ROUNDS: usize = 30_000;
+        let a = Accountant::new(Sizes::of(LEAST_MEMORY));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b = a.clone();
+        std::thread::spawn(move || {
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let admitters: Vec<_> = (0..2)
+                .map(|_| {
+                    let (a, gate) = (b.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        let mut panics = 0;
+                        for _ in 0..ROUNDS {
+                            gate.wait();
+                            let admitted =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    drop(a.admit());
+                                }));
+                            panics += usize::from(admitted.is_err());
+                            gate.wait();
+                        }
+                        panics
+                    })
+                })
+                .collect();
+            let mut emptied = Vec::new();
+            for _ in 0..ROUNDS {
+                let shelves: Vec<_> = (0..2)
+                    .map(|_| b.shelve(Vec::new(), b.admit(), 4 << 20))
+                    .collect();
+                gate.wait();
+                gate.wait();
+                emptied.push(
+                    shelves
+                        .iter()
+                        .filter(|s| s.lock().unwrap().is_none())
+                        .count(),
+                );
+            }
+            let panics: usize = admitters.into_iter().map(|t| t.join().unwrap()).sum();
+            let _ = tx.send((panics, emptied));
+        });
+        let (panics, emptied) = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("every round admitted within the timeout");
+        assert_eq!(panics, 0, "no admission found shelved rows on no shelf");
+        assert!(
+            emptied.iter().all(|&n| n == 1),
+            "each round emptied the one shelf its room needed"
+        );
+        assert_eq!(a.emptied(), emptied.iter().sum::<usize>() as u64);
     }
 }
