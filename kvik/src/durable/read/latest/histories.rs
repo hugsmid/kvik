@@ -321,6 +321,13 @@ fn positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position()
         positions_lost(&[data_lost(12, Some(12), Some(12))], &bridges),
         "a report without positions differs from one with them"
     );
+    let mut possible = data_lost(12, Some(12), Some(12));
+    possible.kind = crate::health::LossKind::PossibleLoss;
+    assert_eq!(
+        positions_lost(std::slice::from_ref(&possible), &bridges),
+        (vec![possible], vec![]),
+        "a possible loss inside a bridge is compared whole"
+    );
     assert_eq!(
         positions_lost(&[outside.clone()], &[]),
         (vec![outside], vec![]),
