@@ -20,6 +20,8 @@ pub(super) fn run(history: &[Step]) -> Result<[u64; 4], TestCaseError> {
     }
     rig.check()?;
     rig.shut();
+    // Q-1104 rests on the store writing no series directory under the default seal interval.
+    prop_assert_eq!(rig.over_damage, 0, "a check before a start skipped");
     Ok([rig.seeded, rig.searches, rig.after_damage, rig.set_aside])
 }
 
@@ -185,10 +187,6 @@ fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_an
     for s in &history {
         rig.step(s).unwrap();
     }
-    let at = |s| Position {
-        generation: 0,
-        sequence: s,
-    };
     let whole = rig.reader();
     let records = recorded_ranges(&whole);
     assert_eq!(
@@ -200,7 +198,7 @@ fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_an
         ],
         "(identity, first, last) of each lost-range record"
     );
-    assert!(bridged(&records));
+    assert_eq!(bridged(&records), [(at(8), at(10))]);
     let brief = |l: Losses| -> Vec<(Position, Option<Position>, Option<Position>, bool)> {
         l.into_iter()
             .map(|r| (r.identity, r.first, r.last, r.recorded))
@@ -220,8 +218,8 @@ fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_an
     );
     for l in [own.losses(), whole.losses()] {
         assert_eq!(
-            positions_lost(&l).1,
-            [(at(8), at(10))],
+            positions_lost(&l, &bridged(&records)),
+            (vec![], vec![(at(8), at(10))]),
             "what the property compares"
         );
     }
@@ -231,4 +229,101 @@ fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_an
         "the property compares this history as Q-1102 sets aside"
     );
     rig.shut();
+}
+
+fn at(sequence: u64) -> Position {
+    Position {
+        generation: 0,
+        sequence,
+    }
+}
+
+fn data_lost(identity: u64, first: Option<u64>, last: Option<u64>) -> crate::health::LossReport {
+    use crate::health::{LossCause, LossKind, LossReport, MarkState};
+    LossReport {
+        identity: at(identity),
+        kind: LossKind::DataLost,
+        cause: LossCause::Corruption,
+        first: first.map(at),
+        last: last.map(at),
+        file_id: None,
+        bytes: 0,
+        readable_commit_blocks: 0,
+        mark_state: MarkState::Readable,
+        boot_id: None,
+        commit_time_before: None,
+        commit_time_after: None,
+        cursors_missing: Vec::new(),
+        recorded: true,
+        acknowledged: false,
+    }
+}
+
+#[test]
+fn only_records_of_two_identities_that_overlap_bridge() {
+    let disjoint = [(at(4), at(4), at(5)), (at(8), at(8), at(9))];
+    assert_eq!(bridged(&disjoint), [], "two losses apart");
+    let touching = [(at(4), at(4), at(5)), (at(6), at(6), at(7))];
+    assert_eq!(bridged(&touching), [], "two losses side by side");
+    let one = [(at(4), at(4), at(4)), (at(4), at(3), at(5))];
+    assert_eq!(bridged(&one), [], "one loss extended");
+    let apart = [
+        (at(2), at(2), at(2)),
+        (at(4), at(4), at(4)),
+        (at(4), at(4), at(6)),
+        (at(9), at(9), at(9)),
+    ];
+    assert_eq!(bridged(&apart), [], "a bridge needs two identities");
+    let bridge = [
+        (at(2), at(2), at(2)),
+        (at(4), at(4), at(4)),
+        (at(2), at(2), at(4)),
+        (at(9), at(9), at(9)),
+    ];
+    assert_eq!(bridged(&bridge), [(at(2), at(4))], "the bridge alone");
+}
+
+#[test]
+fn positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position() {
+    let bridges = [(at(10), at(20))];
+    let inside = [
+        data_lost(10, Some(10), Some(11)),
+        data_lost(14, Some(14), Some(15)),
+    ];
+    assert_eq!(
+        positions_lost(&inside, &bridges),
+        (vec![], vec![(at(10), at(11)), (at(14), at(15))]),
+        "separate spans stay apart"
+    );
+    let touching = [
+        data_lost(10, Some(10), Some(11)),
+        data_lost(12, Some(12), Some(13)),
+    ];
+    assert_eq!(
+        positions_lost(&touching, &bridges).1,
+        [(at(10), at(11)), (at(12), at(13))],
+        "spans that only touch stay apart"
+    );
+    let overlapping = [
+        data_lost(10, Some(10), Some(12)),
+        data_lost(11, Some(11), Some(13)),
+    ];
+    assert_eq!(positions_lost(&overlapping, &bridges).1, [(at(10), at(13))]);
+    let outside = data_lost(30, Some(30), Some(31));
+    let unplaced = data_lost(12, None, Some(12));
+    let l = [inside[0].clone(), outside.clone(), unplaced.clone()];
+    assert_eq!(
+        positions_lost(&l, &bridges),
+        (vec![outside.clone(), unplaced], vec![(at(10), at(11))])
+    );
+    assert_ne!(
+        positions_lost(&[data_lost(12, None, None)], &bridges),
+        positions_lost(&[data_lost(12, Some(12), Some(12))], &bridges),
+        "a report without positions differs from one with them"
+    );
+    assert_eq!(
+        positions_lost(&[outside.clone()], &[]),
+        (vec![outside], vec![]),
+        "without a bridge every report is compared whole"
+    );
 }

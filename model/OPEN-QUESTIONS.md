@@ -4437,7 +4437,8 @@ both; its step 4 extends the first recorded loss it overlaps, writing a record u
 (`log/src/writer/recovery.rs` `record_loss`). The manifest then holds two identities whose ranges overlap. The
 writer's process reports one loss: identity 10, 8..10, recorded. A reader of the whole log reports two: identity 10,
 8..10, recorded, and identity 8, grown to 8..10 by its own find and marked not recorded, though records hold every
-position. About two runs in 26 of the property at 1,024 cases met it.
+position. The property meets it at about one check in 200 of those after damage (2 of 404 in three runs at 1,024
+cases).
 **The gap.** §3 Order of a start step 4 says how a range that extends one recorded loss is recorded (one loss,
 counted once), not one that overlaps two; §11 Health counts each loss once; Q-940 makes a find across two losses not
 yet recorded one loss under the lower identity. Whichever rule is chosen, the writer and readers then agree; a
@@ -4452,11 +4453,14 @@ as now; loss 8 leaves the list though a start recorded it, and its earlier re-se
 report carries.
 (c) Two losses: each recorded identity stays a loss, a find counts against a record that covers it, and the writer
 reports two as well; the positions of loss 8 are then in two losses, against "counted once".
-**Now.** As built. The property compares a check whose records bridge two identities by the possible losses and the
-positions lost data covers only; other checks are compared whole.
+**Now.** As built. Where records of two identities overlap, the property compares the data losses that overlap those
+records' span by the positions they cover, joining spans that overlap but not spans that only touch; every other
+report, a data loss without both positions among them, is compared whole, as are all reports of a check with no such
+records.
 **Pinned by.** `kvik/src/durable/read/latest/histories.rs`
 `a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader` (the records, both
-reports as built, and the property's set-aside reached).
+reports as built, and the property's set-aside reached), `only_records_of_two_identities_that_overlap_bridge` and
+`positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position`.
 
 ## Q-1103 — The first call's memory bound and the refresh within it
 Decided by the lead (a technical decision on a test: no engine or promise changes).
