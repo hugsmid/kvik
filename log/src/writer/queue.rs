@@ -13,8 +13,9 @@ pub trait CallSource {
     fn take(&mut self, max_bytes: u64) -> Vec<Call>;
     /// Puts calls taken by [`CallSource::take`] back at the front, in the same order.
     fn put_back(&mut self, calls: Vec<Call>);
-    /// The wall clock read as the last [`CallSource::take`] ended, after every call it took was queued: a batch's
-    /// `received_at` is no earlier (`spec.md` §2.2 `received_at`, §2.3 As-of time; Q-1070).
+    /// The wall clock read after the last [`CallSource::take`], so after every call it took was queued: a batch's
+    /// `received_at` is no earlier (`spec.md` §2.2 `received_at`, §2.3 As-of time; Q-1070). A source fed from other
+    /// threads must implement it; `None` keeps the step's own read.
     fn taken_at(&self) -> Option<i64> {
         None
     }

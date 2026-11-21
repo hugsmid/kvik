@@ -205,26 +205,37 @@ impl Shared {
     }
 }
 
-struct SharedSource<'a>(&'a Shared, Option<i64>);
+struct SharedSource<'a> {
+    shared: &'a Shared,
+    taken_at: Option<i64>,
+}
+
+impl<'a> SharedSource<'a> {
+    fn new(shared: &'a Shared) -> Self {
+        SharedSource {
+            shared,
+            taken_at: None,
+        }
+    }
+}
 
 impl CallSource for SharedSource<'_> {
     fn is_empty(&self) -> bool {
-        lock(&self.0.front).queue.is_empty()
+        lock(&self.shared.front).queue.is_empty()
     }
     fn take(&mut self, max_bytes: u64) -> Vec<Call> {
-        let mut f = lock(&self.0.front);
-        let calls = f.queue.take(max_bytes);
-        // Read under the queue's lock, so no call taken was queued after it.
-        self.1 = Some(self.0.clock.wall());
-        drop(f);
-        self.0.room_cv.notify_all();
+        let calls = lock(&self.shared.front).queue.take(max_bytes);
+        // After the take, so after every call taken was queued (Q-1070); not under the lock, so a slow clock stalls
+        // no submitter.
+        self.taken_at = Some(self.shared.clock.wall());
+        self.shared.room_cv.notify_all();
         calls
     }
     fn put_back(&mut self, calls: Vec<Call>) {
-        lock(&self.0.front).queue.put_back(calls);
+        lock(&self.shared.front).queue.put_back(calls);
     }
     fn taken_at(&self) -> Option<i64> {
-        self.1
+        self.taken_at
     }
 }
 
@@ -673,16 +684,24 @@ mod tests {
     /// read at once released.
     #[derive(Debug, Default)]
     struct HeldClock {
-        state: Mutex<(i64, bool, usize, usize)>,
+        state: Mutex<Held>,
         cv: Condvar,
+    }
+
+    #[derive(Debug, Default)]
+    struct Held {
+        wall: i64,
+        on: bool,
+        reads: usize,
+        released: usize,
     }
 
     impl HeldClock {
         fn set(&self, wall: i64) {
-            lock(&self.state).0 = wall;
+            lock(&self.state).wall = wall;
         }
         fn hold(&self, on: bool) {
-            lock(&self.state).1 = on;
+            lock(&self.state).on = on;
             self.cv.notify_all();
         }
         /// Waits until the writer is held in its `n`th wall read since the hold began.
@@ -690,12 +709,12 @@ mod tests {
             let s = lock(&self.state);
             drop(
                 self.cv
-                    .wait_while(s, |s| s.2 < n)
+                    .wait_while(s, |s| s.reads < n)
                     .unwrap_or_else(PoisonError::into_inner),
             );
         }
         fn release_one(&self) {
-            lock(&self.state).3 += 1;
+            lock(&self.state).released += 1;
             self.cv.notify_all();
         }
     }
@@ -706,14 +725,14 @@ mod tests {
         }
         fn wall(&self) -> i64 {
             let mut s = lock(&self.state);
-            let at = s.0;
-            if s.1 && std::thread::current().name() == Some("kvik-writer") {
-                s.2 += 1;
-                let me = s.2;
+            let at = s.wall;
+            if s.on && std::thread::current().name() == Some("kvik-writer") {
+                s.reads += 1;
+                let me = s.reads;
                 self.cv.notify_all();
                 s = self
                     .cv
-                    .wait_while(s, |s| s.1 && s.3 < me)
+                    .wait_while(s, |s| s.on && s.released < me)
                     .unwrap_or_else(PoisonError::into_inner);
             }
             drop(s);

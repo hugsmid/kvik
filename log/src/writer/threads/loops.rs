@@ -131,7 +131,7 @@ pub(super) fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, L
         let step = w.step(
             s.clock.monotonic(),
             s.clock.wall(),
-            &mut SharedSource(s, None),
+            &mut SharedSource::new(s),
         );
         // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
         // published before any call of this step completes, so a caller that holds its acknowledgement sees them.

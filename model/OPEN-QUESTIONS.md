@@ -3953,12 +3953,21 @@ batch. A call queued between the two, at 157 s by the same clock, was committed 
 52 s. As of a time between 52 s and 157 s, the durable fact index then held a fact whose `emit` had not begun by that
 time, where the model (whose receive time is the call's) did not. A property comparing the fact index with the model
 in the as-of-time view found it after a power loss and restart; the timing, not the damage, was the cause.
-**Decided.** The batch's `received_at` is at least the wall clock read under the queue's lock as its calls are taken
+**Decided.** The batch's `received_at` is at least the wall clock read after its calls are taken
 (`CallSource::taken_at`), so no call is stamped earlier than it was queued; `commit_time` stays
-`max(received_at, previous commit_time)`. No promise changes: §2.2 says `received_at` is the host clock at commit.
+`max(received_at, previous commit_time)`. The read follows the take and is not made under the queue's lock: any read
+after the take is after every taken call was queued, and a caller's clock must not stall submitters. A source fed
+from other threads must give `taken_at`; one that does not keeps the step's own read, the old gap. No promise
+changes: §2.2 says `received_at` is the host clock at commit.
+**Remaining gaps, one-sided.** `emit` decides the `future` and lateness flags against its own read, so a fact within
+the gap of the 60 s bound can carry a flag its stored, later times do not show. Between a call's read and the take,
+the model, whose receive time is the call's, holds a fact the durable index does not as of a time in that gap; the
+rigs move the clock only between calls, so no property meets it, and a later one that does should set it aside.
 **Tests.** `log/src/writer/threads.rs`
 `a_call_queued_after_the_writer_read_the_clock_commits_no_earlier_than_it_was_queued` (holds the writer between its
-read of the clock and its take).
+read of the clock and its take); `log/tests/writer.rs`
+`a_batch_is_received_at_the_later_of_the_steps_wall_clock_and_its_taking` (a source's time of taking above, then
+below, the step's read).
 
 ## Q-1071 — The commit time before a loss, as a reader that continues a series directory knows it
 Decided by the lead (a technical decision on a test: no engine or promise changes).
