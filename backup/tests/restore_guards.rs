@@ -5,7 +5,6 @@ mod support;
 
 use std::sync::Arc;
 
-use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{ClaimMarker, Keys, ObjectName};
 use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan};
@@ -14,7 +13,7 @@ use kvik_backup::upload::Refused;
 use kvik_files::record::{Body, Rebuild, Record};
 use kvik_log::fs::MemFs;
 use kvik_sink::fake::FakeBucket;
-use kvik_sink_api::{BackupSink, SinkError};
+use kvik_sink_api::SinkError;
 use support::*;
 
 #[test]
@@ -231,20 +230,20 @@ fn q108_a_rebuilt_manifest_not_yet_whole_in_the_bucket_is_not_read() {
     let sink = MemSink::new();
     upload(&sink, &mut src);
     use_copies(&src);
-    let (keys, env) = (Keys::new(ID), TestEnvelope::new(KEY));
     let mut carried = Record::new(7, 0, 12, Body::Sealed(vec![src.segments[0].0.clone()]));
     carried.old_epoch = Some(2);
-    for r in [
-        Record::new(5, 0, 12, Body::Rebuild(Rebuild::default())),
-        Record {
-            old_epoch: Some(1),
-            ..Record::new(6, 0, 12, Body::Empty)
-        },
-        carried,
+    for (previous, r) in [
+        (0, Record::new(5, 0, 12, Body::Rebuild(Rebuild::default()))),
+        (
+            5,
+            Record {
+                old_epoch: Some(1),
+                ..Record::new(6, 0, 12, Body::Empty)
+            },
+        ),
+        (6, carried),
     ] {
-        let k = keys.record(0, r.epoch);
-        let sealed = env.seal(&k, &r.encode().unwrap()).unwrap();
-        block_on(sink.put(&k, sealed.clone().into(), sha256(&sealed))).unwrap();
+        put_record(&sink, ID, previous, &r);
     }
     let fs = MemFs::new();
     let (p, o) = restore(&mut restorer(sink, &fs, PlanMode::Drill, KEY)).unwrap();
@@ -300,4 +299,49 @@ fn a_plan_whose_record_has_the_other_mode_is_refused_before_the_record_is_writte
         );
         assert!(fs.paths().is_empty(), "{mode:?}");
     }
+}
+
+#[test]
+fn a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let keys = Keys::new(ID);
+    sink.set(&keys.record(0, 1), Some(Fault::Delay(1)));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
+    let first = block_on(r.prepare(1));
+    assert!(matches!(first, Err(RestoreError::Sink(_))), "{first:?}");
+    assert_eq!(claims(&sink.inner.objects(), ID), [keys.claim(1)]);
+    let (p, _) = restore(&mut r).unwrap();
+    assert_eq!(p.record.generation, 1);
+    assert_eq!(claims(&sink.inner.objects(), ID), [keys.claim(1)]);
+    let mine = ClaimMarker::decode(&sink.inner.objects()[&keys.claim(1)]).unwrap();
+    assert_eq!(mine.nonce, p.record.stamp.nonce);
+}
+
+#[test]
+fn a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let keys = Keys::new(ID);
+    sink.set(&keys.record(0, 1), Some(Fault::Delay(1)));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
+    assert!(block_on(r.prepare(1)).is_err());
+    let other = ClaimMarker {
+        generation: 2,
+        nonce: 99,
+    }
+    .encode();
+    sink.inner.set(&keys.claim(2), &other);
+    let again = block_on(r.prepare(1));
+    assert!(
+        matches!(again, Err(RestoreError::Superseded { by: 2 })),
+        "{again:?}"
+    );
+    assert_eq!(
+        claims(&sink.inner.objects(), ID),
+        [keys.claim(1), keys.claim(2)]
+    );
+    assert!(fs.paths().is_empty());
 }

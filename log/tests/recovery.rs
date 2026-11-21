@@ -20,7 +20,7 @@ use kvik_log::scan::{ScanLimit, Tail, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
     Call, CallSource as _, IngestQueue, LogWriter, LossKind, MarkSync, StartReport, StartRule,
-    WriterConfig, create_segment, seal_segment,
+    WriterConfig, create_segment, seal_segment_described,
 };
 use proptest::prelude::*;
 
@@ -160,7 +160,7 @@ impl Rig {
                 w.segment_created(r);
             }
             for job in w.take_seal_jobs(self.now) {
-                let r = seal_segment(&fs, &job, &w.halt());
+                let r = seal_segment_described(&fs, &job, &w.halt());
                 w.seal_done(job, r, self.now);
             }
         }
@@ -536,8 +536,11 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
             },
             ..cfg()
         });
-        r.submit(vec![fact(1, 0)]);
-        r.drain();
+        // The segment's first batch syncs the mark either way (Q-630); the second is the one at risk.
+        for t in 0..2 {
+            r.submit(vec![fact(1, t)]);
+            r.drain();
+        }
         r.w = None;
         r.fs.power_loss();
         r.fs.restart();
@@ -549,11 +552,11 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
             // truncation is reported and is a reset point: a recovery entry after the mark's position (Q-118 (e)).
             assert_eq!(rep.rule, StartRule::SameBoot);
             let e = rep.entry.as_ref().expect("a recovery entry");
-            assert_eq!(e.entry.after, 0);
+            assert_eq!(e.entry.after, 1);
             assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
             let p = r.positions();
-            assert_eq!(p.len(), 1);
-            assert!(matches!(p.get(&1), Some(Item::Entry(Entry::Recovery(e))) if e.after == 0));
+            assert_eq!(p.len(), 2);
+            assert!(matches!(p.get(&2), Some(Item::Entry(Entry::Recovery(e))) if e.after == 1));
         }
     }
 }
@@ -568,6 +571,9 @@ fn damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point() {
         mark_sync: MarkSync::Interval(Duration::from_secs(1)),
         ..cfg()
     });
+    // The segment's first batch syncs the mark (Q-630).
+    r.submit(vec![fact(3, 0)]);
+    r.drain();
     r.submit(vec![fact(1, 0), fact(2, 0)]);
     r.drain();
     r.w = None;
@@ -580,7 +586,7 @@ fn damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point() {
         file_id: 1,
         generation: 0,
     };
-    let batch = scan(&bytes, &id, ScanLimit::End).unwrap().batches[0].offset;
+    let batch = scan(&bytes, &id, ScanLimit::End).unwrap().batches[1].offset;
     r.fs.poke(&seg, batch as usize + 40, &[0xff; 8]);
     let before = read_mark(&r.fs.read(&log_path("MARK")).unwrap(), &STORE_ID)
         .unwrap()
@@ -1828,8 +1834,9 @@ fn a_crash_while_creating_the_store_or_in_its_first_start_is_recovered() {
 
 #[test]
 fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
-    // b_one is sealed in segment 1 and b_two committed in segment 2; the mark, synced only on its timer, still names
-    // nothing when a remount loses the page cache. Rule 1 would truncate b_two; the mark is stale.
+    // b_one and b_two in segment 1, then a timed seal with no batch waiting; the mark, synced at b_one (Q-630) and
+    // then only on its timer, still names b_one when a remount loses the page cache. The sealed segment holds b_two
+    // above it; the mark is stale.
     let mut r = Rig::new(WriterConfig {
         segment_size: 4096,
         min_sync_interval: Duration::ZERO,
@@ -1839,10 +1846,10 @@ fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
     r.submit(vec![fact(1, 0)]);
     r.step();
     r.maint();
-    r.advance(10 * MS);
+    r.submit(vec![fact(1, 1)]);
     r.step();
     r.maint();
-    r.submit(vec![fact(1, 1)]);
+    r.advance(10 * MS);
     r.step();
     r.maint();
     assert!(
@@ -1851,6 +1858,7 @@ fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
             .any(|p| p.to_string_lossy().ends_with(".kvl"))
     );
     assert_eq!(r.acked.len(), 2);
+    assert_eq!(r.w().stats().mark_synced.sequence, 1);
     r.w = None;
     r.fs.power_loss();
     r.fs.restart();
@@ -1947,11 +1955,12 @@ fn exactly_two_batches_beyond_the_mark_on_the_same_boot_make_it_stale() {
         min_sync_interval: Duration::ZERO,
         ..cfg()
     });
-    for i in 0..2 {
+    // The segment's first batch syncs the mark (Q-630); the two after it lie beyond it.
+    for i in 0..3 {
         r.submit(vec![fact(1, i)]);
         r.step();
     }
-    assert_eq!(r.acked.len(), 2);
+    assert_eq!(r.acked.len(), 3);
     r.w = None;
     r.fs.power_loss();
     r.fs.restart();
@@ -2143,6 +2152,10 @@ fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
     r.fs.clear_ops();
     r.open().unwrap();
     let ops = r.fs.ops();
+    // Opening the store syncs the store directory (format A.12 Open); the start then syncs the log directory.
+    assert_eq!((ops[0].op, ops[0].ok), (FaultOp::SyncDir, true));
+    assert_eq!(ops[0].path, dir());
+    let ops = &ops[1..];
     assert_eq!((ops[0].op, ops[0].ok), (FaultOp::SyncDir, true));
     assert!(ops[0].path.ends_with("log"));
     // Step 3 syncs the kept segments and then the directory, before the manifest is touched.
@@ -2167,9 +2180,10 @@ fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
     let ops = r.fs.ops();
     assert_eq!(
         ops.len(),
-        1,
+        2,
         "nothing written or deleted after the failed directory sync: {ops:?}"
     );
+    assert_eq!((ops[1].op, ops[1].ok), (FaultOp::SyncDir, false));
 }
 
 #[test]
@@ -2693,7 +2707,7 @@ fn an_unused_segment_below_a_header_only_segment_left_by_a_cut_start_is_reported
     r.fs.restart();
     let unused = r.unused_bytes_beyond(Some(m));
     assert!(unused > 0);
-    r.fs.crash_after(11);
+    r.fs.crash_after(12);
     assert!(r.open().is_none());
     r.w = None;
     r.fs.power_loss_partial(5);

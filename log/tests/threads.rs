@@ -476,8 +476,14 @@ fn a_mark_sync_on_request_and_progress_for_watchers() {
     let mut c = cfg();
     c.mark_sync = kvik_log::writer::MarkSync::Interval(Duration::from_secs(3600));
     let log = start(fs, Path::new("store"), c);
+    let first = log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    assert_eq!(
+        log.stats().mark_synced,
+        first.last,
+        "the segment's first batch syncs the mark (Q-630)"
+    );
     let seen = log.wait_progress(0, Duration::ZERO);
-    let ack = log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    let ack = log.submit(vec![fact(1, 1)]).unwrap().wait().unwrap();
     // The watcher sees a turn after the acknowledgement, and the stats show it durable.
     assert!(log.wait_progress(seen, Duration::from_secs(5)) > seen);
     assert_eq!(log.stats().durable, ack.last);

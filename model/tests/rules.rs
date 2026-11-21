@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
+use kvik_model::engine::{Alert, Corruption};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
     Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, MarkSync,
@@ -160,6 +161,28 @@ fn s2_5_unsynchronised_clock() {
         .find(|f| f.position == p)
         .unwrap();
     assert!(f.flags.host_time && !f.flags.unsynced_clock);
+}
+
+/// §2.2, Q-74: a fact flagged `unsynced_clock` does not raise the lateness
+/// reference, live or as a start rebuilds it.
+#[test]
+fn s2_2_an_unsynchronised_fact_leaves_the_lateness_reference_live_and_after_a_restart() {
+    let (mut m, s) = model(10 * SECOND);
+    let now = m.wall;
+    m.ingest(vec![Reading::num(s, now - 100 * SECOND, 1.0)])
+        .unwrap();
+    m.clock_synchronised = false;
+    m.ingest(vec![Reading::num(s, now + HOUR, 2.0)]).unwrap();
+    m.clock_synchronised = true;
+    let late_at = |m: &mut Model, t: Nanos| {
+        let p = m.ingest(vec![Reading::num(s, t, 3.0)]).unwrap().positions[0];
+        let f = m.facts().unwrap().into_iter().find(|f| f.position == p);
+        f.unwrap().flags.late
+    };
+    assert!(!late_at(&mut m, now - 50 * SECOND));
+    assert!(late_at(&mut m, now - 130 * SECOND));
+    m.restart();
+    assert!(!late_at(&mut m, now - 60 * SECOND));
 }
 
 #[test]
@@ -723,8 +746,10 @@ fn s5_2_text_nodes_carry_coverage() {
 /// nor compacted is the only copy; corruption there loses its range, which is
 /// recorded as a lost range and reported as `data_lost`, so its positions are
 /// not issued again (§3 Recovery rule 2, invariant 1). It is never repaired in
-/// place. The model loses the whole segment, not only the damaged region, and
-/// its quarantine stays fatal (see `OPEN-QUESTIONS.md`).
+/// place. The model loses the whole segment, not only the damaged region (see
+/// `OPEN-QUESTIONS.md`). The error ends with the lost-range record (§8
+/// Corrupt block): health is degraded by the loss, not fatal, and the
+/// corruption alerts (§8 Self-repair).
 #[test]
 fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     let (mut m, s) = model(10 * SECOND);
@@ -748,9 +773,14 @@ fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     assert!(m.disk.all_facts().is_empty());
     assert_eq!(m.disk.lost_ranges(), vec![(p, p)], "the range is recorded");
     let h = m.health();
-    assert_eq!(h.level, Level::Fatal);
-    assert!(h.reasons.contains(&Reason::Quarantined(f)));
+    assert_eq!(h.level, Level::Degraded);
+    assert!(!h.reasons.contains(&Reason::Quarantined(f)));
     assert!(h.reasons.contains(&Reason::DataLost(p, p)));
+    assert!(
+        m.attention()
+            .iter()
+            .any(|a| matches!(a, Alert::Corruption(Corruption::File(g, Some(_))) if *g == f))
+    );
     // Its positions are not issued again, also after a restart.
     m.restart();
     let next = m
@@ -1099,6 +1129,29 @@ fn s3_timed_mark_sync_forced_by_a_definition_and_a_cursor() {
     assert!(m.disk.synced_mark.unwrap().last >= m.disk.cursors[&C]);
 }
 
+/// §3 Commit, Q-630: under the timed sync the first batch in a segment is
+/// acknowledged only once the mark naming it is synced, so a power loss keeps
+/// it; the batches after it in the segment wait for the timer.
+#[test]
+fn s3_the_first_batch_in_a_segment_syncs_the_mark() {
+    let (mut m, s) = timed_consumer_model();
+    m.seal_active();
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    assert_eq!(m.disk.synced_mark.unwrap().last, first);
+    assert_eq!(Some(m.disk.synced_mark.unwrap().file), m.disk.active);
+    for i in 1..3 {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, 1.0)])
+            .unwrap();
+    }
+    assert_eq!(m.disk.synced_mark.unwrap().last, first);
+    m.crash();
+    assert_eq!(
+        m.power_loss_losing(3),
+        2,
+        "the segment's first batch is kept"
+    );
+}
+
 /// §3 Recovery rule 1, accepted limit: a remount within the boot loses the
 /// mark's updates since its last sync; with exactly one complete batch beyond
 /// the synced mark, recovery truncates it, though it was acknowledged and
@@ -1201,7 +1254,7 @@ fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
         (losses[1].kind, losses[1].identity, losses[1].mark_state),
         (LossKind::PossibleLoss, at, MarkState::Missing)
     );
-    assert_eq!(m.health().level, Level::Degraded, "until acknowledged");
+    assert_eq!(m.health().level, Level::Degraded, "until closed");
     assert_eq!(
         m.reset_points(),
         vec![ResetPoint {
@@ -3426,6 +3479,46 @@ fn s2_2_changed_at_on_versioned_series_only() {
     }
     m.ingest(vec![Reading::versioned(v, T0, 1.0, 1)]).unwrap();
     assert_eq!(m.current().unwrap()[&(v, T0)].changed_at, Some(1));
+}
+
+/// §2.2, Q-195: a `changed_at` of kind `time` above `i64::MAX` is refused and
+/// counted; one of kind `version` is not.
+#[test]
+fn s2_2_a_time_changed_at_above_i64_max_is_refused() {
+    let (mut m, version) = versioned_model();
+    let time = m
+        .define_with(
+            "site/forecast-1/issued",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Time)
+            },
+        )
+        .unwrap();
+    let max = i64::MAX as u64;
+    for c in [max + 1, u64::MAX] {
+        assert_eq!(
+            m.emit(Reading::versioned(time, T0, 1.0, c)),
+            Err(Refusal::ChangedAtOutOfRange.into())
+        );
+    }
+    assert_eq!(m.counters.refused[&Refusal::ChangedAtOutOfRange], 2);
+    assert_eq!(
+        m.emit_revise(Reading::versioned(time, T0, 1.0, max + 1)),
+        Err(Refusal::ReviseOnVersioned.into())
+    );
+    m.ingest(vec![
+        Reading::versioned(time, T0, 1.0, max),
+        Reading::versioned(version, T0, 1.0, u64::MAX),
+    ])
+    .unwrap();
+    let current = m.current().unwrap();
+    assert_eq!(current[&(time, T0)].changed_at, Some(max));
+    assert_eq!(current[&(version, T0)].changed_at, Some(u64::MAX));
 }
 
 /// §2.1 `timing`: a forecast series "must be versioned with `changed_at kind`

@@ -293,6 +293,7 @@ fn scripted_restore_replays_then_is_done() {
         store_id: ID,
         record: record(),
         resumed: false,
+        unnamed: Vec::new(),
     };
     let mut d = ScriptedRestore {
         prepared: [Ok(prepared.clone())].into(),

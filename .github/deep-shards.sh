@@ -30,6 +30,8 @@ recovery        model recovery_histories
 edge_cases      model edge_cases
 rules           model rules
 open_questions  model open_questions
+durability      model durability
+self_repair     model self_repair
 model           model model
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
@@ -40,9 +42,13 @@ log-writer      log   writer
 log-recovery    log   recovery    --rest
 log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
+log-seal-describe log seal_describe
+log-scan-bound  log   scan_bound
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
+kvik-patterns   kvik  patterns
 kvik-restore-plan kvik restore_plan_model
+kvik-durable    kvik  durable_differential
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 files-records   files records
@@ -57,6 +63,8 @@ backup-keys     backup keys
 backup-upload   backup upload_histories
 backup-plan     backup restore_plan
 backup-restore  backup restore_properties
+backup-chain    backup restore_chain_properties
+export-layout   export layout
 '
 
 cd "$(dirname "$0")/.."

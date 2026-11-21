@@ -11,6 +11,7 @@ use kvik_log::reader::{LogReader, ReaderConfig as LogReaderConfig, ReaderError};
 use super::LogClock;
 use super::clock::Clocks;
 use super::index::{Index, pos};
+use super::loss::Latch;
 use crate::backend::Error;
 use crate::env::Env;
 use crate::error::{OpenError, QueryError};
@@ -43,6 +44,9 @@ pub(crate) struct DurableReader {
     clocks: Arc<Clocks>,
     /// The site zone at creation, from the store descriptor: in force before the first site-zone entry (spec §5.7).
     created_zone: String,
+    /// Where the losses its reads find go: the writer's, for the reader of its own process.
+    latch: Arc<Latch>,
+    store_id: [u8; 16],
 }
 
 pub(crate) fn open_error(dir: &Path, e: ReaderError) -> OpenError {
@@ -86,15 +90,17 @@ impl DurableReader {
             env,
             lease_refresh,
             Arc::new(Clocks::new(env.clock.clone())),
+            Arc::default(),
         )
     }
 
-    /// [`DurableReader::open`] with the window clock and refresh instants of the process.
+    /// [`DurableReader::open`] with the window clock, refresh instants and loss latch of the process.
     pub(crate) fn open_with(
         dir: &Path,
         env: &Env,
         lease_refresh: Duration,
         clocks: Arc<Clocks>,
+        latch: Arc<Latch>,
     ) -> Result<Self, OpenError> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
@@ -107,9 +113,8 @@ impl DurableReader {
         );
         cfg.lease_refresh = lease_refresh;
         let log = LogReader::open(cfg).map_err(|e| open_error(dir, e))?;
-        let created_zone = kvik_log::store::read_descriptor(&*env.fs, dir)
-            .map_err(|e| super::store_error(dir, e))?
-            .site_zone;
+        let descriptor = kvik_log::store::read_descriptor(&*env.fs, dir)
+            .map_err(|e| super::store_error(dir, e))?;
         Ok(DurableReader {
             dir: dir.to_path_buf(),
             state: Mutex::new(State {
@@ -117,7 +122,9 @@ impl DurableReader {
                 index: Index::default(),
             }),
             clocks,
-            created_zone,
+            created_zone: descriptor.site_zone,
+            store_id: descriptor.store_id,
+            latch,
         })
     }
 
@@ -136,6 +143,11 @@ impl DurableReader {
         &self.created_zone
     }
 
+    /// The store id, from the descriptor read at open.
+    pub(crate) fn store_id(&self) -> [u8; 16] {
+        self.store_id
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -151,7 +163,10 @@ impl DurableReader {
             return Err(QueryError::Closed);
         };
         let update = log.refresh().map_err(|e| query_error(&self.dir, e))?;
-        s.index.apply(&update.events);
+        let found = s.index.apply(&update.events, update.state.durable);
+        if !found.is_empty() {
+            self.latch.note(&found);
+        }
         f(&s.index, log).map_err(Error::query)
     }
 

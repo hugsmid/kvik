@@ -21,8 +21,10 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 ## Intended shape
 1. **Log.** Readings are validated, stamped and appended to the log in batches; a batch is synced before
    anything else sees it (group commit; no added delay after a quiet period; batch syncs due at least
-   `min_sync_interval`, default 10 ms, apart).
-2. **Delivery.** Only after the sync, funnels deliver to consumers and live state updates. A funnel is a route
+   `min_sync_interval`, default 10 ms, apart), except a batch of series at the faster durability level, seen once
+   written, its sync starting within `max_unsynced` (spec §2.1 `durability`).
+2. **Delivery.** Only after its acknowledgement (the sync, or the write at the faster level), funnels deliver to
+   consumers and live state updates. A funnel is a route
    compiled from configuration: series selection, optional windowed operator, condition, consumer. A consumer
    that falls behind catches up from the log; it never blocks the log or other consumers.
 3. **Summary tree.** Per series, summaries over time: stored 1-minute and 15-minute nodes, calendar days and
@@ -69,6 +71,16 @@ a caller who needs lower latency at high rates sets it lower or to 0.
 with ALP for decimal `f64` data, about 1 % for the same series declared as scaled `i64`, and larger than Parquet's
 dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
+
+**Crafted files.** The restart budget covers files the engine wrote, damaged or not; an undamaged segment is read in
+one pass of direct checksums (Q-231). A file crafted by a process with write access to the store has its cost
+bounded by `format.md` A, common rules (scan bound; Q-110): about 2L bytes checksummed and 16 block headers per 8 bytes
+for a file of L bytes, and failed full reads checking at most 16 MiB of body per window (8 MiB in a segment, 16 MiB in
+the manifest), past which the rest of the window is passed as damaged and reported with the damage around it; damage
+does not reach that budget. A crafted segment costs at most about 2 s at 64 MiB and 0.6 s at 16 MiB, a crafted
+manifest about 0.25 s per 16 MiB at a start and 0.45 s at a refresh (Q-230). That is above the 1 s restart budget at
+64 MiB, which the Q-110 ruling meant crafted files to stay within: whether the promise or the bound changes is the
+owner's (Q-651).
 
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).

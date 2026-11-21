@@ -166,13 +166,8 @@ fn header_bytes(
     raw.try_into().map_err(|_| BlockFault::Header)
 }
 
-/// The header of the block at `offset`, without reading or checking its body: a cheap test before
-/// [`read_block`]. Type 0 is not a header.
-pub(crate) fn peek_header(bytes: &[u8], offset: u64, limit: u64) -> Option<BlockHeader> {
-    peek_raw(bytes, offset, limit).map(|(h, _)| h)
-}
-
-/// [`peek_header`] with the 16 header bytes as read.
+/// The header of the block at `offset` and its 16 bytes as read, without reading or checking its body: a cheap
+/// test before [`read_block`]. Type 0 is not a header.
 pub(crate) fn peek_raw(
     bytes: &[u8],
     offset: u64,
@@ -192,6 +187,17 @@ pub(crate) fn read_block(
     offset: u64,
     limit: u64,
 ) -> Result<RawBlock<'_>, BlockFault> {
+    read_block_with(bytes, offset, limit, |_, body| crc32c(body))
+}
+
+/// [`read_block`] with the body checksum taken from `body_crc(body_offset, body)`, so a scan can derive it from a
+/// prefix table (Q-110).
+pub(crate) fn read_block_with<'a>(
+    bytes: &'a [u8],
+    offset: u64,
+    limit: u64,
+    body_crc: impl FnOnce(u64, &'a [u8]) -> u32,
+) -> Result<RawBlock<'a>, BlockFault> {
     #[cfg(test)]
     BLOCK_READS.with(|c| c.set(c.get() + 1));
     let header_end = offset
@@ -209,7 +215,7 @@ pub(crate) fn read_block(
         return Err(BlockFault::Length);
     }
     let body = slice(bytes, header_end, u64::from(header.body_len)).ok_or(BlockFault::Length)?;
-    if crc32c(body) != header.body_crc32c {
+    if body_crc(header_end, body) != header.body_crc32c {
         return Err(BlockFault::Body);
     }
     // Padding is not checked (`format.md` A, common rules).

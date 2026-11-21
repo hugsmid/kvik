@@ -68,16 +68,20 @@ fn check_objects(h: &Harness) {
                 env.seal(&k, content).unwrap()
             }
             Some(ObjectName::Record { epoch, .. }) => {
-                let r = records
+                let i = records
                     .iter()
-                    .find(|r| r.epoch == epoch)
+                    .position(|r| r.epoch == epoch)
                     .expect("an object for a record not in the manifest");
-                env.seal(&k, &r.encode().unwrap()).unwrap()
+                env.seal(&k, &uploaded_form(&records, i)).unwrap()
             }
             other => panic!("unexpected object {k}: {other:?}"),
         };
         assert_eq!(v, want, "{k}");
     }
+    assert_eq!(
+        kvik_backup::plan::check_chain(&in_bucket(&h.sink.mem)),
+        Ok(())
+    );
     let log = lock(&h.sink.log);
     assert_eq!(log.violations, Vec::<String>::new());
 }

@@ -4,9 +4,13 @@
 //! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
 //! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
-use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
+use std::collections::BTreeSet;
+
+use crate::block::{BLOCK_HEADER_LEN, MAX_BODY_LEN, encode_block, read_block, read_block_with};
+use crate::crc::PrefixCrc;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
+use crate::scan::{FailedReads, ScanStats};
 
 /// An empty record.
 pub const RECORD_EMPTY: u8 = 0x20;
@@ -28,6 +32,8 @@ pub const RECORD_ACKNOWLEDGEMENT: u8 = 0x24;
 pub const RECORD_REBUILD: u8 = 0x28;
 /// Bytes of a record body before its field list.
 const RECORD_PREFIX: usize = 24;
+/// The bytes of a restore record's field 9 before its file description (`format.md` A.14 `0x25`).
+const RESTORED_FILE_FIXED: usize = 44;
 
 /// A position as written in a record: `(generation, sequence)`, 12 bytes.
 pub type RecordPosition = (u32, u64);
@@ -182,58 +188,121 @@ fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
     })
 }
 
-/// The record at `at`, if it is a valid record whose epoch is above `min_epoch`.
-fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, ManifestError> {
-    let Ok(b) = read_block(bytes, at, bytes.len() as u64) else {
-        return Ok(None);
-    };
-    let t = b.header.block_type;
-    let body = b.body;
-    if body.len() < RECORD_PREFIX {
-        return Ok(None);
-    }
-    let epoch = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
-    let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
-    let Some(list) = fields(&body[RECORD_PREFIX..]) else {
-        return Ok(None);
-    };
-    if epoch <= min_epoch {
-        return Ok(None);
-    }
-    let lost = match t {
-        RECORD_LOST_RANGE => match decode_lost(&list) {
-            Some(l) => Some(l),
-            None => return Ok(None),
-        },
-        RECORD_EMPTY
-        | RECORD_PUBLISH
-        | RECORD_SEALED
-        | RECORD_ACKNOWLEDGEMENT
-        | RECORD_REBUILD
-        | RECORD_RESTORE
-        | RECORD_QUARANTINE
-        | RECORD_TIER_MOVE => None,
-        _ if b.header.skippable() => None,
-        _ => {
-            return Err(ManifestError::Unsupported(FormatError::Unsupported {
-                offset: at,
-                element: Element::BlockType(t),
-            }));
+/// The record reads of one manifest read: body checksums from a prefix table asked at rising offsets, so a read
+/// checksums at most twice the file (`format.md` A, common rules: scan bound).
+struct Search<'a> {
+    bytes: &'a [u8],
+    sums: PrefixCrc<'a>,
+    headers: u64,
+    body: u64,
+    failed: FailedReads,
+}
+
+impl<'a> Search<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            sums: PrefixCrc::new(bytes),
+            headers: 0,
+            body: 0,
+            failed: FailedReads::new(u64::from(MAX_BODY_LEN)),
         }
-    };
-    Ok(Some(Record {
-        offset: at,
-        end: b.next_offset(),
-        record_type: t,
-        epoch,
-        generation,
-        lost,
-    }))
+    }
+
+    fn stats(&self) -> ScanStats {
+        ScanStats {
+            bytes_checksummed: self.sums.checksummed(),
+            headers_visited: self.headers,
+            bytes_body_checked: self.body,
+            failed_bytes_peak: self.failed.peak(),
+        }
+    }
+
+    /// The record at `at`, if it is a valid record whose epoch is above `min_epoch`.
+    fn record_at(&mut self, at: u64, min_epoch: u64) -> Result<Option<Record>, ManifestError> {
+        let bytes = self.bytes;
+        let sums = &mut self.sums;
+        sums.forget_below(at);
+        let crc = |start, body: &[u8]| {
+            sums.range(start, body.len() as u64)
+                .unwrap_or_else(|| crate::crc::crc32c(body))
+        };
+        self.headers += 1;
+        let Ok(b) = read_block_with(bytes, at, bytes.len() as u64, crc) else {
+            return Ok(None);
+        };
+        let t = b.header.block_type;
+        let body = b.body;
+        if body.len() < RECORD_PREFIX {
+            return Ok(None);
+        }
+        let epoch = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
+        if epoch <= min_epoch {
+            return Ok(None);
+        }
+        let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
+        self.body += body.len() as u64;
+        let Some(list) = fields(&body[RECORD_PREFIX..]) else {
+            self.failed.charge(at, body.len() as u64);
+            return Ok(None);
+        };
+        let lost = match t {
+            RECORD_LOST_RANGE => match decode_lost(&list) {
+                Some(l) => Some(l),
+                None => {
+                    self.failed.charge(at, body.len() as u64);
+                    return Ok(None);
+                }
+            },
+            RECORD_EMPTY
+            | RECORD_PUBLISH
+            | RECORD_SEALED
+            | RECORD_ACKNOWLEDGEMENT
+            | RECORD_REBUILD
+            | RECORD_RESTORE
+            | RECORD_QUARANTINE
+            | RECORD_TIER_MOVE => None,
+            _ if b.header.skippable() => None,
+            _ => {
+                return Err(ManifestError::Unsupported(FormatError::Unsupported {
+                    offset: at,
+                    element: Element::BlockType(t),
+                }));
+            }
+        };
+        Ok(Some(Record {
+            offset: at,
+            end: b.next_offset(),
+            record_type: t,
+            epoch,
+            generation,
+            lost,
+        }))
+    }
 }
 
 /// Reads a manifest (A.14, `spec.md` §7 Manifest): its records up to the first invalid one; an invalid record
 /// followed, at an 8-byte boundary, by a valid record of a higher epoch is corrupt.
 pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, ManifestError> {
+    read_manifest_with_stats(bytes, store_id).0
+}
+
+/// [`read_manifest`], with the work it did; [`ScanStats::within_bound`] holds for every input (`format.md` A, common
+/// rules: scan bound).
+pub fn read_manifest_with_stats(
+    bytes: &[u8],
+    store_id: &[u8; 16],
+) -> (Result<ManifestRead, ManifestError>, ScanStats) {
+    let mut search = Search::new(bytes);
+    let r = read_all(bytes, store_id, &mut search);
+    (r, search.stats())
+}
+
+fn read_all(
+    bytes: &[u8],
+    store_id: &[u8; 16],
+    search: &mut Search<'_>,
+) -> Result<ManifestRead, ManifestError> {
     let h = FileHeader::decode(bytes).ok_or(ManifestError::Header)?;
     if h.format_major > crate::FORMAT_MAJOR {
         return Err(ManifestError::Unsupported(FormatError::Unsupported {
@@ -248,7 +317,7 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
     let mut at = HEADER_LEN as u64;
     while at < bytes.len() as u64 {
         let min = records.last().map_or(0, |r| r.epoch);
-        match record_at(bytes, at, min)? {
+        match search.record_at(at, min)? {
             Some(r) => {
                 at = r.end;
                 records.push(r);
@@ -257,11 +326,18 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
         }
     }
     let valid_end = at.min(bytes.len() as u64);
-    // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced.
+    // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced. Past
+    // the failed reads' budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan
+    // bound).
     let min = records.last().map_or(0, |r| r.epoch);
     let mut probe = valid_end + 8;
     while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
-        if record_at(bytes, probe, min)?.is_some() {
+        let next = search.failed.next_from(probe);
+        if next != probe {
+            probe = next;
+            continue;
+        }
+        if search.record_at(probe, min)?.is_some() {
             return Err(ManifestError::Corrupt(valid_end));
         }
         probe += 8;
@@ -335,6 +411,40 @@ pub fn encode_initial(store_id: [u8; 16], created_at: i64) -> Vec<u8> {
         .encode()
         .to_vec();
     out.extend(encode_record(RECORD_EMPTY, 1, 0, created_at, None));
+    out
+}
+
+/// The generation and file id of each log segment that valid records name (`format.md` A.14): field 1 of a
+/// sealed-segment record, fields 1 and 2 of a publish-and-retire record and field 9 of a restore record (past its
+/// tier, copy size and copy hash), each a file description of kind 1 (Q-221 (b)). A value too short to hold a kind,
+/// generation and `file_id` names nothing.
+pub fn listed_segments(bytes: &[u8], read: &ManifestRead) -> BTreeSet<(u32, u64)> {
+    let mut out = BTreeSet::new();
+    for r in &read.records {
+        let (named, skip): (&[u16], usize) = match r.record_type {
+            RECORD_SEALED => (&[1], 0),
+            RECORD_PUBLISH => (&[1, 2], 0),
+            RECORD_RESTORE => (&[9], RESTORED_FILE_FIXED),
+            _ => continue,
+        };
+        let Ok(b) = read_block(bytes, r.offset, bytes.len() as u64) else {
+            continue;
+        };
+        let Some(list) = b.body.get(RECORD_PREFIX..).and_then(fields) else {
+            continue;
+        };
+        for (_, v) in list.iter().filter(|(id, _)| named.contains(id)) {
+            let Some(v) = v.get(skip..) else {
+                continue;
+            };
+            if v.first() == Some(&kind::LOG_SEGMENT)
+                && let Some(g) = v.get(4..8).and_then(|b| b.try_into().ok())
+                && let Some(id) = v.get(8..16).and_then(u64_of)
+            {
+                out.insert((u32::from_le_bytes(g), id));
+            }
+        }
+    }
     out
 }
 
@@ -479,5 +589,95 @@ mod tests {
         assert_eq!(r.last_epoch(), 6);
         assert_eq!(r.records.len(), 6);
         assert!(r.records.iter().all(|x| x.lost.is_none()));
+    }
+
+    /// `n` block headers 16 bytes apart after a damaged word, each claiming a body that runs to the end of the file
+    /// with a wrong checksum: every one is read by the forward search.
+    fn nested_records(n: u64) -> Vec<u8> {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [2; 16])
+            .encode()
+            .to_vec();
+        f.extend_from_slice(&[0xFF; 8]);
+        let base = f.len() as u64;
+        let len = base + 16 * n + 64;
+        for i in 0..n {
+            let o = base + 16 * i;
+            let h = crate::block::BlockHeader {
+                block_type: 0x50,
+                flags: crate::block::FLAG_SKIPPABLE,
+                body_len: (len - o - 16) as u32,
+                body_crc32c: 0xDEAD_BEEF,
+            };
+            f.extend_from_slice(&h.encode());
+        }
+        f.resize(len as usize, 0x11);
+        f
+    }
+
+    #[test]
+    fn the_forward_search_over_nested_records_checksums_linear_bytes() {
+        for n in [500u64, 1_000, 2_000] {
+            let f = nested_records(n);
+            let len = f.len() as u64;
+            let bound = 2 * len + 12 * (len / 8);
+            // Each candidate's body checksummed directly, as before the prefix table.
+            let direct: u64 = (0..n).map(|i| len - 88 - 16 * i).sum();
+            assert!(direct > bound);
+            crate::crc::BYTES_HASHED.with(|c| c.set(0));
+            let r = read_manifest(&f, &[2; 16]).unwrap();
+            let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
+            assert!(r.records.is_empty() && r.torn);
+            // Twice the file in bodies, and a 12-byte header checksum per 8-byte step.
+            assert!(hashed <= bound, "{hashed} bytes hashed for {len}");
+        }
+    }
+
+    #[test]
+    fn records_of_a_lower_epoch_have_no_fields_parsed() {
+        let mut m = encode_initial([2; 16], 0);
+        m.extend(encode_record(RECORD_EMPTY, 9, 0, 1, None));
+        let kept = m.len() as u64 - HEADER_LEN as u64 - 2 * BLOCK_HEADER_LEN as u64;
+        m.extend_from_slice(&[0xFF; 8]);
+        let mut body = 3u64.to_le_bytes().to_vec();
+        body.resize(4_096, 0);
+        for _ in 0..50 {
+            encode_block(0x50, crate::block::FLAG_SKIPPABLE, &body, &mut m).unwrap();
+        }
+        let (r, stats) = read_manifest_with_stats(&m, &[2; 16]);
+        let r = r.unwrap();
+        assert!(r.torn);
+        assert_eq!(stats.bytes_body_checked, kept);
+        // The records and the damaged word, then one header per step of the forward search.
+        let steps = (m.len() as u64 - 16 - (r.valid_end + 8)) / 8 + 1;
+        assert_eq!(stats.headers_visited, 3 + steps);
+    }
+
+    #[test]
+    fn a_header_of_a_newer_major_another_kind_or_another_store_is_refused() {
+        let record = encode_record(RECORD_EMPTY, 1, 0, 0, None);
+        let with = |h: FileHeader| [h.encode().to_vec(), record.clone()].concat();
+        let mut newer = FileHeader::new(kind::MANIFEST, 0, 0, 0, [2; 16]);
+        newer.format_major = crate::FORMAT_MAJOR + 1;
+        assert!(matches!(
+            read_manifest(&with(newer), &[2; 16]),
+            Err(ManifestError::Unsupported(_))
+        ));
+        let segment = FileHeader::new(kind::LOG_SEGMENT, 0, 0, 0, [2; 16]);
+        assert_eq!(
+            read_manifest(&with(segment), &[2; 16]),
+            Err(ManifestError::Header)
+        );
+        let other = FileHeader::new(kind::MANIFEST, 0, 0, 0, [3; 16]);
+        assert_eq!(
+            read_manifest(&with(other), &[2; 16]),
+            Err(ManifestError::Header)
+        );
+        // A whole manifest is read with one header per record and no search.
+        let (r, stats) = read_manifest_with_stats(
+            &with(FileHeader::new(kind::MANIFEST, 0, 0, 0, [2; 16])),
+            &[2; 16],
+        );
+        assert!(!r.unwrap().torn);
+        assert_eq!(stats.headers_visited, 1);
     }
 }

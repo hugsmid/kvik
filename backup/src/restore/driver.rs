@@ -17,12 +17,15 @@ use sha2::{Digest, Sha256};
 use super::judge::{FileState, Verdict};
 use super::local::{self, Found, invalid};
 use super::{
-    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, codec,
-    probe,
+    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, probe,
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
-use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, records_to_read};
+use crate::plan::{
+    ChainBreak, PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, after_last, check_chain,
+    read_tail, records_to_read,
+};
+use crate::uploaded::UploadedRecord;
 use crate::{DriverFuture, LocalStore};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
@@ -38,6 +41,15 @@ pub struct Restorer<S, E> {
     nonce: Box<dyn FnMut() -> u64 + Send>,
     cfg: RestoreConfig,
     run: Option<Run<E>>,
+    /// The generation this restorer claimed, kept across failed `prepare` calls (Q-266).
+    claimed: Option<Claimed>,
+}
+
+#[derive(Clone, Copy)]
+struct Claimed {
+    store_id: [u8; 16],
+    generation: u32,
+    nonce: u64,
 }
 
 struct Pending {
@@ -199,8 +211,9 @@ async fn claim<S: BackupSink>(
 }
 
 /// The records a restore reads (`plan::records_to_read`, Q-108) of the highest generation below `generation` that has
-/// any.
-/// A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304).
+/// any. A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304). The
+/// records from the first read to the last listed must chain (Q-611), and `stat` must report no record after the last
+/// listed or, where the records read end before the listing, after the last read (Q-612).
 async fn source_records<S: BackupSink, E: Envelope>(
     sink: &S,
     env: &E,
@@ -220,30 +233,114 @@ async fn source_records<S: BackupSink, E: Envelope>(
                 _ => None,
             })
             .collect();
-        if listed.is_empty() {
+        let incomplete = RestoreError::ListingIncomplete { generation: g };
+        let Some(last) = listed.iter().map(|(e, _)| *e).max() else {
             // Q-304: absence from a listing proves nothing; a generation's first record is at epoch 1.
             if sink.stat(&keys.record(g, 1)).await?.is_some() {
-                return Err(RestoreError::ListingIncomplete { generation: g });
+                return Err(incomplete);
             }
             continue;
+        };
+        // Q-612: right after the listing, so that a record uploaded since, or hidden by it, is seen.
+        if any_reported(sink, keys, g, after_last(last)).await? {
+            return Err(incomplete);
         }
         listed.sort();
-        let mut out: Vec<Record> = Vec::with_capacity(listed.len());
+        let mut uploaded: Vec<UploadedRecord> = Vec::with_capacity(listed.len());
         for (epoch, key) in listed {
             let plain = open(env, &key, &sink.get(&key, None).await?)?;
-            let r = codec::decode_block(&plain)?;
-            if r.epoch != epoch {
+            let u = UploadedRecord::decode(&plain)?;
+            if u.record.epoch != epoch || u.record.generation != g {
                 return Err(RestoreError::Record(
                     kvik_files::record::RecordError::Invalid(
-                        "an uploaded record under another epoch's key",
+                        "an uploaded record under another record's key",
                     ),
                 ));
             }
-            out.push(r);
+            uploaded.push(u);
         }
-        return Ok((g, records_to_read(&out).to_vec()));
+        let records: Vec<Record> = uploaded.iter().map(|u| u.record.clone()).collect();
+        let read = records_to_read(&records);
+        // With nothing read the listing starts with an unfinished rebuilt manifest, checked from its first record.
+        let first = read.first().map_or(0, |f| {
+            records.iter().position(|r| r.epoch == f.epoch).unwrap_or(0)
+        });
+        match check_chain(&uploaded[first..]) {
+            Ok(()) => {}
+            Err(ChainBreak::Missing { previous, .. })
+                if reported(sink, keys, g, previous).await? =>
+            {
+                return Err(incomplete);
+            }
+            Err(
+                ChainBreak::Missing { epoch, previous } | ChainBreak::Forked { epoch, previous },
+            ) => {
+                return Err(RestoreError::BrokenChain {
+                    generation: g,
+                    epoch,
+                    previous,
+                });
+            }
+            Err(ChainBreak::Repeated { epoch }) => {
+                return Err(SinkError::Failed {
+                    reason: format!("a listing of generation {g}'s records repeats epoch {epoch}"),
+                }
+                .into());
+            }
+        }
+        if any_reported(sink, keys, g, read_tail(&records, read)).await? {
+            return Err(incomplete);
+        }
+        return Ok((g, read.to_vec()));
     }
     Err(PlanError::NoRecords.into())
+}
+
+/// Whether `stat` reports record `epoch` of generation `g`; an unanswered `stat` fails the restore (Q-612).
+async fn reported<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    epoch: u64,
+) -> Result<bool, RestoreError> {
+    Ok(sink.stat(&keys.record(g, epoch)).await?.is_some())
+}
+
+/// Whether `stat` reports any of `epochs`, asked in order until one is.
+async fn any_reported<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    epochs: impl IntoIterator<Item = u64>,
+) -> Result<bool, RestoreError> {
+    for e in epochs {
+        if reported(sink, keys, g, e).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The files of generation `g` in the bucket that no record of `source` names (Q-613).
+async fn unnamed<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    source: &Catalogue,
+) -> Result<Vec<FileRef>, RestoreError> {
+    let mut out = Vec::new();
+    for prefix in [keys.log_prefix(g), keys.files_prefix()] {
+        for k in list_all(sink, &prefix).await? {
+            if let Some(ObjectName::File { file, generation }) = keys.parse(&k)
+                && generation == g
+                && source.file(file).is_none()
+            {
+                out.push(file);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn by_position(files: &[RestoredFile]) -> Vec<RestoredFile> {
@@ -392,6 +489,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             nonce,
             cfg,
             run: None,
+            claimed: None,
         }
     }
 
@@ -423,7 +521,16 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
                 let store = fetch_store(&self.sink, &env, &keys).await?;
                 let appender = local::open_appender(&self.local, store_id)?;
                 self.finish(
-                    keys, env, appender, *written, *record, &lost, &store, wall, true,
+                    keys,
+                    env,
+                    appender,
+                    *written,
+                    *record,
+                    &lost,
+                    &store,
+                    wall,
+                    true,
+                    Vec::new(),
                 )
                 .await
             }
@@ -440,18 +547,38 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             probe::probe(&self.sink, &env, &keys, &mut *self.nonce).await?;
         }
         let highest = highest_claimed(&self.sink, &keys, 0).await?;
-        let nonce = (self.nonce)();
-        let generation = if self.drill() {
-            highest
-                .checked_add(1)
-                .ok_or(PlanError::GenerationsExhausted)?
-        } else {
-            claim(&self.sink, &keys, highest, nonce).await?
+        let mine = self
+            .claimed
+            .filter(|c| !self.drill() && c.store_id == store_id);
+        let (generation, nonce) = match mine {
+            // Q-266: a retry after a failure past the claim runs in the generation claimed, unless superseded.
+            Some(c) if highest > c.generation => {
+                return Err(RestoreError::Superseded { by: highest });
+            }
+            Some(c) => (c.generation, c.nonce),
+            None => {
+                let nonce = (self.nonce)();
+                let generation = if self.drill() {
+                    highest
+                        .checked_add(1)
+                        .ok_or(PlanError::GenerationsExhausted)?
+                } else {
+                    let generation = claim(&self.sink, &keys, highest, nonce).await?;
+                    self.claimed = Some(Claimed {
+                        store_id,
+                        generation,
+                        nonce,
+                    });
+                    generation
+                };
+                (generation, nonce)
+            }
         };
         let (source_generation, records) =
             source_records(&self.sink, &env, &keys, generation).await?;
         let source = Catalogue::replay(&records)
             .map_err(|_| PlanError::Invalid("the records read contradict each other"))?;
+        let unnamed = unnamed(&self.sink, &keys, source_generation, &source).await?;
         let plan = (self.plan)(&PlanInput {
             generation,
             nonce,
@@ -474,6 +601,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             &store,
             wall,
             false,
+            unnamed,
         )
         .await
     }
@@ -492,6 +620,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         store: &[u8],
         wall: i64,
         resumed: bool,
+        unnamed: Vec<FileRef>,
     ) -> Result<Prepared, RestoreError> {
         let g = record.generation;
         // `record.drill` is the configured mode here: `prepare_inner` refuses a directory of the other mode and
@@ -499,12 +628,14 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         if !record.drill {
             appender.settle(written.epoch, wall)?;
             let key = keys.record(g, written.epoch);
-            let sealed = env.seal(
-                &key,
-                &written
-                    .encode()
-                    .map_err(|e| RestoreError::Append(e.into()))?,
-            )?;
+            // A generation's first record names no predecessor (format A.17, Q-610).
+            let plain = UploadedRecord {
+                previous: 0,
+                record: written.clone(),
+            }
+            .encode()
+            .map_err(|e| RestoreError::Append(e.into()))?;
+            let sealed = env.seal(&key, &plain)?;
             let sha = sha256(&sealed);
             self.sink.put(&key, sealed.into(), sha).await?;
             let top = highest_claimed(&self.sink, &keys, g).await?;
@@ -537,6 +668,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             store_id: keys.store_id(),
             record,
             resumed,
+            unnamed,
         })
     }
 

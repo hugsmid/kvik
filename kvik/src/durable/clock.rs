@@ -1,10 +1,8 @@
 //! The window clock and the refresh instants of live staleness, kept per process.
 //!
-//! `now` (spec §6) is an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by
-//! the monotonic clock. Live staleness of an observed series (spec §5.4) is measured on the monotonic clock since
-//! the series' last commit of a fact that is not bad quality, not a future fact and not outranked, taken when the
-//! log acknowledges the call (after the covering sync, whether or not anyone waits for it); the instant lives only in the writer's process, so a reader process, and the writer before its first such commit, measure
-//! it in event time, `now − t` of the live-state fact, as the reference model does after a restart (Q-16).
+//! `now` (spec §6) never runs backwards: max(system clock, previous value), advanced by the monotonic clock. Live
+//! staleness of an observed series (spec §5.4, Q-16) is measured on the monotonic clock since the call that last
+//! refreshed it was acknowledged; a reader process, and the writer before such a call, measure it in event time.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

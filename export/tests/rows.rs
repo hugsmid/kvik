@@ -289,6 +289,12 @@ fn columns_come_in_the_documented_order_with_the_documented_nullability() {
             .map(|(n, o)| (n.to_string(), *o))
             .collect();
         assert_eq!(column_order(&file), expected, "{:?}", series.value);
+        for (name, _) in &expected {
+            assert!(
+                !["site", "series", "area", "device", "metric", "month"].contains(&name.as_str()),
+                "{name} is a partition column of the partitioned layout"
+            );
+        }
     }
 }
 
@@ -308,6 +314,51 @@ fn every_column_chunk_is_zstd_compressed() {
             c.column_path()
         );
     }
+}
+
+#[test]
+fn quality_columns_are_dictionary_encoded() {
+    let rows: Vec<ExportRow> = (0..64)
+        .map(|i| row(1, i, i as u64 + 1, Value::F64(1.0)))
+        .collect();
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(&file),
+    )
+    .unwrap();
+    for c in b.metadata().row_group(0).columns() {
+        let name = c.column_path().string();
+        if name == column::QUALITY || name == column::SUPPLIED_QUALITY {
+            assert!(
+                c.encodings()
+                    .any(|e| e == parquet::basic::Encoding::RLE_DICTIONARY),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_settled_defaults_are_the_current_view_131072_rows_a_group_and_zstd_level_1() {
+    let options = ExportOptions::default();
+    assert_eq!(options.view, View::Current);
+    assert_eq!(options.row_group_rows, 131_072);
+    assert_eq!(kvik_export::ZSTD_LEVEL, 1);
+    let rows: Vec<ExportRow> = (0..131_073)
+        .map(|i| row(1, i, i as u64 + 1, Value::F64(0.0)))
+        .collect();
+    let file = export_to_vec(&f64_series(1), &rows, &options).unwrap();
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(&file),
+    )
+    .unwrap();
+    let groups: Vec<i64> = b
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|g| g.num_rows())
+        .collect();
+    assert_eq!(groups, vec![131_072, 1]);
 }
 
 #[test]
@@ -349,7 +400,7 @@ fn file_metadata_names_the_series_view_and_range() {
     let file = export_to_vec(&f64_series(1), &[], &options).unwrap();
     let f = open(&file);
     for (k, v) in [
-        ("kvik.export_version", "0"),
+        ("kvik.export_version", "1"),
         ("kvik.series_id", "1"),
         ("kvik.series_name", "site/meter/power"),
         ("kvik.unit", "W"),

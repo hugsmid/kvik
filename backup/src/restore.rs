@@ -16,7 +16,6 @@ use crate::envelope::EnvelopeError;
 use crate::plan::{PlanError, PlanMode};
 use crate::upload::Refused;
 
-mod codec;
 mod driver;
 mod judge;
 mod local;
@@ -46,6 +45,9 @@ pub struct Prepared {
     pub record: RestoreRecord,
     /// The directory already held this record.
     pub resumed: bool,
+    /// Files of the source generation in the bucket that no record read names, which the restore leaves out (Q-613);
+    /// empty on a resume.
+    pub unnamed: Vec<FileRef>,
 }
 
 /// What one [`RestoreDriver::step`] did.
@@ -117,11 +119,24 @@ pub enum RestoreError {
         /// The higher generation.
         by: u32,
     },
-    /// A generation's records list empty while `stat` reports its first record: the listing lags; retry (Q-304).
+    /// A record the listing of a generation's records does not show is reported by `stat`: the listing lags; retry
+    /// (Q-304, Q-611, Q-612).
     #[error("the listing of generation {generation}'s records is incomplete; retry")]
     ListingIncomplete {
         /// The generation.
         generation: u32,
+    },
+    /// A record of the generation read names a predecessor the bucket does not hold before it (format A.17; Q-611).
+    #[error(
+        "generation {generation}'s record {epoch} names record {previous}, which breaks the chain of its records"
+    )]
+    BrokenChain {
+        /// The generation.
+        generation: u32,
+        /// The record.
+        epoch: u64,
+        /// The epoch it names.
+        previous: u64,
     },
     /// No plan can be made.
     #[error(transparent)]

@@ -256,6 +256,7 @@ pub fn entry_to_event(e: &Entry) -> RegistryEvent {
                     }),
                     _ => None,
                 },
+                durability: kvik_model::registry::Durability::Synced,
             },
         },
         Entry::Alias { id, name } => RegistryEvent::Alias {

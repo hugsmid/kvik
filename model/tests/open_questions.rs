@@ -680,11 +680,11 @@ fn q73_record_on_change_series_records_every_reading() {
     assert_eq!(m.ingest(polls).unwrap().positions.len(), 10);
 }
 
-/// Q-74: the first clause of `late` compares with the series' latest
-/// recorded `t`, which a `future`-flagged reading a day ahead raises; every
-/// later on-time reading is then flagged `late`.
+/// Q-74: the first clause of `late` compares with the lateness reference,
+/// which leaves out a `future`-flagged reading a day ahead, so later on-time
+/// readings are not `late`.
 #[test]
-fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
+fn q74_a_far_future_reading_leaves_later_on_time_readings_on_time() {
     let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
     let s = m
         .define(
@@ -717,9 +717,9 @@ fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
         vec![
             (false, false),
             (true, false),
-            (false, true),
-            (false, true),
-            (false, true)
+            (false, false),
+            (false, false),
+            (false, false)
         ]
     );
 }
@@ -889,4 +889,159 @@ fn q77_day_whose_midnight_occurs_twice_starts_at_the_earlier() {
         (utc("2026-11-01T04:00:00Z"), utc("2026-11-02T05:00:00Z"))
     );
     assert_eq!(nov1.node.count, 150);
+}
+
+/// A store with the timed mark sync, one consumer and a series at the
+/// `written` level (§2.1 `durability`).
+fn written_level_store() -> (
+    kvik_model::engine::Model,
+    kvik_model::engine::ConsumerId,
+    SeriesId,
+) {
+    use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, MarkSync, Model, Selection};
+    use kvik_model::registry::Durability;
+    let c = ConsumerId(1);
+    let consumer = ConsumerDecl {
+        id: c,
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let cfg = Config {
+        mark_sync: MarkSync::Timed,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![consumer], T0 + 3_600 * SECOND);
+    let s = m
+        .define_with(
+            "market/feed/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            10 * SECOND,
+            SeriesOptions::durability(Durability::Written),
+        )
+        .unwrap();
+    m.drain().unwrap();
+    (m, c, s)
+}
+
+/// Q-250 (open, the owner's ruling): flagged batches acknowledged and
+/// delivered, then removed whole by a remount within the boot, leave nothing
+/// beyond the mark; the start sees a clean crash and gives their positions
+/// again with no reset point and no `possible_loss`.
+#[test]
+fn q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again() {
+    let (mut m, c, s) = written_level_store();
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    m.ingest(vec![Reading::num(s, T0 + 1, 2.0)]).unwrap();
+    assert_eq!(m.poll(c, 10).unwrap()[0].position, first, "delivered");
+    m.remount();
+    m.restart();
+    assert!(m.recovery_entries().is_empty());
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, first, "given again with no reset point");
+}
+
+/// Q-250 (open): a remount after which the first flagged batch reached the
+/// disk and the second did not: rule 1 keeps the first, and the second's
+/// position is given again with no reset point.
+#[test]
+fn q250_a_remount_keeping_part_of_the_flagged_batches_gives_the_rest_again() {
+    let (mut m, c, s) = written_level_store();
+    let kept = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    let lost = m
+        .ingest(vec![Reading::num(s, T0 + 1, 2.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(m.poll(c, 10).unwrap().len(), 2, "both delivered");
+    m.remount_keeping(1);
+    m.restart();
+    assert!(m.disk.live_entries().contains_key(&kept));
+    assert!(m.recovery_entries().is_empty());
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, lost, "given again with no reset point");
+}
+
+/// Q-254 (open, the owner's ruling): flagged batches acknowledged and
+/// delivered, then a failed sync; the pages whose write-back failed are
+/// clean and reclaimed before a restart on the same boot, so rule 1 finds
+/// nothing beyond the mark and gives their positions again with no report.
+#[test]
+fn q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positions_again() {
+    use kvik_model::engine::{Fault, WriteOutcome};
+    let (mut m, c, s) = written_level_store();
+    let slow = m
+        .define(
+            "site/meter/energy",
+            Kind::Gauge,
+            ValueType::Number,
+            "kWh",
+            10 * SECOND,
+        )
+        .unwrap();
+    let synced = m
+        .ingest(vec![Reading::num(slow, T0, 1.0)])
+        .unwrap()
+        .positions[0];
+    assert!(
+        m.disk.synced_mark.unwrap().last < synced,
+        "the mark file lags"
+    );
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    let got = m.poll(c, 10).unwrap();
+    assert_eq!(got.last().unwrap().position, first, "delivered");
+    let _ = m.emit(Reading::num(s, T0 + 1, 2.0));
+    assert!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Lost)))
+            .is_err()
+    );
+    m.crash();
+    m.evict_failed_write_back().unwrap();
+    m.restart();
+    assert!(
+        m.disk.live_entries().contains_key(&synced),
+        "synced before the failure"
+    );
+    assert!(
+        m.recovery_entries().is_empty(),
+        "the mark's dirty page was kept"
+    );
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, first, "given again with no reset point");
+}
+
+/// Q-254: the eviction injection needs a failed write-back since the last
+/// start that synced; a crash alone leaves dirty pages, which are not evicted.
+#[test]
+fn q254_eviction_is_refused_without_a_failed_sync() {
+    use kvik_model::engine::{Fault, WriteOutcome};
+    let (mut m, _, s) = written_level_store();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.crash();
+    assert!(m.evict_failed_write_back().is_err(), "a crash alone");
+    m.restart();
+    let _ = m.emit(Reading::num(s, T0 + 1, 2.0));
+    assert!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Lost)))
+            .is_err()
+    );
+    m.crash();
+    m.restart();
+    m.crash();
+    assert!(
+        m.evict_failed_write_back().is_err(),
+        "a start synced since the failure"
+    );
 }

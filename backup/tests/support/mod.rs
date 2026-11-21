@@ -98,6 +98,30 @@ fn put(sink: &dyn BackupSink, key: &str, bytes: Vec<u8>) -> Stored {
 /// Uploads the source as a backup would: `STORE`, each segment, then its records (an empty record, then one sealed
 /// record per segment). Fills `copies` with what the bucket reports.
 pub fn upload(sink: &dyn BackupSink, src: &mut Source) {
+    upload_files(sink, src);
+    let mut previous = 0;
+    for r in records_of(src) {
+        put_record(sink, src.id, previous, &r);
+        previous = r.epoch;
+    }
+}
+
+/// The records [`upload`] puts: an empty record at epoch 1, then one sealed record per segment.
+pub fn records_of(src: &Source) -> Vec<Record> {
+    let mut records = vec![Record::new(1, 0, 10, Body::Empty)];
+    for (i, (d, _)) in src.segments.iter().enumerate() {
+        records.push(Record::new(
+            i as u64 + 2,
+            0,
+            11,
+            Body::Sealed(vec![d.clone()]),
+        ));
+    }
+    records
+}
+
+/// `STORE` and each segment, with no record. Fills `copies` with what the bucket reports.
+pub fn upload_files(sink: &dyn BackupSink, src: &mut Source) {
     let keys = Keys::new(src.id);
     let env = TestEnvelope::new(KEY);
     put(
@@ -116,19 +140,23 @@ pub fn upload(sink: &dyn BackupSink, src: &mut Source) {
             },
         );
     }
-    let mut records = vec![Record::new(1, 0, 10, Body::Empty)];
-    for (i, (d, _)) in src.segments.iter().enumerate() {
-        records.push(Record::new(
-            i as u64 + 2,
-            0,
-            11,
-            Body::Sealed(vec![d.clone()]),
-        ));
-    }
-    for r in records {
-        let k = keys.record(0, r.epoch);
-        put(sink, &k, env.seal(&k, &r.encode().unwrap()).unwrap());
-    }
+}
+
+/// A record's uploaded form, built from `format.md` A.17: the predecessor's epoch, then the record's block.
+pub fn uploaded(previous: u64, r: &Record) -> Vec<u8> {
+    [previous.to_le_bytes().as_slice(), &r.encode().unwrap()].concat()
+}
+
+/// Seals and puts store `id`'s record `r` naming `previous`, as the upload driver would.
+pub fn put_record(sink: &dyn BackupSink, id: [u8; 16], previous: u64, r: &Record) {
+    let k = Keys::new(id).record(r.generation, r.epoch);
+    put(
+        sink,
+        &k,
+        TestEnvelope::new(KEY)
+            .seal(&k, &uploaded(previous, r))
+            .unwrap(),
+    );
 }
 
 thread_local! {
@@ -344,6 +372,10 @@ pub enum Fault {
     OverwriteQuietly,
     /// An upload to an existing object succeeds and changes nothing.
     Pretend,
+    /// Listings leave it out; every other call finds it.
+    Unlisted,
+    /// Listings show it twice.
+    ListedTwice,
 }
 
 /// A sink over a [`MemSink`] that applies per-key faults and logs every call as (operation, key).
@@ -428,6 +460,7 @@ impl FaultSink {
                 | Fault::OverwriteQuietly
                 | Fault::Pretend,
             ) if op != "put" => None,
+            Some(Fault::Unlisted | Fault::ListedTwice) => None,
             other => other.copied(),
         }
     }
@@ -512,7 +545,9 @@ impl BackupSink for FaultSink {
                 | Fault::StoreThenMismatch
                 | Fault::Overwrite
                 | Fault::OverwriteQuietly
-                | Fault::Pretend,
+                | Fault::Pretend
+                | Fault::Unlisted
+                | Fault::ListedTwice,
             ) => block_on(self.inner.get(key, range)),
         };
         Box::pin(async move { r })
@@ -524,19 +559,17 @@ impl BackupSink for FaultSink {
         start_after: Option<&'a str>,
     ) -> SinkFuture<'a, ListPage> {
         self.log.lock().unwrap().push(("list", prefix.into()));
-        let lost: Vec<String> = self
-            .faults
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, f)| **f == Fault::Lose)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let faults = self.faults.lock().unwrap().clone();
         let r = block_on(self.inner.list(prefix, start_after)).map(|p| {
-            ListPage::new(
-                p.keys.into_iter().filter(|k| !lost.contains(k)).collect(),
-                p.more,
-            )
+            let mut keys = Vec::new();
+            for k in p.keys {
+                match faults.get(&k) {
+                    Some(Fault::Lose | Fault::Unlisted) => {}
+                    Some(Fault::ListedTwice) => keys.extend([k.clone(), k]),
+                    _ => keys.push(k),
+                }
+            }
+            ListPage::new(keys, p.more)
         });
         Box::pin(async move { r })
     }

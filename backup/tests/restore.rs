@@ -62,7 +62,7 @@ fn a_full_restore_claims_generation_one_uploads_its_record_and_installs_every_fi
     let uploaded = TestEnvelope::new(KEY)
         .open(&keys.record(1, 1), &after[&keys.record(1, 1)])
         .unwrap();
-    assert_eq!(uploaded, restores[0].encode().unwrap());
+    assert_eq!(uploaded, support::uploaded(0, &restores[0]));
     assert_eq!(restores[0].generation, 1);
     assert_eq!(
         fs.read(&Path::new(DIR).join("STORE")),
@@ -634,7 +634,7 @@ fn check_finished(
                 &after[&keys.record(got.generation, 1)],
             )
             .unwrap();
-        assert_eq!(up, restores[0].encode().unwrap());
+        assert_eq!(up, support::uploaded(0, &restores[0]));
         let mine = ClaimMarker::decode(&after[&keys.claim(got.generation)]).unwrap();
         assert_eq!(mine.nonce, got.stamp.nonce);
     }

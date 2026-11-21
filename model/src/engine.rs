@@ -11,13 +11,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::calendar::{self, CalendarFile, CalendarWindow, Month, Period, Tzdb, Zoning};
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
 use crate::recovery::{
-    Acknowledged, Loss, LossCause, LostRecord, MarkState, PointCheck, RecoveryEntry, Reset,
-    ResetPoint, ResetStamp, SavedPoint, Tail,
+    Acknowledged, Loss, LossCause, LostRecord, MarkState, Outcome, PointCheck, RecoveryEntry,
+    Reset, ResetPoint, ResetStamp, SavedPoint, Tail,
 };
 
+mod faults;
 mod recovery;
+mod repair;
 use crate::registry::{
-    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
+    ChangedAtKind, Durability, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef,
+    SeriesOptions, Timing,
 };
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{LEVELS, SeriesTree, TreeError};
@@ -26,6 +29,9 @@ use crate::types::{
     SECOND, SeriesId, TSource, Value, ValueType, floor_to,
 };
 use crate::view;
+pub use repair::{
+    Alert, Corruption, CorruptionReport, QuarantineCause, RepairConfig, ResendRequest,
+};
 
 /// Engine configuration. Defaults follow the spec where it gives one.
 #[derive(Clone, Debug)]
@@ -87,6 +93,8 @@ pub struct Config {
     /// `log.mark_sync`). The model's default is every commit, so a power loss
     /// loses no acknowledged batch unless a test asks for the timed sync.
     pub mark_sync: MarkSync,
+    /// Self-repair (§8 Self-repair, `api.md` `repair.*`).
+    pub repair: RepairConfig,
 }
 
 /// When the mark file is synced (§3 Durable mark).
@@ -125,6 +133,7 @@ impl Default for Config {
             fill_threshold_pct: 70,
             site_zone: "UTC".into(),
             mark_sync: MarkSync::EveryCommit,
+            repair: RepairConfig::default(),
         }
     }
 }
@@ -441,11 +450,22 @@ pub enum ManifestOp {
         /// counts as later than every reset.
         stamp: Option<ResetStamp>,
     },
-    /// An acknowledgement (§8 Acknowledging a loss): for each `data_lost`
-    /// acknowledged, its identity and its range as reported then.
+    /// An acknowledgement or closing record (§8 Acknowledging a loss,
+    /// Self-repair): each loss with its range as reported then and its
+    /// outcome, and the corruptions named as seen.
     Acknowledge {
-        /// The losses acknowledged.
+        /// The losses closed.
         losses: Vec<Acknowledged>,
+        /// Corruptions seen (`format.md` A.14 `0x24` field 5).
+        seen: Vec<Corruption>,
+    },
+    /// A quarantine record (`format.md` A.14 `0x26`): a file found damaged or
+    /// lost by the bucket, a corruption (§8 Self-repair, Attention).
+    Quarantine {
+        /// The file.
+        file: FileId,
+        /// Why.
+        cause: QuarantineCause,
     },
 }
 
@@ -547,6 +567,8 @@ pub struct Bucket {
     pub objects: BTreeMap<FileId, (u64, StoredFile)>,
     /// Fault injection: the next upload arrives corrupted.
     pub corrupt_next_upload: bool,
+    /// Fault injection: objects the bucket has lost (§8 Self-repair, Q-85).
+    pub missing: BTreeSet<FileId>,
     /// Generations claimed by restores, each by a create-if-absent marker
     /// (§8 Generations).
     pub claims: BTreeSet<u32>,
@@ -688,6 +710,9 @@ pub enum Refusal {
     /// value there is a fact with a higher `changed_at`.
     #[error("revise on a versioned series")]
     ReviseOnVersioned,
+    /// A `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` (§2.2, Q-195).
+    #[error("changed_at of kind time above i64::MAX")]
+    ChangedAtOutOfRange,
     /// A reading of an interval series whose `t` is off its phase (§2.1).
     #[error("t off the interval phase")]
     OffPhase,
@@ -845,6 +870,9 @@ pub enum Reason {
     /// its first and last position. Read from the manifest, so it is reported
     /// after every start (see Q-34 (c)).
     DataLost(Position, Position),
+    /// Repeated corruption: this many corruptions within
+    /// `repair.suspect_within` (§8 Self-repair, Q-247).
+    StorageSuspect(u32),
 }
 
 /// Health report.
@@ -1181,10 +1209,21 @@ pub struct Disk {
     pub corrupt: BTreeSet<FileId>,
     /// Quarantined hot copies.
     pub quarantined: BTreeSet<FileId>,
+    /// Quarantined files that no quarantine record names yet: found while
+    /// the engine could not write, recorded by the next start that can (§8
+    /// Self-repair, Attention).
+    pub unrecorded: BTreeSet<FileId>,
+    /// Objects judged lost by the scheduled check whose loss no copy has
+    /// restored since (a `0x26` reason 4 with no later `0x27`, `format.md`
+    /// A.14): looked up no more (§8 Self-repair, Lost in the bucket).
+    pub judged_lost: BTreeSet<FileId>,
     /// Batches of the open segment whose bytes were damaged (fault
     /// injection), each with the first and last position it held; the next
     /// recovery finds them (§3 Recovery rule 2).
     pub damaged: BTreeMap<(FileId, usize), (Position, Position)>,
+    /// Batches of the log flagged in their commit block: acknowledged once
+    /// written (§3 Batches, `format.md` A.7).
+    pub flagged: BTreeSet<(FileId, usize)>,
     /// Lost ranges of sealed segments found while the engine could not write
     /// (read-only or stopped): reported as found, recorded by the next
     /// recovery that can write (Q-79).
@@ -1202,6 +1241,13 @@ pub struct Disk {
     /// What a power loss leaves of the active segment's batches past the mark
     /// (written, not covered by the mark). `None` when there are none.
     pub tail_fate: Option<WriteOutcome>,
+    /// No batch written since the page cache was last lost: every batch of
+    /// the log is on stable storage, though [`Disk::mark`] may lag the last
+    /// log sync, so a further power loss or remount drops none.
+    pub cache_lost: bool,
+    /// A log sync failed and no start has synced since: the pages whose
+    /// write-back failed are clean and may be reclaimed (Q-254).
+    pub write_back_failed: bool,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
     /// Durable latches, one per condition funnel, written with the cursor
@@ -1399,8 +1445,8 @@ impl Disk {
     pub fn lost_records(&self) -> Vec<LostRecord> {
         self.manifest
             .iter()
-            .filter_map(|r| match r.op {
-                ManifestOp::LostRange {
+            .filter_map(|r| match &r.op {
+                &ManifestOp::LostRange {
                     from,
                     to,
                     identity,
@@ -1411,18 +1457,23 @@ impl Disk {
                     from,
                     to,
                     cause,
+                    at: r.at,
+                    epoch: r.epoch,
                 }),
                 _ => None,
             })
             .collect()
     }
 
-    /// Every acknowledgement the manifest holds (§8 Acknowledging a loss).
-    pub fn acknowledged(&self) -> Vec<Acknowledged> {
+    /// Every acknowledgement the manifest holds (§8 Acknowledging a loss),
+    /// each with the epoch of its record.
+    pub fn acknowledged(&self) -> Vec<(u64, Acknowledged)> {
         self.manifest
             .iter()
             .flat_map(|r| match &r.op {
-                ManifestOp::Acknowledge { losses } => losses.clone(),
+                ManifestOp::Acknowledge { losses, .. } => {
+                    losses.iter().map(|a| (r.epoch, *a)).collect()
+                }
                 _ => Vec::new(),
             })
             .collect()
@@ -1456,7 +1507,15 @@ impl Disk {
             ManifestOp::Seal { .. } => Vec::new(),
             ManifestOp::Restore { restored_end, .. } => vec![*restored_end],
             ManifestOp::LostRange { to, .. } => vec![*to],
-            ManifestOp::Acknowledge { losses } => losses.iter().map(|a| a.to).collect(),
+            ManifestOp::Acknowledge { losses, seen } => losses
+                .iter()
+                .map(|a| a.to)
+                .chain(seen.iter().filter_map(|c| match c {
+                    Corruption::Range(p) => Some(*p),
+                    Corruption::File(..) => None,
+                }))
+                .collect(),
+            ManifestOp::Quarantine { .. } => Vec::new(),
         }
     }
 
@@ -1519,7 +1578,8 @@ impl Disk {
                 ManifestOp::Seal { .. }
                 | ManifestOp::Restore { .. }
                 | ManifestOp::LostRange { .. }
-                | ManifestOp::Acknowledge { .. } => Vec::new(),
+                | ManifestOp::Acknowledge { .. }
+                | ManifestOp::Quarantine { .. } => Vec::new(),
             })
             .collect()
     }
@@ -1562,13 +1622,27 @@ impl Disk {
         self.cold.contains(&f) || self.in_bucket(f)
     }
 
+    /// Whether a copy outside the fast disk is there or may still come: a
+    /// verified copy now, or an upload not judged lost, however the bucket
+    /// answers now (§8 Self-repair stage 1).
+    pub fn copy_may_come(&self, f: FileId) -> bool {
+        let uploaded = self
+            .bucket
+            .objects
+            .get(&f)
+            .is_some_and(|(h, _)| Some(*h) == self.manifest_hash(f));
+        self.verified_elsewhere(f) || (uploaded && !self.judged_lost.contains(&f))
+    }
+
     /// Whether the bucket holds the file with the manifest's hash.
     pub fn in_bucket(&self, f: FileId) -> bool {
         let want = self.manifest_hash(f);
-        self.bucket
-            .objects
-            .get(&f)
-            .is_some_and(|(h, _)| Some(*h) == want)
+        !self.bucket.missing.contains(&f)
+            && self
+                .bucket
+                .objects
+                .get(&f)
+                .is_some_and(|(h, _)| Some(*h) == want)
     }
 
     /// The latest hash the manifest records for a file.
@@ -1626,7 +1700,40 @@ impl Disk {
                 }
             }
         }
+        // A recorded lost range holds nothing until it is closed as restored
+        // in full (§8 Self-repair stage 1, Q-246).
+        let hidden = self.hidden_ranges();
+        if !hidden.is_empty() {
+            out.retain(|p, _| !hidden.iter().any(|(a, b)| a <= p && p <= b));
+        }
         out
+    }
+
+    /// The recorded lost ranges not closed as restored in full by a record
+    /// written after them.
+    fn hidden_ranges(&self) -> Vec<(Position, Position)> {
+        let restored: Vec<(u64, Acknowledged)> = self
+            .acknowledged()
+            .into_iter()
+            .filter(|(_, a)| matches!(a.outcome, Outcome::Restored(_)))
+            .collect();
+        self.lost_records()
+            .into_iter()
+            .filter(|r| {
+                !restored.iter().any(|(epoch, a)| {
+                    *epoch > r.epoch && a.identity == r.identity && a.from <= r.from && r.to <= a.to
+                })
+            })
+            .map(|r| (r.from, r.to))
+            .collect()
+    }
+
+    /// Whether `p` lies in a recorded lost range that holds nothing: not
+    /// restored in full since (§8 Self-repair stage 1).
+    pub fn is_hidden(&self, p: Position) -> bool {
+        self.hidden_ranges()
+            .iter()
+            .any(|(from, to)| *from <= p && p <= *to)
     }
 
     /// Every distinct fact readable from any tier.
@@ -1675,9 +1782,22 @@ impl Disk {
 
     /// Sealed, published files whose backup is not yet verified.
     pub fn upload_queue(&self) -> Vec<FileId> {
+        // Only a verified local copy is uploaded (§8 Hashes); an object the
+        // bucket has lost is the scheduled check's to find (§8 Self-repair).
         self.published()
             .into_iter()
-            .filter(|f| self.files[f].sealed && !self.in_bucket(*f))
+            .filter(|f| {
+                let local = (self.hot.contains(f)
+                    && !self.corrupt.contains(f)
+                    && !self.quarantined.contains(f))
+                    || self.cold.contains(f);
+                let uploaded = self
+                    .bucket
+                    .objects
+                    .get(f)
+                    .is_some_and(|(h, _)| Some(*h) == self.manifest_hash(*f));
+                self.files[f].sealed && !uploaded && local
+            })
             .collect()
     }
 }
@@ -1722,6 +1842,9 @@ struct Volatile {
     entries: BTreeMap<Position, Entry>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
+    /// The lateness reference of each series (§2.2, Q-74): the greatest `t` of its facts flagged neither `future`
+    /// nor `unsynced_clock`.
+    reference: BTreeMap<SeriesId, Nanos>,
     /// Every recorded fact's identity per key, for the duplicate rule.
     history: History,
     /// The version index (§2.4), exact also while a restore brings detail
@@ -1763,6 +1886,12 @@ struct Volatile {
     /// Per lease, the counter last observed and when the writer first
     /// observed it (§7 Leases).
     leases_seen: BTreeMap<u64, (u64, Nanos)>,
+    /// Losses whose re-send stage `repair_done` ended under manual
+    /// acknowledgement; held in memory only (Q-243).
+    resend_done: BTreeSet<Position>,
+    /// Failed lookups of each object the scheduled check missed in the
+    /// bucket, counted per run (§8 Self-repair, Q-82).
+    lookups: BTreeMap<FileId, Vec<Nanos>>,
 }
 
 /// Volatile state derived from the disk alone.
@@ -1772,6 +1901,9 @@ struct Derived {
     routes: BTreeMap<Position, RouteChange>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
+    /// The lateness reference of each series (§2.2, Q-74): the greatest `t` of its facts flagged neither `future`
+    /// nor `unsynced_clock`.
+    reference: BTreeMap<SeriesId, Nanos>,
     history: History,
     versions: Versions,
     cp_versions: Option<(Position, Versions)>,
@@ -2034,6 +2166,7 @@ impl Model {
         let sync_failed = self.recover_tail(recovery_sync_fails);
         // Read-only after a failed recovery sync: nothing more is written.
         if !sync_failed {
+            self.disk.write_back_failed = false;
             self.clean_up_files();
         }
         self.verify_restored();
@@ -2098,6 +2231,7 @@ impl Model {
             entries: d.entries,
             current: d.current,
             newest_t: d.newest_t,
+            reference: d.reference,
             history: d.history,
             versions: d.versions,
             cp_versions: d.cp_versions,
@@ -2124,6 +2258,8 @@ impl Model {
                 .filter(|(_, l)| l.boot == self.boot)
                 .map(|(id, l)| (*id, (l.counter, self.mono)))
                 .collect(),
+            resend_done: BTreeSet::new(),
+            lookups: BTreeMap::new(),
         });
         for (i, cursor) in resuming {
             self.begin_resume(i, cursor);
@@ -2169,6 +2305,9 @@ impl Model {
                 .filter(|f| f.changed_at.is_none_or(|c| c >= versions[&(f.series, f.t)])),
         );
         let mut newest_t = restoring.map_or_else(BTreeMap::new, |r| r.latest_t.clone());
+        // While restoring, the checkpoint's latest recorded `t` stands in for its lateness reference, which a
+        // checkpoint does not carry yet.
+        let mut reference = newest_t.clone();
         let mut history: History = BTreeMap::new();
         for f in &facts {
             history
@@ -2177,6 +2316,10 @@ impl Model {
                 .push(Known::of(f));
             let n = newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                let n = reference.entry(f.series).or_insert(f.t);
+                *n = (*n).max(f.t);
+            }
         }
         // While restoring, the checkpoint's revised-key index, so a replay of
         // an earlier value of a revised key is dropped before the current
@@ -2225,6 +2368,7 @@ impl Model {
             routes,
             current,
             newest_t,
+            reference,
             history,
             versions,
             cp_versions,
@@ -2245,6 +2389,7 @@ impl Model {
             v.routes = d.routes;
             v.current = d.current;
             v.newest_t = d.newest_t;
+            v.reference = d.reference;
             v.history = d.history;
             v.versions = d.versions;
             v.cp_versions = d.cp_versions;
@@ -2458,6 +2603,9 @@ impl Model {
         if d.retired {
             return Err(RegistryError::Retired(id).into());
         }
+        if !crate::registry::name_has_three_segments(new_name) {
+            return Err(RegistryError::BadName(new_name.to_string()).into());
+        }
         if r.resolve(new_name).is_some_and(|o| o.id != id) {
             return Err(RegistryError::NameInUse(new_name.to_string()).into());
         }
@@ -2570,6 +2718,11 @@ impl Model {
             (true, true) if revise => return Err(Refusal::ReviseOnVersioned.into()),
             _ => {}
         }
+        if d.options.versioned == Some(ChangedAtKind::Time)
+            && r.changed_at.is_some_and(|c| i64::try_from(c).is_err())
+        {
+            return Err(Refusal::ChangedAtOutOfRange.into());
+        }
         let non_finite = matches!(r.value, Value::Num(x) if !x.is_finite());
         if !non_finite && !r.value.fits(d.value_type) {
             return Err(Refusal::WrongType.into());
@@ -2625,7 +2778,7 @@ impl Model {
         let mut batch_history: History = BTreeMap::new();
         let mut batch_versions: Versions = BTreeMap::new();
         let mut outranked: BTreeSet<Position> = BTreeSet::new();
-        let mut batch_newest: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
+        let mut batch_reference: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
         let mut duplicates = 0;
         let mut unchecked = 0;
         let mut non_finite = 0;
@@ -2754,17 +2907,18 @@ impl Model {
             {
                 unchecked += 1;
             }
-            // The latest recorded `t`: earlier batches and this one.
-            let newest = batch_newest
+            // The lateness reference (Q-74): earlier batches and this one.
+            let reference = batch_reference
                 .get(&r.series)
                 .copied()
-                .max(v.newest_t.get(&r.series).copied());
-            // `late` (§2.2): on an observed series, earlier than the latest
-            // recorded `t` by more than 2 × S; on any series, older than the
-            // lateness bound. Neither before the clock is synchronised (§2.5).
+                .max(v.reference.get(&r.series).copied());
+            // `late` (§2.2): on an observed series, a fact not flagged `future`
+            // earlier than the lateness reference by more than 2 × S; on any
+            // series, older than the lateness bound. Neither before the clock
+            // is synchronised (§2.5).
             let def = v.registry.get(r.series).expect("checked above");
-            let out_of_order = match (newest, def.staleness) {
-                (Some(n), Some(s)) => observed && r.t < n.saturating_sub(2 * s),
+            let out_of_order = match (reference, def.staleness) {
+                (Some(n), Some(s)) => observed && !future && r.t < n.saturating_sub(2 * s),
                 _ => false,
             };
             let bound = def.options.lateness_bound.unwrap_or(cfg.lateness_bound);
@@ -2788,8 +2942,10 @@ impl Model {
                 },
             };
             next = next.next();
-            let n = batch_newest.entry(r.series).or_insert(r.t);
-            *n = (*n).max(r.t);
+            if !future && synced {
+                let n = batch_reference.entry(r.series).or_insert(r.t);
+                *n = (*n).max(r.t);
+            }
             batch_history.entry(key).or_default().push(Known::of(&fact));
             if let Some(c) = fact.changed_at {
                 if top.is_some_and(|top| c < top) {
@@ -2805,6 +2961,15 @@ impl Model {
             });
         }
         v.next_position = next;
+        // §3 Batches: flagged only when every reading is at the `written`
+        // level; a mixed batch takes the default level.
+        let flagged = batch.iter().all(|e| {
+            e.fact().is_some_and(|f| {
+                v.registry
+                    .get(f.series)
+                    .is_some_and(|d| d.options.durability == Durability::Written)
+            })
+        });
         self.counters.duplicates_dropped += duplicates as u64;
         self.counters.non_finite += non_finite;
         self.counters.negative_counter += negative;
@@ -2822,6 +2987,11 @@ impl Model {
         }
         // Write: the batch is in the active segment, past the durable mark.
         self.append_batch(batch.clone());
+        if flagged {
+            let id = self.disk.active.expect("active");
+            let b = self.disk.files[&id].batches.len() - 1;
+            self.disk.flagged.insert((id, b));
+        }
         match fault {
             Some(Fault::Crash(CrashPoint::AfterWrite(outcome))) => {
                 self.disk.tail_fate = Some(outcome);
@@ -2835,6 +3005,7 @@ impl Model {
             }
             Some(Fault::SyncError(outcome)) => {
                 self.disk.tail_fate = Some(outcome);
+                self.disk.write_back_failed = true;
                 let v = self.vol_mut()?;
                 v.read_only = true;
                 v.sync_failed = true;
@@ -2849,8 +3020,11 @@ impl Model {
             self.crash();
             return Err(Error::Crashed);
         }
-        // Durable mark; only now may anything see the batch.
-        self.sync_mark();
+        // Durable mark; only now may anything see the batch, except a flagged
+        // batch, which is seen once written and synced later (§3 Commit).
+        if !flagged {
+            self.sync_mark();
+        }
         if fault == Some(Fault::Crash(CrashPoint::AfterSync)) {
             self.crash();
             return Err(Error::Crashed);
@@ -2922,6 +3096,7 @@ impl Model {
     fn append_batch(&mut self, batch: Vec<Entry>) {
         self.ensure_active();
         let id = self.disk.active.expect("active");
+        self.disk.cache_lost = false;
         self.disk
             .files
             .get_mut(&id)
@@ -2948,9 +3123,13 @@ impl Model {
             return;
         }
         if self.disk.tail_len() > 0 {
-            // Batches past the durable mark (failed sync): the segment is not
-            // sealed until a restart has decided what reached the disk.
-            return;
+            // Batches past the durable mark after a failed sync: the segment
+            // is not sealed until a restart has decided what reached the
+            // disk. Flagged batches are synced first (§3 Commit).
+            if self.disk.tail_fate.is_some() {
+                return;
+            }
+            self.sync_mark();
         }
         if let Some(id) = self.disk.active.take() {
             let wall = self.wall;
@@ -2994,6 +3173,10 @@ impl Model {
             }
             let n = v.newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                let n = v.reference.entry(f.series).or_insert(f.t);
+                *n = (*n).max(f.t);
+            }
             // An outranked fact changes no current fact and no node (§2.3,
             // §5.6).
             if !outranked.contains(&e.position) {
@@ -3498,6 +3681,14 @@ impl Model {
                         .iter()
                         .map(|e| e.position),
                 );
+                // Catch-up reads on through the flagged batches written
+                // beyond the mark (§4 Overflow, §3 Commit).
+                let flagged = file
+                    .batches
+                    .iter()
+                    .enumerate()
+                    .filter(|(b, _)| self.disk.flagged.contains(&(f, *b)));
+                out.extend(flagged.flat_map(|(_, x)| x.iter().map(|e| e.position)));
             }
         }
         out
@@ -3672,6 +3863,9 @@ impl Model {
             return Ok(());
         };
         let points = self.reset_points();
+        // Positions restored in full into a lost range are not sent: the
+        // reset point's `resync` covers them (§8 Self-repair stage 1).
+        let lost = self.disk.lost_ranges();
         let mut reads = 0usize;
         loop {
             let v = self.vol.as_mut().expect("up");
@@ -3703,7 +3897,10 @@ impl Model {
                     break;
                 }
                 merge(&mut pending, next, *p);
-                let fact = e.fact().filter(|f| routed(&c.decl, &v.routes, f));
+                let fact = e
+                    .fact()
+                    .filter(|f| routed(&c.decl, &v.routes, f))
+                    .filter(|_| !lost.iter().any(|(a, b)| a <= p && p <= b));
                 if fact.is_some()
                     && let Some(rp) = pending
                 {
@@ -3877,6 +4074,14 @@ impl Model {
     }
 
     fn confirm_prefix(&mut self, i: usize, n: usize, p: Position) {
+        self.sync_log_through(p);
+        // A flagged position not yet synced while read-only: the cursor and
+        // latch writes naming it wait, here for ever (§3 Durable mark,
+        // invariant 26).
+        let p = match self.disk.mark {
+            Some(m) if self.disk.tail_len() > 0 && m.last < p => m.last,
+            _ => p,
+        };
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         let id = c.decl.id;
@@ -3909,7 +4114,7 @@ impl Model {
             }
         };
         let mut gc_confirmed = false;
-        for d in &done {
+        for d in done.iter().filter(|d| d.position <= p) {
             match &d.kind {
                 DeliveryKind::Trigger(t) => latch(t.funnel, t.incarnation, &t.state, d.position),
                 DeliveryKind::Resync(r) => {
@@ -4377,16 +4582,21 @@ impl Model {
             raise(Level::Fatal, Reason::OpenRefused, &mut reasons);
         }
         for f in &self.disk.quarantined {
-            raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
+            if self.quarantine_open(*f) {
+                raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
+            }
         }
         // Not read-only (§3 Recovery rule 2). Ranges found while the engine
         // could not write (by a scrub, or by a recovery whose sync failed, the
         // only way damage is still pending while it is up) are reported as
         // found, not yet recorded (Q-79). A `data_lost` degrades until it is
-        // acknowledged; a `possible_loss` never does (§11 Health).
+        // closed (§8 Self-repair); a `possible_loss` never does (§11 Health).
         for l in self.losses().into_iter().filter(Loss::degrades) {
             let (from, to) = (l.first.unwrap_or(l.identity), l.last.unwrap_or(l.identity));
             raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
+        }
+        if let Some(n) = self.suspect_count() {
+            raise(Level::Degraded, Reason::StorageSuspect(n), &mut reasons);
         }
         let free = self.free_bytes();
         if free < self.config.critical_mark {
@@ -5044,33 +5254,50 @@ impl Model {
             .filter(|f| self.disk.corrupt.contains(f) && !self.disk.quarantined.contains(f))
             .copied()
             .collect();
+        let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
         for f in &bad {
             self.disk.quarantined.insert(*f);
+            // Each finding is a corruption of its own, named by its record
+            // (§8 Self-repair, Attention); a start writes it for a file
+            // quarantined while the store could not.
+            if writable {
+                self.record_quarantine(*f, QuarantineCause::Damaged);
+            } else {
+                self.disk.unrecorded.insert(*f);
+            }
         }
         // §8 Corrupt block: a sealed log segment with no other copy loses
         // its positions that no other file holds, recorded as lost ranges
         // and reported as `data_lost`, so they are not issued again. The
         // model damages a whole file, so the whole segment is lost. A
-        // read-only or stopped engine writes no record: the range is reported
-        // as found and recorded by the next recovery that can write (Q-79).
-        let held: BTreeSet<Position> = self.disk.all_entries().into_keys().collect();
-        let at = self.wall;
-        let stamp = self.stamp_in_force();
-        let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
+        // read-only or stopped engine writes no record and cannot swap a copy
+        // in: the range is reported as found and recorded by the next
+        // recovery that can write (Q-79), and a copy found then restores it
+        // in full (§8 Self-repair stage 1).
         for f in &bad {
             let file = &self.disk.files[f];
             if file.class != FileClass::Segment || !file.sealed {
                 continue;
             }
+            let held = self.held_without(*f, writable);
             let lost: Vec<Position> = file
                 .entries()
                 .map(|e| e.position)
                 .filter(|p| {
                     !held.contains(p)
-                        && !self.disk.is_lost(*p)
+                        && !self.disk.is_hidden(*p)
                         && !self.disk.found_lost.iter().any(|(a, b)| a <= p && p <= b)
                 })
                 .collect();
+            if writable {
+                // Stage 1 waits while a copy may still come: deep is not
+                // reached, or the lost-object rule has not judged it lost.
+                if !self.disk.copy_may_come(*f) {
+                    self.record_runs(&lost, LossCause::Corruption);
+                }
+                continue;
+            }
+            // Runs of one segment each, so a range names one loss's identity.
             let mut runs: Vec<(Position, Position)> = Vec::new();
             for p in lost {
                 match runs.last_mut() {
@@ -5078,34 +5305,30 @@ impl Model {
                     _ => runs.push((p, p)),
                 }
             }
-            for (from, to) in runs {
-                if !writable {
-                    self.disk.found_lost.push((from, to));
-                    continue;
-                }
-                let epoch = self.disk.epoch();
-                self.disk.manifest.push(ManifestRecord {
-                    epoch,
-                    at,
-                    op: ManifestOp::LostRange {
-                        from,
-                        to,
-                        identity: from,
-                        cause: LossCause::Corruption,
-                        stamp,
-                    },
-                });
-            }
+            self.disk.found_lost.extend(runs);
         }
         bad
     }
 
-    /// Replaces a quarantined hot copy with a verified copy from another tier.
-    /// Returns whether a copy was found.
+    /// Replaces a quarantined hot copy with a verified copy from another tier,
+    /// by a manifest record, so not while the engine cannot write (§8 Corrupt
+    /// block). Returns whether a copy was swapped in.
+    /// A recorded loss the copy holds again is closed as restored in full
+    /// (§8 Self-repair stage 1); a copy of a file holding a closed loss is
+    /// not swapped in (Q-246).
     pub fn restore_file(&mut self, f: FileId) -> bool {
-        if self.disk.quarantined.contains(&f) && self.disk.verified_elsewhere(f) {
+        let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
+        if writable
+            && self.disk.quarantined.contains(&f)
+            && self.disk.verified_elsewhere(f)
+            && !self.holds_closed_loss(f)
+        {
             self.disk.corrupt.remove(&f);
             self.disk.quarantined.remove(&f);
+            // The copy answered: the object is looked up again (§8
+            // Self-repair, Lost in the bucket).
+            self.disk.judged_lost.remove(&f);
+            self.close_restored(f);
             true
         } else {
             false
@@ -5157,6 +5380,7 @@ impl Model {
         };
         // A derived file names no position above the last synced mark (§3
         // Durable mark, invariant 26).
+        self.sync_log_through(position);
         self.disk.cover(position);
         self.disk.checkpoints.push(cp);
         Ok(position)
@@ -5370,6 +5594,9 @@ impl Model {
             g
         };
         let mut m = Model::new(config, consumers, wall);
+        // The directory is empty before the restore: no first start ran there.
+        m.disk.mark = None;
+        m.disk.synced_mark = None;
         m.disk.bucket = bucket.clone();
         if let Some(h) = &bucket.header {
             m.disk.header = h.clone();

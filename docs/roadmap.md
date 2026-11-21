@@ -48,7 +48,7 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   (`model/OPEN-QUESTIONS.md`). The owner's run on the Linux NVMe target is recorded
   (`docs/measurements/4.8-commit-latency.md`). Remaining: (1) a run on the target confirming the fix for Q-310
   (p50 above 5 ms at exactly 100 × 1 Hz) and a cold start on the target for Q-116 (n) (warm: 0.39–0.74 s); (2) the owner's decisions
-  on Q-110 (trust boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
+  on Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
   (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k) (full disk after a power
   loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence
 
@@ -61,9 +61,10 @@ again; nothing after a gate starts before it is passed. Items that do not depend
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
 - [ ] 5.4 Live state and windowed operators over recent facts
 - [ ] 5.5 Differential tests against the model; routing and delivery benchmarks
-- [ ] 5.5a Durability levels chosen per source: acknowledged once written or after the sync (Q-170); for the faster
-  level, §3 Recovery rule 1, principle 3 and invariant 2 rewritten to keep checksum-valid complete batches beyond the
-  mark (Q-125)
+- [ ] 5.5a Durability levels chosen per source (Q-170): spec text and model; for the faster level, §3 Recovery
+  rule 1, principle 3 and invariants 2 and 11 rewritten to keep complete flagged batches beyond the mark (Q-125)
+- [ ] 5.5b Durability levels: log writer acknowledges at write; commit-block flag; recovery keeps flagged batches
+- [ ] 5.5c Durability levels: definition parameter, `Outcome`, durable-up-to watermark
 - [ ] 5.6 **Gate** — delivery looked at as a whole
 
 ## 6. Compacted segments
@@ -74,7 +75,7 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   A.14; Q-171 and Q-174 settled at its review)
 - [ ] 6.3b Atomic publish-and-retire: the store publishes compaction outputs and retires inputs through the manifest,
   and a start calls the rebuild and the copies of a corrupt record (moved from 6.3)
-- [ ] 6.4a Parquet export: the export schema (provisional, `docs/export.md`) and the Parquet writer (unticked pending Q-190 to Q-197)
+- [x] 6.4a Parquet export: the export schema (`docs/export.md`, version 1 by the owner's rulings on Q-190 to Q-197), the Parquet writer and the partitioned layout
 - [ ] 6.4b Differential check of compacted data against the Parquet export (moved from 6.4)
 - [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
   stream; within about 10 % of zstd level 3 on the °F→°C shape it replaces the C library, otherwise zstd stays and CI
@@ -93,6 +94,10 @@ again; nothing after a gate starts before it is passed. Items that do not depend
 - [x] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
 - [ ] 8.3 Restore, partial restore and rebuild
 - [ ] 8.4 **Gate** — restore passes end to end
+- [ ] 8.5 Self-repair: a loss is restored from a verified copy, then offered to the application for re-sending, then
+  closed by a record, with health back to OK; manual acknowledgement as a setting; scheduled hash check of local files
+  (8.5a spec, format and model; 8.5b scrub, quarantine and fetch-verify-swap; 8.5c the store wired: loss states,
+  re-send requests, closing records, alerts; 8.5d the fault matrix against the model)
 
 ## 9. Query
 - [ ] 9.1 Table provider and tier selection by zoom level

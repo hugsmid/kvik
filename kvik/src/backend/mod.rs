@@ -88,6 +88,10 @@ impl Shared {
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
+
+    pub(crate) fn store_id(&self) -> [u8; 16] {
+        self.with(|s| s.store_id)
+    }
 }
 
 /// Finds the in-memory store of a directory, for a reader.
@@ -185,6 +189,9 @@ pub(crate) struct Slot {
     /// Waits by reason.
     waits: BTreeMap<Wait, u64>,
     batches: u64,
+    /// Drawn from the environment's entropy at creation, as the durable backend's is; kept across restarts in
+    /// this process.
+    store_id: [u8; 16],
     clock_jumps: u64,
     last_jump: Option<ClockJump>,
     /// Loss identities acknowledged.
@@ -214,23 +221,6 @@ fn model_config(config: &StoreConfig) -> Result<km::engine::Config> {
     })
 }
 
-/// Whether `name` matches `pattern`: the same number of `/`-separated
-/// segments, `*` matching any run of characters within a segment.
-pub(crate) fn matches_pattern(pattern: &str, name: &str) -> bool {
-    fn segment(p: &[u8], s: &[u8]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some((b'*', rest)) => (0..=s.len()).any(|i| segment(rest, &s[i..])),
-            Some((c, rest)) => s.first() == Some(c) && segment(rest, &s[1..]),
-        }
-    }
-    let (p, n): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), name.split('/').collect());
-    p.len() == n.len()
-        && p.iter()
-            .zip(&n)
-            .all(|(p, n)| segment(p.as_bytes(), n.as_bytes()))
-}
-
 fn without_name(spec: &SeriesSpec) -> SeriesSpec {
     SeriesSpec {
         name: String::new(),
@@ -254,6 +244,8 @@ impl Slot {
             .collect::<Result<Vec<_>>>()?;
         let mut model = Model::new(model_config(config)?, slots, wall);
         model.clock_synchronised = clock.synchronised();
+        let mut store_id = [0u8; 16];
+        config.env.entropy.fill(&mut store_id);
         Ok(Slot {
             dir: config.dir.clone(),
             mark_sync: mark_sync_mode(config),
@@ -273,6 +265,7 @@ impl Slot {
             next_wait_token: 0,
             waits: BTreeMap::new(),
             batches: 0,
+            store_id,
             clock_jumps: 0,
             last_jump: None,
             acknowledged: BTreeSet::new(),
@@ -433,6 +426,7 @@ impl Slot {
 
     pub(crate) fn define(&mut self, epoch: u64, spec: SeriesSpec) -> Result<SeriesId> {
         self.writable(epoch)?;
+        convert::check_name(&spec.name)?;
         let d = convert::definition(&spec)?;
         let defined = self.model.define_with(
             &spec.name,
@@ -562,6 +556,13 @@ impl Slot {
 
     pub(crate) fn alias(&mut self, epoch: u64, id: SeriesId, name: &str) -> Result<()> {
         self.writable(epoch)?;
+        // An unknown or retired series is reported before the name, as on the durable backend.
+        match self.model.registry().map_err(convert::error)?.get(msid(id)) {
+            None => return Err(Error::UnknownSeries(id.to_string())),
+            Some(d) if d.retired => return Err(Error::Retired(id)),
+            Some(_) => {}
+        }
+        convert::check_name(name)?;
         self.model.rename(msid(id), name).map_err(convert::error)?;
         self.reroute_patterns()
     }
@@ -621,7 +622,7 @@ impl Slot {
             .registry()
             .map_err(convert::error)?
             .live()
-            .filter(|d| d.names.iter().any(|n| matches_pattern(pattern, n)))
+            .filter(|d| d.names.iter().any(|n| crate::pattern::matches(pattern, n)))
             .map(|d| d.id)
             .collect())
     }
@@ -912,6 +913,9 @@ impl Slot {
             return Err(Error::Closed);
         }
         self.up()?;
+        if let Select::Names(p) = emits {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
+        }
         if *emits != Select::None {
             return Err(Error::NotSupportedYet(
                 "a consumer that emits readings (emits other than Select::None): the model \
@@ -1029,6 +1033,9 @@ impl Slot {
         let cid = self.bound(epoch, name)?;
         if self.model.is_read_only() {
             return Err(Error::ReadOnly("routing changes are log entries".into()));
+        }
+        if let Select::Names(p) = &funnel.series {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
         }
         // The same definition again (a consumer that routes at every start) is the funnel in force, with its latch
         // (Q-91 (c)).
@@ -1703,7 +1710,7 @@ impl Slot {
                 }
                 R::LowDisk => reasons.push(Reason::DiskLow { free }),
                 R::CriticalDisk => reasons.push(Reason::DiskCritical { free }),
-                R::UploadStalled => {}
+                R::UploadStalled | R::StorageSuspect(_) => {}
                 R::ClockSkew(s) => reasons.push(Reason::ClockSkew(sid(*s))),
                 R::DataLost(a, _) => {
                     if let Some(l) = losses.iter().find(|l| l.identity == pos(*a))
@@ -1814,21 +1821,5 @@ impl Slot {
             self.sync_clock();
         }
         ts(self.model.now)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::matches_pattern;
-
-    #[test]
-    fn patterns_match_within_segments() {
-        assert!(matches_pattern("plant/*/power", "plant/line-1/power"));
-        assert!(matches_pattern("plant/line-*/p*r", "plant/line-12/power"));
-        assert!(!matches_pattern("plant/*/power", "plant/line-1/sub/power"));
-        assert!(!matches_pattern("plant/*/power", "plant/line-1/energy"));
-        assert!(matches_pattern("a/b/c", "a/b/c"));
-        assert!(matches_pattern("*/*/*", "a/b/c"));
-        assert!(!matches_pattern("*", "a/b"));
     }
 }

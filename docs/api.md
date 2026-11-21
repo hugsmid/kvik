@@ -68,7 +68,8 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
-| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
+| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact, and the first batch in each segment when it is unflagged (Q-630), force a mark sync at once either way |
+| `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
@@ -78,7 +79,15 @@ The keys roadmap section 4 needs; all may change between opens.
 Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items. One is
 fixed already: `manifest.rebuild_wait` (roadmap 6.3), `RebuildWait::After(Duration)` (default 15 minutes) or
 `RebuildWait::Never`, how long the store stays read-only while deep cannot say whether it holds a copy of a corrupt
-manifest record before it rebuilds provisionally (spec §7 Manifest).
+manifest record before it rebuilds provisionally (spec §7 Manifest). The self-repair keys (spec §8 Self-repair,
+roadmap 8.5) are fixed too:
+
+| Key | Type | Default | Limits |
+|---|---|---|---|
+| `repair.acknowledge` | `RepairAcknowledge::Automatic` or `Manual` | `Automatic` | `Manual`: a loss whose re-send stage has ended waits for `acknowledge_losses` |
+| `repair.resend_wait` | `Duration` | 24 h | 0: nothing listens for re-send requests, and stage 2 ends at once (Q-242) |
+| `repair.lost_tries`, `repair.lost_over` | `u32`, `Duration` | 3, 10 min | the scheduled check's lost-object rule, as `RestoreConfig::lost_tries` and `lost_over` (Q-82) |
+| `repair.suspect_after` | `u32` corruptions in a `Duration` | 2 in 30 days | ≥ 1 |
 
 ## Core types (accepted at gate 3.3)
 ```rust
@@ -112,7 +121,7 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
 ```rust
 pub enum Refusal {                 // per reading, in Ack; each counted per series
     UnknownSeries, Retired, WrongType, StateOutOfRange, TextTooLong, ChangedAtMissing, ChangedAtUnexpected,
-    ReviseOnVersioned, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
+    ReviseOnVersioned, ChangedAtOutOfRange, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
 pub enum Wait { QueueFull, DiskFull, UnsyncedClock }                // back-pressure: not a refusal, not a fault
 pub enum EmitError {               // per call
     Busy(Wait),                    // try_emit only: nothing was queued
@@ -121,7 +130,7 @@ pub enum EmitError {               // per call
     OutcomeUnknown(Fault) }        // the call's batch may or may not be stored; never acknowledged; re-send after restart
 pub enum OpenError { Locked, NotAStore, StoreIdMismatch { file }, UnsupportedFormat { file, found, supported },
     SiteZoneMismatch { configured, in_force }, UnknownZone, Corrupt { file }, UnsupportedPlatform { reason },
-    MarkUnreadable, Config { key, reason }, Io { path, source } }     // MarkUnreadable: Reader::open only (format.md A.10)
+    MarkUnreadable, Config { key, reason }, Io { path, source } }     // MarkUnreadable: Reader::open, and Store::open when its start leaves no readable mark (format.md A.10)
 pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path },
     Drill }                        // a restore drill's store refuses writes (spec §8 Restore)
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault),      // any call that appends an entry
@@ -132,10 +141,11 @@ pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timesta
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source } }
 ```
-Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence) and
-`ConsumerError::RouteCycle` (a route or a change of `emits`), and `DefineError::RouteCycle` for an alias, each naming
-the cycle (roadmap 5.2). A `Start::Position` whose saved point is unknown is `ConsumerError::UnknownPoint`. Backup
-errors are added by roadmap 8.2.
+Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence),
+`ConsumerError::Pattern(RouteError)` (a name pattern refused, Consuming), and `ConsumerError::RouteCycle` (a route
+or a change of `emits`) and `DefineError::RouteCycle` for an alias, each naming the cycle (roadmap 5.2). A
+`Start::Position` whose saved point is unknown is `ConsumerError::UnknownPoint`. Backup errors are added by roadmap
+8.2.
 
 ## Handles and life cycle (accepted at gate 3.3)
 - `Store` is `Clone + Send + Sync`; clones share the one writer. `Consumer` is `Send`, not `Clone`, and owns a share
@@ -156,25 +166,39 @@ let id: SeriesId = store.define_series(
                     Kind::Gauge { value: ValueType::Decimal { scale: 1 } },   // ValueType::decimal() declares scale 4
                     "°C")
         .expected_interval(Duration::from_secs(1))
-        .excess_precision(ExcessPrecision::Round),   // default; or Refuse, or AutoRaise { max_scale }
+        .excess_precision(ExcessPrecision::Round)    // default; or Refuse, or AutoRaise { max_scale }
+        .durability(Durability::Synced),             // default; or Written (spec §2.1 `durability`)
 ).await?;
 store.set_parameters(id, effective_from, ParameterChange::default().staleness(s)).await?;
 store.raise_scale(id, 3).await?;              // from this entry's position on; never lowered
 store.set_excess_precision(id, ExcessPrecision::AutoRaise { max_scale: 6 }).await?;   // from this entry's position on
+store.set_durability(id, Durability::Written).await?;                             // from this entry's position on
 store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
 ```
 These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
 Commit). The writer forces that mark sync at once rather than waiting for the timed interval, so each call waits for
-one mark sync, not for up to the interval. Defining a series that already exists with the same specification
+one mark sync, not for up to the interval. A name has exactly three `/`-separated segments, none empty (spec §2.1
+`name`): `define_series` and `alias` refuse a name of another shape, on both backends, with
+`DefineError::Invalid { field: "name", .. }` (Q-670). A store whose log holds such a name from before the rule
+opens; the series stays readable and writable by id, and an alias of the right shape gives it a name patterns can
+select.
+Defining a series that already exists with the same specification
 returns its id. A different kind, value type or unit, or a lower scale, under the same name is an error; the caller
 retires and defines anew. A higher scale is set with `raise_scale`, which appends a scale raise entry (spec §2.1
 `decimal scale`); it fails with `ScaleNotRaised` unless the new scale is higher, and with `ScaleOverflow` if the
 largest magnitude stored so far would overflow `i64` at it. Earlier facts keep their scale and are returned rescaled
 exactly to the current one. `set_excess_precision(id, policy) -> Result<(), DefineError>` appends a parameter change
 that takes effect at its position (spec §2.1 `excess precision`); a maximum scale below the current scale is
-`DefineError::Invalid`.
+`DefineError::Invalid`. `set_durability(id, level) -> Result<(), DefineError>` appends a parameter change that takes
+effect at its position (spec §2.1 `durability`); `enum Durability { Synced, Written }`, `Synced` by default.
+`Written` acknowledges and delivers a reading once its batch is written, before its sync (after any default-level
+sync already in flight, Q-255). A crash or restart of the process keeps it while the page cache holds it. A power
+loss or a kernel crash before its sync returns can remove it: a later start reports `PossibleLoss` with a reset point,
+or `DataLost` when a later batch reached the disk and it did not (Q-257). Two removals go unreported (open): a
+remount within the boot (Q-250), and a failed sync whose pages are evicted before a restart on the same boot (Q-254).
+Every call in this section is synced whatever the level, and a change of level takes effect at its position (Q-256).
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
 series; a day may start at a declared local time instead of midnight:
@@ -194,7 +218,7 @@ pub async fn emit(&self, readings: &[Reading]) -> Result<Ack, EmitError>;       
 pub fn try_emit(&self, readings: &[Reading]) -> Result<Pending, EmitError>;         // never waits; Err(Busy(w))
 pub struct Pending;  /* impl Future<Output = Result<Ack, EmitError>> */              // may be dropped
 pub struct Ack { pub outcomes: Vec<Outcome> }                                        // one per reading, by index
-pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool, rounded: bool, out_of_range: bool },
+pub enum Outcome { Recorded { position: Position, durability: Durability, outranked: bool, unchecked: bool, rounded: bool, out_of_range: bool },
                    Duplicate, Refused(Refusal) }
 impl Ack { pub fn first(&self) -> Option<Position>; pub fn last(&self) -> Option<Position>;
            pub fn duplicates_dropped(&self) -> u32; pub fn refused(&self) -> impl Iterator<Item = (usize, Refusal)>; }
@@ -205,18 +229,25 @@ store.emit_with(&readings, Intent::Revise).await?;
 - **One call is one batch unit:** its readings are committed in one batch or not at all, in order. A call is at
   most `min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`EmitError::TooLarge` otherwise; the
   caller splits). Several calls may share a batch. Calls from different tasks are ordered by commit.
-- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). `emit` and `Pending`
+- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). Calls share a batch only
+  with calls of the same class (spec §3 Batches, Q-255): a call all of whose readings are of series at
+  `Durability::Written` goes into a flagged batch, and `emit` and `Pending` resolve once it is written, after any
+  default-level sync already in flight; every `Recorded` outcome carries the level it was acknowledged at, here
+  `Written`. Any other call resolves at the default level, its outcomes say `Synced`: `emit` and `Pending`
   resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
   the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
   a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
-- **An acknowledgement means durable**, for every outcome. A call none of whose readings is recorded writes no
+- **An acknowledgement means durable at its level**, for every outcome: after the sync for `Synced`, in the
+  operating system's cache for `Written` (`LogStats.durable` says how far the sync has reached). A call none of whose readings is recorded writes no
   batch; if one of them is a duplicate of a reading queued by an earlier call that is not yet acknowledged, the call
   resolves only when that earlier call does, with its result: its outcomes if that call is acknowledged, its error
   (`OutcomeUnknown`, `ReadOnly` or `Closed`) if not. A call with readings to record resolves with its own batch,
   which is acknowledged after every batch before it (Q-123 (b)).
 - Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused,
   and so is a decimal value out of range, whose outcome says so (`out_of_range`, spec §2.5).
-  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.
+  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`, and a
+  `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` with `Refusal::ChangedAtOutOfRange` (spec
+  §2.2, Q-195).
 - **Back-pressure** is a wait, with its reason: `try_emit` returns `Busy(Wait)`, including `UnsyncedClock` when the
   call holds a host-stamped reading; `emit` waits, and `stats().ingest.waiting` and health name the reason. There is
   no timeout parameter: a caller that must not wait uses `try_emit`.
@@ -287,16 +318,26 @@ enum Live { Value(Fact), None, Unknown }
   route, a change of `emits` or an alias (`store.alias`) that closes a cycle between consumers is refused with the
   error `RouteCycle`, naming the cycle (spec §4 Routing). Routes are kept across restarts: `route` with a funnel equal
   to one in force returns that funnel's id and writes nothing, keeping its latch, so an application may route its
-  funnels at every start, as the example does (Q-91 (c)). Whether two name patterns overlap must be decidable from
-  the two patterns alone. The pattern grammar is provisional until roadmap 5.6 (`model/OPEN-QUESTIONS.md`, Q-88): a
-  name pattern has as many `/`-separated segments as the names it matches, and `*` matches any run of characters
-  within one segment; two patterns overlap when they have as many segments and, in each, some string that both
-  match.
+  funnels at every start, as the example does (Q-91 (c)).
+- A name pattern, in a funnel or in `emits`, has exactly the three `/`-separated segments of a name, each a literal
+  or `*`, which matches one whole segment (spec §4 Funnel, Q-88). It is refused when routes are compiled, on both
+  backends, with `ConsumerError::Pattern` and a `RouteError`, checked in this order: `TooLong { len }` (over 255
+  bytes), `Segments { found }` (not three segments), `EmptySegment`, `PartialWildcard` (a `*` inside a segment, such
+  as `plant/line-*/power`). There is no escape: a name segment holding `*` is matched only by `*`. Two patterns
+  overlap when, segment by segment, they are equal or either is `*`; an id overlaps a pattern when any name of its
+  series matches it, aliases included. A funnel in force whose pattern the grammar refuses (one a log held before
+  it) is read as built, each segment a literal and `*` alone a wildcard, and is refused when routed again, not
+  returned as the funnel in force; a stored `emits` so refused is refused when declared again (Q-670 (b)).
+```rust
+#[non_exhaustive]
+pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySegment, PartialWildcard }
+```
 
 ## Reader processes (accepted at gate 3.3)
 ```rust
 pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min }; blocking
 pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease
+pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id read at open; no file read, no lease renewal
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
 pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
 pub struct SavedPoint { pub position: Position, pub stamp: ResetStamp }
@@ -306,7 +347,9 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
   the mark at call time. The lease is written at open and renewed by any call once half of `lease_refresh` has
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
-  epoch on its next call. There is no background task.
+  epoch on its next call. There is no background task. `store_id` is the exception: an additive item (Q-196), it
+  returns the store id (`format.md` A.1) read with the descriptor at open and reads nothing. On the model backend it
+  is drawn from the environment's entropy at creation and kept while the process lives.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
@@ -364,11 +407,14 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
-    SealBlocked { file_id: u64 },
+    SealBlocked { file_id: u64 }, SegmentDamaged { file_id: u64 }, SegmentUnreadable { file_id: u64 },
+    Other { reason: String /* a log reason this version does not name, in its debug form */ },
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
-    SetAside(SetAsideReport) }     // information, not degraded (Q-90)
+    SetAside(SetAsideReport),      // information, not degraded (Q-90)
+    LossesUnknown { error: String },
+    StorageSuspect { corruptions: u32, within: Span } }   // repeated corruption (spec §8 Self-repair, Q-247)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
     pub commit_time_first: Timestamp, pub commit_time_last: Timestamp }
@@ -377,14 +423,32 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
     pub readable_commit_blocks: u32, pub mark_state: MarkState /* Readable | Missing | Unreadable | Stale */,
     pub boot_id: Option<[u8; 16]>, pub commit_time_before: Option<Timestamp>, pub commit_time_after: Option<Timestamp>,
-    pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool }
+    pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool /* closed, by any outcome */,
+    pub state: Option<LossState> /* None for a PossibleLoss */ }
+pub enum LossState { Found, Copying, AwaitingResend { until: Timestamp }, AwaitingOperator, Closed(Closed) }
+pub enum Closed { Restored { positions: u64 }, ResendEnded, Operator }
 pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for ever; Store and Reader
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
+pub struct ResendRequest { pub identity: Position, pub first: Position, pub last: Position,
+    pub received_after: Option<Timestamp>, pub received_before: Option<Timestamp>,
+    pub series: Option<Vec<(SeriesId, Timestamp, Timestamp)>> /* None: every series */, pub until: Timestamp }
+pub fn repairs(&self) -> impl Stream<Item = ResendRequest>;  // Store only; every open request, then new ones
+pub async fn repair_done(&self, identity: Position) -> Result<(), WriteError>;
+pub enum Alert { Corruption(CorruptionReport), StorageSuspect { corruptions: u32, within: Span },
+    Fault(Fault), BackupFailed { since: Timestamp } }
+pub enum CorruptionId { File { kind: u8, file_id: u64, epoch: Option<u64> /* its quarantine record; None until
+    written */ }, Range(Position), ManifestRecord { epoch: u64 } }   // one per finding (`format.md` A.14)
+pub struct CorruptionReport { pub id: CorruptionId, pub found_at: Timestamp, pub loss: Option<Position>,
+    pub repaired: bool }
+pub fn attention(&self) -> Vec<Alert>;                      // Store and Reader; empty: nobody needs to look
+pub async fn acknowledge_corruptions(&self, ids: &[CorruptionId]) -> Result<(), WriteError>;
+// LossState, Closed, ResendRequest, repairs, repair_done, Alert, CorruptionId, CorruptionReport, attention,
+// acknowledge_corruptions, LossReport.state, Reason::StorageSuspect and the repair.* keys are built with roadmap 8.5c.
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
-// LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
+// LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
@@ -396,9 +460,22 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 ```
 - A loss's identity is the first position of its range when it was first reported; a `PossibleLoss` has its
   recovery entry's position, and the gap before that entry is a `DataLost` with cause `TruncatedTail`. Reports are read from the
-  manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
-  `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
-  a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
+  manifest and the recovery entries at every start. A loss found while the store is open, by a read of that process,
+  or by a start that could not write, is reported at once with `recorded` false, and is the same loss, recorded,
+  after the next start that can write (spec §3 Recovery rule 2, Q-200); one found next to or over a reported loss
+  grows that loss under its identity, `recorded` false and not acknowledged until a record and a new acknowledgement
+  cover its whole range. When the loss reports cannot be read (the
+  mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
+  `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A `DataLost` holds health `Degraded` until it is closed (spec §8
+  Self-repair): restored in full from a copy, its re-send stage ended (`repair_done`, `repair.resend_wait`), or by
+  `acknowledge_losses`, which with `repair.acknowledge = Manual` is the only way once the re-send stage has ended. A
+  `PossibleLoss` is listed by `losses()`, counted, never degrades, has no state and needs no acknowledgement (spec §8
+  Acknowledging a loss, §11 Health). `acknowledge_losses`, `acknowledge_corruptions` and `repair_done` are refused
+  while read-only and in a drill; `repair_done` of a loss not awaiting re-send writes nothing. Re-sent readings go
+  through `emit` and take new positions. `attention()` lists what needs a person (spec §8 Self-repair, Attention):
+  each corruption until it is seen, repaired or not, repeated corruption, a fault and a failed or stalled backup. A
+  corruption's alert never changes `Health`; repeated corruption is also `Reason::StorageSuspect`, degraded, while
+  `repair.suspect_after` is crossed (Q-247). `acknowledge_losses` does not close a loss in stage 1 (Q-248). `acknowledge_losses` also marks as seen the corruption each loss came from. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,
   which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
   given again as for `acknowledge_losses` (spec §7 Manifest).
@@ -411,7 +488,14 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `LossCause::Unknown` is the cause of a loss that a manifest rebuild found again with no cause given by a valid
   record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
-  `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
+  `acknowledged` is the last position acknowledged at either level and `durable` the last synced one ("durable up
+  to"); they differ only while flagged batches wait for their sync (spec §3 Commit). A recovery entry written while
+  a series is at `Durability::Written` is a `PossibleLoss` (spec §3 Recovery rule 3; Q-251).
+  `SealBlocked` lasts until the seal succeeds. `SegmentDamaged` names a sealed segment that no manifest record lists
+  and that fails its checks (`format.md` A.9, Q-221 (c)): it lasts while the store runs and is raised again at each
+  start until the file is repaired. A failure to open or read such a segment is retried; once the wait
+  between tries has reached its cap of 10 minutes, `SegmentUnreadable` names it until a read succeeds (Q-640). `Other` degrades
+  health with a reason from the log that this version of the interface does not name, so none is dropped (Q-221 (d)). A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
@@ -443,7 +527,7 @@ pub enum RestoreMode { Full /* default */, Drill, Partial(RestoreScope) }   // n
 pub struct RestoreScope { pub time: Option<Range<Timestamp>> }            // non-exhaustive; a series selection arrives with 8.3f
 pub enum BackupError { NotSupportedYet { what }, Sink(SinkError), Refused(BackupRefusal), WrongKey, NotEmpty, NoStore,
     SeveralStores { store_ids: Vec<[u8; 16]> }, Superseded { generation: u32 }, AlreadyAttached, RestoreFailed { file_id: u64, reason: String }, Drill,
-    Io { op, path, kind } }
+    BrokenChain { generation: u32, epoch: u64 }, Io { op, path, kind } }
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
@@ -477,7 +561,19 @@ only, boxed `Send` futures):
   (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
-  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304).
+  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304). So is a record missing
+  from the listing that a later record names, or that lies within a few epochs after the last listed or the last
+  read, when `stat` reports it (Q-611, Q-612). A drill of a live store, or a full restore while the source store
+  still uploads, can see a record uploaded after its listing and is retried the same way; on a bucket whose listings
+  lag longer than the time between two record uploads it never passes, so there a drill runs from a paused copy, a
+  copy of the store's objects made while the store uploads nothing (spec §8 Restore drill, Q-612 (d)). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
+  or one no listing could hide (`format.md` A.17 Uploaded forms; `RestoreError::BrokenChain`, Q-611); a retry gives
+  the same answer. A full restore whose
+  `prepare` fails after its claim, retried on the same driver, runs in the generation it claimed while no higher one
+  is claimed; a new driver, or a new process, claims the next (Q-266).
+- **Superseded writer.** The upload driver reads the claim above its generation before each record upload; once a
+  restore has claimed one, every step fails with `UploadError::Superseded { by }` and nothing more is uploaded, and
+  the store becomes read-only with fatal health (the store's wiring is roadmap 8.1d; spec §8 Generations; Q-265).
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.
@@ -495,8 +591,10 @@ the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and
   A restore reports a refused bucket as `RestoreError::Refused` (Q-214).
 
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
-`export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to
-Q-197).
+`export_series(&reader, id, &ExportOptions, writer)` for one file, `export_partitioned(&reader, id, &ExportOptions,
+open)` for one file per UTC month under `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/`, the
+series name's three segments (Q-670); both write `reader.store_id()` into every file. Its schema is export version
+1 ([`export.md`](export.md), Q-190 to Q-197).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust

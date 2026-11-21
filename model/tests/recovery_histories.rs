@@ -4,16 +4,22 @@
 //! take and confirm deliveries, crash, lose power (losing acknowledged
 //! batches above the last synced mark), remount, lose the mark or a cursor
 //! file, damage a batch, fail a start's sync, acknowledge losses, compact,
-//! upload, move files off the local tiers and let time pass.
+//! upload, move files off the local tiers and let time pass, and self-repair:
+//! damage a sealed segment, lose an object in the bucket, swap copies in,
+//! close losses and name corruptions seen. A second series is at the `written`
+//! level: its batches are flagged (§3 Batches, Q-170).
 
 mod common;
+#[path = "recovery_histories/ops.rs"]
+mod ops;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{T0, seqs};
 use kvik_model::engine::ConsumerId;
-use kvik_model::recovery::LossKind;
+use kvik_model::recovery::{Loss, LossCause, LossKind, LossState, Outcome};
 use kvik_model::types::{DAY, Kind, Nanos, SECOND};
+use ops::{ROp, arb_rop};
 use proptest::prelude::*;
 
 fn cases(n: u32) -> ProptestConfig {
@@ -26,102 +32,27 @@ fn cases(n: u32) -> ProptestConfig {
     }
 }
 
-/// One step of a recovery history: commits on a store with the timed mark
-/// sync, consumers taking and confirming deliveries, and every stop and fault
-/// a start must recover from (§3 Recovery rules 1–3).
-#[derive(Clone, Debug)]
-enum ROp {
-    /// Readings committed in one batch, with a fault or none.
-    Ingest(u8, Option<kvik_model::engine::Fault>),
-    /// A definition: a batch that is not only facts forces a mark sync.
-    Define,
-    /// The timed mark sync fires.
-    SyncMark,
-    Take {
-        c: usize,
-        n: usize,
-    },
-    Confirm {
-        c: usize,
-    },
-    CatchUp {
-        c: usize,
-    },
-    Reconnect {
-        c: usize,
-    },
-    Crash,
-    /// A power loss losing up to this many acknowledged batches above the
-    /// last synced mark.
-    PowerLoss(usize),
-    Remount,
-    LoseMark(bool),
-    /// The mark is lost, then a power loss loses up to this many batches,
-    /// below positions a cursor or a derived file may name.
-    LoseMarkAndBatches(usize),
-    LoseCursor {
-        c: usize,
-    },
-    Corrupt(usize),
-    /// Restart; with `true` the start's sync fails.
-    Restart(bool),
-    Acknowledge,
-    Seal,
-    Compact,
-    Merge,
-    Housekeeping,
-    Checkpoint,
-    /// Every closed segment is uploaded to the bucket.
-    Upload,
-    /// The clocks move on this many days, so tier moves take log segments
-    /// off the local tiers and cursors fall behind the oldest local segment.
-    Advance(u16),
-}
-
-fn arb_rop() -> impl Strategy<Value = ROp> {
-    use kvik_model::engine::{CrashPoint, Fault, WriteOutcome};
-    let outcome = prop_oneof![
-        Just(WriteOutcome::Lost),
-        Just(WriteOutcome::Torn),
-        Just(WriteOutcome::Survived)
-    ];
-    let fault = prop_oneof![
-        outcome
-            .clone()
-            .prop_map(|o| Fault::Crash(CrashPoint::AfterWrite(o))),
-        Just(Fault::Crash(CrashPoint::AfterSyncBeforeMark)),
-        Just(Fault::Crash(CrashPoint::BeforeWrite)),
-        outcome.clone().prop_map(Fault::PowerLoss),
-        outcome.prop_map(Fault::SyncError),
-    ];
-    prop_oneof![
-        8 => (1u8..4, proptest::option::weighted(0.15, fault)).prop_map(|(n, f)| ROp::Ingest(n, f)),
-        1 => Just(ROp::Define),
-        1 => Just(ROp::SyncMark),
-        12 => (0usize..2, 4usize..16).prop_map(|(c, n)| ROp::Take { c, n }),
-        10 => (0usize..2).prop_map(|c| ROp::Confirm { c }),
-        2 => (0usize..2).prop_map(|c| ROp::CatchUp { c }),
-        1 => (0usize..2).prop_map(|c| ROp::Reconnect { c }),
-        1 => Just(ROp::Crash),
-        2 => (0usize..4).prop_map(ROp::PowerLoss),
-        2 => Just(ROp::Remount),
-        1 => any::<bool>().prop_map(ROp::LoseMark),
-        1 => (1usize..4).prop_map(ROp::LoseMarkAndBatches),
-        1 => (0usize..2).prop_map(|c| ROp::LoseCursor { c }),
-        1 => (0usize..8).prop_map(ROp::Corrupt),
-        1 => proptest::bool::weighted(0.1).prop_map(ROp::Restart),
-        1 => Just(ROp::Acknowledge),
-        1 => Just(ROp::Seal),
-        1 => Just(ROp::Compact),
-        1 => Just(ROp::Merge),
-        1 => Just(ROp::Housekeeping),
-        1 => Just(ROp::Checkpoint),
-        1 => Just(ROp::Upload),
-        1 => prop_oneof![Just(1u16), Just(100)].prop_map(ROp::Advance),
-    ]
-}
-
 const RC: [ConsumerId; 2] = [ConsumerId(1), ConsumerId(2)];
+
+/// The losses with their closing and state set aside: what invariant 27 says
+/// acknowledging and closing never change.
+/// How many losses are closed as restored in full.
+fn restored(v: &[Loss]) -> usize {
+    v.iter()
+        .filter(|l| matches!(l.state, Some(LossState::Closed(Outcome::Restored(_)))))
+        .count()
+}
+
+fn strip(v: &[Loss]) -> Vec<Loss> {
+    v.iter()
+        .map(|l| {
+            let mut l = l.clone();
+            l.acknowledged = false;
+            l.state = None;
+            l
+        })
+        .collect()
+}
 
 /// What a recovery history saw, for the properties and their guard.
 #[derive(Default)]
@@ -129,16 +60,38 @@ struct Seen {
     /// Every fact each consumer received, by position: a different fact at
     /// a position received before is a reassigned position.
     facts: BTreeMap<(usize, kvik_model::types::Position), kvik_model::types::Fact>,
+    /// The facts each consumer received that no `resync` since has told it
+    /// to forget (`forget_above` below their position).
+    known: BTreeMap<(usize, kvik_model::types::Position), kvik_model::types::Fact>,
     reassigned: usize,
+    /// Reassigned positions that held a fact of the `written` series.
+    flagged_reassigned: usize,
+    /// Remounts with flagged batches not yet synced.
+    flagged_remounts: usize,
     forget_resyncs: usize,
     behind_resyncs: usize,
     forced_syncs: usize,
     stale: usize,
     gaps: usize,
     rule_1_resets: usize,
+    /// Starts on the same boot that kept flagged batches beyond the mark.
+    flagged_kept: usize,
+    /// Entries that are a `possible_loss` only for the `written` level.
+    written_resets: usize,
     acknowledged: usize,
     possible: usize,
     data_lost: usize,
+    closed_by_repair: usize,
+    restored: usize,
+    lost_in_bucket: usize,
+    judged_lost: usize,
+    corruptions_seen: usize,
+    /// Every recorded corruption reported, with whether it was seen.
+    corruptions: BTreeMap<kvik_model::engine::Corruption, bool>,
+    /// The step names corruptions as seen.
+    acknowledging: bool,
+    /// Positions of sealed log segments readable at some step.
+    readable: BTreeSet<kvik_model::types::Position>,
     /// Every loss listed, by identity and kind, with its range.
     losses: BTreeMap<
         (kvik_model::types::Position, bool),
@@ -156,17 +109,29 @@ struct Checks {
     inv25: bool,
     inv26: bool,
     inv27: bool,
+    /// §4 Resync, principle 5: a position is given again only after a
+    /// `resync` whose `forget_above` lies below it.
+    reuse: bool,
 }
+
+const NONE: Checks = Checks {
+    inv25: false,
+    inv26: false,
+    inv27: false,
+    reuse: false,
+};
 
 const ALL: Checks = Checks {
     inv25: true,
     inv26: true,
     inv27: true,
+    reuse: true,
 };
 
 struct RWorld {
     m: kvik_model::engine::Model,
     s: kvik_model::types::SeriesId,
+    fast: kvik_model::types::SeriesId,
     t: Nanos,
     defs: usize,
     last: [Option<kvik_model::engine::DeliveryId>; 2],
@@ -199,14 +164,64 @@ impl RWorld {
                 5 * SECOND,
             )
             .unwrap();
+        let fast = m
+            .define_with(
+                "market/feed/price",
+                Kind::Gauge,
+                kvik_model::types::ValueType::Number,
+                "1",
+                5 * SECOND,
+                kvik_model::registry::SeriesOptions::durability(
+                    kvik_model::registry::Durability::Written,
+                ),
+            )
+            .unwrap();
         RWorld {
             m,
             s,
+            fast,
             t: T0,
             defs: 0,
             last: [None, None],
             checks,
         }
+    }
+
+    /// A lost range recorded at run time is followed by a restart: the model
+    /// sends no reset point for it in the session (Q-33 requirement 1, "the
+    /// writer restarts recovery when it records one").
+    fn restart_after_run_time_loss(&mut self, before: usize) {
+        if self.m.disk.lost_ranges().len() > before {
+            self.m.crash();
+            self.m.restart();
+            self.last = [None, None];
+        }
+    }
+
+    /// The scheduled check, `n` times 5 minutes apart.
+    fn check_bucket(&mut self, n: usize, seen: &mut Seen) -> Result<(), TestCaseError> {
+        let lost = self.m.disk.lost_ranges().len();
+        let in_bucket = |m: &kvik_model::engine::Model| {
+            m.losses()
+                .iter()
+                .filter(|l| l.cause == LossCause::LostInBucket)
+                .count()
+        };
+        let before = in_bucket(&self.m);
+        for i in 0..n {
+            if i > 0 {
+                self.m.advance(5 * 60 * SECOND);
+            }
+            let corruptions = self.m.corruptions().len();
+            if let Ok(judged) = self.m.check_bucket() {
+                seen.judged_lost += judged.len();
+                // Each object judged lost is a corruption of its own.
+                prop_assert_eq!(self.m.corruptions().len(), corruptions + judged.len());
+            }
+        }
+        seen.lost_in_bucket += in_bucket(&self.m) - before;
+        self.restart_after_run_time_loss(lost);
+        Ok(())
     }
 
     fn down(&mut self) {
@@ -221,6 +236,7 @@ impl RWorld {
         use kvik_model::recovery::MarkState;
         let entries = self.m.recovery_entries().len();
         let mark_boot = self.m.disk.mark.map(|m| m.boot);
+        let pending = self.pending_flagged();
         // A step that needs the engine starts it first, so histories spend
         // most of their time up.
         let needs_up = !matches!(
@@ -228,9 +244,16 @@ impl RWorld {
             ROp::SyncMark
                 | ROp::Upload
                 | ROp::Advance(_)
+                | ROp::Minutes(_)
+                | ROp::LoseObject(_)
+                | ROp::CorruptSealed(_)
+                | ROp::DamageStoppedRestore(_)
+                | ROp::Evict
                 | ROp::Crash
                 | ROp::PowerLoss(_)
-                | ROp::Remount
+                | ROp::PowerLossKeeping(_)
+                | ROp::SyncLog
+                | ROp::Remount(_)
                 | ROp::LoseMark(_)
                 | ROp::LoseMarkAndBatches(_)
                 | ROp::LoseCursor { .. }
@@ -252,6 +275,21 @@ impl RWorld {
                 }
                 let _ = self.m.commit(*fault);
             }
+            ROp::IngestWritten(n, fault) if up => {
+                for _ in 0..*n {
+                    self.t += SECOND;
+                    let _ = self
+                        .m
+                        .emit(kvik_model::types::Reading::num(self.fast, self.t, 1.0));
+                }
+                let _ = self.m.commit(*fault);
+            }
+            ROp::SyncLog => self.m.sync_log(),
+            ROp::PowerLossKeeping(k) => {
+                if self.m.is_up() {
+                    self.m.power_loss_keeping(*k);
+                }
+            }
             ROp::Define if up => {
                 self.defs += 1;
                 let _ = self.m.define(
@@ -270,6 +308,9 @@ impl RWorld {
                 let cursor = self.m.disk.cursors.get(&RC[*c]).copied();
                 let points = self.m.reset_points();
                 for d in &got {
+                    if let Some(x) = d.resync().and_then(|r| r.forget_above) {
+                        seen.known.retain(|(k, p), _| *k != *c || *p <= x);
+                    }
                     if let Some(r) = d.resync()
                         && r.forget_above.is_some()
                     {
@@ -296,10 +337,21 @@ impl RWorld {
                             cursor
                         );
                     }
+                    if let Some(old) = seen.known.insert((*c, f.position), f.clone()) {
+                        prop_assert!(
+                            !self.checks.reuse || old == *f,
+                            "{:?} given again to {:?} with no forget_above below it: {:?}, then {:?}",
+                            f.position,
+                            RC[*c],
+                            old,
+                            f
+                        );
+                    }
                     if let Some(old) = seen.facts.insert((*c, f.position), f.clone())
                         && old != *f
                     {
                         seen.reassigned += 1;
+                        seen.flagged_reassigned += usize::from(old.series == self.fast);
                     }
                 }
                 if let Some(d) = got.last() {
@@ -324,7 +376,19 @@ impl RWorld {
             ROp::PowerLoss(n) => {
                 self.m.power_loss_losing(*n);
             }
-            ROp::Remount => self.m.remount(),
+            ROp::Remount(keep) => {
+                let unsynced = self.unsynced_flagged();
+                seen.flagged_remounts += usize::from(unsynced > 0);
+                // A remount that loses an acknowledged flagged batch is
+                // Q-250's open case, excluded from the reuse property: there
+                // every unsynced batch reached the disk.
+                let keep = if self.checks.reuse && unsynced > *keep {
+                    usize::MAX
+                } else {
+                    *keep
+                };
+                self.m.remount_keeping(keep);
+            }
             ROp::LoseMark(missing) => {
                 self.down();
                 let state = if *missing {
@@ -357,21 +421,163 @@ impl RWorld {
             ROp::Acknowledge if up => {
                 let ids: Vec<_> = self.m.losses().iter().map(|l| l.identity).collect();
                 let before = self.m.losses();
+                seen.acknowledging = true;
                 if self.m.acknowledge_losses(&ids).is_ok() && self.checks.inv27 {
                     let after = self.m.losses();
-                    let strip = |v: &[kvik_model::recovery::Loss]| -> Vec<_> {
-                        v.iter()
-                            .map(|l| {
-                                let mut l = l.clone();
-                                l.acknowledged = false;
-                                l
-                            })
-                            .collect()
-                    };
-                    // 27. Acknowledging changes only the health state.
+                    // 27. Acknowledging changes only the state and health.
                     prop_assert_eq!(strip(&before), strip(&after));
-                    prop_assert!(after.iter().all(|l| !l.degrades()));
+                    // A loss whose copy is being brought back stays open
+                    // (Q-248); every other closes.
+                    for l in &after {
+                        let copying = before.iter().any(|b| {
+                            b.identity == l.identity
+                                && b.kind == l.kind
+                                && b.state == Some(LossState::Copying)
+                        });
+                        prop_assert_eq!(l.degrades(), copying, "{:?}", l);
+                    }
                     seen.acknowledged += after.iter().filter(|l| l.acknowledged).count();
+                }
+            }
+            ROp::Repair if up => {
+                let before = self.m.losses();
+                if let Ok(n) = self.m.repair()
+                    && self.checks.inv27
+                {
+                    let after = self.m.losses();
+                    // 27. A loss closed by self-repair stays listed; closing
+                    // changes only its state and health.
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    let closed = |v: &[Loss]| v.iter().filter(|l| l.acknowledged).count();
+                    prop_assert_eq!(closed(&after), closed(&before) + n);
+                    seen.closed_by_repair += n;
+                }
+            }
+            ROp::RepairDone if up => {
+                if let Some(r) = self.m.resend_requests().first()
+                    && !self.m.is_read_only()
+                {
+                    let before = self.m.losses();
+                    self.m.repair_done(r.identity).unwrap();
+                    let after = self.m.losses();
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    let l = after.iter().find(|l| l.identity == r.identity).unwrap();
+                    prop_assert_eq!(l.state, Some(LossState::Closed(Outcome::ResendEnded)));
+                    seen.closed_by_repair += 1;
+                }
+            }
+            ROp::AcknowledgeCorruptions if up => {
+                let ids: Vec<_> = self.m.corruptions().iter().map(|c| c.id).collect();
+                seen.acknowledging = true;
+                let before = self.m.losses();
+                if self.m.acknowledge_corruptions(&ids).is_ok() {
+                    prop_assert_eq!(
+                        before,
+                        self.m.losses(),
+                        "naming corruptions seen closes nothing"
+                    );
+                    seen.corruptions_seen += ids.len();
+                }
+            }
+            ROp::Minutes(n) => self.m.advance(i64::from(*n) * 60 * SECOND),
+            ROp::Evict => {
+                let verified: Vec<_> = self
+                    .m
+                    .disk
+                    .hot
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        let file = &self.m.disk.files[f];
+                        file.sealed
+                            && file.class == kvik_model::engine::FileClass::Segment
+                            && self.m.disk.in_bucket(*f)
+                    })
+                    .collect();
+                for f in verified {
+                    self.m.disk.hot.remove(&f);
+                }
+            }
+            ROp::CorruptSealed(k) => {
+                let mut sealed: Vec<_> = self
+                    .m
+                    .disk
+                    .hot
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        let file = &self.m.disk.files[f];
+                        file.sealed && file.class == kvik_model::engine::FileClass::Segment
+                    })
+                    .collect();
+                // Segments with a copy in the bucket first, so that stage 1
+                // is reached often.
+                sealed.sort_by_key(|f| !self.m.disk.in_bucket(*f));
+                if let Some(f) = sealed.get(k % sealed.len().max(1)) {
+                    let lost = self.m.disk.lost_ranges().len();
+                    self.m.corrupt_hot(*f);
+                    self.m.scrub();
+                    self.restart_after_run_time_loss(lost);
+                }
+            }
+            ROp::RestoreFiles if up => {
+                let q: Vec<_> = self.m.disk.quarantined.iter().copied().collect();
+                for f in q {
+                    let before = self.m.losses();
+                    self.m.restore_file(f);
+                    let after = self.m.losses();
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    seen.restored += restored(&after) - restored(&before);
+                }
+            }
+            ROp::LoseObject(k) => {
+                let objects: Vec<_> = self.m.disk.bucket.objects.keys().copied().collect();
+                if let Some(f) = objects.get(k % objects.len().max(1)) {
+                    self.m.lose_object(*f);
+                }
+            }
+            ROp::CheckBucket(n) if up => self.check_bucket(usize::from(*n), seen)?,
+            ROp::LoseEvicted(k) if up => {
+                let uploaded: Vec<_> = self
+                    .m
+                    .disk
+                    .bucket
+                    .objects
+                    .keys()
+                    .copied()
+                    .filter(|f| !self.m.disk.quarantined.contains(f))
+                    .collect();
+                if let Some(f) = uploaded.get(k % uploaded.len().max(1)) {
+                    self.m.disk.hot.remove(f);
+                    self.m.lose_object(*f);
+                    self.check_bucket(3, seen)?;
+                }
+            }
+            ROp::DamageStoppedRestore(k) => {
+                let uploaded: Vec<_> = self
+                    .m
+                    .disk
+                    .hot
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        let file = &self.m.disk.files[f];
+                        file.sealed
+                            && file.class == kvik_model::engine::FileClass::Segment
+                            && self.m.disk.in_bucket(*f)
+                            && !self.m.disk.corrupt.contains(f)
+                    })
+                    .collect();
+                if let Some(f) = uploaded.get(k % uploaded.len().max(1)) {
+                    self.down();
+                    self.m.corrupt_hot(*f);
+                    self.m.scrub();
+                    self.m.restart();
+                    self.last = [None, None];
+                    self.check(seen)?;
+                    let before = self.m.losses();
+                    self.m.restore_file(*f);
+                    seen.restored += restored(&self.m.losses()) - restored(&before);
                 }
             }
             ROp::Seal if up => self.m.seal_active(),
@@ -396,7 +602,55 @@ impl RWorld {
         if !matches!(op, ROp::Take { .. }) {
             self.last = self.last.map(|l| l.filter(|_| self.m.is_up()));
         }
+        if let Some(last) = pending
+            && self.m.is_up()
+            && self
+                .m
+                .disk
+                .mark
+                .is_some_and(|m| Some(m.boot) == mark_boot && m.last >= last)
+        {
+            seen.flagged_kept += 1;
+        }
+        let acknowledging = std::mem::take(&mut seen.acknowledging);
+        if self.checks.inv27 && self.m.is_up() {
+            // A corruption's alert ends only when a record names it as seen
+            // (Q-240): never by a restart, time or its repair.
+            let now: BTreeMap<_, _> = self
+                .m
+                .corruptions()
+                .into_iter()
+                .map(|c| (c.id, (c.seen, c.at.is_some())))
+                .collect();
+            for (id, was_seen) in &seen.corruptions {
+                let Some((is_seen, _)) = now.get(id) else {
+                    return Err(TestCaseError::fail(format!("corruption {id:?} lost")));
+                };
+                prop_assert!(!was_seen || *is_seen, "{:?} unseen again", id);
+                prop_assert!(
+                    *was_seen || !is_seen || acknowledging,
+                    "{:?} seen by itself",
+                    id
+                );
+            }
+            let alerts = self.m.attention();
+            for (id, (is_seen, recorded)) in now {
+                prop_assert_eq!(
+                    alerts.contains(&kvik_model::engine::Alert::Corruption(id)),
+                    !is_seen
+                );
+                if recorded {
+                    seen.corruptions.insert(id, is_seen);
+                }
+            }
+        }
         for (p, e) in self.m.recovery_entries().into_iter().skip(entries) {
+            seen.written_resets += usize::from(
+                e.written_level
+                    && e.tail.is_empty()
+                    && e.mark_state == MarkState::Readable
+                    && e.cursors_missing.is_empty(),
+            );
             seen.stale += usize::from(e.mark_state == MarkState::Stale);
             seen.gaps += usize::from(e.gap(p).is_some());
             seen.rule_1_resets +=
@@ -405,8 +659,58 @@ impl RWorld {
         self.check(seen)
     }
 
+    /// Flagged batches beyond the page cache's mark: written, not yet synced
+    /// (§3 Commit).
+    fn unsynced_flagged(&self) -> usize {
+        let d = &self.m.disk;
+        let (Some(f), false) = (d.active, d.cache_lost) else {
+            return 0;
+        };
+        let floor = d
+            .mark
+            .map_or(0, |m| if m.file == f { m.batches } else { 0 });
+        d.flagged
+            .iter()
+            .filter(|(g, b)| *g == f && *b >= floor)
+            .count()
+    }
+
+    /// The last position of the flagged batches beyond the mark while the
+    /// engine is down on the boot that wrote them, which a start keeps (§3
+    /// Recovery rule 1).
+    fn pending_flagged(&self) -> Option<kvik_model::types::Position> {
+        let d = &self.m.disk;
+        let (f, mark) = (d.active?, d.mark?);
+        if self.m.is_up() || mark.boot != self.m.boot {
+            return None;
+        }
+        let floor = if mark.file == f { mark.batches } else { 0 };
+        let batches = &d.files[&f].batches;
+        let run = (floor..batches.len()).take_while(|b| d.flagged.contains(&(f, *b)));
+        run.last()
+            .and_then(|b| batches[b].last())
+            .map(|e| e.position)
+    }
+
     fn check(&self, seen: &mut Seen) -> Result<(), TestCaseError> {
         let m = &self.m;
+        // §3 Batches: a flagged batch holds only facts of a series at the
+        // `written` level (none once damaged), so no flag outlives the batch
+        // it was written for.
+        for (f, b) in &m.disk.flagged {
+            let batch = m.disk.files.get(f).and_then(|x| x.batches.get(*b));
+            let facts_of_fast = batch.is_some_and(|x| {
+                x.iter()
+                    .all(|e| e.fact().is_some_and(|ft| ft.series == self.fast))
+            });
+            prop_assert!(
+                facts_of_fast,
+                "flag on {:?} batch {} that holds {:?}",
+                f,
+                b,
+                batch
+            );
+        }
         if !m.is_up() {
             return Ok(());
         }
@@ -466,6 +770,41 @@ impl RWorld {
         }
         let top = held.iter().next_back().copied().unwrap_or(0);
         prop_assert_eq!(held.len() as u64, top, "a gap that no lost range holds");
+        // A position of a sealed log segment once readable and no longer
+        // readable lies in a loss that is open or closed otherwise than
+        // restored in full, or waits for the lost-object rule (§8
+        // Self-repair).
+        if self.checks.inv27 {
+            let all = m.disk.all_entries();
+            let sealed: Vec<(kvik_model::engine::FileId, kvik_model::types::Position)> = m
+                .disk
+                .files
+                .iter()
+                .filter(|(_, f)| f.sealed && f.class == kvik_model::engine::FileClass::Segment)
+                .flat_map(|(id, f)| f.entries().map(move |e| (*id, e.position)))
+                .collect();
+            seen.readable.extend(
+                sealed
+                    .iter()
+                    .map(|(_, p)| *p)
+                    .filter(|p| all.contains_key(p)),
+            );
+            let losses = m.losses();
+            for p in seen.readable.iter().filter(|p| !all.contains_key(p)) {
+                let open = losses.iter().any(|l| {
+                    l.kind == LossKind::DataLost
+                        && l.first.zip(l.last).is_some_and(|(a, b)| a <= *p && *p <= b)
+                        && !matches!(l.state, Some(LossState::Closed(Outcome::Restored(_))))
+                });
+                // Any file holding it, a compacted one included.
+                let pending = m.disk.files.iter().any(|(f, file)| {
+                    m.disk.bucket.missing.contains(f)
+                        && !m.disk.judged_lost.contains(f)
+                        && file.entries().any(|e| e.position == *p)
+                });
+                prop_assert!(open || pending, "{:?} unreadable outside an open loss", p);
+            }
+        }
         // 27. The list of losses never loses a loss, each keeps one identity
         // and its range only grows; health is degraded by exactly the
         // unacknowledged `data_lost`.
@@ -509,6 +848,11 @@ impl RWorld {
                 .filter(|r| matches!(r, kvik_model::engine::Reason::DataLost(..)))
                 .count();
             prop_assert_eq!(degraded, losses.iter().filter(|l| l.degrades()).count());
+            for l in &losses {
+                let closed = matches!(l.state, Some(LossState::Closed(_)));
+                prop_assert_eq!(closed, l.acknowledged);
+                prop_assert_eq!(l.state.is_none(), l.kind == LossKind::PossibleLoss);
+            }
         }
         Ok(())
     }
@@ -541,7 +885,7 @@ proptest! {
     fn inv25_nothing_above_forget_above_before_the_reset_point_is_confirmed(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: true, inv26: false, inv27: false })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv25: true, ..NONE })?;
     }
 
     /// 26. No cursor file or derived file is written naming a position above
@@ -552,24 +896,62 @@ proptest! {
     fn inv26_nothing_names_a_position_above_the_last_synced_mark(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: false, inv26: true, inv27: false })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv26: true, ..NONE })?;
     }
 
     /// 27. The list of losses never loses a loss across restarts, each loss
-    /// keeps one identity however its range grows, and acknowledging changes
-    /// only the health state (§8 Acknowledging a loss, §11 Health).
+    /// keeps one identity however its range grows, acknowledging or closing a
+    /// loss changes only its state and the health state, and a loss closed
+    /// by self-repair stays listed (§8 Self-repair, Acknowledging a loss,
+    /// §11 Health); a corruption alerts until a record names it seen.
     #[test]
     fn inv27_losses_are_never_lost_and_acknowledging_changes_only_health(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: false, inv26: false, inv27: true })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv27: true, ..NONE })?;
     }
 }
 
-/// Guards the recovery-history properties (invariants 25–27): positions
-/// delivered and then assigned again after a reset, `resync`s carrying
-/// `forget_above`, confirmations that forced a mark sync, stale marks, gaps,
-/// rule 1 resets, acknowledged losses and both kinds of loss.
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// Principle 5 and §4 Resync: a consumer never receives a different fact
+    /// at a position it received before unless a `resync` whose
+    /// `forget_above` lies below that position came between, across crashes,
+    /// power losses and remounts over flagged batches not yet synced, except
+    /// a remount that loses one (Q-250, excluded).
+    #[test]
+    fn s4_a_position_is_given_again_only_after_a_forget_above_below_it(
+        ops in proptest::collection::vec(arb_rop(), 1..120)
+    ) {
+        run_recovery(&ops, &mut Seen::default(), Checks { reuse: true, ..NONE })?;
+    }
+}
+
+#[test]
+fn recovery_history_a_compacted_object_lost_while_read_only_waits_for_the_lost_object_rule() {
+    let ops = [
+        ROp::PowerLoss(0),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Define,
+        ROp::Compact,
+        ROp::CorruptSealed(0),
+        ROp::Upload,
+        ROp::Restart(true),
+        ROp::LoseEvicted(0),
+    ];
+    run_recovery(&ops, &mut Seen::default(), ALL).unwrap();
+}
+
+/// Guards the recovery-history properties (invariants 25–27 and reuse):
+/// positions delivered and then assigned again after a reset (flagged ones
+/// among them), `resync`s carrying `forget_above`, confirmations that forced
+/// a mark sync, stale marks, gaps, rule 1 resets, flagged batches kept by a
+/// same-boot start, remounts over flagged batches not yet synced, entries
+/// reported only for the `written` level, acknowledged losses, both kinds of
+/// loss, losses closed by self-repair and restored in full, objects judged
+/// lost and losses of cause lost in the bucket.
 #[test]
 fn recovery_generator_coverage() {
     use proptest::strategy::ValueTree;
@@ -578,7 +960,7 @@ fn recovery_generator_coverage() {
     let strat = proptest::collection::vec(arb_rop(), 80..120);
     let mut seen = Seen::default();
     let (mut possible, mut data_lost) = (0, 0);
-    for _ in 0..200 {
+    for _ in 0..300 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let mut s = Seen::default();
         run_recovery(&ops, &mut s, ALL).unwrap();
@@ -589,12 +971,21 @@ fn recovery_generator_coverage() {
         seen.stale += s.stale;
         seen.gaps += s.gaps;
         seen.rule_1_resets += s.rule_1_resets;
+        seen.flagged_kept += s.flagged_kept;
+        seen.flagged_reassigned += s.flagged_reassigned;
+        seen.flagged_remounts += s.flagged_remounts;
+        seen.written_resets += s.written_resets;
         seen.acknowledged += s.acknowledged;
+        seen.closed_by_repair += s.closed_by_repair;
+        seen.restored += s.restored;
+        seen.lost_in_bucket += s.lost_in_bucket;
+        seen.judged_lost += s.judged_lost;
+        seen.corruptions_seen += s.corruptions_seen;
         possible += usize::from(s.possible > 0);
         data_lost += usize::from(s.data_lost > 0);
     }
     eprintln!(
-        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} acknowledged {} possible {possible} data-lost {data_lost}",
+        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} flagged-kept {} written-resets {} flagged-reassigned {} flagged-remounts {} acknowledged {} possible {possible} data-lost {data_lost}",
         seen.reassigned,
         seen.forget_resyncs,
         seen.behind_resyncs,
@@ -602,10 +993,26 @@ fn recovery_generator_coverage() {
         seen.stale,
         seen.gaps,
         seen.rule_1_resets,
+        seen.flagged_kept,
+        seen.written_resets,
+        seen.flagged_reassigned,
+        seen.flagged_remounts,
         seen.acknowledged
     );
-    assert!(seen.reassigned > 5 && seen.forget_resyncs > 100 && seen.forced_syncs > 20);
-    assert!(seen.behind_resyncs > 20);
-    assert!(seen.stale > 20 && seen.gaps > 5 && seen.rule_1_resets > 20);
-    assert!(seen.acknowledged > 50 && possible > 100 && data_lost > 50);
+    assert!(seen.reassigned > 7 && seen.forget_resyncs > 1500 && seen.forced_syncs > 30);
+    assert!(seen.behind_resyncs > 200);
+    assert!(seen.stale > 60 && seen.gaps > 7 && seen.rule_1_resets > 180);
+    assert!(seen.flagged_kept > 20 && seen.written_resets > 20);
+    assert!(seen.flagged_reassigned > 0 && seen.flagged_remounts > 20);
+    assert!(seen.acknowledged > 225 && possible > 150 && data_lost > 125);
+    eprintln!(
+        "closed-by-repair {} restored {} judged-lost {} lost-in-bucket {} corruptions-seen {}",
+        seen.closed_by_repair,
+        seen.restored,
+        seen.judged_lost,
+        seen.lost_in_bucket,
+        seen.corruptions_seen
+    );
+    assert!(seen.closed_by_repair > 35 && seen.corruptions_seen > 100);
+    assert!(seen.restored > 30 && seen.judged_lost > 50 && seen.lost_in_bucket > 20);
 }

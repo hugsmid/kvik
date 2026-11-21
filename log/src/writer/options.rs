@@ -51,8 +51,9 @@ impl fmt::Debug for StartOptions {
 }
 
 impl LogWriter {
-    /// [`LogWriter::open`] with `opts`. Until roadmap 8.3c threads them through the start, any field set is
-    /// refused with [`OpenError::NotSupportedYet`] rather than ignored.
+    /// [`LogWriter::open`] with `opts`: in the generation `opts.generation` names, at the first position and with the
+    /// reset stamp of its restore record (`spec.md` §8 Generations). `recorder` and `sealed` are refused with
+    /// [`OpenError::NotSupportedYet`] rather than ignored until roadmap 6.3c and 6.3b provide what they call.
     pub fn open_with(
         store: StoreDir,
         cfg: WriterConfig,
@@ -61,18 +62,16 @@ impl LogWriter {
         wall: i64,
         opts: StartOptions,
     ) -> Result<Self, OpenError> {
-        let unsupported = if opts.recorder.is_some() {
-            Some("StartOptions::recorder")
-        } else if opts.sealed.is_some() {
-            Some("StartOptions::sealed")
-        } else if opts.generation.is_some() {
-            Some("StartOptions::generation")
-        } else {
-            None
-        };
-        match unsupported {
-            Some(what) => Err(OpenError::NotSupportedYet { what }),
-            None => Self::open(store, cfg, boot_id, now, wall),
+        if opts.recorder.is_some() {
+            return Err(OpenError::NotSupportedYet {
+                what: "StartOptions::recorder",
+            });
         }
+        if opts.sealed.is_some() {
+            return Err(OpenError::NotSupportedYet {
+                what: "StartOptions::sealed",
+            });
+        }
+        Self::start(store, cfg, boot_id, now, wall, opts)
     }
 }

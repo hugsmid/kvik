@@ -7,19 +7,26 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
+use super::maint::{
+    AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest,
+    describe_sealed_until,
+};
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
-    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment,
+    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment_described,
 };
+use crate::batch::SegmentIdentity;
 use crate::content::Item;
 use crate::fs::Fs;
+use crate::segment::SealedFile;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -153,7 +160,9 @@ struct Maint {
     request: Option<SegmentRequest>,
     created: Option<Result<AheadSegment, CreateError>>,
     jobs: VecDeque<SealJob>,
-    results: Vec<(SealJob, Result<(), SealError>)>,
+    results: Vec<(SealJob, Result<SealedFile, SealError>)>,
+    describe: Option<(PathBuf, SegmentIdentity)>,
+    described: Option<Result<SealedFile, DescribeError>>,
     stop: bool,
 }
 
@@ -166,6 +175,7 @@ struct Info {
     progress: u64,
     /// The writer thread has ended.
     stopped: bool,
+    sealed: Vec<SealedFile>,
 }
 
 #[derive(Debug)]
@@ -177,6 +187,8 @@ struct Shared {
     maint_cv: Condvar,
     info: Mutex<Info>,
     progress_cv: Condvar,
+    /// A shutdown has begun: no description is handed out and one in flight is dropped (Q-221 (b)).
+    stopping: AtomicBool,
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
@@ -260,12 +272,49 @@ impl Watch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Wait,
+    Try,
+    Offer,
+}
+
+/// Waits for room in a log's ingest queue ([`Log::room`]).
+#[derive(Debug, Clone)]
+pub struct Room {
+    shared: Arc<Shared>,
+}
+
+impl Room {
+    /// Blocks until a call of `len` entries would be queued, or the log turns read-only or shuts down. Room found
+    /// here may be taken by another caller before this one queues.
+    pub fn wait(&self, len: usize) -> Result<(), SubmitError> {
+        let mut f = lock(&self.shared.front);
+        loop {
+            if f.read_only {
+                return Err(SubmitError::ReadOnly);
+            }
+            if f.shutdown {
+                return Err(SubmitError::ShutDown);
+            }
+            if f.queue.has_room(len) {
+                return Ok(());
+            }
+            f = self
+                .shared
+                .room_cv
+                .wait(f)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 /// The log writer on its threads. See the module documentation of [`crate::writer`].
 #[derive(Debug)]
 pub struct Log {
     shared: Arc<Shared>,
     call_limit: usize,
-    writer: Option<JoinHandle<Result<(), Fault>>>,
+    writer: Option<JoinHandle<(Result<(), Fault>, LogWriter)>>,
     maint: Option<JoinHandle<()>>,
 }
 
@@ -293,8 +342,10 @@ impl Log {
                 fault: None,
                 progress: 0,
                 stopped: false,
+                sealed: Vec::new(),
             }),
             progress_cv: Condvar::new(),
+            stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
             clock,
@@ -324,7 +375,7 @@ impl Log {
         })
     }
 
-    fn enqueue(&self, items: Vec<Item>, wait: bool) -> Result<Pending, SubmitError> {
+    fn enqueue(&self, items: Vec<Item>, mode: Mode) -> Result<Pending, SubmitError> {
         let call = Call::new(items, self.call_limit)?;
         let mut f = lock(&self.shared.front);
         loop {
@@ -334,13 +385,15 @@ impl Log {
             if f.shutdown {
                 return Err(SubmitError::ShutDown);
             }
-            if !wait && let Some(w) = f.waiting {
+            if mode == Mode::Try
+                && let Some(w) = f.waiting
+            {
                 return Err(SubmitError::Busy(w));
             }
             if f.queue.has_room(call.len()) {
                 break;
             }
-            if !wait {
+            if mode != Mode::Wait {
                 return Err(SubmitError::Busy(Wait::QueueFull));
             }
             f = self
@@ -363,12 +416,26 @@ impl Log {
 
     /// Queues a call, waiting while the queue is full (back-pressure).
     pub fn submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, true)
+        self.enqueue(items, Mode::Wait)
     }
 
     /// Queues a call without waiting: [`SubmitError::Busy`] names the reason ingest would wait.
     pub fn try_submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, false)
+        self.enqueue(items, Mode::Try)
+    }
+
+    /// Queues a call if the queue has room for it now, as [`Log::submit`] would without waiting, whatever else
+    /// ingest waits on; [`SubmitError::Busy`] with [`Wait::QueueFull`] otherwise. With [`Log::room`], a caller
+    /// that must not wait while it holds a lock queues as `submit` does.
+    pub fn offer(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
+        self.enqueue(items, Mode::Offer)
+    }
+
+    /// A handle that waits for room in the queue without borrowing the log.
+    pub fn room(&self) -> Room {
+        Room {
+            shared: self.shared.clone(),
+        }
     }
 
     /// The writer's statistics, as of its last turn.
@@ -409,19 +476,37 @@ impl Log {
         self.watch().sync_mark()
     }
 
+    /// The descriptions of segments sealed, and of sealed segments no manifest record listed at the start, since the
+    /// last call ([`LogWriter::take_sealed`]).
+    pub fn take_sealed(&self) -> Vec<SealedFile> {
+        std::mem::take(&mut lock(&self.shared.info).sealed)
+    }
+
     /// Entries queued.
     pub fn queue_depth(&self) -> usize {
         lock(&self.shared.front).queue.depth()
     }
 
-    /// Clean shutdown: commits the calls already queued, finishes the seals under way, syncs the mark and joins
-    /// both threads. Calls that cannot be committed (ingest waiting on the disk) fail with
+    /// Clean shutdown: commits the calls already queued, finishes the seals under way, drops a description in flight
+    /// (Q-221 (b)), syncs the mark and joins both threads. Calls that cannot be committed (ingest waiting on the disk) fail with
     /// [`CommitError::ShutDown`]. Returns the fault if the store became read-only.
     pub fn shutdown(mut self) -> Result<(), Fault> {
-        self.stop()
+        self.stop().0
     }
 
-    fn stop(&mut self) -> Result<(), Fault> {
+    /// [`Log::shutdown`], then, if the store did not become read-only, `then` on the stopped writer before the
+    /// writer, and with it the store's lock, is dropped: for work that must finish under the single-writer lock
+    /// after the clean shutdown's mark sync (`spec.md` §3 Single writer).
+    pub fn shutdown_then<R>(mut self, then: impl FnOnce(&LogWriter) -> R) -> Result<R, Fault> {
+        let (r, writer) = self.stop();
+        r?;
+        Ok(then(
+            writer.as_ref().expect("a writer after a clean shutdown"),
+        ))
+    }
+
+    fn stop(&mut self) -> (Result<(), Fault>, Option<LogWriter>) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
         {
             lock(&self.shared.front).shutdown = true;
         }
@@ -435,9 +520,9 @@ impl Log {
         let m = self.maint.take().map(JoinHandle::join);
         // Both threads are joined before a panic of either is passed on.
         let r = match w {
-            Some(Ok(r)) => r,
+            Some(Ok((r, writer))) => (r, Some(writer)),
             Some(Err(p)) => std::panic::resume_unwind(p),
-            None => Ok(()),
+            None => (Ok(()), None),
         };
         if let Some(Err(p)) = m {
             std::panic::resume_unwind(p);
@@ -464,6 +549,9 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     for (job, r) in m.results.drain(..) {
         w.seal_done(job, r, now);
     }
+    if let Some(r) = m.described.take() {
+        w.unlisted_done(r, now);
+    }
     let mut work = false;
     if let Some(req) = w.segment_request(s.clock.wall()) {
         m.request = Some(req);
@@ -472,6 +560,12 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     let jobs = w.take_seal_jobs(now);
     work |= !jobs.is_empty();
     m.jobs.extend(jobs);
+    if !s.stopping.load(Ordering::SeqCst)
+        && let Some(id) = w.take_unlisted(now)
+    {
+        m.describe = Some((w.log_dir().to_path_buf(), id));
+        work = true;
+    }
     drop(m);
     if work {
         s.maint_cv.notify_all();
@@ -493,13 +587,14 @@ fn complete(s: &Shared, done: Vec<Done>) {
     }
 }
 
-fn publish(s: &Shared, w: &LogWriter) {
+fn publish(s: &Shared, w: &mut LogWriter) {
     {
         let mut i = lock(&s.info);
         i.stats = w.stats().clone();
         i.reasons = w.reasons();
         i.fault = w.fault().cloned();
         i.progress += 1;
+        i.sealed.extend(w.take_sealed());
     }
     s.progress_cv.notify_all();
     let mut f = lock(&s.front);
@@ -545,7 +640,7 @@ impl Drop for PanicGuard<'_> {
     }
 }
 
-fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
+fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, LogWriter) {
     let _guard = PanicGuard(s);
     loop {
         let sync_now = {
@@ -561,7 +656,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
         // published before any call of this step completes, so a caller that holds its acknowledgement sees them.
         exchange(s, &mut w);
-        publish(s, &w);
+        publish(s, &mut w);
         complete(s, step.done);
         s.room_cv.notify_all();
         let mut f = lock(&s.front);
@@ -613,10 +708,10 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         }
     }
     let r = w.shutdown(s.clock.monotonic());
-    publish(s, &w);
+    publish(s, &mut w);
     lock(&s.info).stopped = true;
     s.progress_cv.notify_all();
-    r
+    (r, w)
 }
 
 /// If `kvik-maint` panics: the store turns read-only and the writer is woken, so that it stops writing and its
@@ -641,13 +736,21 @@ fn maint_loop(s: &Shared) {
     let _guard = MaintGuard(s);
     loop {
         let mut m = lock(&s.maint);
-        while m.request.is_none() && m.jobs.is_empty() && !m.stop {
+        loop {
+            // A description dropped at shutdown leaves the thread waiting for the seals the writer still hands out.
+            if s.stopping.load(Ordering::SeqCst) {
+                m.describe = None;
+            }
+            if m.request.is_some() || !m.jobs.is_empty() || m.describe.is_some() || m.stop {
+                break;
+            }
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
             m.request = None;
             m.jobs.clear();
+            m.describe = None;
             if m.stop {
                 return;
             }
@@ -661,8 +764,14 @@ fn maint_loop(s: &Shared) {
             lock(&s.maint).created = Some(r);
         } else if let Some(job) = m.jobs.pop_front() {
             drop(m);
-            let r = seal_segment(&*s.fs, &job, &s.halt);
+            let r = seal_segment_described(&*s.fs, &job, &s.halt);
             lock(&s.maint).results.push((job, r));
+        } else if let Some((dir, id)) = m.describe.take() {
+            drop(m);
+            let stop = || s.stopping.load(Ordering::SeqCst) || s.halt.is_set();
+            if let Some(r) = describe_sealed_until(&*s.fs, &dir, &id, &stop) {
+                lock(&s.maint).described = Some(r);
+            }
         } else {
             return;
         }

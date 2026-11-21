@@ -1,13 +1,12 @@
 //! Deciding a call's outcomes before it is committed (spec §2.2 to §2.5): refusals, stamping and flags, values
 //! recorded without one, the duplicate rule and outranked facts. The reference model makes the same decisions
-//! inside its commit, which is not callable on its own; this follows it rule by rule, except where the
-//! specification has moved on (the first clause of `late` uses the lateness reference, spec §2.2), and the
-//! differential test in `tests/durable.rs` holds the two backends to the same outcomes.
+//! inside its commit, which is not callable on its own; `tests/durable_differential.rs` holds the two backends to
+//! the same outcomes and facts.
 //!
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
 //! sees the calls before it whether or not their sync has returned yet.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kvik_log::content::Item;
 use kvik_log::entries::{
@@ -17,11 +16,21 @@ use kvik_log::facts::{
     FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Quality as LogQuality, Value as LogValue,
     ValueType as LogType,
 };
+use kvik_log::writer::Position as LogPos;
 
 use super::index::{Index, quality_in};
 use super::registry::Registry;
 use crate::error::Refusal;
 use crate::types::{Intent, Reading, TimeSource, Value};
+
+/// Where a recorded fact is in the log.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum At {
+    /// A fact of the kept log read at the start, at its position.
+    Kept(LogPos),
+    /// The fact with this index among its call's items.
+    Item(u64),
+}
 
 /// A recorded fact as the duplicate rule compares it: value, adapter-supplied quality and `changed_at`.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,15 +40,20 @@ struct Known {
     changed_at: Option<u64>,
     /// The call that queued it in this process; 0 for a fact of the kept log read at the start.
     call: u64,
+    at: At,
+    /// Flagged neither `future` nor `unsynced_clock`: it counts for the lateness reference (spec §2.2).
+    reference: bool,
 }
 
 impl Known {
-    fn of(r: &FactRow, call: u64) -> Self {
+    fn of(r: &FactRow, call: u64, at: At) -> Self {
         Known {
             value: r.value.clone(),
             supplied: r.quality,
             changed_at: r.changed_at,
             call,
+            at,
+            reference: !r.flags.future && !r.flags.unsynced_clock,
         }
     }
 
@@ -95,13 +109,16 @@ pub(crate) struct Plan {
 }
 
 /// The state decisions are made against: the registry and the history of every key, including calls queued but
-/// not yet acknowledged.
+/// not yet acknowledged, less the facts of ranges found lost while the store is open (Q-200).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Decider {
     pub(crate) registry: Registry,
     history: HashMap<(u32, i64), Vec<Known>>,
     versions: HashMap<(u32, i64), u64>,
     reference: HashMap<u32, i64>,
+    /// The first and last positions of each acknowledged call of this process.
+    placed: BTreeMap<u64, (LogPos, LogPos)>,
+    lost: Vec<(LogPos, LogPos)>,
 }
 
 fn reach(observed: bool, interval: Option<&LogInterval>, t: i64) -> i64 {
@@ -129,18 +146,18 @@ impl Decider {
         };
         for id in index.fact_series() {
             for f in index.series_facts(id) {
-                d.note(&f.row, 0);
+                d.note(&f.row, 0, At::Kept(f.position));
             }
         }
         d
     }
 
-    fn note(&mut self, r: &FactRow, call: u64) {
+    fn note(&mut self, r: &FactRow, call: u64, at: At) {
         let key = (r.series_id, r.t);
         self.history
             .entry(key)
             .or_default()
-            .push(Known::of(r, call));
+            .push(Known::of(r, call, at));
         if let Some(c) = r.changed_at {
             let v = self.versions.entry(key).or_insert(c);
             *v = (*v).max(c);
@@ -153,15 +170,78 @@ impl Decider {
 
     /// Takes a planned call's facts into the state, once it is queued.
     pub(crate) fn apply(&mut self, plan: &Plan) {
-        for item in &plan.items {
+        for (i, item) in plan.items.iter().enumerate() {
             if let Item::Fact(r) = item {
-                self.note(r, plan.call);
+                self.note(r, plan.call, At::Item(i as u64));
+            }
+        }
+    }
+
+    /// Notes the positions the log gave an acknowledged call.
+    pub(crate) fn placed(&mut self, call: u64, first: LogPos, last: LogPos) {
+        self.placed.insert(call, (first, last));
+        if self.lost.iter().any(|&(a, b)| first <= b && a <= last) {
+            self.forget_lost();
+        }
+    }
+
+    /// Takes in a range found lost while the store is open: its facts leave every key's history, so a replay of
+    /// one is recorded again (spec §3 Recovery rule 2, Q-200).
+    pub(crate) fn lose(&mut self, first: LogPos, last: LogPos) {
+        self.lost.push((first, last));
+        self.forget_lost();
+    }
+
+    fn position(&self, k: &Known) -> Option<LogPos> {
+        match k.at {
+            At::Kept(p) => Some(p),
+            At::Item(i) => self.placed.get(&k.call).map(|(f, _)| LogPos {
+                generation: f.generation,
+                sequence: f.sequence + i,
+            }),
+        }
+    }
+
+    fn forget_lost(&mut self) {
+        let mut history = std::mem::take(&mut self.history);
+        let mut changed = Vec::new();
+        for (key, ks) in &mut history {
+            let n = ks.len();
+            ks.retain(|k| {
+                !self
+                    .position(k)
+                    .is_some_and(|p| self.lost.iter().any(|&(a, b)| a <= p && p <= b))
+            });
+            if ks.len() != n {
+                changed.push(*key);
+            }
+        }
+        history.retain(|_, ks| !ks.is_empty());
+        self.history = history;
+        let series: BTreeSet<u32> = changed.iter().map(|(id, _)| *id).collect();
+        for key in changed {
+            match self
+                .history
+                .get(&key)
+                .and_then(|ks| ks.iter().filter_map(|k| k.changed_at).max())
+            {
+                Some(c) => self.versions.insert(key, c),
+                None => self.versions.remove(&key),
+            };
+        }
+        for id in &series {
+            self.reference.remove(id);
+        }
+        for ((id, t), ks) in &self.history {
+            if series.contains(id) && ks.iter().any(|k| k.reference) {
+                let v = self.reference.entry(*id).or_insert(*t);
+                *v = (*v).max(*t);
             }
         }
     }
 
     /// The refusal of a reading, if any, in the order the model backend checks: unknown series, value type,
-    /// retirement, phase, `changed_at`, text length.
+    /// retirement, phase, `changed_at` (then its range, Q-195), text length.
     fn refusal(&self, r: &Reading, revise: bool) -> Result<LogValue, Refusal> {
         let s = self
             .registry
@@ -195,6 +275,11 @@ impl Decider {
             (false, true) => return Err(Refusal::ChangedAtUnexpected),
             (true, true) if revise => return Err(Refusal::ReviseOnVersioned),
             _ => {}
+        }
+        if d.versioning == Versioning::Time
+            && r.changed_at.is_some_and(|c| i64::try_from(c).is_err())
+        {
+            return Err(Refusal::ChangedAtOutOfRange);
         }
         if matches!(&value, LogValue::Text(t) if t.len() > MAX_TEXT_LEN) {
             return Err(Refusal::TextTooLong);
@@ -315,10 +400,11 @@ impl Decider {
                 changed_at: r.changed_at,
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
-            batch_history
-                .entry(key)
-                .or_default()
-                .push(Known::of(&row, call));
+            batch_history.entry(key).or_default().push(Known::of(
+                &row,
+                call,
+                At::Item(plan.items.len() as u64),
+            ));
             if let Some(c) = r.changed_at {
                 let v = batch_versions.entry(key).or_insert(c);
                 *v = (*v).max(c);
@@ -335,5 +421,134 @@ impl Decider {
             plan.items.push(Item::Fact(row));
         }
         plan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kvik_log::entries::Entry;
+
+    use super::*;
+    use crate::durable::registry::definition_of;
+    use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};
+    use crate::time::Timestamp;
+    use crate::types::SeriesId;
+
+    const SEC: i64 = 1_000_000_000;
+    const WALL: i64 = 1_000_000 * SEC;
+
+    fn decider(spec: SeriesSpec) -> Decider {
+        let mut d = Decider::default();
+        let def = definition_of(&spec, 1, Duration::from_secs(3600)).unwrap();
+        d.registry.apply(&Entry::Definition(Box::new(def)));
+        d
+    }
+
+    /// An observed gauge with S = 10 s, so `late` by the reference is more than 20 s behind it.
+    fn observed() -> Decider {
+        decider(
+            SeriesSpec::new(
+                "a/b/power",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+            .staleness(Duration::from_secs(10)),
+        )
+    }
+
+    fn reading(t: i64, v: f64) -> Reading {
+        Reading::new(SeriesId(1), Timestamp(t), Value::F64(v))
+    }
+
+    fn pos(sequence: u64) -> LogPos {
+        LogPos {
+            generation: 0,
+            sequence,
+        }
+    }
+
+    fn plan(d: &Decider, r: Reading, call: u64, synced: bool) -> Plan {
+        let clock = Clock {
+            wall: WALL,
+            synced,
+            future_tolerance: 60 * SEC,
+        };
+        d.plan(&[r], Intent::Normal, clock, call)
+    }
+
+    /// Plans, queues and acknowledges a call of one reading at position `at`.
+    fn record(d: &mut Decider, r: Reading, call: u64, at: u64, synced: bool) {
+        let p = plan(d, r, call, synced);
+        assert!(matches!(p.decisions[0], Decision::Record { .. }));
+        d.apply(&p);
+        d.placed(call, pos(at), pos(at));
+    }
+
+    fn late(p: &Plan) -> bool {
+        match &p.items[..] {
+            [Item::Fact(f)] => f.flags.late,
+            other => panic!("one fact expected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reading_only_a_lost_version_outranked_is_not_outranked() {
+        let mut d = decider(
+            SeriesSpec::new(
+                "a/b/price",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "p",
+            )
+            .versioned(ChangedAtKind::Version),
+        );
+        let t = WALL - 10 * SEC;
+        record(&mut d, reading(t, 1.0).changed_at(1), 1, 1, true);
+        record(&mut d, reading(t, 2.0).changed_at(2), 2, 2, true);
+        d.lose(pos(2), pos(2));
+        let p = plan(&d, reading(t, 3.0).changed_at(1), 3, true);
+        assert_eq!(
+            p.decisions,
+            vec![Decision::Record {
+                item: 0,
+                outranked: false,
+                absent: false
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lost_latest_fact_no_longer_holds_the_lateness_reference() {
+        let mut d = observed();
+        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
+        record(&mut d, reading(WALL, 2.0), 2, 2, true);
+        assert!(late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+        d.lose(pos(2), pos(2));
+        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+        assert!(late(&plan(&d, reading(WALL - 130 * SEC, 3.0), 3, true)));
+    }
+
+    #[test]
+    fn a_call_acknowledged_inside_a_range_already_lost_leaves_the_history() {
+        let mut d = observed();
+        let p = plan(&d, reading(WALL - 5 * SEC, 1.0), 1, true);
+        d.apply(&p);
+        d.lose(pos(4), pos(6));
+        d.placed(1, pos(5), pos(5));
+        let replay = plan(&d, reading(WALL - 5 * SEC, 1.0), 2, true);
+        assert!(matches!(replay.decisions[0], Decision::Record { .. }));
+    }
+
+    #[test]
+    fn a_fact_taken_while_the_clock_is_unsynchronised_leaves_the_lateness_reference_alone() {
+        let mut d = observed();
+        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
+        record(&mut d, reading(WALL, 2.0), 2, 2, false);
+        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
     }
 }

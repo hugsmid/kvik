@@ -38,6 +38,29 @@ specified here before the roadmap item that writes it.
   region, a torn tail or a lost range, and recovery never truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
+- **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
+  checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
+  a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
+  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body checksum is derived from
+  a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes (Q-110).
+  A body whose checksum holds is checked by its type (A.5, A.6, A.14). A **failed read** is a candidate read in full,
+  with at least one body checked, that is rejected: a resynchronisation candidate or a boundary read that keeps no
+  batch (A.2), or a manifest record whose checksum holds and whose fields are rejected (A.14). The file is divided into
+  **windows** of w bytes from offset 0: w = 8 MiB (a batch) in a log segment, 16 MiB (a body) in the manifest. Once
+  the failed reads starting in one window have checked 16 MiB of body, no other candidate in it is read in full: the
+  rest of the window is passed as damaged and reported with the invalid region, corrupt record or torn tail it falls
+  in (Q-110). Failed reads caused by damage check disjoint bodies, each inside its own batch, so those starting in one
+  segment window check less than the window and one batch beyond it, 16 MiB; a manifest record needs a valid checksum
+  to fail this way. Damage to a file the engine wrote, or older complete batches left at their offsets, therefore never
+  reach the budget; overlapping bodies, which only a crafted file has, do. In a segment, body checks total at most 2L,
+  the direct read that found damage, and per window the budget and the read that reached it (two batches): about
+  390 MiB of bodies for a 64 MiB segment and 100 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body
+  and decodes in about 100 ns at most (a 255-byte text value, release build), so a crafted segment costs at most
+  about 2 s at 64 MiB and 0.6 s at 16 MiB, against 29 to 170 ms for an undamaged one. A crafted manifest costs at most
+  about 0.25 s per 16 MiB for the start's reader and 0.45 s for the whole-file reader (measured: 0.16 s and 0.28 s on
+  a crafted 16.5 MB window; Q-230). An undamaged segment is read in one pass of direct checksums; the bounded reading
+  starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231). Apart from
+  the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |
@@ -85,7 +108,10 @@ each data block's `body_crc32c`, every body (A.7), so a batch image at any other
 that imitate a batch without its exact blocks, are not accepted. A reader
 process applies the same rule below the mark's `offset` and never above it. A structural failure inside a
 checksum-valid block (the checks of A.5 and A.6) makes the block invalid; the region is handled as corruption
-(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14).
+(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14). Once failed reads
+starting in one 8 MiB window of the file have checked 16 MiB of body (common rules: scan bound), the rest of that
+window is not read: it lies in the invalid
+region, or the torn tail, that holds it.
 
 ### A.3 Versioning
 - A reader refuses a file whose `format_major` is greater than it supports, with an error that names both
@@ -152,7 +178,8 @@ of the segment it resumes in again, in place, before its first sync (`spec.md` �
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
 segment index block, the trailer block and the 16-byte end marker; (2) set the file length to the end of the end
 marker (the file may grow or shrink); (3) `sync_all`; (4) rename `.open` to `.kvl`; (5) sync the directory. The mark
-does not move at sealing: it keeps naming S until the first commit in the next segment. An empty segment is never
+does not move at sealing: it keeps naming S until the first commit in the next segment, whose batch is acknowledged
+only once the mark naming it is synced (`spec.md` §3 Commit, Q-630). An empty segment is never
 sealed.
 
 **States recovery may find**, handled in `file_id` order. `spec.md` §3 Recovery rules 1 and 3 (truncation, torn
@@ -175,8 +202,9 @@ value); the file falls under the other rows. In the last segment in use a seal i
 A `.kvl` file is sealed and is not scanned by recovery. Whether a segment that is not the last in use lost data is
 decided only by the gap between its last sequence and the next segment's `base_sequence` (`spec.md` §3 Recovery
 rule 2), never by the bytes after its last batch. A start checks the gap rule for unsealed segments and against the
-last sealed one or, with no sealed segment, against position 1 of generation 0, so that a lowest segment damaged,
-zeroed or missing leaves a recorded gap (Q-321); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
+last sealed one of the current generation or, with none, against the generation's first position (1 in generation
+0, the restore record's in a restored generation), so that a lowest segment damaged, zeroed or missing leaves a
+recorded gap (Q-321, Q-264); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
 may be awaiting a seal.
 
 **Truncation is zero-filling.** Recovery never shortens an unsealed segment. It overwrites with zeros from the
@@ -231,8 +259,10 @@ and ignorable rule.
   stored: bad for a `no_value` row, else the worse of the supplied quality and suspect when `future` is set.
 - A `no_value` row has `value = 0` and the series' declared `value_type`.
 - Flag bit 6 `has_changed_at`: the row belongs to a versioned series and column 8 holds its `changed_at`, an unsigned
-  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Flag bit 7 `rounded`: the
-  value was rounded to the series' scale (`spec.md` §2.1 `excess precision`). Bits 8–15 are undefined and critical.
+  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Ingest refuses a `changed_at`
+  above `i64::MAX` on a series of versioning 1 (`spec.md` §2.2, Q-195); a reader accepts any value (Q-760). Flag
+  bit 7 `rounded`: the value was rounded to the series' scale (`spec.md` §2.1 `excess precision`). Bits 8–15 are
+  undefined and critical.
 - Column 9 holds the scale each decimal row was stored at (the series' scale at the row's position); other rows hold
   0 there. A reader rescales exactly to the series' current scale, so a fact never depends on a raise entry being
   kept.
@@ -270,13 +300,13 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 and 28 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
-| 5 routing change | 50 consumer name (A.12); 51 change `u8` (1 adds a funnel, 2 removes one, 3 declares `emits` only); 52 funnel id `u32` (changes 1 and 2); for change 1: 53 selection kind `u8` (0 none, 1 ids, 2 name pattern, 3 every series), 54 series id `u32` (repeated: the ids of kind 1; for kind 2, the ids a condition funnel's pattern was resolved to when routed, else none), 55 pattern (UTF-8, 1–255 bytes, kind 2 only), 56 aggregate `u8` (1 avg, 2 sum, 3 integral, 4 min, 5 max, 6 count, 7 increase, 8 rate, 9 last, 10 time in state) with 57 window width `i64` ns > 0, 58 state counted (5 bytes: tag 0 then a boolean byte and 3 zero bytes, or tag 1 then a named state's index `u32`; aggregate 10 only), 63 condition `u8` (1 threshold: 64 activation and 65 clear level, clear ≤ activation; 2 on change: 64 dead-band ≥ 0; 3 held for: 64 level, 66 duration; 4 stale for: 66 duration beyond the series' staleness limit in force at the entry's position), levels finite `f64` and durations `i64` ns ≥ 0; always: 60 the consumer's `emits` kind, 61 its ids (repeated), 62 its pattern, as 53 to 55 but never with resolved ids. Fields 53 to 58 and 63 to 66 appear only in change 1 (`spec.md` §4 Routing) |
+| 5 routing change | 50 consumer name (A.12); 51 change `u8` (1 adds a funnel, 2 removes one, 3 declares `emits` only); 52 funnel id `u32` (changes 1 and 2); for change 1: 53 selection kind `u8` (0 none, 1 ids, 2 name pattern, 3 every series), 54 series id `u32` (repeated: the ids of kind 1; for kind 2, the ids a condition funnel's pattern was resolved to when routed, else none), 55 pattern (UTF-8, 1–255 bytes, kind 2 only), 56 aggregate `u8` (1 avg, 2 sum, 3 integral, 4 min, 5 max, 6 count, 7 increase, 8 rate, 9 last, 10 time in state) with 57 window width `i64` ns > 0, 58 state counted (5 bytes: tag 0 then a boolean byte and 3 zero bytes, or tag 1 then a named state's index `u32`; aggregate 10 only), 63 condition `u8` (1 threshold: 64 activation and 65 clear level, clear ≤ activation; 2 on change: 64 dead-band ≥ 0; 3 held for: 64 level, 66 duration; 4 stale for: 66 duration beyond the series' staleness limit in force at the entry's position), levels finite `f64` and durations `i64` ns ≥ 0; always: 60 the consumer's `emits` kind, 61 its ids (repeated), 62 its pattern, as 53 to 55 but never with resolved ids. Fields 53 to 58 and 63 to 66 appear only in change 1 (`spec.md` §4 Routing). A pattern in field 55 or 62 that the grammar of `spec.md` §4 Funnel refuses (written before it) is read as built, each segment a literal and `*` alone a wildcard; its funnel stays in force, and routing it, or declaring its `emits`, again is refused (`model/OPEN-QUESTIONS.md` Q-670 (b)) |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
-| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
+| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable); 48 `written` level in force `u8` (1 when a series is at the `written` level in the registry at `after`, making the entry a `possible_loss`, `spec.md` §3 Recovery rule 3; an entry without it reads as 0) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
 
 Series definition fields, all critical:
@@ -307,6 +337,7 @@ Series definition fields, all critical:
 | 25 | excess precision | u8: 0 round, 1 refuse, 2 auto-raise | value type 2 |
 | 26 | maximum scale | u8, 0–18, at least field 5 | field 25 = 2 |
 | 27 | staleness limit set | u8: 1 S was set by the caller, 0 S follows the expected interval | always; also in a parameter change carrying 8 |
+| 28 | durability level | u8: 0 `synced`, 1 `written` (`spec.md` §2.1 `durability`) | always; a definition written before roadmap 5.5b without it reads as 0 |
 
 **Checks** (a failure makes the block invalid, A.2; the presence and recovery checks are invalid content): `length`
 or a field overrunning its container; a critical field out of order or repeated when not marked repeated; a value
@@ -329,7 +360,12 @@ entries block until the next would take its body past 16 MiB.
 | 24 | 8 | `commit_time` | non-decreasing within a generation by construction: `received_at` and the commit time are the wall clock when the batch is formed, raised to the previous batch's commit time; a reader does not test it |
 | 32 | 8 | `batch_bytes` | from the first byte of the batch's first block header up to, not including, this block's header, padding included; so this header is at `o + batch_bytes`, where `o` is the batch's offset |
 | 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then bytes 0..12 of the header of every block before the commit block, in order: each header without its `header_crc32c`, so that the bodies are reached through their `body_crc32c` (a header followed by its own CRC32C would cancel out of the sum, Q-119) |
-| 44 | 4 | reserved | |
+| 44 | 4 | `flags` | bit 0 `written`: a flagged batch, acknowledged once written (`spec.md` §3 Commit), holding only facts of series at the `written` level; other bits zero, and a set bit not defined here is critical (common rules) |
+
+`flags` was reserved before roadmap 5.5a, and every batch written before then holds zero there: unflagged. A writer
+that sets bit 0 cannot be read correctly by a build that predates it, which reads reserved bytes as nothing (common
+rules); no release predates it (Q-253). Recovery keeps a complete flagged batch beyond a same-boot mark and counts
+only unflagged batches for the stale-mark test (`spec.md` §3 Recovery rule 1).
 
 A batch is **complete** when every data block is valid, the commit block is valid, `block_count` and `batch_bytes`
 match what precedes it, `batch_crc32c` matches, each data block's `first_sequence` equals the counted sequence, the
@@ -377,12 +413,23 @@ input, and by the scrub; not at open and not on reads. A mismatch while every ba
 padding or seal blocks: the segment is copied to a new segment (A.4) and swapped in by one manifest record, with no
 loss report.
 
+**Plaintext hash** (`spec.md` §8 Hashes). A log segment's plaintext SHA-256 is over every byte of the sealed file,
+header to end marker. The trailer has no room for it (4 reserved bytes), so the file description of a manifest record
+(A.14) alone holds it; the trailer is unchanged and no version rule applies. The sealer computes it in the pass that
+computes `file_crc32c`, off the commit thread, once per seal (a blocked seal's retry reuses it). After a start the
+writer computes it, one segment at a time and only while no seal is ready or running, for every sealed segment that
+no record names by generation and `file_id`, after checking the header against the name, the trailer, the end marker
+and `file_crc32c`; a segment that fails a check is left unnamed, degrades health (`SegmentDamaged`, `api.md` Health)
+and is tried again at the next start, and one that cannot be opened or read whole is tried again in the run, after a
+wait that doubles from 10 s to 10 minutes, and degrades health (`SegmentUnreadable`) from the try that sets the
+10-minute wait until a read succeeds (Q-220, Q-221, Q-640).
+
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
 read and written by positional I/O and never mapped; it is synced on the timer (`mark_sync_interval`, on the writer
-thread, also when idle), at once after a batch holding an entry that is not a fact (`spec.md` §3 Commit), at clean
-shutdown and by recovery. It is updated in place and never replaced while it
-exists; a new file is created only when none exists.
+thread, also when idle), at once after a batch holding an entry that is not a fact or an unflagged first batch in a
+segment (`spec.md` §3 Commit, Q-630), at clean shutdown and by recovery. It is updated in place and never replaced
+while it exists; a new file is created only when none exists.
 
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
@@ -428,14 +475,15 @@ exists; a new file is created only when none exists.
 - **No boot identity** (`boot_id` zero) or `mark_sync = EveryCommit`: the mark is synced after every update, before
   the batch is acknowledged. Recovery then follows `spec.md` §3 as for any mark: a readable mark gives rule 1; a
   missing or unreadable mark gives rule 3.
-- **Same boot, page cache lost.** Rule 1 trusts the boot identity, because it must truncate a batch whose sync failed
-  and which sits complete in the page cache. Since a batch is written only after the previous batch's sync and mark
-  update, a current mark has at most one complete batch beyond it; two or more on the same boot mean the mark is
-  stale and rule 3 applies (`spec.md` §3 Recovery rule 1, with its accepted limit). The recovery entry records mark
+- **Same boot, page cache lost.** Rule 1 trusts the boot identity, because it must truncate an unflagged batch whose
+  sync failed and which sits complete in the page cache, and keep the flagged batches there (A.7). Since a batch is
+  written only after the previous unflagged batch's sync and mark update, a current mark has beyond it flagged
+  batches and at most one complete unflagged batch, the last; a complete unflagged batch followed by another
+  complete batch on the same boot means the mark is stale and rule 3 applies (`spec.md` §3 Recovery rule 1, with its accepted limit). The recovery entry records mark
   state 3.
 - **No usable mark.** With the mark missing, unreadable or stale, recovery cannot rule out the same boot, so it
-  writes the last complete batch again before its first sync (`spec.md` §3 Recovery rule 3), with the segment's
-  header when that batch is the segment's first. It does the same when the last complete batch is a recovery entry
+  writes the last complete batch, and the flagged batches directly before it, again before its first sync
+  (`spec.md` §3 Recovery rule 3), with the segment's header when the first of them is the segment's first. It does the same when the last complete batch is a recovery entry
   that the mark does not cover, whatever the mark, as the start that wrote it may have failed its sync (Q-117).
 - Readers of an unsealed segment never read past `offset`; they open the mark by path for each read of it. Sealed
   segments are read whole.
@@ -446,11 +494,12 @@ exists; a new file is created only when none exists.
 - Golden files for v1, including: an unsealed segment with a torn final batch; segments with a recovery entry, with
   a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail; corruption
   inside a segment with a kept batch after it; each seal state of A.4; a mark with one torn slot; a stale mark below
-  acknowledged batches after a power loss; a block with an unknown ignorable and an unknown critical element; the
+  acknowledged batches after a power loss; flagged batches beyond a same-boot mark, then an unflagged one (A.7); a block with an unknown ignorable and an unknown critical element; the
   store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
   file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
-  length before it is checked against the body, and decoded output is bounded by the row and entry limits.
+  length before it is checked against the body, and decoded output is bounded by the row and entry limits. The
+  segment and manifest targets also check the scan bound (common rules).
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
 
@@ -478,7 +527,8 @@ exists; a new file is created only when none exists.
   lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
   directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
   store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
-- **Open.** `STORE` valid: open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
+- **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
+  `STORE` in the page cache only), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
   `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
   what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
   created over; a directory part-way
@@ -534,7 +584,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   epoch named by the last valid record and by any lease file (`spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
-  positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
+  positions; field 2: the epoch of a rebuild record acknowledged; field 3: outcome `u8`, 1 restored in full, 2 re-send
+  ended, 3 by an operator, absent meaning 3; field 4: positions restored `u64`, present exactly with outcome 1;
+  repeated field 5: a corruption seen, below; a record with outcome 1 or 2 is a closing record of self-repair and
+  names exactly one loss in field 1, `spec.md` §8 Self-repair; one with outcome 1 closes only the lost-range records of
+  that identity with a lower epoch, so a later one opens the loss again; a record names at least one of fields 1, 2 and 5; fields 3 to 5 are
+  decoded from roadmap 8.5b, which refuses a record holding them until then, and written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
   presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
   5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
@@ -543,13 +598,36 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
-  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore and `0x27` copy verified are laid out below. Reserved for its roadmap item:
-  `0x26` quarantine (8.1). A rebuild never reconstructs `0x26` or `0x27`: a
+  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore, `0x26` quarantine and `0x27` copy verified are
+  laid out below. A rebuild never reconstructs `0x26` or `0x27`: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
-  another tier" is verified again, so their layouts may hold no fact that only they hold. Until their items lay them
+  another tier" is verified again, so their layouts may hold no fact that only they hold; after a rebuild a
+  file under `quarantine/` that no carried record names is a corruption dated at the rebuild record, and a lost range
+  found again with cause 5 is one too, with no new field (`spec.md` §8 Self-repair, Q-244). Until their items lay them
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
   with field 100 added; the catalogue of files does not apply one. A reserved type stays written and carried as a
   field list once laid out; only its decoding becomes strict.
+- Quarantine (`0x26`, `spec.md` §8 Corrupt block, Self-repair): 1 the file, a file description (below); 2 reason
+  `u8` (1 damaged on hot, 2 damaged on cold, 3 damaged in deep, 4 lost in the bucket); 3 the copy tried first `u8` (0
+  none, 1 hot, 2 cold, 3 deep, 4 the mirror path). Each field exactly once; another field below `0x8000` is
+  unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
+  corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. A reason 4 with no later `0x27` for the file
+  takes its copy out of a restore's plan (Q-295) only where recorded lost ranges cover each of its positions that
+  no other listed file holds; otherwise (the re-upload from a local copy or the lost-range record not yet written)
+  it stays listed and the restore judges it (`spec.md` §8 Restore, Failures and end). A
+  re-upload from a verified local copy writes a new `0x27`, as does an object that answers again while its loss is
+  open and so restores it in full; one that answers again after its loss was closed gets none, so it stays out of
+  every restore's plan and the closed loss stays closed in every generation (Q-600). Decoded strictly
+  from roadmap 8.5b, with `0x24` fields 3 to 5 and `0x25` fields 11 to 13; until then it is read as a reserved type.
+- Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 24 bytes): 0 kind `u8` (1 a file, by its
+  quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
+  file, its kind `u8`, 3 reserved and `file_id` `u64` (12 bytes, as an input entry of a file description), then the
+  epoch `u64` of the quarantine record that names this finding of it (matched against field 100 where a record has
+  it) or, for a file under `quarantine/` that no valid record names after a rebuild, of that rebuild record (Q-244);
+  for a lost range, the identity (a position, 12 bytes) then 8 reserved bytes; for a manifest record, its epoch `u64`
+  then 12 reserved bytes. Each finding of a file is a corruption of its own: a file found damaged or judged lost
+  again, after its copy was swapped in or its object answered again, has a new quarantine record and is a new
+  corruption, so seeing an earlier finding does not see it. Naming a corruption seen twice changes nothing.
 - Copy verified (`0x27`, Q-281): 1 the file, a file description (below), so the record repeats the file's kind,
   position range and plaintext hash as every record naming a file does, and a record describing a file otherwise than
   an earlier record is refused; 2 the tier
@@ -577,7 +655,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   outputs and retires its compacted inputs. No epoch lists a compacted file live together with a compacted file it
   names as an input (invariant 14 as the records show it).
 - Sealed log segment (`0x22`): repeated field 1, a sealed log segment's description (kind 1), in strictly ascending
-  order of id, at least one. When it is appended relative to the seal is roadmap 6.3b's.
+  order of id, at least one. It is appended after the seal, never before: from the description the sealer hands over
+  once the `.kvl` name and the directory are synced (A.9 Plaintext hash), and a seal does not wait for it; one lost
+  in a crash is appended again after the next start (`spec.md` §7 Manifest). A description leaves the writer only
+  after the start that preceded the seal has synced every lost-range record it wrote (steps 4 and 6); a start that
+  cannot write one is read-only and hands out none. So no sealed-segment record has an epoch below a lost-range record
+  of the start that preceded its seal (Q-290).
 - Restore (`0x25`, `spec.md` §8 Generations, Restore step 1): 1 generation `u32`, the one the restore claimed, at
   least 1; 2 reset stamp, 16 bytes: sequence `u64`, always 1 (the generation's first position), then nonce `u64`,
   never zero; 3 source generation `u32`, whose records it read, below field 1; 4 restored end (position), in a
@@ -590,7 +673,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   the order read; 9 repeated, a file it restores from, set-aside segments included: tier `u8` (1 hot, 2 cold, 3 deep:
   where the restore places it, step 3), 3 reserved, the size `u64` and SHA-256 (32 bytes) of its copy in deep as the
   bucket reported them (ciphertext), then its file description, in strictly ascending order of kind, generation and
-  `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded. In every range
+  `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded; 11 repeated, the outcome of a carried acknowledged range closed otherwise than by an operator:
+  identity (position), outcome `u8` (1 or 2), 3 reserved, positions restored `u64` (0 with outcome 2), in strictly
+  ascending order of identity, each naming a field 7 range; 12 repeated, a corruption seen carried, as `0x24` field
+  5, in the order read; 13 repeated, a corruption not yet seen carried, as `0x24` field 5, in the order read, each
+  named once in fields 12 and 13 together (fields 11 to 13 are decoded from roadmap 8.5b, which refuses a record holding them until then, and written from
+  roadmap 8.5c, Q-241). In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
   lost range, is a version refusal. A reader keeps a restore record's fields in the order read, as for a reserved
   type, so it is carried unchanged; canonical writing puts them in ascending id order. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
@@ -604,11 +692,13 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   Fields that settling Q-33 and Q-48 needs are added by roadmap 4.5 as new field ids.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
-  synced.
+  synced. Once failed reads starting in one 16 MiB window of the file have checked 16 MiB of body (common rules:
+  scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
+  corrupt span; with none, they are part of the torn tail (provisional, Q-650).
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
-  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
-  with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
-  call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
+  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body; a log segment's
+  hash is computed from its bytes, A.9). A corrupt record with no copy is rebuilt by the writer itself, by the
+  procedure of `spec.md` §7 Manifest (the same as the operator call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
   (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at
   the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
   epoch in field 2. The rebuilt manifest carries every valid record of the old one, and the rebuild reconstructs
@@ -706,9 +796,15 @@ its own prefix, which the engine never sees.
   listing from the first key: none is `NoStore`, more than one `SeveralStores`; `attach_backup` refuses a bucket
   holding a key under another store id (`OtherStore`).
 - **Uploaded forms (the plaintext).** `STORE` and a sealed log segment: the local file, byte for byte, so its
-  plaintext SHA-256 is the one the manifest records. A manifest record: the record's A.2 block (header, body and
-  padding) in its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and
-  nothing else; checks: one valid record block, its `generation` and `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
+  plaintext SHA-256 is the one the manifest records. A manifest record: `previous` `u64`, the epoch of the record
+  before it in the manifest it was read from, 0 for none (a generation's first record, and a rebuild record that
+  opens a rebuilt manifest, the one without field 100), then the record's A.2 block (header, body and padding) in
+  its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and nothing else;
+  checks: `previous` below the record's epoch, and 0 for a rebuild record without field 100; one valid record block,
+  its `generation` and `epoch` those of its key. `previous` comes from the manifest alone, never from the bucket, so
+  an upload repeated after a restart sends the same bytes. Records upload in epoch order, so in the bucket each
+  names the record of its generation and manifest uploaded before it, and a restore checks that chain (Q-610 to
+  Q-612). A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
   The store id is bound by the envelope (key derivation and associated data), not repeated in the plaintext.
 - **Claim marker** (12 bytes, exactly, unsealed): 0 generation `u32`, that of its key; 4 reset nonce `u64`, the
   claiming restore's fresh nonce (`spec.md` §8 Generations), never zero. The store id and the generation are in the

@@ -10,7 +10,7 @@ use crate::facts::FactsBlock;
 use crate::header::{FileHeader, HEADER_LEN};
 use crate::lease::LeaseSlot;
 use crate::mark::read_mark;
-use crate::scan::{ScanLimit, ScanReport, Tail, scan};
+use crate::scan::{ScanLimit, ScanReport, Tail, scan_with_stats};
 
 /// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file, a registry file and each
 /// body type, and
@@ -40,7 +40,9 @@ pub fn decode_all(data: &[u8]) {
         (len / 2) & !7,
         data.get(..8).map_or(0, |_| u64_at(data, 0) % (len + 64)) & !7,
     ];
-    if let Ok(r) = scan(data, &id, ScanLimit::End) {
+    let (end, stats) = scan_with_stats(data, &id, ScanLimit::End);
+    assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    if let Ok(r) = end {
         check(&r, len, true);
         if let Some(s) = &r.seal {
             assert!(s.end <= len && s.trailer_offset < s.end && s.start <= s.trailer_offset);
@@ -63,10 +65,17 @@ pub fn decode_all(data: &[u8]) {
         }
     }
     for m in marks {
-        if let Ok(r) = scan(data, &id, ScanLimit::Mark(m)) {
+        let (r, stats) = scan_with_stats(data, &id, ScanLimit::Mark(m));
+        assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+        if let Ok(r) = r {
             check(&r, m, false);
         }
     }
+    let (_, stats) = crate::scan::legacy::scan_ignoring_seal(data, &id, false);
+    assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    // As a manifest (A.14), read by the start's reader for the store its header names.
+    let (_, stats) = crate::manifest::read_manifest_with_stats(data, &id.store_id);
+    assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
     let _ = FileHeader::decode(data);
     let _ = read_mark(data, &id.store_id);
     // As a mark file: the store id where slot 0 holds it.

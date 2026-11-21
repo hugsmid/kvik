@@ -28,11 +28,13 @@ pub enum Select {
     /// The listed series.
     Ids(Vec<SeriesId>),
     /// Live series with a name or alias matching a pattern, re-evaluated when
-    /// a series is defined or aliased (spec §4 Routing). `*` matches any run
-    /// of characters within one `/`-separated segment. The specification does
-    /// not define the grammar yet, so this one is provisional
-    /// (`model/OPEN-QUESTIONS.md` Q-88). A condition funnel's pattern is
-    /// resolved once, when routed, and must match exactly one series.
+    /// a series is defined or aliased (spec §4 Funnel, Routing): three
+    /// `/`-separated segments, each a literal or `*`, which matches one whole
+    /// segment; any other pattern is refused with [`ConsumerError::Pattern`].
+    /// A condition funnel's pattern is resolved once, when routed, and must
+    /// match exactly one series.
+    ///
+    /// [`ConsumerError::Pattern`]: crate::ConsumerError::Pattern
     Names(String),
     /// Every series.
     All,

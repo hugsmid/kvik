@@ -9,13 +9,9 @@ use std::time::Duration;
 use kvik_log::batch::SegmentIdentity;
 use kvik_log::fs::MemFs;
 use kvik_log::manifest::{LossCause, LostRange, Recorder};
-use kvik_log::mark::ResetStamp;
 use kvik_log::segment::SealedFile;
-use kvik_log::setaside::{RestoredEnd, SetAside};
 use kvik_log::store::{NewStore, StoreDir};
-use kvik_log::writer::{
-    GenerationStart, LogWriter, OpenError, SealListener, StartOptions, WriterConfig,
-};
+use kvik_log::writer::{LogWriter, OpenError, SealListener, StartOptions, WriterConfig};
 use support::{MemRecorder, STORE, T0};
 
 fn store(fs: &Arc<MemFs>) -> StoreDir {
@@ -113,19 +109,8 @@ fn open_with_default_options_opens_as_open_does() {
 }
 
 #[test]
-fn open_with_refuses_every_option_it_does_not_act_on_yet() {
-    let generation = GenerationStart {
-        generation: 1,
-        stamp: ResetStamp {
-            sequence: 1,
-            nonce: 7,
-        },
-        set_aside: SetAside::new(vec![RestoredEnd {
-            generation: 1,
-            end: (0, 10),
-        }]),
-    };
-    let options: [(StartOptions, &str); 3] = [
+fn open_with_refuses_the_recorder_and_the_seal_listener_until_their_providers_land() {
+    let options: [(StartOptions, &str); 2] = [
         (
             StartOptions {
                 recorder: Some(Box::new(MemRecorder::default())),
@@ -139,13 +124,6 @@ fn open_with_refuses_every_option_it_does_not_act_on_yet() {
                 ..StartOptions::default()
             },
             "StartOptions::sealed",
-        ),
-        (
-            StartOptions {
-                generation: Some(generation),
-                ..StartOptions::default()
-            },
-            "StartOptions::generation",
         ),
     ];
     for (opts, field) in options {

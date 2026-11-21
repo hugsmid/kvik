@@ -11,12 +11,12 @@
 in one library, with no database service.**
 
 kvik is designed to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
-log and are synced to disk before anything reacts to them; the same library then delivers them to in-process
-consumers, keeps per-series summaries for drill-down from years to seconds, and moves old files to cheaper storage
-and an off-site bucket; the engine itself never deletes a fact. Typical uses are home and building automation, energy
-monitoring, small industrial or laboratory installations and edge devices: places where per-second data from many
-sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure
-([who it is for](#who-it-is-for)).
+log and are synced to disk before anything reacts to them (a series may opt for acknowledgement once written); the
+same library then delivers them to in-process consumers, keeps per-series summaries for drill-down from years to
+seconds, and moves old files to cheaper storage and an off-site bucket; the engine itself never deletes a fact.
+Typical uses are home and building automation, energy monitoring, small industrial or laboratory installations and
+edge devices: places where per-second data from many sources must be acted on quickly, kept for years and restored to
+a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 
 > [!IMPORTANT]
 > **Status: design stage. The engine does not exist yet.**
@@ -39,14 +39,14 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, on macOS and the Linux NVMe target) |
-> | 5. Delivery | 2 of 8 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c)) |
-> | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
+> | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for the owner's ruling on Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
+> | 6. Compacted segments | 3 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export at schema version 1, with the partitioned layout) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
-> | 8. Tiers and backup | 1 of 4 done (8.2, the backup sink interface) |
+> | 8. Tiers and backup | 1 of 5 done (8.2, the backup sink interface) |
 > | 9. Query | not started |
 > | 10. Scale | not started |
 >
-> 28 of 52 roadmap items are done, including 3 of 9 gates.
+> 29 of 55 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -77,7 +77,9 @@ sources must be acted on quickly, kept for years and restored to a known, record
 From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 - **Durable before anything reacts.** A batch of readings is synced and the durable mark moved before adapters are
-  acknowledged, summaries are updated or any consumer or reader process sees it.
+  acknowledged, summaries are updated or any consumer or reader process sees it; a series at the faster durability
+  level is acknowledged once written, its sync starting within `max_unsynced`, and reader processes still see it
+  only once synced.
 - **Late and corrected data are recorded.** A reading is never edited in place; a correction is a new fact and the
   old one stays as a revision. Sources that revise what they have published declare a *versioned series*, so a
   replay cannot undo a correction that carries a higher `changed_at`.
@@ -125,7 +127,7 @@ engine does not exist yet, so each item below says what it is designed to do, no
 ### What it is not
 kvik is a storage engine, not a complete system. **Not planned for v1:** a network server, SQL, multiple writers,
 clustering, conditions over several series, interval readings over irregular billing periods, or any form of
-deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export for other tools exists, with a provisional schema ([`docs/export.md`](docs/export.md)). An application
+deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export for other tools exists, at schema version 1 ([`docs/export.md`](docs/export.md)). An application
 built on it would add:
 
 - adapters for the protocols its devices speak, such as OPC UA, Modbus or MQTT;
@@ -213,9 +215,9 @@ demand for fact reads, never for windows or consumer catch-up. The engine never 
 
 ### Planned interface
 *Subject to change: an outline from [`docs/api.md`](docs/api.md). The [`kvik`](kvik/) crate implements it on the
-durable log (series, writing, facts; consumers, live state and windows to come) and on the in-memory reference model,
-which is not durable; decimal value types, calendar-length intervals, backup and restore are among what neither
-supports yet ([coverage](kvik/README.md#coverage)).*
+durable log (series, writing, facts, live state, windows, buckets, calendar results and consumers) and on the
+in-memory reference model, which is not durable; decimal value types, calendar-length intervals, backup and
+restore are among what neither supports yet ([coverage](kvik/README.md#coverage)).*
 
 ```rust
 let store = Store::open(config).await?;   // StoreConfig: directory, time zone, limits, tiers, ...
@@ -273,7 +275,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots, typed arrival batches), with golden files, property tests, a differential test against the model and a fuzz target |
 | [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), with golden files, property tests and a fuzz target |
 | [`files/`](files/) | `kvik-files`: the manifest's records, the catalogue of files replayed from them, and the rebuild of a manifest with a corrupt record from the local files, with golden files, property tests and a fuzz target |
-| [`export/`](export/) | `kvik-export`: Parquet export of a series' facts; the schema is provisional ([`docs/export.md`](docs/export.md)) |
+| [`export/`](export/) | `kvik-export`: Parquet export of a series' facts, one file or one per UTC month; schema version 1 ([`docs/export.md`](docs/export.md)) |
 | [`sinkapi/`](sinkapi/) | `kvik-sink-api`: the backup sink trait and its types, a leaf crate shared by the store, the sinks and the backup driver; `kvik` re-exports it |
 | [`backup/`](backup/) | `kvik-backup`: backup and restore: the envelope, object keys, the manifest port and the upload and restore drivers' interfaces, with fakes behind the `test-support` feature |
 | [`sink/`](sink/) | `kvik-sink`: the backup sink over S3-compatible object storage (signing, conditional single-part uploads with their SHA-256, retries and timeouts) and an in-memory fake bucket with injected faults |

@@ -20,8 +20,6 @@ use crate::series::{
 };
 use crate::time::{LocalTime, ZoneName};
 
-/// The longest name (`format.md` A.6 field 2).
-const MAX_NAME: usize = 255;
 /// The longest unit (field 6).
 const MAX_UNIT: usize = 63;
 /// The longest state name (field 13).
@@ -186,9 +184,7 @@ pub(crate) fn definition_of(
     id: u32,
     default_lateness: Duration,
 ) -> Result<Definition, Error> {
-    if spec.name.is_empty() || spec.name.len() > MAX_NAME {
-        return Err(invalid("name", "1 to 255 bytes"));
-    }
+    convert::check_name(&spec.name)?;
     if spec.unit.len() > MAX_UNIT {
         return Err(invalid("unit", "at most 63 bytes"));
     }
@@ -460,5 +456,142 @@ mod tests {
         .unwrap();
         assert_eq!(difference(&b, &a), Some("expected_interval"));
         assert_eq!(difference(&a, &a), None);
+    }
+
+    #[test]
+    fn a_definition_refuses_a_name_without_three_non_empty_segments() {
+        for name in ["plant", "plant/power", "a/b/c/d", "a//c", "/b/c", "a/b/"] {
+            let spec = SeriesSpec {
+                name: name.into(),
+                ..gauge()
+            };
+            assert!(
+                matches!(
+                    definition_of(&spec, 1, Duration::from_secs(300)),
+                    Err(Error::Invalid { field: "name", .. })
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// Q-670: a log written before the three-segment rule opens with names of another shape; such a series stays
+    /// readable and writable by id, no pattern selects it through a name of another number of segments, `*` matches
+    /// an empty segment, and only an alias of the right shape can be added, which patterns then select (spec §4).
+    #[test]
+    fn a_logged_name_of_another_shape_opens_and_stays_readable_by_id() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Waker};
+
+        use super::super::{Emitted, Writer, facts, lock};
+        use crate::config::StoreConfig;
+        use crate::consume::{DeliveryKind, Funnel, Select, Start};
+        use crate::env::{Env, ManualClock, MemFs};
+        use crate::read::View;
+        use crate::series::SeriesKey;
+        use crate::time::Timestamp;
+        use crate::types::{Intent, Reading, SeriesId, Value};
+
+        fn emit(w: &Arc<Writer>, ids: &[SeriesId], t: Timestamp) {
+            let r: Vec<Reading> = ids
+                .iter()
+                .map(|id| Reading::new(*id, t, Value::F64(1.0)))
+                .collect();
+            if let Emitted::Queued(mut q) = w.emit(&r, Intent::Normal, true).unwrap() {
+                let mut cx = Context::from_waker(Waker::noop());
+                loop {
+                    if let Poll::Ready(r) = q.poll(&mut cx) {
+                        q.finish(r).unwrap();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        fn delivered(w: &Writer, consumer: &str) -> Vec<SeriesId> {
+            let mut got = Vec::new();
+            while let Some(d) = w.poll_delivery(consumer, None).unwrap() {
+                w.confirm(consumer, d.id).unwrap();
+                if let DeliveryKind::Fact(f) = d.kind {
+                    got.push(f.series);
+                }
+            }
+            got
+        }
+
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        env.background_timers = false;
+        let config = StoreConfig::new(PathBuf::from("durable-unit/old-name"), "UTC")
+            .create_if_missing(true)
+            .env(env);
+        let (old, empty) = ("plant/power", "x//z");
+        let w = Writer::open(&config).unwrap();
+        let line = w.define(&gauge()).unwrap();
+        let mut ids = Vec::new();
+        for (k, name) in [old, empty].into_iter().enumerate() {
+            let mut def =
+                definition_of(&gauge(), line.0 + 1 + k as u32, Duration::from_secs(300)).unwrap();
+            def.name = name.into();
+            ids.push(SeriesId(def.id));
+            w.commit_entry_held(&mut lock(&w.decider), Entry::Definition(Box::new(def)))
+                .unwrap();
+        }
+        let (id, e) = (ids[0], ids[1]);
+        w.shutdown().unwrap();
+        drop(w);
+
+        let w = Writer::open(&config).unwrap();
+        assert_eq!(w.series(&SeriesKey::Id(id)).unwrap().name, old);
+        assert_eq!(w.series(&SeriesKey::Name(old.into())).unwrap().id, id);
+        let t = clock.wall();
+        emit(&w, &[id], t);
+        w.shutdown().unwrap();
+        drop(w);
+
+        let w = Writer::open(&config).unwrap();
+        let range = t..Timestamp(t.0 + 1);
+        let got: Vec<_> = facts(&w.reader().unwrap(), id, range.into(), View::Current)
+            .unwrap()
+            .collect();
+        assert_eq!(got.len(), 1, "readable by id");
+        let again = SeriesSpec {
+            name: old.into(),
+            ..gauge()
+        };
+        assert!(matches!(
+            w.define(&again),
+            Err(Error::Invalid { field: "name", .. })
+        ));
+        assert!(matches!(
+            w.alias(id, "plant/power-2"),
+            Err(Error::Invalid { field: "name", .. })
+        ));
+        w.take_consumer("p", Start::Now, &Select::None).unwrap();
+        w.route("p", &Funnel::facts(Select::Names("plant/*/power".into())))
+            .unwrap();
+        w.take_consumer("q", Start::Now, &Select::None).unwrap();
+        w.route("q", &Funnel::facts(Select::Names("x/*/z".into())))
+            .unwrap();
+        emit(&w, &[line, id, e], Timestamp(t.0 + 1_000_000_000));
+        assert_eq!(
+            delivered(&w, "p"),
+            [],
+            "no pattern selects a name of two segments"
+        );
+        assert_eq!(delivered(&w, "q"), [e], "`*` matches an empty segment");
+        w.alias(id, "plant/line-2/power").unwrap();
+        let info = w.series(&SeriesKey::Id(id)).unwrap();
+        assert_eq!(
+            info.names,
+            vec![old.to_string(), "plant/line-2/power".into()]
+        );
+        emit(&w, &[line, id, e], Timestamp(t.0 + 2_000_000_000));
+        assert_eq!(delivered(&w, "p"), [id], "selected through its alias");
+        w.release("p");
+        w.release("q");
+        w.shutdown().unwrap();
     }
 }

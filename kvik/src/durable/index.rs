@@ -1,6 +1,6 @@
-//! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch and
-//! the recovery entries, built from the batches a log reader returns and cut back when it voids what it took
-//! (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
+//! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, the
+//! recovery entries and the lost ranges its reads found, built from what a log reader returns and cut back when it
+//! voids what it took (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -12,8 +12,10 @@ use kvik_log::facts::{FactRow, Quality as LogQuality, Value as LogValue};
 use kvik_log::manifest::{LossCause as LogCause, LostRange};
 use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::registry::RegistryFile;
+use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 use kvik_log::writer::Position as LogPos;
 
+use super::loss::{self, merge};
 use super::registry::{Registry, Series};
 use crate::backend::Error;
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
@@ -46,6 +48,8 @@ pub(crate) struct Index {
     /// Each batch's last position and commit time, in log order.
     commits: Vec<(LogPos, i64)>,
     recoveries: BTreeMap<LogPos, Recovery>,
+    /// Lost ranges found by this index's reads, latched (spec §3 Recovery rule 2, Q-200).
+    found: Vec<LossReport>,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -56,6 +60,25 @@ pub(crate) fn log_pos(p: Position) -> LogPos {
     LogPos {
         generation: p.generation,
         sequence: p.sequence,
+    }
+}
+
+pub(crate) fn cause_out(c: LogCause) -> LossCause {
+    match c {
+        LogCause::Corruption => LossCause::Corruption,
+        LogCause::TruncatedTail => LossCause::TruncatedTail,
+        LogCause::LostInBucket => LossCause::LostInBucket,
+        LogCause::InvalidContent => LossCause::InvalidContent,
+        LogCause::Unknown => LossCause::Unknown,
+    }
+}
+
+pub(crate) fn mark_state_out(m: LogMarkState) -> MarkState {
+    match m {
+        LogMarkState::Readable => MarkState::Readable,
+        LogMarkState::Missing => MarkState::Missing,
+        LogMarkState::Unreadable => MarkState::Unreadable,
+        LogMarkState::Stale => MarkState::Stale,
     }
 }
 
@@ -123,19 +146,83 @@ pub(crate) fn fact_out(s: &Stored) -> Fact {
 }
 
 impl Index {
-    /// Applies what a refresh found, in order.
-    pub(crate) fn apply(&mut self, events: &[ReadEvent]) {
+    /// Applies what a refresh up to the mark's position `durable` found, in order. Returns the lost ranges it found.
+    pub(crate) fn apply(&mut self, events: &[ReadEvent], durable: LogPos) -> Vec<LossReport> {
+        let mut found = Vec::new();
         for e in events {
             match e {
                 ReadEvent::Batch(b) => self.batch(b),
                 ReadEvent::Void { above, .. } => self.void(*above),
-                // A region below the mark is a loss for the writer's next start to record in the manifest.
-                ReadEvent::Corruption { .. } => {}
+                ReadEvent::Corruption { file_id, region } => {
+                    found.extend(self.corruption(*file_id, region, durable));
+                }
             }
         }
+        found
+    }
+
+    /// A region below the mark: the positions from the last batch before it to the next batch after it or, at the
+    /// tail, to the mark's last position are lost (spec §3 Recovery rule 2), with the identity the next start
+    /// records them under.
+    fn corruption(
+        &mut self,
+        file_id: u64,
+        region: &InvalidRegion,
+        durable: LogPos,
+    ) -> Option<LossReport> {
+        let before = self.commits.last().copied();
+        let first = region
+            .last_sequence_before
+            .or(before.map(|(p, _)| p.sequence))
+            .map_or(1, |s| s.saturating_add(1));
+        let last = region
+            .first_sequence_after
+            .map_or(durable.sequence, |s| s.saturating_sub(1));
+        if last < first {
+            return None;
+        }
+        let g = durable.generation;
+        let report = LossReport {
+            identity: Position::new(g, first),
+            kind: LossKind::DataLost,
+            cause: match region.cause {
+                ScanCause::Corruption => LossCause::Corruption,
+                ScanCause::InvalidContent => LossCause::InvalidContent,
+            },
+            first: Some(Position::new(g, first)),
+            last: Some(Position::new(g, last)),
+            file_id: Some(file_id),
+            bytes: region.end.saturating_sub(region.start),
+            readable_commit_blocks: 0,
+            mark_state: MarkState::Readable,
+            boot_id: None,
+            commit_time_before: before.map(|(_, t)| Timestamp(t)),
+            commit_time_after: None,
+            cursors_missing: Vec::new(),
+            recorded: false,
+            acknowledged: false,
+        };
+        // A region that overlaps a loss already found is that loss, grown, under its first identity (spec §3 Order
+        // of a start step 4).
+        let overlaps = |f: &&mut LossReport| f.first <= report.last && report.first <= f.last;
+        if let Some(f) = self.found.iter_mut().find(overlaps) {
+            if !loss::widen(f, &report) {
+                return None;
+            }
+            return Some(f.clone());
+        }
+        self.found.push(report.clone());
+        Some(report)
     }
 
     fn batch(&mut self, b: &ReadBatch) {
+        if let Some(l) = self.found.last_mut()
+            && l.commit_time_after.is_none()
+            && l.last
+                .is_some_and(|p| log_pos(p).sequence.checked_add(1) == Some(b.first.sequence))
+        {
+            l.commit_time_after = Some(Timestamp(b.commit_time));
+        }
         let mut sequence = b.first.sequence;
         for item in &b.content.items {
             let p = LogPos {
@@ -178,6 +265,7 @@ impl Index {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
+        // Found losses outlive a void: lost positions are never reused (spec §3 Recovery rule 2).
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
@@ -377,7 +465,8 @@ impl Index {
             .collect()
     }
 
-    /// Losses: the manifest's lost-range records and the recovery entries of the kept log (Q-116 (c)).
+    /// Losses: the manifest's lost-range records, the recovery entries of the kept log (Q-116 (c)) and the lost
+    /// ranges this index's reads found that no record holds yet.
     pub(crate) fn losses(&self, recorded: &[LostRange]) -> Vec<LossReport> {
         let mut out: BTreeMap<(Position, bool), LossReport> = BTreeMap::new();
         for l in recorded {
@@ -387,13 +476,7 @@ impl Index {
             let e = out.entry((identity, false)).or_insert_with(|| LossReport {
                 identity,
                 kind: LossKind::DataLost,
-                cause: match l.cause {
-                    LogCause::Corruption => LossCause::Corruption,
-                    LogCause::TruncatedTail => LossCause::TruncatedTail,
-                    LogCause::LostInBucket => LossCause::LostInBucket,
-                    LogCause::InvalidContent => LossCause::InvalidContent,
-                    LogCause::Unknown => LossCause::Unknown,
-                },
+                cause: cause_out(l.cause),
                 first: Some(first),
                 last: Some(last),
                 file_id: Some(l.file_id),
@@ -433,12 +516,7 @@ impl Index {
                     file_id: None,
                     bytes: r.tail_bytes,
                     readable_commit_blocks: r.readable_commits,
-                    mark_state: match r.mark_state {
-                        LogMarkState::Readable => MarkState::Readable,
-                        LogMarkState::Missing => MarkState::Missing,
-                        LogMarkState::Unreadable => MarkState::Unreadable,
-                        LogMarkState::Stale => MarkState::Stale,
-                    },
+                    mark_state: mark_state_out(r.mark_state),
                     boot_id: (r.boot_id != [0; 16]).then_some(r.boot_id),
                     commit_time_before: None,
                     commit_time_after: None,
@@ -448,7 +526,9 @@ impl Index {
                 },
             );
         }
-        out.into_values().collect()
+        let mut out: Vec<LossReport> = out.into_values().collect();
+        merge(&mut out, self.found.iter().cloned());
+        out
     }
 }
 
@@ -483,6 +563,24 @@ mod tests {
         })
     }
 
+    const MARK: LogPos = LogPos {
+        generation: 0,
+        sequence: 100,
+    };
+
+    fn region(start: u64, before: Option<u64>, after: Option<u64>) -> ReadEvent {
+        ReadEvent::Corruption {
+            file_id: 1,
+            region: InvalidRegion {
+                start,
+                end: start + 64,
+                last_sequence_before: before,
+                first_sequence_after: after,
+                cause: ScanCause::Corruption,
+            },
+        }
+    }
+
     fn fact(t: i64, v: f64) -> Item {
         Item::Fact(FactRow {
             series_id: 1,
@@ -506,41 +604,124 @@ mod tests {
         let def =
             super::super::registry::definition_of(&spec, 1, Duration::from_secs(300)).unwrap();
         let mut i = Index::default();
-        i.apply(&[
-            batch(1, vec![Item::Entry(Entry::Definition(Box::new(def)))]),
-            batch(2, vec![fact(10, 1.0), fact(20, 2.0)]),
-            batch(
-                4,
-                vec![Item::Entry(Entry::Alias {
-                    id: 1,
-                    name: "a/b/d".into(),
-                })],
-            ),
-        ]);
+        i.apply(
+            &[
+                batch(1, vec![Item::Entry(Entry::Definition(Box::new(def)))]),
+                batch(2, vec![fact(10, 1.0), fact(20, 2.0)]),
+                batch(
+                    4,
+                    vec![Item::Entry(Entry::Alias {
+                        id: 1,
+                        name: "a/b/d".into(),
+                    })],
+                ),
+            ],
+            MARK,
+        );
         assert!(i.registry().resolve("a/b/d").is_some());
         assert_eq!(i.series_facts(1).count(), 2);
         // A start truncated everything above position 2: the second fact and the alias are void.
-        i.apply(&[ReadEvent::Void {
-            above: LogPos {
-                generation: 0,
-                sequence: 2,
-            },
-            cause: VoidCause::Rewritten,
-        }]);
+        i.apply(
+            &[ReadEvent::Void {
+                above: LogPos {
+                    generation: 0,
+                    sequence: 2,
+                },
+                cause: VoidCause::Rewritten,
+            }],
+            MARK,
+        );
         assert!(i.registry().resolve("a/b/d").is_none());
         assert!(i.registry().resolve("a/b/c").is_some());
         let left: Vec<_> = i.series_facts(1).map(|s| s.row.t).collect();
         assert_eq!(left, vec![10]);
         assert_eq!(i.latest_t(1), Some(10));
         // Positions above the void are taken again.
-        i.apply(&[batch(3, vec![fact(30, 3.0)])]);
+        i.apply(&[batch(3, vec![fact(30, 3.0)])], MARK);
         assert_eq!(i.latest_t(1), Some(30));
         // Everything void.
-        i.apply(&[ReadEvent::Void {
-            above: LogPos::default(),
-            cause: VoidCause::Rewritten,
-        }]);
+        i.apply(
+            &[ReadEvent::Void {
+                above: LogPos::default(),
+                cause: VoidCause::Rewritten,
+            }],
+            MARK,
+        );
         assert!(i.registry().get(1).is_none());
         assert_eq!(i.series_facts(1).count(), 0);
+    }
+
+    #[test]
+    fn a_region_found_by_a_read_is_a_latched_loss_between_its_batches() {
+        let mut i = Index::default();
+        let found = i.apply(
+            &[
+                batch(1, vec![fact(10, 1.0)]),
+                region(100, Some(1), Some(4)),
+                batch(4, vec![fact(40, 4.0)]),
+            ],
+            MARK,
+        );
+        assert_eq!(found.len(), 1);
+        let l = &i.losses(&[])[0];
+        assert_eq!(
+            (l.identity, l.first, l.last),
+            (
+                Position::new(0, 2),
+                Some(Position::new(0, 2)),
+                Some(Position::new(0, 3))
+            )
+        );
+        assert_eq!(
+            (l.commit_time_before, l.commit_time_after),
+            (Some(Timestamp(1)), Some(Timestamp(4)))
+        );
+        assert!(!l.recorded);
+        // Found again by a later pass: one loss.
+        assert!(i.apply(&[region(100, Some(1), Some(4))], MARK).is_empty());
+        assert_eq!(i.losses(&[]).len(), 1);
+    }
+
+    #[test]
+    fn a_region_at_the_tail_runs_to_the_marks_position_and_a_record_replaces_it() {
+        let mut i = Index::default();
+        i.apply(
+            &[batch(1, vec![fact(10, 1.0)]), region(100, Some(1), None)],
+            MARK,
+        );
+        let l = &i.losses(&[])[0];
+        assert_eq!(l.last, Some(Position::new(0, MARK.sequence)));
+        let record = LostRange {
+            identity: (0, 2),
+            first: (0, 2),
+            last: (0, MARK.sequence),
+            file_id: 1,
+            offset: 100,
+            length: 64,
+            cause: LogCause::Corruption,
+            boot_id: [0; 16],
+            id_floor: 0,
+            time_before: Some(1),
+            time_after: None,
+            extends: false,
+            stamp: None,
+        };
+        let losses = i.losses(&[record]);
+        assert_eq!(losses.len(), 1);
+        assert!(losses[0].recorded);
+    }
+
+    #[test]
+    fn a_region_that_held_no_position_is_no_loss() {
+        let mut i = Index::default();
+        let found = i.apply(
+            &[
+                batch(1, vec![fact(10, 1.0)]),
+                region(100, Some(1), Some(2)),
+                batch(2, vec![fact(20, 2.0)]),
+            ],
+            MARK,
+        );
+        assert!(found.is_empty());
     }
 }
