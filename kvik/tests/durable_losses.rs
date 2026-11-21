@@ -675,6 +675,38 @@ fn a_reader_that_took_facts_from_a_removed_segment_fails_every_read_after_readin
     block_on(s.shutdown()).unwrap();
 }
 
+/// A reader whose `facts` read a sealed segment and took nothing from it (its facts lie either side of the range
+/// asked) does not stand in it: removed with no record, it is passed over as one only listed would be (Q-1066).
+#[test]
+fn a_segment_a_read_took_nothing_from_is_passed_over_once_removed() {
+    let w = World::new("read-took-nothing");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    block_on(s.emit(&[note(id, 0, "RN-ZERO"), note(id, 10, "RN-TEN")])).unwrap();
+    sealed_with(&w, b"RN-TEN");
+    block_on(s.emit(&[note(id, 20, "RN-TWENTY")])).unwrap();
+    sealed_with(&w, b"RN-TWENTY");
+    let r = w.reader();
+    let between = r
+        .facts(id, common::at(4)..common::at(6), View::History)
+        .and_then(|f| f.collect::<Result<Vec<_>, _>>())
+        .unwrap();
+    assert!(between.is_empty());
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"RN-TEN"))
+        .unwrap();
+    kvik::env::Fs::remove_file(&*w.fs, &path).unwrap();
+    for _ in 0..2 {
+        let texts: Vec<_> = history(&r, id).into_iter().map(|f| f.value).collect();
+        assert_eq!(texts, [Value::Text("RN-TWENTY".into())]);
+    }
+    block_on(s.shutdown()).unwrap();
+}
+
 /// A segment no caught-up reader of the process stands in, removed with no record naming the removal, is passed
 /// over: a caught-up reader opens segments by name and skips one no listing holds (Q-852), as it must for a segment
 /// recovery deleted holding no batch in use. The watch reads on and still finds damage written after it; the removed

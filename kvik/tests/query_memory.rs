@@ -1,6 +1,7 @@
 //! A reader's queries allocate within its memory cap (`ReaderConfig::memory`, Q-1063): the peak of the heap while
-//! `facts` streams 104,000 text facts from four maximal batches whose event times interleave, and while `at` reads,
-//! measured above the heap before the call. Alone in its binary, so that the allocator counts this test only.
+//! `facts` streams 104,000 text facts from four maximal batches whose event times interleave, and while `at` reads.
+//! Measured above the heap before each call against what one pass alone is granted, the first call with the lookups'
+//! cache it fills. Alone in its binary, so that the allocator counts this test only.
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,19 @@ const PER_BATCH: i64 = 26_000;
 /// What a query allocates outside the cap's accounting: the stream, its plan and cut, a key's fold, the error and
 /// iterator state.
 const OVERHEAD: usize = 1 << 20;
+/// What the lookups' log reader keeps (`kvik_log::reader::LOOKUP_CACHE_BYTES`), in the cache's share.
+const LOOKUPS: usize = 8 << 20;
+
+/// The grant one pass takes alone at `cap` (Q-1063): the cap less the cache's share, all of it under two least
+/// grants of 17 MiB, else half.
+fn lone_pass(cap: usize) -> usize {
+    let free = cap - (cap / 4).max(LOOKUPS);
+    if free < 2 * (17 << 20) {
+        free
+    } else {
+        free / 2
+    }
+}
 
 /// The most the heap held above where it stood before `f`.
 fn peak_of(f: impl FnOnce()) -> usize {
@@ -52,10 +66,22 @@ fn facts_and_at_allocate_within_the_memory_cap() {
     let all = Timestamp(i64::MIN)..Timestamp(i64::MAX);
     let last = Timestamp(first + (PER_BATCH * BATCHES - 1) * 1_000_000);
     for cap in [32u64 << 20, 64 << 20] {
+        let grant = lone_pass(cap as usize);
         let r = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(cap)).unwrap();
-        r.facts(id, Timestamp(0)..Timestamp(1), View::History)
-            .unwrap()
-            .for_each(drop);
+        let first = peak_of(|| {
+            let n = r
+                .facts(id, all.clone(), View::History)
+                .unwrap()
+                .map(Result::unwrap)
+                .count();
+            assert_eq!(n, (BATCHES * PER_BATCH) as usize);
+        });
+        eprintln!("first facts at {} MiB: peak {first} bytes", cap >> 20);
+        assert!(
+            first <= grant + LOOKUPS + OVERHEAD,
+            "first facts at {} MiB: {first} bytes",
+            cap >> 20
+        );
         for view in [View::History, View::Current] {
             let mut n = 0;
             let peak = peak_of(|| {
@@ -67,7 +93,7 @@ fn facts_and_at_allocate_within_the_memory_cap() {
             assert_eq!(n, (BATCHES * PER_BATCH) as usize);
             eprintln!("facts {view:?} at {} MiB: peak {peak} bytes", cap >> 20);
             assert!(
-                peak <= cap as usize + OVERHEAD,
+                peak <= grant + OVERHEAD,
                 "{view:?} at {} MiB: {peak} bytes",
                 cap >> 20
             );
@@ -76,6 +102,6 @@ fn facts_and_at_allocate_within_the_memory_cap() {
         let peak = peak_of(|| got = r.at(id, last, View::Current).unwrap());
         assert_eq!(got.map(|f| f.t), Some(last));
         eprintln!("at at {} MiB: peak {peak} bytes", cap >> 20);
-        assert!(peak <= cap as usize + OVERHEAD, "at: {peak} bytes");
+        assert!(peak <= grant + OVERHEAD, "at: {peak} bytes");
     }
 }
