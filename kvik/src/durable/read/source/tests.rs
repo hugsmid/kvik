@@ -682,3 +682,51 @@ fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_late
 }
 
 mod shelves;
+
+/// The shrunk history of the property (Q-1104): with timed seals the clean stop before the damage can leave the
+/// store's own series directory through the damaged batch, and a fresh reader continues it before the start meets
+/// the damage (Q-1002); the check before the start then skips. Seals run on real time, so the history repeats until
+/// one attempt reaches it; every attempt passes.
+#[test]
+fn a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start() {
+    let log = LogConfig {
+        seal_interval: Duration::from_millis(20),
+        ..LogConfig::default()
+    };
+    // In the second history the newest batch holds one reading, so the directory's `through` can equal the damaged
+    // position.
+    for newest in [
+        vec![
+            (0, -214, 222, 241, 0),
+            (6, -96, 158, 143, 0),
+            (0, 4, 225, 98, 0),
+            (6, 105, 93, 198, 0),
+        ],
+        vec![(0, -214, 222, 241, 0)],
+    ] {
+        let history = [
+            Step::Emit(
+                vec![
+                    (0, -168, 121, 203, 0),
+                    (3, -85, 36, 155, 1),
+                    (3, 30, 5, 244, 0),
+                ],
+                false,
+            ),
+            Step::Emit(vec![(0, -274, 96, 162, 2)], false),
+            Step::PowerLoss,
+            Step::Emit(newest.clone(), true),
+            Step::Damage(64454, true),
+            Step::Check,
+        ];
+        let reached = (0..64).any(|_| {
+            let mut rig = Rig::with_log("sources-over-damage", log.clone());
+            for s in &history {
+                rig.step(s).unwrap();
+            }
+            rig.shut();
+            rig.over_damage > 0
+        });
+        assert!(reached, "the store's directory over the damage, {newest:?}");
+    }
+}

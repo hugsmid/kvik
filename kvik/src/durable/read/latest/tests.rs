@@ -150,6 +150,11 @@ pub(in crate::durable::read) struct Rig {
     pub(super) set_aside: u64,
     /// Checks after damage whose lost-range records bridge two identities, compared by positions lost (Q-1102).
     pub(super) bridged: u64,
+    /// Checks before a start skipped because the fresh reader continues a directory the store wrote at or above the
+    /// damage (Q-1002, Q-1104).
+    pub(in crate::durable::read) over_damage: u64,
+    /// The file identities of the series directories the rig wrote.
+    written: Vec<u64>,
     /// The `through` of the last series directory the rig wrote; kept when a run removes the directories, where it
     /// only narrows the choice of batch to damage.
     directory: Option<kvik_log::writer::Position>,
@@ -209,6 +214,8 @@ impl Rig {
             after_damage: 0,
             set_aside: 0,
             bridged: 0,
+            over_damage: 0,
+            written: Vec::new(),
             directory: None,
         }
     }
@@ -286,9 +293,9 @@ impl Rig {
                 // A clean stop keeps the series directory a reader continues (Q-1003); the power loss after the
                 // check makes the start find the damage.
                 self.shut();
-                if self.damage_batch(usize::from(*k), self.directory).is_some() {
+                if let Some(at) = self.damage_batch(usize::from(*k), self.directory) {
                     self.faulted = true;
-                    self.check_unmet_damage()?;
+                    self.check_unmet_damage(at)?;
                 }
                 self.power_loss();
                 self.reopen();
@@ -297,6 +304,11 @@ impl Rig {
                 self.shut();
                 if let Some(through) = write_directory(&self.env, &self.dir, usize::from(*k)) {
                     self.directory = Some(through);
+                    self.written.extend(
+                        kvik_log::directory::generations(&*self.env.fs, &self.dir, Family::Series)
+                            .first()
+                            .map(|(id, _)| *id),
+                    );
                     let r =
                         Reader::open(ReaderConfig::new(&self.dir).env(self.env.clone())).unwrap();
                     if self.continuing.len() == 3 {
@@ -394,14 +406,25 @@ impl Rig {
         r
     }
 
-    /// Before any start meets the damage: a reader that continues a series directory, which lies below the damage,
-    /// reports the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules.
-    fn check_unmet_damage(&mut self) -> Result<(), TestCaseError> {
+    /// Before any start meets the damage at `damaged`: a reader that continues a series directory below it reports
+    /// the losses a reader of the whole log reports, the commit time before set aside as Q-1071 rules. A directory
+    /// at or above it covers damage no record names (Q-1002), which only the store's own directory can (Q-1104).
+    fn check_unmet_damage(&mut self, damaged: Position) -> Result<(), TestCaseError> {
         let whole = self.whole_reader();
         prop_assert_eq!(seed(&whole), None);
         let fresh = self.reader();
         let snap = fresh.snapshot().unwrap();
         let at = seed(&fresh);
+        if let Some(t) = at.filter(|t| *t >= damaged) {
+            prop_assert!(
+                self.store_wrote(t),
+                "{:?} at or above the damage {:?}",
+                t,
+                damaged
+            );
+            self.over_damage += 1;
+            return Ok(());
+        }
         let want = (whole.losses(), None);
         prop_assert!(!want.0.is_empty(), "the damage is reported");
         for got in [fresh.losses(), snap.losses().unwrap()] {
@@ -410,6 +433,22 @@ impl Rig {
             prop_assert_eq!(alike, wanted);
         }
         Ok(())
+    }
+
+    /// Whether the series directories through `t` are the store's own: at least one, and none the rig wrote.
+    pub(in crate::durable::read) fn store_wrote(&self, t: Position) -> bool {
+        let store_id = kvik_log::store::read_descriptor(&*self.env.fs, &self.dir)
+            .unwrap()
+            .store_id;
+        let through: Vec<u64> =
+            kvik_log::directory::generations(&*self.env.fs, &self.dir, Family::Series)
+                .into_iter()
+                .filter_map(|(id, p)| {
+                    let (_, d) = SeriesDirectory::decode(&self.fs.read(&p)?, &store_id).ok()?;
+                    (crate::durable::index::pos(d.through) == t).then_some(id)
+                })
+                .collect();
+        !through.is_empty() && through.iter().all(|id| !self.written.contains(id))
     }
 
     /// Every durable reader's live state, series and losses equal the model's: the facts with positions set aside

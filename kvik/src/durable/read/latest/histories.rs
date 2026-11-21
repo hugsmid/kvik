@@ -70,6 +70,24 @@ fn a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_tim
 }
 
 #[test]
+fn only_a_directory_the_store_wrote_counts_as_the_store_s_own() {
+    let mut rig = Rig::new("own-directory");
+    rig.step(&Step::Emit(vec![(0, -30, 1, 0, 0)], false))
+        .unwrap();
+    rig.step(&Step::Directory(6)).unwrap();
+    let r = rig.reader();
+    r.live(rig.ids[0]).unwrap();
+    let t = seed(&r).expect("the rig's directory");
+    assert!(!rig.store_wrote(t), "the rig wrote it");
+    let none = Position {
+        sequence: t.sequence + 100,
+        ..t
+    };
+    assert!(!rig.store_wrote(none), "no directory through it");
+    rig.shut();
+}
+
+#[test]
 fn a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it() {
     let mut rig = Rig::new("seeded-loss");
     let id = rig.ids[2];

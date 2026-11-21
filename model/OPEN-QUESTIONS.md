@@ -159,6 +159,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
 | Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
 | Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
+| Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4334,10 +4335,11 @@ draws, and checking before the start meets it: a reader of the whole log (the se
 while it seeds) against a fresh reader and its snapshot. About three histories in 256 reach the set-aside, so a fixed
 history pins it. Aiming at the batch just above the directory whatever it holds is not done: a batch there without a
 fact is a definition or a recovery entry, whose loss is a different scenario from this one, and the fixed history gives
-the reach. The damage always lies above the directory a fresh reader continues, so every such check compares. A reader
-continuing a directory that lies over unrecorded damage, before any start meets it, could not know of the loss; that
-window is a consequence of Q-1002 as built (the next start removes the directories), not something Q-1002 states, and
-nothing is promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
+the reach. The damage always lies above any directory the rig writes; a directory the store writes itself can lie over
+it where segments seal within a run, which the latest values' rig does not do and the sources property does, and the
+check then skips (Q-1104). A reader continuing a directory that lies over unrecorded damage, before any start meets
+it, need not know of the loss or its commit time before; that window is a consequence of Q-1002 as built (the next
+start removes the directories), not something Q-1002 states, and nothing is promised for it. Damage in a sealed segment would also meet Q-937, which stays with that question's own item.
 **Tests.** `kvik/src/durable/read/latest/histories.rs`
 `a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_above_it`,
 `a_history_damaging_the_batch_just_above_a_directory_sets_aside_the_commit_time_before` and
@@ -4466,6 +4468,28 @@ pass, is measured alone against the followed segment plus 12 MiB at both caps: 1
 segment, the 9.9 MiB figure. The first `facts` bound is the followed segment plus the grant and its overhead, which
 holds since the refresh is over before the first pass is admitted and its allowance is under the grant (asserted).
 **Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
+## Q-1104 — A series directory the store wrote over damage no start has met
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** The sources property (`kvik/src/durable/read/source/tests.rs`
+`facts_and_at_equal_the_fact_index_and_the_model_at_every_cap`) seals segments every 20 ms, so the clean stop of
+`Step::Damage(_, true)` can write the store's own series directory through the newest batch: the first directory of a
+run is due as soon as a sealed segment is uncovered (`format.md` A.18). The batch then damaged lies at or below that
+directory's `through`. A fresh reader continues it and reports the loss with no commit time before (seen: positions
+13 to 16 lost under a directory through 16), a reader of the whole log with one, and the check before the start
+failed on the difference in about two runs of three at 1,024 cases. The latest values' rig keeps the default seal
+interval, so no segment seals within its runs and the store writes no directory there; the rig's own directories
+always lie below the damage.
+**Decided.** The check before the start skips, and counts, a fresh reader that continues a directory at or above the
+damage, only where the series directories through that position are the store's own (at least one, none the rig
+wrote); otherwise it fails. That is the window Q-1071 leaves to Q-1002 as built: nothing is promised for a reader
+continuing a directory over damage before a start meets it. Everything else is compared as before, and the latest
+values' fixed history still pins the set-aside.
+**Tests.** `kvik/src/durable/read/source/tests.rs`
+`a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start` (the shrunk history, and one whose newest
+batch holds one reading so that the directory's `through` can equal the damaged position; seals run on real time, so
+each repeats until an attempt reaches the skip, and every attempt must pass) and
+`kvik/src/durable/read/latest/histories.rs` `only_a_directory_the_store_wrote_counts_as_the_store_s_own`.
 
 ## Open at v0.2
 
