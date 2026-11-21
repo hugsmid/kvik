@@ -4,7 +4,10 @@ use std::time::Duration;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
 
-use super::tests::{Losses, Rig, S, Step, T0, known_alike, seed, steps, write_directory};
+use super::tests::{
+    Losses, Rig, S, Step, T0, bridged, known_alike, recorded_ranges, seed, steps, write_directory,
+};
+use crate::Store;
 use crate::time::Timestamp;
 use crate::types::{Intent, Position, Reading, Value};
 
@@ -143,4 +146,63 @@ fn a_reader_seeded_from_a_directory_knows_no_commit_time_before_a_loss_just_abov
         a, b,
         "a reader that read the whole log keeps the commit time compared"
     );
+}
+
+/// Pins the engine as built until the owner rules on Q-1102: the third damage bridges two recorded losses, the start
+/// records the bridge under the first one's identity, and the writer and a reader of the whole log report it apart.
+#[test]
+fn a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader() {
+    let emit = |q, revise| Step::Emit(vec![(0, -60, 0, q, 0)], revise);
+    let history = [
+        emit(0, false),
+        emit(250, false),
+        emit(0, true),
+        Step::Restart,
+        Step::Damage(2876, false),
+        Step::Damage(13022, false),
+        Step::Damage(0, false),
+    ];
+    let mut rig = Rig::new("bridge");
+    for s in &history {
+        rig.step(s).unwrap();
+    }
+    let at = |s| Position {
+        generation: 0,
+        sequence: s,
+    };
+    let whole = rig.reader();
+    let records = recorded_ranges(&whole);
+    assert_eq!(
+        records,
+        [
+            (at(10), at(10), at(10)),
+            (at(8), at(8), at(8)),
+            (at(10), at(8), at(10))
+        ],
+        "(identity, first, last) of each lost-range record"
+    );
+    assert!(bridged(&records));
+    let brief = |l: Losses| -> Vec<(Position, Option<Position>, Option<Position>, bool)> {
+        l.into_iter()
+            .map(|r| (r.identity, r.first, r.last, r.recorded))
+            .collect()
+    };
+    let own = rig.store.as_ref().map(Store::reader).unwrap();
+    assert_eq!(
+        brief(own.losses()),
+        [(at(10), Some(at(8)), Some(at(10)), true)]
+    );
+    assert_eq!(
+        brief(whole.losses()),
+        [
+            (at(8), Some(at(8)), Some(at(10)), false),
+            (at(10), Some(at(8)), Some(at(10)), true)
+        ]
+    );
+    rig.check().unwrap();
+    assert_eq!(
+        rig.bridged, 1,
+        "the property compares this history as Q-1102 sets aside"
+    );
+    rig.shut();
 }

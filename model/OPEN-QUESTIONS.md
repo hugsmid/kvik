@@ -156,6 +156,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
 | Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
 | Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
+| Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4412,6 +4413,35 @@ not proposed here.
 `a_far_reader_that_indexed_for_a_recorded_loss_is_damaged_only_above_what_it_read` (fails with the rig's old check)
 and `every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
 
+## Q-1102 — A start's lost range across two recorded losses (OWNER)
+Recorded by the loss-reports item. For the owner: it decides what `losses()` reports and under which identity.
+**Scenario.** The latest values' shrunk history: batches at positions 10, 8 and 9 are damaged in turn, each found by a
+start after a power loss. The first two starts record losses 10 (10..10) and 8 (8..8). The third finds 8..10, across
+both; its step 4 extends the first recorded loss it overlaps, writing a record under identity 10 for 8..10
+(`log/src/writer/recovery.rs` `record_loss`). The manifest then holds two identities whose ranges overlap. The
+writer's process reports one loss: identity 10, 8..10, recorded. A reader of the whole log reports two: identity 10,
+8..10, recorded, and identity 8, grown to 8..10 by its own find and marked not recorded, though records hold every
+position. About two runs in 26 of the property at 1,024 cases met it.
+**The gap.** §3 Order of a start step 4 says how a range that extends one recorded loss is recorded (one loss,
+counted once), not one that overlaps two; §11 Health counts each loss once; Q-940 makes a find across two losses not
+yet recorded one loss under the lower identity. Whichever rule is chosen, the writer and readers then agree; a
+reader's report of a recorded range as not recorded is wrong under all three.
+**Options.**
+(a) One loss under the lower identity, as Q-940: the start writes the bridge as an extension of the lowest identity it
+overlaps, and readers and the writer fold records of two identities whose ranges overlap into the lower one
+(records already written under the higher identity are folded the same way). Acknowledgement, re-send requests and
+the corruption count then name 8. About 40 lines with tests. The lead's recommendation.
+(b) One loss under the identity the bridging record names (10 here), the others folded into it: the writer's report
+as now; loss 8 leaves the list though a start recorded it, and its earlier re-send request names an identity no
+report carries.
+(c) Two losses: each recorded identity stays a loss, a find counts against a record that covers it, and the writer
+reports two as well; the positions of loss 8 are then in two losses, against "counted once".
+**Now.** As built. The property compares a check whose records bridge two identities by the possible losses and the
+positions lost data covers only; other checks are compared whole.
+**Pinned by.** `kvik/src/durable/read/latest/histories.rs`
+`a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader` (the records, both
+reports as built, and the property's set-aside reached).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4607,6 +4637,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1068 | 9.0g | Decided by the lead with 9.0f's fix round: one key splits by position, the current view folded; for review |
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
+| Q-1102 | 6.3b | OWNER. A start's range across two recorded losses: one loss or two, and its identity; (a) recommended. As built until ruled, the property comparing positions lost there |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

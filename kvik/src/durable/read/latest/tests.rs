@@ -148,6 +148,8 @@ pub(in crate::durable::read) struct Rig {
     pub(in crate::durable::read) after_damage: u64,
     /// Loss reports compared with the commit time before set aside (Q-1071).
     pub(super) set_aside: u64,
+    /// Checks after damage whose lost-range records bridge two identities, compared by positions lost (Q-1102).
+    pub(super) bridged: u64,
     /// The `through` of the last series directory the rig wrote; kept when a run removes the directories, where it
     /// only narrows the choice of batch to damage.
     directory: Option<kvik_log::writer::Position>,
@@ -206,6 +208,7 @@ impl Rig {
             faulted: false,
             after_damage: 0,
             set_aside: 0,
+            bridged: 0,
             directory: None,
         }
     }
@@ -490,8 +493,14 @@ impl Rig {
         }
         let want = (reference.losses(), seed(&reference));
         prop_assert!(!want.0.is_empty(), "the damage is reported");
+        let bridge = bridged(&recorded_ranges(&reference));
+        self.bridged += u64::from(bridge);
         let mut set_aside = 0;
         let mut compare = |got: Losses, seed: Option<Position>| {
+            if bridge {
+                prop_assert_eq!(positions_lost(&got), positions_lost(&want.0));
+                return Ok(());
+            }
             let (alike, wanted) = known_alike((got.clone(), seed), want.clone());
             set_aside += u64::from(alike != got || wanted != want.0);
             prop_assert_eq!(alike, wanted);
@@ -513,6 +522,56 @@ pub(super) fn seed(r: &Reader) -> Option<Position> {
 }
 
 pub(super) type Losses = Vec<crate::health::LossReport>;
+
+/// `(identity, first, last)` of each lost-range record `r`'s view holds, in the manifest's order.
+pub(super) fn recorded_ranges(r: &Reader) -> Vec<(Position, Position, Position)> {
+    let at = |(generation, sequence)| Position {
+        generation,
+        sequence,
+    };
+    let d = r.durable().unwrap().unwrap();
+    d.with_latest(|v| {
+        Ok(v.lost_ranges()
+            .iter()
+            .map(|l| (at(l.identity), at(l.first), at(l.last)))
+            .collect())
+    })
+    .unwrap()
+}
+
+/// Whether records of two identities overlap: a start recorded a range across two losses under one of them, which
+/// the writer and a reader of the whole log report apart (Q-1102).
+pub(super) fn bridged(records: &[(Position, Position, Position)]) -> bool {
+    records
+        .iter()
+        .any(|(i, a, b)| records.iter().any(|(j, c, d)| i != j && a <= d && c <= b))
+}
+
+/// The possible losses whole and the positions lost data covers, as merged intervals: what Q-1102 leaves compared.
+fn positions_lost(l: &Losses) -> (Losses, Vec<(Position, Position)>) {
+    use crate::health::LossKind;
+    let (data, possible): (Losses, Losses) = l
+        .iter()
+        .cloned()
+        .partition(|r| r.kind == LossKind::DataLost);
+    let mut spans: Vec<(Position, Position)> = data
+        .iter()
+        .filter_map(|r| Some((r.first?, r.last?)))
+        .collect();
+    spans.sort();
+    let mut merged: Vec<(Position, Position)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some((_, z))
+                if a.generation == z.generation && a.sequence <= z.sequence.saturating_add(1) =>
+            {
+                *z = (*z).max(b);
+            }
+            _ => merged.push((a, b)),
+        }
+    }
+    (possible, merged)
+}
 
 /// Two readers' loss reports, each with the directory its reader continues, with the commit time before an
 /// unrecorded loss set aside only where a side that continues a directory lacks it for a loss just above that
