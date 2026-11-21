@@ -98,7 +98,7 @@ impl From<Select> for Selection {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Query {
-    /// The live state of each selected series (spec §2.3), as [`Snapshot::live`] gives it.
+    /// The live state of each selected series (spec §2.3), as [`Snapshot::live`](super::Snapshot::live) gives it.
     Latest(Selection),
     /// The facts of the selected series as they become durable, in position order; opened at the cut of its
     /// `Opened`. Live only.
