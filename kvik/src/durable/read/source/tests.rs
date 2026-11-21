@@ -602,113 +602,6 @@ fn at_before_a_series_first_fact_ends_after_one_probe_and_finds_a_fact_far_back(
     rig.shut();
 }
 
-/// One pass at a time keeping `rows` bytes, and a shelf of more than a byte leaves less than the least grant free.
-fn one_pass_of(rows: u64) -> Sizes {
-    Sizes {
-        cap: 400_000,
-        block: 300_000 - rows,
-        min_rows: rows - 1,
-        lookups: 0,
-    }
-}
-
-#[test]
-fn a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once() {
-    let mut rig = Rig::new("shelf-emptied");
-    let id = rig.ids[0];
-    let now = rig.clock.wall().0;
-    let rs: Vec<Reading> = (0..300)
-        .map(|k| Reading::new(id, Timestamp(now - 1_000 + k), Value::F64(k as f64)))
-        .collect();
-    rig.emit_readings(&rs, Intent::Normal);
-    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
-    let want = oracle
-        .with(|i, _| i.facts(id, all(), View::History))
-        .unwrap();
-    let r = reader_with(&rig.env, &rig.dir, one_pass_of(50_000));
-    let mut s = facts(r.clone(), id, all(), View::History).unwrap();
-    let mut got: Vec<Fact> = s.by_ref().take(10).collect::<Result<_, _>>().unwrap();
-    let t = Timestamp(now - 1_000 + 150);
-    assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
-    assert_eq!(r.memory().emptied(), 1);
-    got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
-    assert_eq!(got, want);
-    rig.shut();
-}
-
-/// A shelf holds at most 60 rows here, so the 201st row taken is on the fourth shelf or later; each time holds two
-/// facts, and in history the 201st is the first of its time's two.
-#[test]
-fn a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views() {
-    let mut rig = Rig::new("later-shelf-emptied");
-    let id = rig.ids[0];
-    let now = rig.clock.wall().0;
-    for round in 0..2 {
-        let rs: Vec<Reading> = (0..300)
-            .map(|k| {
-                Reading::new(
-                    id,
-                    Timestamp(now - 1_000 + k),
-                    Value::F64((k + round) as f64),
-                )
-            })
-            .collect();
-        rig.emit_readings(&rs, Intent::Normal);
-    }
-    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
-    for (view, len) in [(View::History, 600), (View::Current, 300)] {
-        let want = oracle.with(|i, _| i.facts(id, all(), view)).unwrap();
-        assert_eq!(want.len(), len);
-        let r = reader_with(&rig.env, &rig.dir, one_pass_of(60 * fact_bytes()));
-        let mut s = facts(r.clone(), id, all(), view).unwrap();
-        let mut got: Vec<Fact> = s.by_ref().take(201).collect::<Result<_, _>>().unwrap();
-        let t = Timestamp(now - 1_000 + 20);
-        assert_eq!(at(&r, id, t, view).unwrap().map(|f| f.t), Some(t));
-        assert_eq!(r.memory().emptied(), 1);
-        got.extend(s.collect::<Result<Vec<_>, _>>().unwrap());
-        assert_eq!(got, want, "{view:?}");
-    }
-    rig.shut();
-}
-
-/// Damage found between a stream's two reads of a part makes the second shorter; the stream passes over rows by the
-/// last it yielded, so none after it is lost (Q-1096).
-#[test]
-fn a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last() {
-    let mut rig = Rig::new("shelf-damaged");
-    let id = rig.ids[0];
-    let now = rig.clock.wall().0;
-    for b in 0..30i64 {
-        let rs: Vec<Reading> = (0..10)
-            .map(|k| {
-                let i = b * 10 + k;
-                Reading::new(id, Timestamp(now - 1_000 + i), Value::F64(i as f64))
-            })
-            .collect();
-        rig.emit_readings(&rs, Intent::Normal);
-    }
-    let r = reader_with(&rig.env, &rig.dir, one_pass_of(50_000));
-    let mut s = facts(r.clone(), id, all(), View::History).unwrap();
-    let got: Vec<Fact> = s.by_ref().take(15).collect::<Result<_, _>>().unwrap();
-    assert!(rig.damage_batch(0));
-    let t = Timestamp(now - 1_000 + 150);
-    assert_eq!(at(&r, id, t, View::History).unwrap().map(|f| f.t), Some(t));
-    assert_eq!(r.memory().emptied(), 1);
-    let rest = s.collect::<Result<Vec<_>, _>>().unwrap();
-    let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
-    let want = oracle
-        .with(|i, _| i.facts(id, all(), View::History))
-        .unwrap();
-    assert_eq!(want.len(), 290);
-    let last = got.last().unwrap().t;
-    assert_eq!(last, Timestamp(now - 1_000 + 14));
-    assert_eq!(
-        rest,
-        want.into_iter().filter(|f| f.t > last).collect::<Vec<_>>()
-    );
-    rig.shut();
-}
-
 /// One `at` keeps the listing of its first pass through every span and the probe: a segment it listed and took
 /// nothing from, gone before the probe, ends it rather than letting the probe find no earlier fact (Q-1066).
 #[test]
@@ -787,3 +680,5 @@ fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_late
     );
     rig.shut();
 }
+
+mod shelves;

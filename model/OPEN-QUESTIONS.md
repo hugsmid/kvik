@@ -3901,7 +3901,8 @@ that returns yields one new row before its shelf can be emptied again. At the de
 which would let one held stream and point reads live together at the least cap at the price of more passes.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `rows_held_for_delivery_are_counted_and_an_admission_needing_them_empties_their_shelf`;
-`kvik/src/durable/read/source/tests.rs` `a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once`,
+`kvik/src/durable/read/source/tests/shelves.rs`
+`a_stream_whose_rows_another_read_needed_reads_them_again_and_yields_each_once`,
 `a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`;
 `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
@@ -3959,9 +3960,11 @@ missing.
 **Decided.** A stream yields rows in strictly ascending keys and remembers the last key it yielded: `(t, series,
 position)` in history, `(t, series)` in the current view, where a part read again may give a key's fact at another
 position. Every row not beyond it is passed over, whatever the second read returns; the count is gone.
-**Pinned by.** `kvik/src/durable/read/source/tests.rs`
+**Pinned by.** `kvik/src/durable/read/source/tests/shelves.rs`
 `a_stream_whose_part_lost_a_batch_before_it_was_read_again_yields_every_row_after_its_last`,
-`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`.
+`a_stream_whose_later_shelf_is_emptied_yields_each_row_once_in_both_views`,
+`a_versioned_key_whose_yielded_fact_is_lost_before_its_part_is_read_again_is_not_yielded_twice` (the current view's
+key).
 
 ## Q-1097 — An admission with nothing to empty, and shelved rows no shelf holds
 Decided by the lead with roadmap 9.0f's follow-up.
