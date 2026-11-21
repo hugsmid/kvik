@@ -270,6 +270,11 @@ impl Accountant {
     pub(crate) fn passes(&self) -> u64 {
         self.lock().passes
     }
+
+    /// The changes counted so far (Q-1097).
+    fn changes(&self) -> u64 {
+        self.lock().changes
+    }
 }
 
 /// The bytes `rows` take as a lookup counts them: the records their vector has room for and their texts.
@@ -345,6 +350,29 @@ mod tests {
         assert!(full.lock().unwrap().is_none());
         assert!(all < g.bytes);
         assert_eq!(g.rows(), LEAST_MEMORY - LEAST_MEMORY / 4 - BLOCK_RESERVE);
+    }
+
+    /// A shelf made is a change, a grant given back another, and so is a shelf emptied (Q-1097, Q-1100).
+    #[test]
+    fn a_shelf_made_a_grant_given_back_and_a_shelf_emptied_each_count_as_one_change() {
+        let a = Accountant::new(Sizes::of(LEAST_MEMORY));
+        let g = a.admit();
+        let before = a.changes();
+        let shelf = a.shelve(Vec::new().into_iter(), g, 8 << 20);
+        assert_eq!(a.changes(), before + 1, "a shelf made");
+        let held = shelf.lock().unwrap().take();
+        drop(held);
+        assert_eq!(a.changes(), before + 2, "a grant given back");
+        drop(shelf);
+        let shelf = a.shelve(Vec::new().into_iter(), a.admit(), 8 << 20);
+        let before = a.changes();
+        drop(admitted_within(&a, Duration::from_secs(10)).expect("the shelf emptied"));
+        assert!(shelf.lock().unwrap().is_none());
+        assert_eq!(
+            a.changes(),
+            before + 3,
+            "the shelf's grant, the emptying, the pass's grant"
+        );
     }
 
     /// Shelves of 7 and 8 MiB at the least cap: an admission needs both emptied, the second found on the list after

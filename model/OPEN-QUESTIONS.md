@@ -155,6 +155,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1095 | query design §3.5; Q-1067 | Admissions that empty shelves at once (decided by the lead) |
 | Q-1096 | §2.3; Q-1067 | Where a stream resumes after its shelf is emptied (decided by the lead) |
 | Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
+| Q-1100 | query design §3.5; Q-1097 | A shelf made counts as a change (decided by the lead) |
 | Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
 | Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
@@ -4393,6 +4394,18 @@ an accounting fault and panics; in a release build the admission waits on. Not a
 would turn an internal fault into a failure every caller must handle, for a state no caller can cause.
 **Pinned by.** `kvik/src/durable/read/cache.rs`
 `two_admissions_with_nothing_to_empty_wait_without_waking_each_other`.
+
+## Q-1100 — A shelf made counts as a change
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** With `changes += 1` taken out of `Accountant::shelve`, every test passed. An admission waits for a change
+only after a pass over the listed shelves emptied nothing, and it makes that pass only with no grant running (with
+one, that grant's return would make room, and it waits for that instead). While it waits, no pass can be admitted to
+make a shelf until a grant is given back, which is a change of its own. So the count for a shelf made is not needed
+today for an admission to wake.
+**Decided.** Kept, as Q-1097 defines a change, so that the wait does not rest on that argument as admission changes,
+and pinned by a test that reads the count after each kind of change.
+**Pinned by.** `kvik/src/durable/read/cache.rs`
+`a_shelf_made_a_grant_given_back_and_a_shelf_emptied_each_count_as_one_change`.
 
 ## Q-1101 — A far reader that built its fact index for a broken state, and damage below what it read
 Decided by the lead (a technical decision on a test: no engine or promise changes).
