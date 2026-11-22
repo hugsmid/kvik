@@ -585,3 +585,50 @@ fn a_commit_nobody_awaits_refreshes_live_staleness() {
     }
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum() {
+    for backend in [Backend::Model, Backend::Durable] {
+        let clock = ManualClock::new(at(600));
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        let s = block_on(Store::open(
+            StoreConfig::new(format!("windows/fields-{}", next()), "Europe/London")
+                .create_if_missing(true)
+                .backend(backend)
+                .env(env),
+        ))
+        .unwrap();
+        let c = block_on(s.define_series(number(counter()).name("w/c/energy"))).unwrap();
+        let g = block_on(s.define_series(number(gauge()).name("w/g/power"))).unwrap();
+        // 100 → 150 → 5 is a reset (below a tenth), 5 → 4 a regression, 4 → 10 a rise: 50 + 5 + 6.
+        let mut readings: Vec<Reading> = [100.0, 150.0, 5.0, 4.0, 10.0]
+            .iter()
+            .enumerate()
+            .map(|(k, v)| Reading::new(c, at(k as i64), Value::F64(*v)))
+            .collect();
+        readings.extend((1..=3).map(|k| Reading::new(g, at(k), Value::F64(k as f64))));
+        block_on(s.emit(&readings)).unwrap();
+        let r = s.reader();
+        let only = |id| match r
+            .buckets(id, at(0)..at(60), Resolution::Step(Duration::from_secs(60)))
+            .unwrap()
+        {
+            ChartData::Buckets { buckets, .. } => buckets.into_iter().next().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let b = only(c);
+        assert_eq!(
+            (b.increase, b.resets, b.regressions, b.sum),
+            (Some(61.0), Some(1), Some(1), None),
+            "{backend:?}"
+        );
+        let b = only(g);
+        assert_eq!(
+            (b.sum, b.increase, b.resets, b.regressions),
+            (Some(6.0), None, None, None),
+            "{backend:?}"
+        );
+        block_on(s.shutdown()).unwrap();
+    }
+}

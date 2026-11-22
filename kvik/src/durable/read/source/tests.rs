@@ -682,6 +682,7 @@ fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_late
 }
 
 mod shelves;
+mod windows;
 
 /// The shrunk history of the property (Q-1104): with timed seals the clean stop before the damage can leave the
 /// store's own series directory through the damaged batch, and a fresh reader continues it before the start meets

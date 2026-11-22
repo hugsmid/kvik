@@ -143,13 +143,17 @@ impl Reader {
         window: Window,
         aggregate: Aggregate,
     ) -> Result<WindowResult, QueryError> {
-        self.on(
-            |s| {
-                s.with(|s| s.window(id, &window, &aggregate))
-                    .map_err(|e| e.query())
-            },
-            |r| durable::window(r, id, &window, &aggregate),
-        )
+        match &self.inner {
+            ReaderInner::Model(s) => s
+                .with(|s| s.window(id, &window, &aggregate))
+                .map_err(|e| e.query()),
+            _ => durable::window(
+                &self.durable().expect("a durable reader")?,
+                id,
+                &window,
+                &aggregate,
+            ),
+        }
     }
 
     /// A chart query: raw facts or buckets with count, min, max, mean and
@@ -161,13 +165,17 @@ impl Reader {
         resolution: Resolution,
     ) -> Result<ChartData, QueryError> {
         let range = range.into();
-        self.on(
-            |s| {
-                s.with(|s| s.buckets(id, range, resolution))
-                    .map_err(|e| e.query())
-            },
-            |r| durable::buckets(r, id, range, resolution),
-        )
+        match &self.inner {
+            ReaderInner::Model(s) => s
+                .with(|s| s.buckets(id, range, resolution))
+                .map_err(|e| e.query()),
+            _ => durable::buckets(
+                &self.durable().expect("a durable reader")?,
+                id,
+                range,
+                resolution,
+            ),
+        }
     }
 
     /// Facts with `t` in a range, in a view (spec §2.3).

@@ -16,7 +16,12 @@ use crate::types::{Fact, SeriesId};
 
 /// What a read of `ids` in `view` selects at `v`'s cut. As of a time meets damage as a pass does: the scanning read
 /// finds it first, and the search runs once more (Q-1064).
-fn plan(r: &DurableReader, v: &View, ids: &[SeriesId], view: ReadView) -> Result<Plan, QueryError> {
+pub(crate) fn plan(
+    r: &DurableReader,
+    v: &View,
+    ids: &[SeriesId],
+    view: ReadView,
+) -> Result<Plan, QueryError> {
     let mut series = Vec::with_capacity(ids.len());
     for id in ids {
         let info = latest::series(v, &SeriesKey::Id(*id))?;
