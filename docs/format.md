@@ -740,8 +740,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
   content, 5 unknown: found again by a manifest rebuild with no cause given, `spec.md` §7 Manifest); 8 boot id
-  (16 bytes); 9 id floor `u32`; 10 and 11 commit times before and after (11 absent at the tail); 12 present when the record extends the loss named by field 1; 13 the reset stamp in force when the record was
-  written (16 bytes, as A.10 bytes 84..100): the mark's or, with the mark lost, that of the last kept recovery
+  (16 bytes); 9 id floor `u32`; 10 and 11 commit times before and after (11 absent at the tail); 12 present when the
+  record extends the loss named by field 1 (records of identities whose ranges overlap are one loss under the lowest
+  identity, `spec.md` §3 Order of a start step 4); 13 the reset stamp in force when the record was written (16 bytes, as A.10 bytes 84..100): the mark's or, with the mark lost, that of the last kept recovery
   entry; absent when none is known, which counts as later than every reset (`spec.md` §7 Readers, Q-124 (c)).
   Fields that settling Q-33 and Q-48 needs are added by roadmap 4.5 as new field ids.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps

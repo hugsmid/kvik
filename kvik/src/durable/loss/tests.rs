@@ -536,3 +536,76 @@ fn data_lost_count(losses: &[crate::health::LossReport]) -> usize {
         .filter(|l| l.kind == LossKind::DataLost)
         .count()
 }
+
+fn record(identity: u64, first: u64, last: u64) -> kvik_log::manifest::LostRange {
+    kvik_log::manifest::LostRange {
+        identity: (0, identity),
+        first: (0, first),
+        last: (0, last),
+        file_id: 1,
+        offset: 0,
+        length: 0,
+        cause: kvik_log::manifest::LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: identity != first,
+        stamp: None,
+    }
+}
+
+/// `(identity, first, last, recorded)` of each report the files give for `records`.
+fn reported(records: &[kvik_log::manifest::LostRange]) -> Vec<(u64, u64, u64, bool)> {
+    Finder::default()
+        .losses(records)
+        .iter()
+        .map(|r| {
+            (
+                r.identity.sequence,
+                r.first.unwrap().sequence,
+                r.last.unwrap().sequence,
+                r.recorded,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn records_of_two_identities_that_overlap_are_one_loss_under_the_lower_identity() {
+    let bridge = [record(10, 10, 10), record(8, 8, 8), record(8, 8, 10)];
+    assert_eq!(reported(&bridge), [(8, 8, 10, true)]);
+    let under_the_higher = [record(10, 10, 10), record(8, 8, 8), record(10, 8, 10)];
+    assert_eq!(reported(&under_the_higher), [(8, 8, 10, true)]);
+    let chained = [
+        record(2, 2, 3),
+        record(6, 6, 7),
+        record(9, 9, 9),
+        record(4, 3, 6),
+    ];
+    assert_eq!(reported(&chained), [(2, 2, 7, true), (9, 9, 9, true)]);
+}
+
+#[test]
+fn records_of_one_identity_or_of_two_that_only_touch_are_not_folded() {
+    assert_eq!(
+        reported(&[record(8, 8, 8), record(8, 8, 9)]),
+        [(8, 8, 9, true)]
+    );
+    assert_eq!(
+        reported(&[record(10, 10, 11), record(8, 8, 9)]),
+        [(8, 8, 9, true), (10, 10, 11, true)]
+    );
+}
+
+#[test]
+fn a_found_range_over_two_recorded_losses_is_one_loss_under_the_lower_identity_not_recorded() {
+    let mut l = Finder::default().losses(&[record(10, 10, 11), record(6, 6, 8)]);
+    merge(&mut l, [find(7, 10).report]);
+    let brief: Vec<_> = l
+        .iter()
+        .map(|r| (r.identity, r.first, r.last, r.recorded))
+        .collect();
+    let p = |s| Position::new(0, s);
+    assert_eq!(brief, [(p(6), Some(p(6)), Some(p(11)), false)]);
+}

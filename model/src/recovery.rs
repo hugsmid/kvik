@@ -286,7 +286,8 @@ pub struct Acknowledged {
 /// The list of losses (§11 Health), from the manifest's lost-range records,
 /// the ranges found but not yet recorded, the recovery entries and the
 /// acknowledgements. Each loss is listed once, under its identity, with the
-/// union of the ranges its records name. A recovery entry's gap is a
+/// union of the ranges its records name; records of identities whose ranges
+/// overlap are one loss under the lowest identity (Q-1102). A recovery entry's gap is a
 /// `data_lost` of cause truncated tail; the entry itself is a `possible_loss`
 /// when it names a tail, a mark not readable or stale, or a missing cursor
 /// file. A `data_lost` is closed by the latest closing record covering its
@@ -299,40 +300,73 @@ pub fn losses(
     stage: impl Fn(&Loss) -> LossState,
 ) -> Vec<Loss> {
     let mut out: Vec<Loss> = Vec::new();
-    let mut add =
-        |identity: Position, cause: LossCause, from: Position, to: Position, recorded: bool| {
-            if let Some(l) = out.iter_mut().find(|l| l.identity == identity) {
-                l.first = l.first.min(Some(from));
-                l.last = l.last.max(Some(to));
-                l.recorded |= recorded;
-            } else {
-                out.push(Loss {
-                    identity,
-                    kind: LossKind::DataLost,
-                    cause,
-                    first: Some(from),
-                    last: Some(to),
-                    tail: Tail::default(),
-                    mark_state: MarkState::Readable,
-                    cursors_missing: Vec::new(),
-                    recorded,
-                    acknowledged: false,
-                    state: None,
-                });
-            }
-        };
+    let add = |out: &mut Vec<Loss>,
+               identity: Position,
+               cause: LossCause,
+               from: Position,
+               to: Position,
+               recorded: bool| {
+        if let Some(l) = out.iter_mut().find(|l| l.identity == identity) {
+            l.first = l.first.min(Some(from));
+            l.last = l.last.max(Some(to));
+            l.recorded |= recorded;
+        } else {
+            out.push(Loss {
+                identity,
+                kind: LossKind::DataLost,
+                cause,
+                first: Some(from),
+                last: Some(to),
+                tail: Tail::default(),
+                mark_state: MarkState::Readable,
+                cursors_missing: Vec::new(),
+                recorded,
+                acknowledged: false,
+                state: None,
+            });
+        }
+    };
     for r in recorded {
-        add(r.identity, r.cause, r.from, r.to, true);
+        add(&mut out, r.identity, r.cause, r.from, r.to, true);
     }
+    // Records of identities whose ranges overlap are one loss under the
+    // lowest identity (Q-1102).
+    out.sort_by_key(|l| l.first);
+    let mut folded: Vec<Loss> = Vec::with_capacity(out.len());
+    let mut into: Vec<(Position, Position)> = Vec::new();
+    for l in out.drain(..) {
+        match folded.last_mut() {
+            Some(f) if l.first <= f.last => {
+                let by = if l.identity < f.identity {
+                    std::mem::replace(f, l)
+                } else {
+                    l
+                };
+                f.first = f.first.min(by.first);
+                f.last = f.last.max(by.last);
+                into.push((by.identity, f.identity));
+            }
+            _ => folded.push(l),
+        }
+    }
+    out = folded;
+    let folded_into = |mut i: Position| {
+        while let Some(&(_, to)) = into.iter().find(|(from, _)| *from == i) {
+            i = to;
+        }
+        i
+    };
     let mut found_again = Vec::new();
     for (from, to) in found {
         // A range found again before it is recorded is the same loss.
         let identity = recorded
             .iter()
-            .find(|r| r.from <= *to && *from <= r.to)
-            .map_or(*from, |r| r.identity);
+            .filter(|r| r.from <= *to && *from <= r.to)
+            .map(|r| folded_into(r.identity))
+            .min()
+            .unwrap_or(*from);
         found_again.push(identity);
-        add(identity, LossCause::Corruption, *from, *to, false);
+        add(&mut out, identity, LossCause::Corruption, *from, *to, false);
     }
     for l in &mut out {
         // The latest closing record that covers the present range; one
@@ -626,6 +660,46 @@ mod tests {
                     forget_above: p(8)
                 },
             ]
+        );
+    }
+
+    fn record(identity: u64, from: u64, to: u64) -> LostRecord {
+        LostRecord {
+            identity: p(identity),
+            from: p(from),
+            to: p(to),
+            cause: LossCause::Corruption,
+            at: 0,
+            epoch: 1,
+        }
+    }
+
+    fn brief(records: &[LostRecord], found: &[(Position, Position)]) -> Vec<(u64, u64, u64, bool)> {
+        losses(records, found, &[], &[], |_| LossState::Found)
+            .iter()
+            .map(|l| {
+                (
+                    l.identity.sequence,
+                    l.first.unwrap().sequence,
+                    l.last.unwrap().sequence,
+                    l.recorded,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_of_identities_whose_ranges_overlap_are_one_loss_under_the_lowest() {
+        let bridge = [record(10, 10, 10), record(8, 8, 8), record(8, 8, 10)];
+        assert_eq!(brief(&bridge, &[]), [(8, 8, 10, true)]);
+        let under_the_higher = [record(10, 10, 10), record(8, 8, 8), record(10, 8, 10)];
+        assert_eq!(brief(&under_the_higher, &[]), [(8, 8, 10, true)]);
+        let touching = [record(8, 8, 9), record(10, 10, 11)];
+        assert_eq!(brief(&touching, &[]), [(8, 8, 9, true), (10, 10, 11, true)]);
+        assert_eq!(
+            brief(&under_the_higher, &[(p(9), p(10))]),
+            [(8, 8, 10, true)],
+            "a range found again over the higher identity is the folded loss"
         );
     }
 }

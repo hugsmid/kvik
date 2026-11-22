@@ -161,16 +161,57 @@ pub(crate) fn widen(into: &mut LossReport, by: &LossReport) -> bool {
     true
 }
 
+/// Recorded lost data of identities whose ranges overlap, as one loss under the lowest identity (Q-1102); the rest
+/// unchanged, ordered by identity.
+pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
+    let (mut data, mut out): (Vec<_>, Vec<_>) = reports.into_iter().partition(|l| {
+        l.kind == LossKind::DataLost && l.recorded && l.first.is_some() && l.last.is_some()
+    });
+    data.sort_by_key(|l| l.first);
+    let mut folded: Vec<LossReport> = Vec::with_capacity(data.len());
+    for l in data {
+        match folded.last_mut() {
+            Some(f) if l.first <= f.last => {
+                let by = if l.identity < f.identity {
+                    std::mem::replace(f, l)
+                } else {
+                    l
+                };
+                if by.first < f.first {
+                    f.first = by.first;
+                    f.commit_time_before = by.commit_time_before;
+                }
+                if by.last > f.last {
+                    f.last = by.last;
+                    f.commit_time_after = by.commit_time_after;
+                }
+                f.bytes = f.bytes.max(by.bytes);
+            }
+            _ => folded.push(l),
+        }
+    }
+    out.extend(folded);
+    out.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
+    out
+}
+
 /// Adds to `into` each report of `extra` that stands for no loss already there, grows the loss it stands for
-/// otherwise, then orders them by identity.
+/// otherwise, then orders them by identity. A report that stands for several makes them one under the lowest
+/// identity (Q-940, Q-1102).
 pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = LossReport>) {
     for l in extra {
-        match into.iter_mut().find(|x| same_loss(x, &l)) {
-            Some(x) => {
-                widen(x, &l);
-            }
-            None => into.push(l),
+        let (mut same, rest): (Vec<_>, Vec<_>) = into.drain(..).partition(|x| same_loss(x, &l));
+        *into = rest;
+        same.sort_by_key(|x| x.identity);
+        let mut it = same.into_iter();
+        let Some(mut kept) = it.next() else {
+            into.push(l);
+            continue;
+        };
+        for by in it.chain(std::iter::once(l)) {
+            widen(&mut kept, &by);
         }
+        into.push(kept);
     }
     into.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
 }

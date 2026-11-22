@@ -1847,31 +1847,33 @@ fn record_loss(
     path: &std::path::Path,
 ) -> Result<bool, Fault> {
     let recorded: Vec<&LostRange> = m.lost_ranges().collect();
+    let span = |identity: (u32, u64)| {
+        recorded
+            .iter()
+            .filter(|x| x.identity == identity)
+            .map(|x| (x.first, x.last))
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+    };
     // Positions, not bare sequences: a restore records losses of earlier generations here (Q-261).
-    let overlap = recorded
+    let overlapped: BTreeSet<(u32, u64)> = recorded
         .iter()
-        .find(|r| r.first <= l.last && l.first <= r.last);
+        .filter(|r| r.first <= l.last && l.first <= r.last)
+        .map(|r| r.identity)
+        .collect();
     let mut rec = l.clone();
-    if let Some(r) = overlap {
-        // Recorded already, or extended under the recorded loss's identity.
-        let lo = recorded
-            .iter()
-            .filter(|x| x.identity == r.identity)
-            .map(|x| x.first)
-            .min()
-            .unwrap_or(r.first);
-        let hi = recorded
-            .iter()
-            .filter(|x| x.identity == r.identity)
-            .map(|x| x.last)
-            .max()
-            .unwrap_or(r.last);
-        if l.first >= lo && l.last <= hi {
+    // Recorded already, or one record under the lowest identity it overlaps, spanning every loss it bridges
+    // (Q-1102, as Q-940).
+    if let Some(&lowest) = overlapped.first() {
+        if span(lowest).is_some_and(|(lo, hi)| lo <= l.first && l.last <= hi) {
             return Ok(true);
         }
-        rec.identity = r.identity;
-        rec.first = l.first.min(lo);
-        rec.last = l.last.max(hi);
+        let (first, last) = overlapped
+            .iter()
+            .filter_map(|&i| span(i))
+            .fold((l.first, l.last), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        rec.identity = lowest;
+        rec.first = first;
+        rec.last = last;
         rec.extends = true;
     }
     // A lease may name any epoch: with none left above it, the start stays read-only rather than wrapping.

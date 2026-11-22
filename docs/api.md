@@ -652,7 +652,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   or by a start that could not write, is reported at once with `recorded` false, and is the same loss, recorded,
   after the next start that can write (spec §3 Recovery rule 2, Q-200); one found next to or over a reported loss
   grows that loss under its identity, `recorded` false and not acknowledged until a record and a new acknowledgement
-  cover its whole range. When the loss reports cannot be read (the
+  cover its whole range. One over two or more losses is one loss under the lowest of their identities, recorded or
+  not (Q-940, Q-1102). When the loss reports cannot be read (the
   mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
   `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A sealed segment that disappears with no
   manifest record naming its removal is a loss only where a reader of the process had read from it: that reader's

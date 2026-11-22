@@ -10,7 +10,7 @@ use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 use kvik_log::writer::Position as LogPos;
 
-use super::{Regions, merge, widen};
+use super::{Regions, fold_recorded, merge, widen};
 use crate::durable::index::{cause_out, log_pos, mark_state_out};
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
 use crate::time::Timestamp;
@@ -261,7 +261,7 @@ impl Finder {
                 },
             );
         }
-        let mut out: Vec<LossReport> = out.into_values().collect();
+        let mut out = fold_recorded(out.into_values().collect());
         merge(&mut out, self.found.iter().cloned());
         out
     }

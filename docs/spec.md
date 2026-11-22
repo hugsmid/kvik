@@ -453,11 +453,12 @@ A.10) is treated as a different boot. The rules apply in this order:
    record, write the last valid record's bytes again in place, and sync. Then, for every lost range found (rule 2
    regions, recovery-entry gaps) none of whose positions a lost-range record holds, append a lost-range record; for
    one that overlaps a recorded loss and extends it, upward or downward, append a record that extends that loss and
-   names its identity (one loss, counted once). A loss's **identity** is the first position of its range when it
-   was first reported (a `possible_loss` has its recovery entry's position as identity; identities are unique within
-   a kind), so a loss reported before any record holds it can be acknowledged at once, and the record,
-   when written, carries that identity. Sync the
-   manifest.
+   names its identity (one loss, counted once); for one that overlaps recorded losses of more than one identity,
+   append one record that extends the loss of the lowest identity over all of them. Records of identities whose
+   ranges overlap are one loss under the lowest identity, as the writer and every reader report it (Q-1102). A
+   loss's **identity** is the first position of its range when it was first reported (a `possible_loss` has its
+   recovery entry's position as identity; identities are unique within a kind), so a loss reported before any record
+   holds it can be acknowledged at once, and the record, when written, carries that identity. Sync the manifest.
 5. Rule 3, or rule 1 with a complete batch or any non-zero byte beyond the mark: write or adopt the recovery entry (in the open segment,
    or first in a new segment when it does not fit, its header written after it) and sync; zero the rest of the torn
    tail, or the bytes after the mark in whichever segment holds them, and batches a stopped reset's entry dropped

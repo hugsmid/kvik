@@ -597,8 +597,10 @@ impl Model {
                 .disk
                 .lost_records()
                 .iter()
-                .find(|r| r.from <= to && from <= r.to)
-                .map_or(from, |r| r.identity);
+                .filter(|r| r.from <= to && from <= r.to)
+                .map(|r| r.identity)
+                .min()
+                .unwrap_or(from);
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,
