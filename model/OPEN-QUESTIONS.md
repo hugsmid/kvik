@@ -127,6 +127,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-983 | §3 Group commit, §13 Sync rate and SSD wear; `design.md` Budgets | The device-time term of the budget against the latency of loads above it (OWNER) |
 | Q-984 | §3 Group commit; `kvik_log::LogStats` | The smoothed sync time and `sync_interval` under the budget |
 | Q-985 | §3 Group commit | The burst of the sync budget: four batch syncs |
+| Q-1031 | §4 Resync, §11 Health | A recovery entry in a segment that cannot be read is a reset point (decided by the lead) |
+| Q-1032 | §3 Recovery, Order of a start | The next position after a start that cannot read a published segment (decided by the lead) |
+| Q-1033 | §4 Resync, §11 Health; `format.md` A.16 | The registry file keeps every recovery entry; the durable deliverer takes reset points from it (decided by the lead) |
+| Q-1034 | §11 Health, `api.md` Health | A sealed segment whose body is zeroed, passed over with health `Ok` |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -3303,6 +3307,81 @@ the NVMe target) before the rate applies; and a closed-loop writer above the rat
 `the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the_next_for_its_refill`, and the window
 properties.
 
+## Q-1031 — A recovery entry in a segment that cannot be read while a copy may still come
+Recorded and decided by the recovery-history fix, for the lead's acceptance.
+**Scenario.** A power loss truncates acknowledged facts at positions 3 and 4 that a consumer has received; the start
+writes a recovery entry at 3 (`after` = 2) and assigns 4 again. The segment holding the entry is sealed and uploaded,
+the bucket stops answering for its object, and a scrub finds the hot copy damaged. The segment is quarantined, and
+no lost range is recorded, since the lost-object rule has not judged the object lost (§8 Corrupt block, Self-repair
+stage 1). The model built reset points from readable entries only, so the entry's reset point vanished, and the
+consumer was given a different fact at 4 with no `forget_above` below it, against principle 5 and §4 Resync.
+**Decided.** A recovery entry is a reset point unless a recorded lost range holds it (that range is then the reset
+point, as §4 Resync says for a range that may have held an entry); whether its segment can be read does not matter,
+since the registry file and each tree checkpoint keep every recovery entry (§11 Health). No promise changes: §4
+Resync now says so in a clause. The durable backend had the same defect at a start that cannot read the entry's
+segment; Q-1033 mends it.
+**Tests.** `tests/recovery_histories.rs`
+`a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point`,
+`a_recovery_entry_in_a_recorded_lost_range_gives_only_the_range_reset_point`,
+`a_recovery_entry_in_a_damaged_sealed_segment_stays_a_reset_point`,
+`a_recovery_entry_in_a_removed_sealed_segment_stays_a_reset_point`, and the reuse property
+`s4_a_position_is_given_again_only_after_a_forget_above_below_it`.
+
+## Q-1032 — The next position after a start that cannot read a published segment
+Recorded and decided by the self-repair history fix, for the lead's acceptance.
+**Scenario.** A sealed segment holding positions 8 to 10 leaves the fast disk and the bucket stops answering for its
+object while it cannot be reached, so no lookup counts and the lost-object rule has not spoken. The engine restarts.
+The model took the next position from the readable entries and the lost ranges only, so the next batch was given
+8 to 10 again; the segment then answered, so two files held different facts at the same positions, against §3
+(positions are assigned once, except above K after a truncation, rule 3) and principle 5.
+**Decided.** A start never assigns a position that a published segment holds, whether or not it can be read now: the
+manifest lists the segment and its range. No promise changes; the model now does what §3 already says. The durable
+log does not have the defect: the review's probe of 48 combinations of stop, harm to the sealed segment (damaged,
+removed, zeroed), mark kept or lost and a later segment found no position assigned again; where the mark is lost
+and the segment gone, the other sources of F (§3 Recovery rule 3, Q-116 (b)) hold the positions. Not covered: the
+segment, the mark, the manifest record, the registry file and every cursor file all lost at once, where §3's F has
+no source.
+**Tests.** `tests/self_repair/properties.rs`
+`a_start_does_not_assign_again_the_positions_of_a_segment_awaiting_its_copy`,
+`self_repair_history_a_segment_found_and_lost_again_after_a_start_keeps_the_rulings` (the shrunk case), and
+`s8_self_repair_histories_keep_the_rulings`.
+
+## Q-1033 — The durable engine's reset points from recovery entries it cannot read
+Decided by the lead (a technical decision: it keeps the promise of §4 Resync and §11 Health).
+**Scenario.** A consumer holds unconfirmed facts at 5 and 6; a power loss takes them with the mark's updates; the
+start writes a recovery entry at 5 (`after` = 4) and assigns 6 again; the segment is sealed and the store shut down
+cleanly. The sealed segment is then damaged in the entry's batch, removed, or its body zeroed. At the next start the
+durable deliverer took reset points from the entries it could read and the recorded lost ranges only; the damaged
+region is passed over and not recorded (Q-755), and A.16 rewrote the registry file from the kept log, so the entry
+left the file. The consumer was given the new fact at 6 with no `forget_above` (damaged), or never told to forget 5
+and 6 (removed, zeroed).
+**Decided.** No layout changes; only the rule for what a rewrite keeps. (a) Every write of the registry file keeps
+the recovery entries of the latest valid file of the same generation that the new content lacks, up to its
+`through` (`kvik_log::registry::write`, `RegistryFile::carry_recovery`), and the derived check at a start compares
+the file with the kept log's entries plus those carried (`format.md` A.16). (b) The deliverer takes a reset point
+from every recovery entry in the registry file of the current generation that no recorded lost range holds, as from
+one in the log, with its consumers' lost cursors (`kvik/src/durable/deliver/mod.rs`). The generation compared is the
+writer's own, not that of the newest batch read, so a restored generation whose readable log holds only earlier
+generations' batches still takes its carried entries. An unreadable registry file
+loses the carried entries with it, as it loses the id floor today.
+**Health.** With the segment removed the start reports no loss and health `Ok`: that is Q-951's limit, ruled by the
+owner to stand until roadmap 6.3b. The zeroed body is Q-1034.
+**Tests.** `kvik/tests/durable_reset_points.rs` (the review's reproduction: control, damaged, removed, zeroed; the
+registry file keeps the entry and passes the derived check, and a confirmed reset point is not sent again at a
+later start); `kvik/src/durable/deliver/tests.rs`
+`kept_resets_are_the_registry_files_recovery_entries_of_the_writers_generation_outside_lost_ranges`;
+`log/src/registry.rs`
+`a_rewrite_keeps_recovery_entries_the_kept_log_no_longer_holds`,
+`write_carries_the_recovery_entries_of_the_latest_file`; the model's side in Q-1031.
+
+## Q-1034 — A sealed segment whose body is zeroed, passed over with health `Ok`
+Recorded by the durable reset-point fix, from the review's probe; to be settled by roadmap 6.3b with Q-755.
+**Scenario.** A sealed segment's body is zeroed after its header while the store is stopped. The next start passes
+over it with no loss listed and health `Ok`, as for a removed segment (Q-951). §11 Health says a sealed segment that
+no manifest record lists and that fails its checks degrades health (`segment_damaged`); a zeroed body fails them.
+**For now.** As built; the reset points it held are kept by Q-1033. Proposed: report it as `segment_damaged`, or
+rule it a removal under Q-951; 6.3b's removal records decide which.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -3426,6 +3505,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-983 | 4.9 | OWNER. Gate; the `8 × d` term against closed-loop latency above the budget, and the burst in the stated bound; (a) for now |
 | Q-984 | 4.9 | Decided by the flush-pacing change; for the lead's acceptance |
 | Q-985 | 4.9 | Decided by the flush-pacing change (a burst of four); for the lead's acceptance |
+| Q-1031 | 5.3 | Decided by the lead; for review |
+| Q-1032 | 5.5 | Decided by the lead; the durable log checked by the review's probe; for review |
+| Q-1033 | 5.3 | Decided by the lead (no layout change); for review |
+| Q-1034 | 6.3b | Recorded only; with Q-755 and Q-951 |
 | Q-760 | 5.6 | Gate; recorded when the owner's ruling on Q-195 (a) was applied |
 | Q-761 | 6.4b | Partitioned export layout; recorded when the owner's ruling on Q-196 was applied |
 | Q-832 | 7.1b | A start that skips old segments; kept with Q-752 by the lead; recorded by the first profiling sweep |

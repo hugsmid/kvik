@@ -759,6 +759,11 @@ impl LogWriter {
         &self.report
     }
 
+    /// The generation this writer assigns positions in (`spec.md` §8 Generations).
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
     /// The fault that made the store read-only, if any.
     pub fn fault(&self) -> Option<&Fault> {
         self.fault.as_ref()

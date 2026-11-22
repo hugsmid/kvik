@@ -96,15 +96,19 @@ impl Writer {
         };
         // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
         // the kept log at every start, and the file, which must equal what the kept log gives up to the last synced
-        // mark, is written again whenever it does not. Its id floor is the writer's, which recovery folded in from
+        // mark with the recovery entries of the file read carried forward (Q-1033), is written again whenever it does
+        // not. Its id floor is the writer's, which recovery folded in from
         // the mark, the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
         let mut start_fault = start_fault;
         if start_fault.is_none() {
             let stats = writer.stats();
-            let expected = index.registry_file(stats.mark_synced, stats.max_series_id);
+            let mut expected = index.registry_file(stats.mark_synced, stats.max_series_id);
             let current = kvik_log::registry::read_latest(&*env.fs, &dir, &descriptor.store_id)
                 .ok()
                 .flatten();
+            if let Some((_, f)) = &current {
+                expected.carry_recovery(f);
+            }
             if current.is_none_or(|(_, f)| f != expected)
                 && let Err(e) =
                     kvik_log::registry::write(&*env.fs, &dir, descriptor.store_id, wall, &expected)
@@ -132,6 +136,7 @@ impl Writer {
             window_budget(&config.limits),
             latch.clone(),
             Some(hook.fold.clone()),
+            writer.generation(),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
