@@ -102,6 +102,7 @@ mod error;
 mod fold;
 mod health;
 mod pattern;
+mod provisional;
 mod read;
 mod rules;
 mod series;
@@ -132,6 +133,10 @@ pub use health::{
     BackupRefusal, BackupStats, ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats,
     Health, IngestStats, Latency, LogStats, LossCause, LossKind, LossReport, MarkState,
     MarkSyncMode, Reason, RestoreStats, SeriesStats, SetAsideReport, Stats,
+};
+pub use provisional::{
+    Accepted, PROVISIONAL_MAX_BEHIND, Provisional, ProvisionalEvent, ProvisionalFact,
+    ProvisionalOptions, Withdrawal,
 };
 pub use read::{
     Aggregate, Aggregated, Answer, Appended, Bucket, CalendarPeriod, CalendarWindow, ChartData,

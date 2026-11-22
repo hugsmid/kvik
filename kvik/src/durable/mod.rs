@@ -22,6 +22,7 @@ mod deliver;
 mod derived;
 mod emit;
 mod entries;
+pub(crate) mod fast;
 #[cfg(test)]
 mod held_state;
 mod history;
@@ -240,6 +241,14 @@ pub(crate) struct Writer {
     registry_written: derived::RegistryWritten,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,
+    /// The provisional streams' ring (spec §4 Fast path).
+    fast: Arc<fast::Fast>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.fast.close();
+    }
 }
 
 impl Writer {
@@ -309,6 +318,18 @@ impl Writer {
     /// what the live sessions of this process wait on (the query design's section 3.6).
     pub(crate) fn progress(&self) -> Option<kvik_log::writer::Watch> {
         self.log().as_ref().map(Log::watch)
+    }
+
+    /// A provisional stream from the next accepted call (spec §4 Fast path).
+    pub(crate) fn provisional(
+        &self,
+        o: &crate::provisional::ProvisionalOptions,
+    ) -> Result<fast::Stream, QueryError> {
+        o.check()?;
+        let watch = self.progress().ok_or_else(|| QueryError::NotAvailable {
+            reason: "the store is closed".into(),
+        })?;
+        Ok(self.fast.open(o, Box::new(watch)))
     }
 
     /// From the deliverer's held state; the reader of the process only when there is no deliverer or its

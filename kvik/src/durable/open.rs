@@ -203,6 +203,7 @@ impl Writer {
             start_losses,
             registry_written,
             bucket_warning: config.log.bucket_warning(),
+            fast: Arc::default(),
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -277,6 +278,7 @@ impl Writer {
             }
             h.run(|_, _| ());
         }
+        self.fast.close();
         let written = shut.map_err(|f| WriteError::ReadOnly(fault_out(&f)))?;
         if let Some(f) = hub_fault() {
             return Err(WriteError::ReadOnly(fault_out(&f)));

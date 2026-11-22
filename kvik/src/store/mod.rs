@@ -19,6 +19,7 @@ use crate::error::{
     BackupError, ConsumerError, DefineError, EmitError, OpenError, QueryError, WriteError,
 };
 use crate::health::{ConsumerStats, Health, LossReport, SeriesStats, Stats};
+use crate::provisional::{Provisional, ProvisionalOptions};
 use crate::read::{
     Aggregate, CalendarPeriod, CalendarWindow, ChartData, Facts, Live, ReaderState, Resolution,
     View, Window, WindowResult,
@@ -385,6 +386,14 @@ impl Store {
                 })
             }
         }
+    }
+
+    /// A stream of readings as the writer accepts them, before they are durable (spec §4 Fast path). The model
+    /// backend has none: [`QueryError::NotAvailable`].
+    pub fn provisional(&self, options: ProvisionalOptions) -> Result<Provisional, QueryError> {
+        by_backend!(self,
+            _m => Err(QueryError::NotAvailable { reason: "the model backend has no fast path".into() }),
+            d => Ok(Provisional { stream: d.provisional(&options)? }))
     }
 
     /// A read-only handle on this store. With the durable backend it reads

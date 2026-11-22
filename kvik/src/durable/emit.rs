@@ -42,6 +42,7 @@ impl Writer {
         let started = Instant::now();
         // Decided and queued in call order under the decision lock; a full queue is waited for with no lock held,
         // and the call decided again.
+        let mut provisional = None;
         let (mut d, call, mut plan, refreshes, queued) = loop {
             let mut d = lock(&self.decider);
             let call = self.next_call.fetch_add(1, Ordering::SeqCst);
@@ -60,6 +61,8 @@ impl Writer {
             let r = {
                 let log = self.log();
                 let log = log.as_ref().ok_or(EmitError::Closed)?;
+                provisional = fast::facts_of(&self.fast, &plan.items, clock.wall)
+                    .map(|f| (f, log.watch().durable()));
                 let items = std::mem::take(&mut plan.items);
                 if wait {
                     log.offer(items)
@@ -104,6 +107,9 @@ impl Writer {
                 let (clocks, ids) = (self.clocks.clone(), refreshes);
                 let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
                 inflight.insert(call, c.clone());
+                if let Some((facts, floor)) = provisional.take() {
+                    self.fast.publish(facts, floor, c.clone());
+                }
                 Some((c, true))
             }
             // Nothing to record. A duplicate of a reading queued by an earlier call that is not yet acknowledged

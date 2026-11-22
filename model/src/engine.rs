@@ -19,6 +19,9 @@ mod cuts;
 mod faults;
 mod recovery;
 mod repair;
+use crate::provisional::{
+    Event as ProvisionalEvent, Outcome as CallOutcome, Provisional, Withdrawal,
+};
 use crate::registry::{
     ChangedAtKind, Durability, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef,
     SeriesOptions, Timing,
@@ -2035,6 +2038,8 @@ pub struct Model {
     pub tzdb: Tzdb,
     /// Calendar rebuilds, logged (§5.7, row 21).
     pub calendar_log: Vec<CalendarRebuild>,
+    /// The fast path of each start, the last that of the running store (§4 Fast path).
+    pub provisional: Vec<Provisional<Fact>>,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
     /// The cuts reader processes hold, by id.
@@ -2072,6 +2077,7 @@ impl Model {
             clock_synchronised: true,
             tzdb: Tzdb::bundled(),
             calendar_log: Vec::new(),
+            provisional: Vec::new(),
             vol: None,
             sessions: BTreeMap::new(),
             cuts: BTreeMap::new(),
@@ -2114,12 +2120,14 @@ impl Model {
 
     /// Stops the machine now: volatile state is lost.
     pub fn crash(&mut self) {
+        self.fast_signal(true);
         self.vol = None;
     }
 
     /// The machine loses power: the process stops and the next start is a new
     /// boot, so the page cache and the boot id of the mark are gone (§3).
     pub fn power_loss(&mut self) {
+        self.fast_signal(true);
         self.boot += 1;
         self.drop_page_cache();
         self.crash();
@@ -2140,6 +2148,8 @@ impl Model {
     /// sync that recovery performs after a reboot fails (§3 Recovery: "If that
     /// sync fails, stay read-only").
     pub fn restart_with(&mut self, recovery_sync_fails: bool) {
+        self.fast_signal(true);
+        self.provisional.push(Provisional::default());
         self.vol = None;
         // A restore that stopped before its record starts again with the
         // next generation (§8 Restore).
@@ -3008,6 +3018,7 @@ impl Model {
         if batch.is_empty() {
             return Ok(report);
         }
+        let seq = self.fast_accept(&batch);
         if fault == Some(Fault::Crash(CrashPoint::BeforeWrite)) {
             self.crash();
             return Err(Error::Crashed);
@@ -3033,6 +3044,7 @@ impl Model {
             Some(Fault::SyncError(outcome)) => {
                 self.disk.tail_fate = Some(outcome);
                 self.disk.write_back_failed = true;
+                self.fast_settle(seq, CallOutcome::Failed(Withdrawal::OutcomeUnknown));
                 let v = self.vol_mut()?;
                 v.read_only = true;
                 v.sync_failed = true;
@@ -3055,6 +3067,9 @@ impl Model {
         if fault == Some(Fault::Crash(CrashPoint::AfterSync)) {
             self.crash();
             return Err(Error::Crashed);
+        }
+        if let Some(last) = batch.last() {
+            self.fast_settle(seq, CallOutcome::Acknowledged(last.position));
         }
         // Live state.
         self.counters.duplicates_unchecked += unchecked;
@@ -3087,6 +3102,52 @@ impl Model {
         }
         self.maybe_seal();
         Ok(report)
+    }
+
+    fn fast_accept(&mut self, batch: &[Entry]) -> u64 {
+        let facts = batch
+            .iter()
+            .filter_map(Entry::fact)
+            .map(|f| (f.series, f.clone()))
+            .collect();
+        self.provisional.last_mut().map_or(0, |p| p.accept(facts))
+    }
+
+    fn fast_settle(&mut self, seq: u64, outcome: CallOutcome) {
+        if let Some(p) = self.provisional.last_mut() {
+            p.settle(seq, outcome);
+        }
+    }
+
+    /// Tells the running store's fast path the durable mark and whether the writer has failed; `stopped` when the
+    /// process stops, before a power loss can move the mark back.
+    fn fast_signal(&mut self, stopped: bool) {
+        let mark = self.disk.mark.map_or(Position::ORIGIN, |m| m.last);
+        let ended = stopped || self.vol.as_ref().is_none_or(|v| v.read_only);
+        if let Some(p) = self.provisional.last_mut() {
+            p.signal(mark, ended, stopped);
+        }
+    }
+
+    /// Opens a provisional stream on the running store (§4 Fast path): its start and its id. `None` selects every
+    /// series.
+    pub fn provisional_open(
+        &mut self,
+        series: Option<BTreeSet<SeriesId>>,
+    ) -> Result<(usize, u64), Error> {
+        self.vol()?;
+        let run = self.provisional.len() - 1;
+        Ok((run, self.provisional[run].open(series)))
+    }
+
+    /// Every event due to a provisional stream now.
+    pub fn provisional_poll(&mut self, (run, id): (usize, u64)) -> Vec<ProvisionalEvent<Fact>> {
+        if run + 1 == self.provisional.len() && self.vol.is_some() {
+            self.fast_signal(false);
+        }
+        self.provisional
+            .get_mut(run)
+            .map_or_else(Vec::new, |p| p.poll(id))
     }
 
     /// Convenience: emit all readings, then commit once without faults.

@@ -15,6 +15,7 @@ impl Model {
     /// A remount after which the first `keep` flagged batches not yet synced
     /// reached the disk (Q-250).
     pub fn remount_keeping(&mut self, keep: usize) {
+        self.fast_signal(true);
         self.drop_page_cache_keeping(keep);
         self.crash();
     }
@@ -77,6 +78,7 @@ impl Model {
     /// A power loss that keeps the first `keep` flagged batches not yet
     /// synced and loses the rest whole (§3 Recovery rule 3, Q-251).
     pub fn power_loss_keeping(&mut self, keep: usize) {
+        self.fast_signal(true);
         self.boot += 1;
         self.drop_page_cache_keeping(keep);
         self.crash();
