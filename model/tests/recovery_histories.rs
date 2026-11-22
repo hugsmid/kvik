@@ -945,6 +945,54 @@ fn recovery_history_a_compacted_object_lost_while_read_only_waits_for_the_lost_o
 }
 
 #[test]
+fn recovery_history_entries_in_a_quarantined_segment_keep_their_reset_points_before_a_catch_up() {
+    let ops = [
+        ROp::LoseMark(false),
+        ROp::Take { c: 0, n: 4 },
+        ROp::PowerLossKeeping(0),
+        ROp::Ingest(1, None),
+        ROp::Upload,
+        ROp::Ingest(1, None),
+        ROp::LoseObject(0),
+        ROp::PowerLossKeeping(0),
+        ROp::Ingest(1, None),
+        ROp::PowerLossKeeping(0),
+        ROp::Ingest(1, None),
+        ROp::PowerLossKeeping(0),
+        ROp::Define,
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::CorruptSealed(3),
+        ROp::CatchUp { c: 0 },
+        ROp::Compact,
+        ROp::Take { c: 0, n: 4 },
+    ];
+    run_recovery(&ops, &mut Seen::default(), ALL).unwrap();
+}
+
+#[test]
+fn recovery_history_an_entry_in_a_damaged_sealed_segment_keeps_its_reset_point_after_a_failed_sync()
+{
+    let ops = [
+        ROp::Ingest(2, None),
+        ROp::Take { c: 1, n: 4 },
+        ROp::PowerLoss(1),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(
+            1,
+            Some(kvik_model::engine::Fault::SyncError(
+                kvik_model::engine::WriteOutcome::Lost,
+            )),
+        ),
+        ROp::CorruptSealed(0),
+        ROp::Take { c: 1, n: 4 },
+    ];
+    run_recovery(&ops, &mut Seen::default(), ALL).unwrap();
+}
+
+#[test]
 fn a_recovery_entry_in_a_quarantined_segment_awaiting_its_copy_stays_a_reset_point() {
     let ops = [
         ROp::Ingest(2, None),
