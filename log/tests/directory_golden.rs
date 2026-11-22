@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use kvik_log::block::encode_block;
 use kvik_log::directory::logdir::{Group, GroupEntry, LostEntry, Root, SegmentRecord};
 use kvik_log::directory::series::{
-    Candidate, CandidateValue, Pending, SeriesDirectory, SeriesEntry,
+    Candidate, CandidateValue, Pending, SeriesDirectory, SeriesEntry, StartCounts,
 };
 use kvik_log::directory::status::{StatusFile, counter, flag, health, reason};
 use kvik_log::directory::{Frame, block_type};
@@ -210,6 +210,12 @@ fn series() -> SeriesDirectory {
                 candidate_unsure: false,
                 pending: None,
                 pending_more: false,
+                counts: Some(StartCounts {
+                    late: 2,
+                    future: 0,
+                    last_received_at: T0 + 591 * S,
+                    last_revisable: false,
+                }),
             },
             SeriesEntry {
                 series_id: 7,
@@ -229,6 +235,7 @@ fn series() -> SeriesDirectory {
                     position: at(51),
                 }),
                 pending_more: true,
+                counts: None,
             },
         ],
     }
@@ -242,10 +249,10 @@ fn series_bytes() -> Vec<u8> {
         .u64(0)
         .i64(T0 + 601 * S)
         .u32(2)
-        .u16(96)
+        .u16(120)
         .zeros(2);
-    // Series 1: latest, reference, candidate (bits 0, 1, 2); an f64 of good quality.
-    b.u32(1).u16(0b111).u8(1).u8(0);
+    // Series 1: latest, reference, candidate, start counts (bits 0, 1, 2, 6); an f64 of good quality.
+    b.u32(1).u16(0b100_0111).u8(1).u8(0);
     b.i64(T0 + 590 * S).i64(T0 + 590 * S).u64(60).u64(0);
     b.i64(T0 + 590 * S)
         .pos(0, 94)
@@ -253,11 +260,13 @@ fn series_bytes() -> Vec<u8> {
         .zeros(3)
         .u64(21.5f64.to_bits());
     b.i64(0).pos(0, 0).zeros(4);
+    b.u64(2).u64(0).i64(T0 + 591 * S);
     // Series 7, orphaned: latest, candidate unsure, pending and more (bits 0, 2, 3, 4, 5); text of suspect quality.
     b.u32(7).u16(0b11_1101).u8(5).u8(2);
     b.i64(T0 + 7_200 * S).i64(0).u64(3).u64(3);
     b.i64(T0 + 300 * S).pos(0, 50).u8(0).zeros(3).u64(0);
     b.i64(T0 + 3_600 * S).pos(0, 51).zeros(4);
+    b.zeros(24);
     file(kind::SERIES_DIRECTORY, block_type::SERIES, 2, &b.0)
 }
 
@@ -344,6 +353,17 @@ fn golden_files_decode_to_what_they_show_and_encode_again() {
         (frame(9), status())
     );
     assert_eq!(status().encode(frame(9), STORE).unwrap(), b);
+}
+
+#[test]
+fn a_v1_series_directory_reads_as_before_with_no_start_counts() {
+    let b = fs::read(dir().join("series-v1.sdir")).unwrap();
+    let (f, d) = SeriesDirectory::decode(&b, &STORE).unwrap();
+    let mut v1 = series();
+    for e in &mut v1.entries {
+        e.counts = None;
+    }
+    assert_eq!((f, d), (frame(2), v1));
 }
 
 #[test]

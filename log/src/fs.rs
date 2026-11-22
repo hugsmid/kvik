@@ -376,7 +376,7 @@ struct MemState {
     names: Vec<NameChange>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Change {
     Write(usize, Vec<u8>),
     Len(usize),
@@ -563,6 +563,54 @@ impl MemFs {
                 img[offset..offset + bytes.len()].copy_from_slice(bytes);
             }
         }
+    }
+
+    /// An independent copy of every file and of the name changes not yet durable, with no faults, crash or hook
+    /// planned and no file locked: the same store as another process would find it, for a second start.
+    pub fn snapshot(&self) -> MemFs {
+        let s = lock(&self.state);
+        let copy = MemFs::new();
+        let mut c = lock(&copy.state);
+        let mut copied: BTreeMap<usize, Arc<Mutex<MemData>>> = BTreeMap::new();
+        let mut copy_of = |data: &Arc<Mutex<MemData>>| {
+            copied
+                .entry(Arc::as_ptr(data) as usize)
+                .or_insert_with(|| {
+                    let d = lock(data);
+                    Arc::new(Mutex::new(MemData {
+                        id: d.id,
+                        path: d.path.clone(),
+                        bytes: d.bytes.clone(),
+                        durable: d.durable.clone(),
+                        locked: false,
+                        pending: d.pending.clone(),
+                        lost: d.lost.clone(),
+                    }))
+                })
+                .clone()
+        };
+        for (path, data) in &s.files {
+            c.files.insert(path.clone(), copy_of(data));
+        }
+        c.names = s
+            .names
+            .iter()
+            .map(|n| match n {
+                NameChange::Created(p) => NameChange::Created(p.clone()),
+                NameChange::Renamed { from, to, replaced } => NameChange::Renamed {
+                    from: from.clone(),
+                    to: to.clone(),
+                    replaced: replaced.as_ref().map(&mut copy_of),
+                },
+                NameChange::Removed { path, data } => NameChange::Removed {
+                    path: path.clone(),
+                    data: copy_of(data),
+                },
+            })
+            .collect();
+        drop(c);
+        *lock(&copy.free) = *lock(&self.free);
+        copy
     }
 
     /// Every file's path, sorted.

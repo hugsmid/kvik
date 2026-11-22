@@ -13,8 +13,10 @@ use crate::header::kind;
 use crate::mark::ResetStamp;
 use crate::writer::Position;
 
-/// An entry's size in v1.
+/// An entry's size in v1: the least a reader accepts.
 pub const ENTRY_LEN: u16 = 96;
+/// An entry's size as written since the start counts (A.18 entry fields 96 to 120).
+pub const ENTRY_LEN_COUNTS: u16 = 120;
 const PREFIX: usize = 48;
 
 /// Entry flag bits (A.18).
@@ -32,6 +34,24 @@ pub mod flag {
     pub const PENDING: u16 = 1 << 4;
     /// Pending facts may exist that the entry does not name: once the named one falls due, a reader finds the next.
     pub const PENDING_MORE: u16 = 1 << 5;
+    /// The start counts are present (fields 96 to 120; never set in a v1 entry).
+    pub const COUNTS: u16 = 1 << 6;
+    /// With the start counts: the last fact by position carries a `changed_at`, so it may have been outranked.
+    pub const LAST_REVISABLE: u16 = 1 << 7;
+}
+
+/// What a writer's start continues from besides the fact count (A.18 entry fields 96 to 120, `spec.md` §3 Order of
+/// a start, seeded start).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StartCounts {
+    /// Kept facts flagged `late`.
+    pub late: u64,
+    /// Kept facts flagged `future`.
+    pub future: u64,
+    /// The receive time of the series' last kept fact by position.
+    pub last_received_at: i64,
+    /// That fact carries a `changed_at` (see [`flag::LAST_REVISABLE`]).
+    pub last_revisable: bool,
 }
 
 /// A candidate's value: inline for fixed-width types; text is read at the candidate's position.
@@ -100,6 +120,8 @@ pub struct SeriesEntry {
     pub pending: Option<Pending>,
     /// See [`flag::PENDING_MORE`].
     pub pending_more: bool,
+    /// `None` when the entry does not carry them (a v1 entry, or a fold continued from one).
+    pub counts: Option<StartCounts>,
 }
 
 fn quality_code(q: Quality) -> u8 {
@@ -135,6 +157,11 @@ impl SeriesEntry {
         set(self.candidate_unsure, flag::CANDIDATE_UNSURE);
         set(self.pending.is_some(), flag::PENDING);
         set(self.pending_more, flag::PENDING_MORE);
+        set(self.counts.is_some(), flag::COUNTS);
+        set(
+            self.counts.is_some_and(|c| c.last_revisable),
+            flag::LAST_REVISABLE,
+        );
         f
     }
 
@@ -171,6 +198,10 @@ impl SeriesEntry {
         out.extend_from_slice(&p.map_or(0, |p| p.t).to_le_bytes());
         put_position(out, p.map_or(Position::default(), |p| p.position));
         out.extend_from_slice(&[0; 4]);
+        let n = self.counts.unwrap_or_default();
+        out.extend_from_slice(&n.late.to_le_bytes());
+        out.extend_from_slice(&n.future.to_le_bytes());
+        out.extend_from_slice(&n.last_received_at.to_le_bytes());
     }
 
     fn decode(b: &[u8]) -> Result<Self, DerivedError> {
@@ -214,6 +245,15 @@ impl SeriesEntry {
                 position: position_at(b, 80),
             }),
             pending_more: has(flag::PENDING_MORE),
+            // A v1 record is too short to hold them, whatever its flags say.
+            counts: (has(flag::COUNTS) && b.len() >= usize::from(ENTRY_LEN_COUNTS)).then(|| {
+                StartCounts {
+                    late: u64_at(b, 96),
+                    future: u64_at(b, 104),
+                    last_received_at: i64_at(b, 112),
+                    last_revisable: has(flag::LAST_REVISABLE),
+                }
+            }),
         })
     }
 }
@@ -238,13 +278,13 @@ pub struct SeriesDirectory {
 impl SeriesDirectory {
     /// The bytes of the file; the frame's `written_at` is the write time the candidates are judged against.
     pub fn encode(&self, frame: Frame, store_id: [u8; 16]) -> Result<Vec<u8>, EncodeError> {
-        let mut b = Vec::with_capacity(PREFIX + self.entries.len() * usize::from(ENTRY_LEN));
+        let mut b = Vec::with_capacity(PREFIX + self.entries.len() * usize::from(ENTRY_LEN_COUNTS));
         put_position(&mut b, self.through);
         b.extend_from_slice(&self.lost.to_le_bytes());
         put_stamp(&mut b, self.stamp);
         b.extend_from_slice(&self.judged_at.to_le_bytes());
         b.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        b.extend_from_slice(&ENTRY_LEN.to_le_bytes());
+        b.extend_from_slice(&ENTRY_LEN_COUNTS.to_le_bytes());
         b.extend_from_slice(&[0; 2]);
         for e in &self.entries {
             e.encode(&mut b);
@@ -397,6 +437,12 @@ mod tests {
                     position: at(4),
                 }),
                 pending_more: i == 1,
+                counts: (i != 3).then_some(StartCounts {
+                    late: i as u64,
+                    future: 1,
+                    last_received_at: -5,
+                    last_revisable: i == 1,
+                }),
             })
             .collect();
         let d = SeriesDirectory {
@@ -416,5 +462,56 @@ mod tests {
             SeriesDirectory::decode(&bytes, &[1; 16]).unwrap(),
             (frame, d)
         );
+    }
+
+    /// The file with each entry cut to `size` bytes, its record size and checksums set to match.
+    fn with_record_size(file: &[u8], size: usize) -> Vec<u8> {
+        let body = &file[80..];
+        let count = u32::from_le_bytes(body[40..44].try_into().unwrap()) as usize;
+        let old = usize::from(u16::from_le_bytes(body[44..46].try_into().unwrap()));
+        let mut b = body[..PREFIX].to_vec();
+        b[44..46].copy_from_slice(&(size as u16).to_le_bytes());
+        for i in 0..count {
+            let at = PREFIX + i * old;
+            b.extend_from_slice(&body[at..at + size]);
+        }
+        let mut out = file[..80].to_vec();
+        out[68..72].copy_from_slice(&(b.len() as u32).to_le_bytes());
+        out[72..76].copy_from_slice(&crate::crc::crc32c(&b).to_le_bytes());
+        let head = crate::crc::crc32c(&out[64..76]).to_le_bytes();
+        out[76..80].copy_from_slice(&head);
+        out.extend_from_slice(&b);
+        out
+    }
+
+    #[test]
+    fn a_v1_entry_carries_no_start_counts_whatever_its_flags_say() {
+        let frame = Frame {
+            generation: 0,
+            file_id: 1,
+            written_at: 0,
+        };
+        let entry = SeriesEntry {
+            series_id: 1,
+            latest_t: Some(7),
+            fact_count: 3,
+            counts: Some(StartCounts {
+                late: 2,
+                future: 1,
+                last_received_at: 9,
+                last_revisable: true,
+            }),
+            ..SeriesEntry::default()
+        };
+        let d = SeriesDirectory {
+            entries: vec![entry],
+            ..SeriesDirectory::default()
+        };
+        let file = d.encode(frame, [1; 16]).unwrap();
+        assert_eq!(SeriesDirectory::decode(&file, &[1; 16]).unwrap().1, d);
+        let v1 = with_record_size(&file, usize::from(ENTRY_LEN));
+        let (_, read) = SeriesDirectory::decode(&v1, &[1; 16]).unwrap();
+        assert_eq!(read.entries[0].counts, None);
+        assert_eq!(read.entries[0].fact_count, 3);
     }
 }
