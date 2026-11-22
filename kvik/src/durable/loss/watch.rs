@@ -75,6 +75,11 @@ impl Watch {
         self.finder.losses(&self.recorded)
     }
 
+    /// The manifest's lost ranges as last read.
+    pub(crate) fn recorded(&self) -> &[LostRange] {
+        &self.recorded
+    }
+
     /// Bytes its reader keeps between catch-ups.
     #[cfg(test)]
     pub(crate) fn kept_bytes(&self) -> usize {

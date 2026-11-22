@@ -4566,25 +4566,44 @@ degraded again though no position was newly lost; loss 10 left the list, against
 ever", its closing outcome with it; and its corruption was read as loss 8's, so the repeated-corruption count fell, and
 `storage_suspect` could clear, at the moment more damage was found.
 **Options.**
-(a) Carry over. A folded loss lists the recorded identities it absorbed (`LossReport::absorbed`, `api.md`). The latest
+(a) Carry over. A folded loss lists the identities it absorbed that have a record (`LossReport::absorbed`, `api.md`),
+whatever the order of the finds that folded them; a range found and folded in with no record is not listed. The latest
 acknowledgement or closing record of each identity folded in, its own included, closes it while together they cover
 its present range (positions follow one another within a generation); a fold that adds a position none of them covers
 needs a new acknowledgement, as a loss that grows does. The outcome is that of the latest of those records; one
 "restored in full" closes nothing once a later lost-range record of an identity folded in overlaps it. Each absorbed
 identity whose records are a corruption keeps its own corruption, named by its own first record, so the count and
 `storage_suspect` never fall at a fold; `acknowledge_losses` naming the folded loss marks them all seen. About 250
-lines with tests.
+lines with tests. Its costs: the closed state rests on several records read together, not one; the loss shows one
+outcome, the latest, where the records folded in had different ones (by an operator and restored in full, say); an
+absorbed loss stays listed by identity only, without its own range, state or outcome, which is less than §8's "with
+its state"; and acknowledged ranges that meet across a generation boundary are not joined, so such a loss asks for a
+new acknowledgement.
 (b) Lapse, as in 3e3a4153: records naming the higher identity close nothing, the higher loss leaves the list and its
-corruption is the folded loss's.
+corruption is the folded loss's. For it: one rule (a record closes the loss it names and no other), no new public
+field, and the person is asked again whenever the listed loss changes shape, which some would want. Against it: the
+loss is degraded again with no position newly lost, the higher loss and its outcome leave the list, and the
+corruption count falls when more damage is found.
+**Within (a).** An identity in `absorbed` given to `acknowledge_losses` does nothing and reports success, as an
+identity with no loss does (built so). The other course reads it as naming the loss that absorbed it, which is kinder
+to a caller holding an identity from an earlier listing, at the cost of one identity naming two losses.
 **Recommendation.** (a): a fold is a change in how records are read, not new damage, so it should take nothing away
 that a user already had. Built so (`kvik/src/durable/loss.rs` `absorb`, `acknowledged`; `kvik/src/durable/status.rs`
 `loss_reports`; `model/src/recovery.rs` `losses`; `model/src/engine/repair.rs` `corruptions`). In the engine the
 acknowledgements are held in memory for the process until roadmap 8.5c writes their record; the model holds them as
-records. `acknowledge_losses` names a loss by its `identity`: an identity in `absorbed` acknowledges nothing.
+records.
 **Pinned by.** `kvik/src/durable/loss/tests.rs` `a_folded_loss_names_every_recorded_identity_it_absorbed`,
-`acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it`; `model/src/recovery.rs`
-`closing_records_of_the_identities_folded_in_carry_over_while_they_cover_the_loss`; `model/tests/self_repair.rs`
-`a_fold_keeps_each_absorbed_loss_s_corruption_and_the_count`.
+`acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it`,
+`a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds`; `kvik/tests/durable_losses.rs`
+`acknowledgements_of_two_recorded_losses_carry_over_a_bridge_that_adds_no_position`,
+`an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`; `log/tests/loss_bridge.rs`
+`a_bridging_record_spans_only_the_losses_its_range_overlaps`; `model/src/recovery.rs`
+`closing_records_of_the_identities_folded_in_carry_over_while_they_cover_the_loss`,
+`a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds`,
+`a_record_of_an_identity_folded_in_reopens_a_restore_only_where_it_overlaps_it`; `model/tests/self_repair.rs`
+`a_fold_keeps_each_absorbed_loss_s_corruption_and_the_count`,
+`acknowledgements_of_two_losses_carry_over_a_bridge_that_adds_no_position`,
+`an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`.
 
 ## Open at v0.2
 

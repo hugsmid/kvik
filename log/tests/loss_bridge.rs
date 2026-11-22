@@ -298,6 +298,22 @@ fn a_range_beside_a_recorded_loss_is_a_loss_of_its_own() {
 }
 
 #[test]
+fn a_bridging_record_spans_only_the_losses_its_range_overlaps() {
+    let mut r = Rig::new();
+    r.record(2, 2, 3);
+    r.record(12, 12, 12);
+    r.record(8, 8, 8);
+    r.record(10, 10, 10);
+    for p in 8..=10 {
+        r.damage(p);
+    }
+    let rep = r.restart();
+    assert_eq!(found(&rep), [(Some(8), Some(10), true)]);
+    assert_eq!(r.records().last(), Some(&(8, 8, 10, true)));
+    assert_eq!(r.records().len(), 5);
+}
+
+#[test]
 fn a_range_across_three_losses_takes_the_lowest_identity_and_spans_them_all() {
     let mut r = Rig::new();
     r.record(10, 10, 12);

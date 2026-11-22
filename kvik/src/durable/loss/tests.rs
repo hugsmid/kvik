@@ -555,6 +555,20 @@ fn record(identity: u64, first: u64, last: u64) -> kvik_log::manifest::LostRange
     }
 }
 
+/// The reports the files give for `records`, with the ranges `finds` found after them, in order.
+fn found_over(
+    records: &[kvik_log::manifest::LostRange],
+    finds: &[(u64, u64)],
+) -> Vec<crate::health::LossReport> {
+    let mut l = Finder::default().losses(records);
+    merge(
+        &mut l,
+        finds.iter().map(|(a, b)| find(*a, *b).report),
+        &identities(records),
+    );
+    l
+}
+
 /// `(identity, first, last, recorded)` of each report the files give for `records`.
 fn reported(records: &[kvik_log::manifest::LostRange]) -> Vec<(u64, u64, u64, bool)> {
     Finder::default()
@@ -600,8 +614,7 @@ fn records_of_one_identity_or_of_two_that_only_touch_are_not_folded() {
 
 #[test]
 fn a_found_range_over_two_recorded_losses_is_one_loss_under_the_lower_identity_not_recorded() {
-    let mut l = Finder::default().losses(&[record(10, 10, 11), record(6, 6, 8)]);
-    merge(&mut l, [find(7, 10).report]);
+    let l = found_over(&[record(10, 10, 11), record(6, 6, 8)], &[(7, 10)]);
     let brief: Vec<_> = l
         .iter()
         .map(|r| (r.identity, r.first, r.last, r.recorded))
@@ -707,8 +720,7 @@ fn a_folded_loss_names_every_recorded_identity_it_absorbed() {
         l.iter().map(absorbed).collect::<Vec<_>>(),
         [vec![4, 6], vec![]]
     );
-    let mut l = Finder::default().losses(&[record(10, 10, 11), record(6, 6, 8)]);
-    merge(&mut l, [find(7, 10).report]);
+    let l = found_over(&[record(10, 10, 11), record(6, 6, 8)], &[(7, 10)]);
     assert_eq!(absorbed(&l[0]), [10]);
     let touching = Finder::default().losses(&[record(10, 10, 11), record(8, 8, 9)]);
     assert!(touching.iter().all(|l| l.absorbed.is_empty()));
@@ -726,8 +738,7 @@ fn acked(l: &crate::health::LossReport, acks: &[(u64, u64, u64)]) -> bool {
 
 #[test]
 fn acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it() {
-    let mut touching = Finder::default().losses(&[record(10, 10, 11), record(8, 8, 9)]);
-    merge(&mut touching, [find(9, 10).report]);
+    let touching = found_over(&[record(10, 10, 11), record(8, 8, 9)], &[(9, 10)]);
     let [l] = touching.as_slice() else {
         panic!("{touching:?}")
     };
@@ -735,8 +746,7 @@ fn acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_c
     assert!(!acked(l, &[(8, 8, 9)]));
     assert!(!acked(l, &[(10, 10, 11)]));
     assert!(acked(l, &[(8, 8, 11)]));
-    let mut gap = Finder::default().losses(&[record(10, 10, 10), record(8, 8, 8)]);
-    merge(&mut gap, [find(8, 10).report]);
+    let gap = found_over(&[record(10, 10, 10), record(8, 8, 8)], &[(8, 10)]);
     assert!(
         !acked(&gap[0], &[(8, 8, 8), (10, 10, 10)]),
         "position 9 is new"
@@ -748,4 +758,22 @@ fn acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_c
         !acked(&old_bridge[0], &[(12, 8, 10)]),
         "only identities folded in count"
     );
+}
+
+#[test]
+fn a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds() {
+    let two = [record(8, 8, 8), record(10, 10, 10)];
+    for finds in [[(10, 11), (8, 11)], [(8, 11), (10, 11)]] {
+        let l = found_over(&two, &finds);
+        assert_eq!(l.len(), 1, "{finds:?}: {l:?}");
+        assert_eq!(absorbed(&l[0]), [10], "{finds:?}");
+    }
+    let three = [record(8, 8, 8), record(10, 10, 10), record(12, 12, 12)];
+    for finds in [[(10, 12), (8, 10)], [(8, 10), (10, 12)]] {
+        let l = found_over(&three, &finds);
+        assert_eq!(l.len(), 1, "{finds:?}: {l:?}");
+        assert_eq!(absorbed(&l[0]), [10, 12], "{finds:?}");
+    }
+    let unrecorded = found_over(&two, &[(12, 12), (8, 12)]);
+    assert_eq!(absorbed(&unrecorded[0]), [10], "a find has no record");
 }

@@ -8,6 +8,7 @@ mod watch;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use kvik_log::manifest::LostRange;
 use kvik_log::writer::Position as LogPos;
 
 pub(crate) use finder::{Find, Finder};
@@ -194,9 +195,10 @@ pub(crate) fn acknowledged(
     false
 }
 
-/// Notes in `into` that `by`, a recorded loss or one that absorbed some, is folded into it (Q-1108).
-fn absorb(into: &mut LossReport, by: &LossReport) {
-    let own = by.recorded && by.identity != into.identity;
+/// Notes in `into` that `by` is folded into it: `by`'s identity when it has a record, whatever `by.recorded` now
+/// says, and those `by` absorbed (Q-1108).
+fn absorb(into: &mut LossReport, by: &LossReport, has_record: bool) {
+    let own = has_record && by.identity != into.identity;
     into.absorbed.extend(own.then_some(by.identity));
     into.absorbed.extend(by.absorbed.iter().copied());
     into.absorbed.retain(|i| *i != into.identity);
@@ -229,7 +231,7 @@ pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
                     f.commit_time_after = by.commit_time_after;
                 }
                 f.bytes = f.bytes.max(by.bytes);
-                absorb(f, &by);
+                absorb(f, &by, true);
             }
             _ => folded.push(l),
         }
@@ -238,10 +240,25 @@ pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
     out
 }
 
+/// Identities of the lost-range records `recorded`, ascending, for [`merge`].
+pub(crate) fn identities(recorded: &[LostRange]) -> Vec<Position> {
+    let mut out: Vec<_> = recorded
+        .iter()
+        .map(|l| Position::new(l.identity.0, l.identity.1))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Adds to `into` each report of `extra` that stands for no loss already there, grows the loss it stands for
 /// otherwise, then orders them by identity. A report that stands for several makes them one under the lowest
-/// identity (Q-940, Q-1102).
-pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = LossReport>) {
+/// identity (Q-940, Q-1102); `records`, ascending, are the identities that have a record.
+pub(crate) fn merge(
+    into: &mut Vec<LossReport>,
+    extra: impl IntoIterator<Item = LossReport>,
+    records: &[Position],
+) {
     for l in extra {
         let (mut same, rest): (Vec<_>, Vec<_>) = into.drain(..).partition(|x| same_loss(x, &l));
         *into = rest;
@@ -253,7 +270,7 @@ pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = 
         };
         for by in it.chain(std::iter::once(l)) {
             widen(&mut kept, &by);
-            absorb(&mut kept, &by);
+            absorb(&mut kept, &by, records.binary_search(&by.identity).is_ok());
         }
         into.push(kept);
     }

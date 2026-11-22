@@ -654,7 +654,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   after the next start that can write (spec §3 Recovery rule 2, Q-200); one found next to or over a reported loss
   grows that loss under its identity, `recorded` false and not acknowledged until a record and a new acknowledgement
   cover its whole range. One over two or more losses is one loss under the lowest of their identities, recorded or
-  not (Q-940, Q-1102); a recorded loss folded in stays listed in its `absorbed`. Acknowledgements and closing records
+  not (Q-940, Q-1102); a loss folded in that has a record stays listed in its `absorbed`, whatever the order of the
+  finds, and a range found with no record names none there. Acknowledgements and closing records
   of every identity folded into a loss close it while together they cover its whole range, and each such identity
   keeps its own corruption in the repeated-corruption count (Q-1108). `acknowledge_losses` names a loss by its
   `identity`; an identity in `absorbed` acknowledges nothing. When the loss reports cannot be read (the

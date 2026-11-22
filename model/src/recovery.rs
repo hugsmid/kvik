@@ -333,13 +333,14 @@ pub fn losses(
     for r in recorded {
         add(&mut out, r.identity, r.cause, r.from, r.to, true);
     }
+    let has_record = |i: Position| recorded.iter().any(|r| r.identity == i);
     // Records of identities whose ranges overlap are one loss under the
     // lowest identity (Q-1102).
     out.sort_by_key(|l| l.first);
     let mut folded: Vec<Loss> = Vec::with_capacity(out.len());
     for l in out.drain(..) {
         match folded.last_mut() {
-            Some(f) if l.first <= f.last => fold(f, l),
+            Some(f) if l.first <= f.last => fold(f, l, has_record),
             _ => folded.push(l),
         }
     }
@@ -375,7 +376,7 @@ pub fn losses(
             .map(|x| (x.first, x.last))
             .collect();
         for by in it {
-            fold(&mut l, by);
+            fold(&mut l, by, has_record);
         }
         l.first = l.first.min(Some(*from));
         l.last = l.last.max(Some(*to));
@@ -444,14 +445,16 @@ pub fn losses(
 }
 
 /// Folds loss `by` into `f`; the lower identity names the loss and the
-/// other's recorded identity is absorbed (Q-1102, Q-1108).
-fn fold(f: &mut Loss, mut by: Loss) {
+/// other's identity is absorbed when it has a record, whatever its
+/// `recorded` now says (Q-1102, Q-1108).
+fn fold(f: &mut Loss, mut by: Loss, has_record: impl Fn(Position) -> bool) {
     if by.identity < f.identity {
         std::mem::swap(f, &mut by);
     }
     f.first = f.first.min(by.first);
     f.last = f.last.max(by.last);
-    f.absorbed.extend(by.recorded.then_some(by.identity));
+    f.absorbed
+        .extend(has_record(by.identity).then_some(by.identity));
     f.absorbed.extend(by.absorbed);
     let own = f.identity;
     f.absorbed.retain(|i| *i != own);
@@ -788,6 +791,27 @@ mod tests {
         assert_eq!(l[0].absorbed, [p(10)]);
     }
 
+    #[test]
+    fn a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds() {
+        let absorbed = |records: &[LostRecord], found: &[(u64, u64)]| {
+            let found: Vec<_> = found.iter().map(|(a, b)| (p(*a), p(*b))).collect();
+            let l = losses(records, &found, &[], &[], |_| LossState::Found);
+            assert_eq!(l.len(), 1, "{l:?}");
+            l[0].absorbed.iter().map(|i| i.sequence).collect::<Vec<_>>()
+        };
+        let two = [record(8, 8, 8), record(10, 10, 10)];
+        assert_eq!(absorbed(&two, &[(10, 11), (8, 11)]), [10]);
+        assert_eq!(absorbed(&two, &[(8, 11), (10, 11)]), [10]);
+        let three = [record(8, 8, 8), record(10, 10, 10), record(12, 12, 12)];
+        assert_eq!(absorbed(&three, &[(10, 12), (8, 10)]), [10, 12]);
+        assert_eq!(absorbed(&three, &[(8, 10), (10, 12)]), [10, 12]);
+        assert_eq!(
+            absorbed(&two, &[(12, 12), (8, 12)]),
+            [10],
+            "a find has no record"
+        );
+    }
+
     fn ack(identity: u64, from: u64, to: u64, outcome: Outcome) -> Acknowledged {
         Acknowledged {
             identity: p(identity),
@@ -855,6 +879,23 @@ mod tests {
             state(&under_the_higher, &restored),
             Some(LossState::Found),
             "lost again under the absorbed identity"
+        );
+    }
+
+    #[test]
+    fn a_record_of_an_identity_folded_in_reopens_a_restore_only_where_it_overlaps_it() {
+        let mut bridge = record(8, 8, 11);
+        bridge.epoch = 2;
+        let mut away = record(8, 6, 9);
+        away.epoch = 5;
+        let records = [record(8, 8, 9), record(10, 10, 11), bridge, away];
+        let acks = [
+            (3, ack(10, 10, 11, Outcome::Restored(2))),
+            (6, ack(8, 6, 9, Outcome::Operator)),
+        ];
+        assert_eq!(
+            state(&records, &acks),
+            Some(LossState::Closed(Outcome::Operator))
         );
     }
 }
