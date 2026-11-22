@@ -322,6 +322,7 @@ fn start_losses(w: &LogWriter, boot_id: Option<[u8; 16]>) -> Vec<LossReport> {
             cursors_missing: Vec::new(),
             recorded: false,
             acknowledged: false,
+            absorbed: Vec::new(),
         })
         .collect()
 }

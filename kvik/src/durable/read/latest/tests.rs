@@ -148,8 +148,6 @@ pub(in crate::durable::read) struct Rig {
     pub(in crate::durable::read) after_damage: u64,
     /// Loss reports compared with the commit time before set aside (Q-1071).
     pub(super) set_aside: u64,
-    /// Checks after damage whose lost-range records bridge two identities, compared by positions lost (Q-1102).
-    pub(super) bridged: u64,
     /// Checks before a start skipped because the fresh reader continues a directory the store wrote at or above the
     /// damage (Q-1002, Q-1104).
     pub(in crate::durable::read) over_damage: u64,
@@ -213,7 +211,6 @@ impl Rig {
             faulted: false,
             after_damage: 0,
             set_aside: 0,
-            bridged: 0,
             over_damage: 0,
             written: Vec::new(),
             directory: None,
@@ -532,16 +529,10 @@ impl Rig {
         }
         let want = (reference.losses(), seed(&reference));
         prop_assert!(!want.0.is_empty(), "the damage is reported");
-        let bridges = bridged(&recorded_ranges(&reference));
-        self.bridged += u64::from(!bridges.is_empty());
-        let (want_whole, want_lost) = positions_lost(&want.0, &bridges);
         let mut set_aside = 0;
         let mut compare = |got: Losses, seed: Option<Position>| {
-            let (got_whole, got_lost) = positions_lost(&got, &bridges);
-            prop_assert_eq!(got_lost, want_lost.clone());
-            let (alike, wanted) =
-                known_alike((got_whole.clone(), seed), (want_whole.clone(), want.1));
-            set_aside += u64::from(alike != got_whole || wanted != want_whole);
+            let (alike, wanted) = known_alike((got.clone(), seed), want.clone());
+            set_aside += u64::from(alike != got || wanted != want.0);
             prop_assert_eq!(alike, wanted);
             Ok(())
         };
@@ -576,53 +567,6 @@ pub(super) fn recorded_ranges(r: &Reader) -> Vec<(Position, Position, Position)>
             .collect())
     })
     .unwrap()
-}
-
-/// The spans of lost-range records that overlap a record of another identity, joined where they overlap: a start
-/// recorded a range across two losses under one of them, which the writer and a reader of the whole log report apart
-/// (Q-1102).
-pub(super) fn bridged(records: &[(Position, Position, Position)]) -> Vec<(Position, Position)> {
-    let spans = records
-        .iter()
-        .filter(|(i, a, b)| records.iter().any(|(j, c, d)| i != j && a <= d && c <= b))
-        .map(|(_, a, b)| (*a, *b))
-        .collect();
-    joined(spans)
-}
-
-/// Spans joined where they overlap; spans that only touch are separate losses and stay apart.
-fn joined(mut spans: Vec<(Position, Position)>) -> Vec<(Position, Position)> {
-    spans.sort();
-    let mut out: Vec<(Position, Position)> = Vec::new();
-    for (a, b) in spans {
-        match out.last_mut() {
-            Some((_, z)) if a <= *z => *z = (*z).max(b),
-            _ => out.push((a, b)),
-        }
-    }
-    out
-}
-
-/// The reports compared whole, and the positions lost data overlapping a bridged span covers, joined: all Q-1102
-/// leaves compared there. A report without both positions cannot be placed, so it is compared whole.
-pub(super) fn positions_lost(
-    l: &[crate::health::LossReport],
-    bridges: &[(Position, Position)],
-) -> (Losses, Vec<(Position, Position)>) {
-    let mut whole = Vec::new();
-    let mut spans = Vec::new();
-    for r in l {
-        match (r.first, r.last) {
-            (Some(a), Some(b))
-                if r.kind == crate::health::LossKind::DataLost
-                    && bridges.iter().any(|(c, d)| a <= *d && *c <= b) =>
-            {
-                spans.push((a, b));
-            }
-            _ => whole.push(r.clone()),
-        }
-    }
-    (whole, joined(spans))
 }
 
 /// Two readers' loss reports, each with the directory its reader continues, with the commit time before an

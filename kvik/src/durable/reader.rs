@@ -778,7 +778,8 @@ pub(crate) fn state_of(v: &View) -> ReaderState {
 pub(crate) fn losses_of(v: &View) -> Vec<LossReport> {
     let mut out = v.latest().losses(v.lost_ranges());
     if let Some(i) = v.index() {
-        super::loss::merge(&mut out, i.losses(v.lost_ranges()));
+        let records = super::loss::identities(v.lost_ranges());
+        super::loss::merge(&mut out, i.losses(v.lost_ranges()), &records);
     }
     out
 }

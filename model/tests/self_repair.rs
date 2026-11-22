@@ -3,6 +3,8 @@
 //! the property tests are in `self_repair/properties.rs`.
 
 mod common;
+#[path = "self_repair/folds.rs"]
+mod folds;
 #[path = "self_repair/properties.rs"]
 mod properties;
 

@@ -795,3 +795,96 @@ fn a_region_after_a_removed_segment_is_reported_from_the_removed_positions() {
     );
     block_on(s.shutdown()).unwrap();
 }
+
+/// Appends a lost-range record for `first..=last` under `identity`, with no store open. The batches it names stay
+/// intact: a hand-written record stands in for losses recorded by earlier starts.
+fn hand_record(w: &World, identity: Position, first: Position, last: Position) {
+    use kvik_log::manifest::{
+        LossCause, LostRange, RECORD_LOST_RANGE, encode_record, read_manifest,
+    };
+    let dir = Path::new(&w.dir);
+    let store_id = kvik_log::store::read_descriptor(&*w.fs, dir)
+        .unwrap()
+        .store_id;
+    let path = dir.join("MANIFEST");
+    let m = read_manifest(&w.fs.read(&path).unwrap(), &store_id).unwrap();
+    let l = LostRange {
+        identity: (identity.generation, identity.sequence),
+        first: (first.generation, first.sequence),
+        last: (last.generation, last.sequence),
+        file_id: 1,
+        offset: 0,
+        length: 0,
+        cause: LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: identity != first,
+        stamp: None,
+    };
+    let rec = encode_record(RECORD_LOST_RANGE, m.last_epoch() + 1, 0, 0, Some(&l));
+    w.fs.poke(&path, m.valid_end as usize, &rec);
+}
+
+/// A store whose recorded losses `a..=b` and `c..=d` touch, the texts of `b` and `c` named `TR-THREE` and `TR-FOUR`,
+/// and its series; the store's first query reads the kept log (Q-928).
+fn touching_recorded(name: &str) -> (World, Store, SeriesId, [Position; 4]) {
+    let w = World::new(name);
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let at = emit_notes(
+        &s,
+        id,
+        &[
+            "TR-ONE", "TR-TWO", "TR-THREE", "TR-FOUR", "TR-FIVE", "TR-SIX",
+        ],
+    );
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let [a, b, c, d] = [at[1], at[2], at[3], at[4]];
+    hand_record(&w, a, a, b);
+    hand_record(&w, c, c, d);
+    let s = w.open();
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(a, Some(a), Some(b), true), (c, Some(c), Some(d), true)]
+    );
+    (w, s, id, [a, b, c, d])
+}
+
+#[test]
+fn acknowledgements_of_two_recorded_losses_carry_over_a_bridge_that_adds_no_position() {
+    let (w, s, id, [a, _, c, d]) = touching_recorded("carry-over");
+    block_on(s.acknowledge_losses(&[a, c])).unwrap();
+    assert!(matches!(s.health(), Health::Ok));
+    damage(&w, b"TR-THREE");
+    damage(&w, b"TR-FOUR");
+    history(&s.reader(), id);
+    let losses = s.losses();
+    assert_eq!(data_lost(&losses), vec![(a, Some(a), Some(d), false)]);
+    assert_eq!(losses[0].absorbed, [c]);
+    assert!(losses[0].acknowledged, "{losses:?}");
+    assert!(matches!(s.health(), Health::Ok), "{:?}", s.health());
+    block_on(s.acknowledge_losses(&[c])).unwrap();
+    assert_eq!(s.losses(), losses);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing() {
+    let (w, s, id, [a, _, c, d]) = touching_recorded("absorbed-ack");
+    block_on(s.acknowledge_losses(&[a])).unwrap();
+    damage(&w, b"TR-THREE");
+    damage(&w, b"TR-FOUR");
+    history(&s.reader(), id);
+    let losses = s.losses();
+    assert_eq!(data_lost(&losses), vec![(a, Some(a), Some(d), false)]);
+    assert!(!losses[0].acknowledged);
+    block_on(s.acknowledge_losses(&[c])).unwrap();
+    assert_eq!(s.losses(), losses);
+    assert!(degraded_by(&s.health(), a), "{:?}", s.health());
+    block_on(s.acknowledge_losses(&[a])).unwrap();
+    assert!(s.losses()[0].acknowledged);
+    block_on(s.shutdown()).unwrap();
+}

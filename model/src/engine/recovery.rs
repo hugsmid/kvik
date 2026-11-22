@@ -376,8 +376,8 @@ impl Model {
     /// A recovery whose sync fails writes no record (Q-79), but reports the
     /// ranges it found as `data_lost` (§8 "recorded when found"); the next
     /// recovery that can write records them, with any a scrub found while the
-    /// engine could not write. A range that overlaps a recorded loss names its
-    /// identity (§3 Order of a start, step 4).
+    /// engine could not write. A range that overlaps recorded losses names the
+    /// lowest of their identities (§3 Order of a start, step 4; Q-1102).
     fn record_lost_ranges(&mut self) {
         let unrecorded = std::mem::take(&mut self.disk.unrecorded);
         for f in unrecorded {
@@ -393,8 +393,10 @@ impl Model {
                 .disk
                 .lost_records()
                 .iter()
-                .find(|r| r.from <= to && from <= r.to)
-                .map_or(from, |r| r.identity);
+                .filter(|r| r.from <= to && from <= r.to)
+                .map(|r| r.identity)
+                .min()
+                .unwrap_or(from);
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,

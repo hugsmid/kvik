@@ -157,10 +157,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1097 | query design §3.5; Q-1095 | An admission with nothing to empty, and shelved rows no shelf holds (decided by the lead) |
 | Q-1100 | query design §3.5; Q-1097 | A shelf made counts as a change (decided by the lead) |
 | Q-1101 | §11 Health; Q-1011, Q-1060 | A far reader that built its fact index for a broken state, and damage below what it read (decided by the lead) |
-| Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (OWNER) |
+| Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (ruled by the owner) |
 | Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
 | Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
+| Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4433,23 +4434,23 @@ not proposed here.
 `NotAvailable` and no loss in its process, the loss from a fresh reader, agreement once a start records it) and
 `every_batch_brings_each_consumer_to_the_static_read_at_its_cut_and_to_the_models`.
 
-## Q-1102 — A start's lost range across two recorded losses (OWNER)
-Recorded by the loss-reports item. For the owner: it decides what `losses()` reports and under which identity.
-**Scenario.** The latest values' shrunk history: batches at positions 10, 8 and 9 are damaged in turn, each found by a
-start after a power loss. The first two starts record losses 10 (10..10) and 8 (8..8). The third finds 8..10, across
-both; its step 4 extends the first recorded loss it overlaps, writing a record under identity 10 for 8..10
-(`log/src/writer/recovery.rs` `record_loss`). The manifest then holds two identities whose ranges overlap. The
-writer's process reports one loss: identity 10, 8..10, recorded. A reader of the whole log reports two: identity 10,
-8..10, recorded, and identity 8, grown to 8..10 by its own find and marked not recorded, though records hold every
-position. The property meets it at about one check in 200 of those after damage (2 of 404 in three runs at 1,024
-cases).
+## Q-1102 — A start's lost range across two recorded losses (ruled by the owner)
+Recorded by the loss-reports item; ruled by the owner on 2026-11-21: option (a).
+**Scenario.** The latest values' shrunk history: batches at positions 10, 8 and 9 are damaged in turn, each found by
+a start after a power loss. The first two starts record losses 10 (10..10) and 8 (8..8). The third finds 8..10,
+across both; as first built, its step 4 extended the first recorded loss it overlapped, writing a record under
+identity 10 for 8..10 (`log/src/writer/recovery.rs` `record_loss`). The manifest then held two identities whose
+ranges overlap. The writer's process reported one loss: identity 10, 8..10, recorded. A reader of the whole log
+reported two: identity 10, 8..10, recorded, and identity 8, grown to 8..10 by its own find and marked not recorded,
+though records hold every position. The property meets it at about one check in 200 of those after damage (2 of 404
+in three runs at 1,024 cases).
 **The gap.** §3 Order of a start step 4 says how a range that extends one recorded loss is recorded (one loss,
 counted once), not one that overlaps two; §11 Health counts each loss once; Q-940 makes a find across two losses not
 yet recorded one loss under the lower identity. Whichever rule is chosen, the writer and readers then agree; a
 reader's report of a recorded range as not recorded is wrong under all three.
 **Options.**
-(a) One loss under the lower identity, as Q-940: the start writes the bridge as an extension of the lowest identity it
-overlaps, and readers and the writer fold records of two identities whose ranges overlap into the lower one
+(a) One loss under the lower identity, as Q-940: the start writes the bridge as an extension of the lowest identity
+it overlaps, and readers and the writer fold records of two identities whose ranges overlap into the lower one
 (records already written under the higher identity are folded the same way). Acknowledgement, re-send requests and
 the corruption count then name 8. About 40 lines with tests. The lead's recommendation.
 (b) One loss under the identity the bridging record names (10 here), the others folded into it: the writer's report
@@ -4457,14 +4458,45 @@ as now; loss 8 leaves the list though a start recorded it, and its earlier re-se
 report carries.
 (c) Two losses: each recorded identity stays a loss, a find counts against a record that covers it, and the writer
 reports two as well; the positions of loss 8 are then in two losses, against "counted once".
-**Now.** As built. Where records of two identities overlap, the property compares the data losses that overlap those
-records' span by the positions they cover, joining spans that overlap but not spans that only touch; every other
-report, a data loss without both positions among them, is compared whole, as are all reports of a check with no such
-records.
+**Ruling.** (a): one loss under the lower identity, as Q-940. A start writes exactly one record for a range across
+recorded losses, under the lowest identity it overlaps, spanning every loss it bridges, and nothing at later starts
+that find the range again (`log/src/writer/recovery.rs` `record_loss`; spec §3 Order of a start step 4). The writer
+and every reader fold records of identities whose ranges overlap into the lowest identity
+(`kvik/src/durable/loss.rs` `fold_recorded`), so records written under the higher identity before the ruling read
+the same (a start that finds such a range again writes the record under the lowest identity once where the range
+reaches the lower identity's own records, and nothing where it lies within the higher one's, which the fold reads the
+same); ranges that only touch stay two losses. A found report over several losses makes them one under the lowest
+identity (`merge`), and the model's losses, found ranges included, and its start records follow the same rule
+(`model/src/recovery.rs` `losses`, `model/src/engine/recovery.rs` `record_lost_ranges`). Each end of the bridging
+record, and of a loss's report, takes the commit time of the range or record that sets it, so a bridge does not keep
+the time of a batch now lost. A start counts the records it wrote before each range, so two ranges of one start over
+one recorded loss leave nothing for the next start. The latest values' property compares every loss report whole
+again, its set-aside for bridged records removed; only the set-aside of Q-1071 remains.
+**What the fold leaves unchanged.** The root of the log directory carries one lost range per identity as before
+(`format.md` A.18): it is read for the positions lost ranges cover, never as a list of losses, so overlapping entries
+change nothing. The `files` crate's catalogue keeps one entry per identity a record names, with no fold: backup,
+restore and the manifest rebuild use it for the positions records cover and to carry records as written, never as a
+list of losses for a user (its per-identity `acknowledged` has no reader outside its tests), and the engine folds
+what they carry when it reads it; a rebuild restates a range under the lowest identity it overlaps, which the fold
+reads the same. Acknowledgements, closing records, the listing of a folded loss and its corruptions are Q-1108.
+The model's starts never meet a range across two identities (corrupting a batch clears it, and a scrub passes
+positions already lost), so the lowest-identity choice in `record_lost_ranges` and in self-repair's records is kept
+for agreement but no model history reaches it; the fold in `losses` is pinned.
 **Pinned by.** `kvik/src/durable/read/latest/histories.rs`
-`a_start_s_range_across_two_recorded_losses_is_reported_apart_by_the_writer_and_a_whole_reader` (the records, both
-reports as built, and the property's set-aside reached), `only_records_of_two_identities_that_overlap_bridge` and
-`positions_lost_compares_whole_what_lies_outside_a_bridge_or_has_no_position`.
+`a_start_s_range_across_two_recorded_losses_is_one_loss_under_the_lower_identity` (the records, the writer's and a
+whole reader's reports, after a power loss and a restart too); `kvik/src/durable/loss/tests.rs`
+`records_of_two_identities_that_overlap_are_one_loss_under_the_lower_identity`,
+`records_of_one_identity_or_of_two_that_only_touch_are_not_folded`,
+`a_found_range_over_two_recorded_losses_is_one_loss_under_the_lower_identity_not_recorded`;
+`a_folded_loss_takes_each_end_s_commit_time_from_the_record_that_sets_it_and_the_largest_byte_count`,
+`a_record_that_extends_a_loss_gives_it_the_commit_time_of_the_end_it_moves`,
+`equal_and_nested_ranges_of_two_identities_fold_into_the_lower`; `log/tests/loss_bridge.rs` (one record under the
+lower identity, three losses bridged, one identity extended once, a range beside a loss, a bridge recorded under the
+higher identity, durability across power losses and restarts, a torn bridging record, the commit times of a bridging
+record, two ranges of one start over one loss); `log/tests/recovery.rs`
+`a_recovery_entry_s_gap_across_two_recorded_losses_is_one_record_under_the_lower_identity`; `model/src/recovery.rs`
+`records_of_identities_whose_ranges_overlap_are_one_loss_under_the_lowest`,
+`a_found_range_over_two_recorded_losses_folds_them_as_the_engine_does`.
 
 ## Q-1103 — The first call's memory bound and the refresh within it
 Decided by the lead (a technical decision on a test: no engine or promise changes).
@@ -4524,6 +4556,55 @@ the followed segment plus the larger of the two (Q-1103's form before it). With 
 batches and the refresh assertion fails; with the cap doubled or ignored the first `facts` assertion fails.
 **Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
+## Q-1108 — Acknowledgements, listing and corruption counts across a fold
+Recorded by the lead with the Q-1102 fix round; for the owner. Built as option (a), the lead's decision until ruled.
+**Scenario.** Losses 8 (8..9) and 10 (10..11) are recorded, each acknowledged or closed (say 10 restored in full) and
+each counted as a corruption. A start finds 9..10 and, under Q-1102, writes 8: 8..11, after which 10 is folded into 8.
+So is a bridge 10: 8..10 written under the higher identity before Q-1102 and acknowledged there for its whole range.
+As first built (3e3a4153), an acknowledgement or closing record naming 10 matched no loss once folded, so loss 8 was
+degraded again though no position was newly lost; loss 10 left the list, against §8 "stays in the list of losses for
+ever", its closing outcome with it; and its corruption was read as loss 8's, so the repeated-corruption count fell, and
+`storage_suspect` could clear, at the moment more damage was found.
+**Options.**
+(a) Carry over. A folded loss lists the identities it absorbed that have a record (`LossReport::absorbed`, `api.md`),
+whatever the order of the finds that folded them; a range found and folded in with no record is not listed. The latest
+acknowledgement or closing record of each identity folded in, its own included, closes it while together they cover
+its present range (positions follow one another within a generation); a fold that adds a position none of them covers
+needs a new acknowledgement, as a loss that grows does. The outcome is that of the latest of those records; one
+"restored in full" closes nothing once a later lost-range record of an identity folded in overlaps it. Each absorbed
+identity whose records are a corruption keeps its own corruption, named by its own first record, so the count and
+`storage_suspect` never fall at a fold; `acknowledge_losses` naming the folded loss marks them all seen. About 250
+lines with tests. Its costs: the closed state rests on several records read together, not one; the loss shows one
+outcome, the latest, where the records folded in had different ones (by an operator and restored in full, say); an
+absorbed loss stays listed by identity only, without its own range, state or outcome, which is less than §8's "with
+its state"; and acknowledged ranges that meet across a generation boundary are not joined, so such a loss asks for a
+new acknowledgement.
+(b) Lapse, as in 3e3a4153: records naming the higher identity close nothing, the higher loss leaves the list and its
+corruption is the folded loss's. For it: one rule (a record closes the loss it names and no other), no new public
+field, and the person is asked again whenever the listed loss changes shape, which some would want. Against it: the
+loss is degraded again with no position newly lost, the higher loss and its outcome leave the list, and the
+corruption count falls when more damage is found.
+**Within (a).** An identity in `absorbed` given to `acknowledge_losses` does nothing and reports success, as an
+identity with no loss does (built so). The other course reads it as naming the loss that absorbed it, which is kinder
+to a caller holding an identity from an earlier listing, at the cost of one identity naming two losses.
+**Recommendation.** (a): a fold is a change in how records are read, not new damage, so it should take nothing away
+that a user already had. Built so (`kvik/src/durable/loss.rs` `absorb`, `acknowledged`; `kvik/src/durable/status.rs`
+`loss_reports`; `model/src/recovery.rs` `losses`; `model/src/engine/repair.rs` `corruptions`). In the engine the
+acknowledgements are held in memory for the process until roadmap 8.5c writes their record; the model holds them as
+records.
+**Pinned by.** `kvik/src/durable/loss/tests.rs` `a_folded_loss_names_every_recorded_identity_it_absorbed`,
+`acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it`,
+`a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds`; `kvik/tests/durable_losses.rs`
+`acknowledgements_of_two_recorded_losses_carry_over_a_bridge_that_adds_no_position`,
+`an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`; `log/tests/loss_bridge.rs`
+`a_bridging_record_spans_only_the_losses_its_range_overlaps`; `model/src/recovery.rs`
+`closing_records_of_the_identities_folded_in_carry_over_while_they_cover_the_loss`,
+`a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds`,
+`a_record_of_an_identity_folded_in_reopens_a_restore_only_where_it_overlaps_it`; `model/tests/self_repair.rs`
+`a_fold_keeps_each_absorbed_loss_s_corruption_and_the_count`,
+`acknowledgements_of_two_losses_carry_over_a_bridge_that_adds_no_position`,
+`an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4537,7 +4618,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -4719,7 +4800,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1068 | 9.0g | Decided by the lead with 9.0f's fix round: one key splits by position, the current view folded; for review |
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
-| Q-1102 | 6.3b | OWNER. A start's range across two recorded losses: one loss or two, and its identity; (a) recommended. As built until ruled, the property comparing positions lost there |
+| Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -5051,6 +5132,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-891 | Effective times in the future are allowed (series labels design) | §2.1 Labels, §2.3 Label views |
 | Q-892 | Label entries held in immutable label parts, not in the registry file, with the `has_labels` flag (series labels design) | §2.1, `format.md` A.8, A.16, Label parts |
 | Q-893 | Labels kept out of the series directory, the chunk index and chunk headers (series labels design) | §2.1 Labels |
+| Q-1102 | A start's lost range across two recorded losses | §3 Order of a start step 4, `format.md` A.14 lost range, `api.md` Health (ruled by the owner, 2026-11-21: one loss under the lower identity, option (a)) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

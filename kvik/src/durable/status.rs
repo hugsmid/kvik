@@ -17,25 +17,27 @@ impl Writer {
     /// files' reports come from the loss watch after it caught up (Q-926, Q-927).
     pub(crate) fn loss_reports(&self) -> (Vec<LossReport>, Option<String>) {
         let acked = lock(&self.acknowledged).clone();
-        let read = {
+        let (read, records) = {
             let mut w = lock(&self.watch);
-            match w.catch_up(&self.latch) {
+            let read = match w.catch_up(&self.latch) {
                 Ok(()) => Ok(w.reports()),
                 Err(e) => Err(reader::query_error(&self.dir, e)),
-            }
+            };
+            (read, loss::identities(w.recorded()))
         };
         let (read, error) = match read {
             Ok(v) => (v, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
         };
         let (mut out, found): (Vec<_>, Vec<_>) = read.into_iter().partition(|l| l.recorded);
-        loss::merge(&mut out, self.start_losses.iter().cloned());
-        loss::merge(&mut out, found);
-        loss::merge(&mut out, self.latch.found());
+        loss::merge(&mut out, self.start_losses.iter().cloned(), &records);
+        loss::merge(&mut out, found, &records);
+        loss::merge(&mut out, self.latch.found(), &records);
         for l in &mut out {
-            l.acknowledged = acked
-                .get(&l.identity)
-                .is_some_and(|(first, last)| *first <= l.first && l.last <= *last);
+            l.acknowledged = loss::acknowledged(l, |i| match acked.get(&i) {
+                Some((Some(a), Some(b))) => Some((*a, *b)),
+                _ => None,
+            });
         }
         (out, error)
     }

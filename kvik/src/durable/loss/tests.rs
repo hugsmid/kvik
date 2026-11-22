@@ -536,3 +536,244 @@ fn data_lost_count(losses: &[crate::health::LossReport]) -> usize {
         .filter(|l| l.kind == LossKind::DataLost)
         .count()
 }
+
+fn record(identity: u64, first: u64, last: u64) -> kvik_log::manifest::LostRange {
+    kvik_log::manifest::LostRange {
+        identity: (0, identity),
+        first: (0, first),
+        last: (0, last),
+        file_id: 1,
+        offset: 0,
+        length: 0,
+        cause: kvik_log::manifest::LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: identity != first,
+        stamp: None,
+    }
+}
+
+/// The reports the files give for `records`, with the ranges `finds` found after them, in order.
+fn found_over(
+    records: &[kvik_log::manifest::LostRange],
+    finds: &[(u64, u64)],
+) -> Vec<crate::health::LossReport> {
+    let mut l = Finder::default().losses(records);
+    merge(
+        &mut l,
+        finds.iter().map(|(a, b)| find(*a, *b).report),
+        &identities(records),
+    );
+    l
+}
+
+/// `(identity, first, last, recorded)` of each report the files give for `records`.
+fn reported(records: &[kvik_log::manifest::LostRange]) -> Vec<(u64, u64, u64, bool)> {
+    Finder::default()
+        .losses(records)
+        .iter()
+        .map(|r| {
+            (
+                r.identity.sequence,
+                r.first.unwrap().sequence,
+                r.last.unwrap().sequence,
+                r.recorded,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn records_of_two_identities_that_overlap_are_one_loss_under_the_lower_identity() {
+    let bridge = [record(10, 10, 10), record(8, 8, 8), record(8, 8, 10)];
+    assert_eq!(reported(&bridge), [(8, 8, 10, true)]);
+    let under_the_higher = [record(10, 10, 10), record(8, 8, 8), record(10, 8, 10)];
+    assert_eq!(reported(&under_the_higher), [(8, 8, 10, true)]);
+    let chained = [
+        record(2, 2, 3),
+        record(6, 6, 7),
+        record(9, 9, 9),
+        record(4, 3, 6),
+    ];
+    assert_eq!(reported(&chained), [(2, 2, 7, true), (9, 9, 9, true)]);
+}
+
+#[test]
+fn records_of_one_identity_or_of_two_that_only_touch_are_not_folded() {
+    assert_eq!(
+        reported(&[record(8, 8, 8), record(8, 8, 9)]),
+        [(8, 8, 9, true)]
+    );
+    assert_eq!(
+        reported(&[record(10, 10, 11), record(8, 8, 9)]),
+        [(8, 8, 9, true), (10, 10, 11, true)]
+    );
+}
+
+#[test]
+fn a_found_range_over_two_recorded_losses_is_one_loss_under_the_lower_identity_not_recorded() {
+    let l = found_over(&[record(10, 10, 11), record(6, 6, 8)], &[(7, 10)]);
+    let brief: Vec<_> = l
+        .iter()
+        .map(|r| (r.identity, r.first, r.last, r.recorded))
+        .collect();
+    let p = |s| Position::new(0, s);
+    assert_eq!(brief, [(p(6), Some(p(6)), Some(p(11)), false)]);
+}
+
+fn timed(
+    (identity, first, last): (u64, u64, u64),
+    (before, after): (i64, i64),
+    length: u64,
+) -> kvik_log::manifest::LostRange {
+    kvik_log::manifest::LostRange {
+        time_before: Some(before),
+        time_after: Some(after),
+        length,
+        ..record(identity, first, last)
+    }
+}
+
+/// `(identity, first, last, commit time before, commit time after, bytes)` of the one loss the files give.
+fn one(records: &[kvik_log::manifest::LostRange]) -> (u64, u64, u64, i64, i64, u64) {
+    let l = Finder::default().losses(records);
+    assert_eq!(l.len(), 1, "{l:?}");
+    let l = &l[0];
+    (
+        l.identity.sequence,
+        l.first.unwrap().sequence,
+        l.last.unwrap().sequence,
+        l.commit_time_before.unwrap().0,
+        l.commit_time_after.unwrap().0,
+        l.bytes,
+    )
+}
+
+#[test]
+fn a_folded_loss_takes_each_end_s_commit_time_from_the_record_that_sets_it_and_the_largest_byte_count()
+ {
+    let bridge = [
+        timed((8, 8, 8), (70, 90), 10),
+        timed((10, 10, 10), (95, 110), 30),
+        timed((8, 8, 10), (70, 110), 20),
+    ];
+    assert_eq!(one(&bridge), (8, 8, 10, 70, 110, 30));
+    let under_the_higher = [
+        timed((10, 10, 10), (95, 110), 30),
+        timed((8, 8, 8), (70, 90), 10),
+        timed((10, 8, 10), (70, 110), 20),
+    ];
+    assert_eq!(one(&under_the_higher), (8, 8, 10, 70, 110, 30));
+    let higher_reaches_below = [
+        timed((8, 8, 8), (75, 90), 10),
+        timed((10, 10, 10), (95, 110), 5),
+        timed((10, 7, 10), (60, 110), 5),
+    ];
+    assert_eq!(one(&higher_reaches_below), (8, 7, 10, 60, 110, 10));
+}
+
+#[test]
+fn a_record_that_extends_a_loss_gives_it_the_commit_time_of_the_end_it_moves() {
+    let up = [
+        timed((8, 8, 8), (70, 90), 10),
+        timed((8, 8, 9), (70, 100), 10),
+    ];
+    assert_eq!(one(&up), (8, 8, 9, 70, 100, 10));
+    let down = [
+        timed((8, 8, 8), (70, 90), 10),
+        timed((8, 7, 8), (60, 90), 10),
+    ];
+    assert_eq!(one(&down), (8, 7, 8, 60, 90, 10));
+}
+
+#[test]
+fn equal_and_nested_ranges_of_two_identities_fold_into_the_lower() {
+    assert_eq!(
+        reported(&[record(10, 8, 10), record(8, 8, 10)]),
+        [(8, 8, 10, true)]
+    );
+    assert_eq!(
+        reported(&[record(5, 3, 9), record(6, 6, 6)]),
+        [(5, 3, 9, true)]
+    );
+    assert_eq!(
+        reported(&[record(9, 3, 9), record(6, 6, 6)]),
+        [(6, 3, 9, true)]
+    );
+}
+
+fn absorbed(l: &crate::health::LossReport) -> Vec<u64> {
+    l.absorbed.iter().map(|p| p.sequence).collect()
+}
+
+#[test]
+fn a_folded_loss_names_every_recorded_identity_it_absorbed() {
+    let l = Finder::default().losses(&[
+        record(2, 2, 3),
+        record(6, 6, 7),
+        record(9, 9, 9),
+        record(4, 3, 6),
+    ]);
+    assert_eq!(
+        l.iter().map(absorbed).collect::<Vec<_>>(),
+        [vec![4, 6], vec![]]
+    );
+    let l = found_over(&[record(10, 10, 11), record(6, 6, 8)], &[(7, 10)]);
+    assert_eq!(absorbed(&l[0]), [10]);
+    let touching = Finder::default().losses(&[record(10, 10, 11), record(8, 8, 9)]);
+    assert!(touching.iter().all(|l| l.absorbed.is_empty()));
+}
+
+/// Whether the loss is acknowledged with `acks` as `(identity, first, last)`.
+fn acked(l: &crate::health::LossReport, acks: &[(u64, u64, u64)]) -> bool {
+    let p = |s| Position::new(0, s);
+    acknowledged(l, |i| {
+        acks.iter()
+            .find(|(id, _, _)| p(*id) == i)
+            .map(|(_, a, b)| (p(*a), p(*b)))
+    })
+}
+
+#[test]
+fn acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it() {
+    let touching = found_over(&[record(10, 10, 11), record(8, 8, 9)], &[(9, 10)]);
+    let [l] = touching.as_slice() else {
+        panic!("{touching:?}")
+    };
+    assert!(acked(l, &[(8, 8, 9), (10, 10, 11)]), "no position added");
+    assert!(!acked(l, &[(8, 8, 9)]));
+    assert!(!acked(l, &[(10, 10, 11)]));
+    assert!(acked(l, &[(8, 8, 11)]));
+    let gap = found_over(&[record(10, 10, 10), record(8, 8, 8)], &[(8, 10)]);
+    assert!(
+        !acked(&gap[0], &[(8, 8, 8), (10, 10, 10)]),
+        "position 9 is new"
+    );
+    let old_bridge =
+        Finder::default().losses(&[record(10, 10, 10), record(8, 8, 8), record(10, 8, 10)]);
+    assert!(acked(&old_bridge[0], &[(10, 8, 10)]));
+    assert!(
+        !acked(&old_bridge[0], &[(12, 8, 10)]),
+        "only identities folded in count"
+    );
+}
+
+#[test]
+fn a_folded_loss_absorbs_every_recorded_identity_whatever_the_order_of_the_finds() {
+    let two = [record(8, 8, 8), record(10, 10, 10)];
+    for finds in [[(10, 11), (8, 11)], [(8, 11), (10, 11)]] {
+        let l = found_over(&two, &finds);
+        assert_eq!(l.len(), 1, "{finds:?}: {l:?}");
+        assert_eq!(absorbed(&l[0]), [10], "{finds:?}");
+    }
+    let three = [record(8, 8, 8), record(10, 10, 10), record(12, 12, 12)];
+    for finds in [[(10, 12), (8, 10)], [(8, 10), (10, 12)]] {
+        let l = found_over(&three, &finds);
+        assert_eq!(l.len(), 1, "{finds:?}: {l:?}");
+        assert_eq!(absorbed(&l[0]), [10, 12], "{finds:?}");
+    }
+    let unrecorded = found_over(&two, &[(12, 12), (8, 12)]);
+    assert_eq!(absorbed(&unrecorded[0]), [10], "a find has no record");
+}

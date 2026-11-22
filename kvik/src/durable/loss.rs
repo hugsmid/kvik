@@ -8,6 +8,7 @@ mod watch;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use kvik_log::manifest::LostRange;
 use kvik_log::writer::Position as LogPos;
 
 pub(crate) use finder::{Find, Finder};
@@ -16,6 +17,7 @@ pub(crate) use watch::Watch;
 
 use super::index::log_pos;
 use crate::health::{LossKind, LossReport};
+use crate::types::Position;
 
 #[derive(Debug, Default)]
 struct State {
@@ -161,16 +163,116 @@ pub(crate) fn widen(into: &mut LossReport, by: &LossReport) -> bool {
     true
 }
 
-/// Adds to `into` each report of `extra` that stands for no loss already there, grows the loss it stands for
-/// otherwise, then orders them by identity.
-pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = LossReport>) {
-    for l in extra {
-        match into.iter_mut().find(|x| same_loss(x, &l)) {
-            Some(x) => {
-                widen(x, &l);
-            }
-            None => into.push(l),
+/// Whether ranges acknowledged under the identities folded into `l`, its own included, cover every position of
+/// it (Q-1108); positions follow one another within a generation.
+pub(crate) fn acknowledged(
+    l: &LossReport,
+    range: impl Fn(Position) -> Option<(Position, Position)>,
+) -> bool {
+    let (Some(first), Some(last)) = (l.first, l.last) else {
+        return false;
+    };
+    let mut ranges: Vec<_> = std::iter::once(l.identity)
+        .chain(l.absorbed.iter().copied())
+        .filter_map(range)
+        .collect();
+    ranges.sort();
+    let mut need = first;
+    for (a, b) in ranges {
+        if a > need {
+            return false;
         }
+        if b >= last {
+            return true;
+        }
+        if b >= need {
+            let Some(s) = b.sequence.checked_add(1) else {
+                return false;
+            };
+            need = Position::new(b.generation, s);
+        }
+    }
+    false
+}
+
+/// Notes in `into` that `by` is folded into it: `by`'s identity when it has a record, whatever `by.recorded` now
+/// says, and those `by` absorbed (Q-1108).
+fn absorb(into: &mut LossReport, by: &LossReport, has_record: bool) {
+    let own = has_record && by.identity != into.identity;
+    into.absorbed.extend(own.then_some(by.identity));
+    into.absorbed.extend(by.absorbed.iter().copied());
+    into.absorbed.retain(|i| *i != into.identity);
+    into.absorbed.sort();
+    into.absorbed.dedup();
+}
+
+/// Recorded lost data of identities whose ranges overlap, as one loss under the lowest identity (Q-1102); the rest
+/// unchanged, in no particular order.
+pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
+    let (mut data, mut out): (Vec<_>, Vec<_>) = reports
+        .into_iter()
+        .partition(|l| l.kind == LossKind::DataLost && l.recorded);
+    data.sort_by_key(|l| l.first);
+    let mut folded: Vec<LossReport> = Vec::with_capacity(data.len());
+    for l in data {
+        match folded.last_mut() {
+            Some(f) if l.first <= f.last => {
+                let by = if l.identity < f.identity {
+                    std::mem::replace(f, l)
+                } else {
+                    l
+                };
+                if by.first < f.first {
+                    f.first = by.first;
+                    f.commit_time_before = by.commit_time_before;
+                }
+                if by.last > f.last {
+                    f.last = by.last;
+                    f.commit_time_after = by.commit_time_after;
+                }
+                f.bytes = f.bytes.max(by.bytes);
+                absorb(f, &by, true);
+            }
+            _ => folded.push(l),
+        }
+    }
+    out.extend(folded);
+    out
+}
+
+/// Identities of the lost-range records `recorded`, ascending, for [`merge`].
+pub(crate) fn identities(recorded: &[LostRange]) -> Vec<Position> {
+    let mut out: Vec<_> = recorded
+        .iter()
+        .map(|l| Position::new(l.identity.0, l.identity.1))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Adds to `into` each report of `extra` that stands for no loss already there, grows the loss it stands for
+/// otherwise, then orders them by identity. A report that stands for several makes them one under the lowest
+/// identity (Q-940, Q-1102); `records`, ascending, are the identities that have a record.
+pub(crate) fn merge(
+    into: &mut Vec<LossReport>,
+    extra: impl IntoIterator<Item = LossReport>,
+    records: &[Position],
+) {
+    for l in extra {
+        let (mut same, rest): (Vec<_>, Vec<_>) = into.drain(..).partition(|x| same_loss(x, &l));
+        *into = rest;
+        same.sort_by_key(|x| x.identity);
+        let mut it = same.into_iter();
+        let Some(mut kept) = it.next() else {
+            into.push(l);
+            continue;
+        };
+        for by in it.chain(std::iter::once(l)) {
+            widen(&mut kept, &by);
+            absorb(&mut kept, &by, records.binary_search(&by.identity).is_ok());
+        }
+        into.push(kept);
     }
     into.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
 }
