@@ -4470,6 +4470,9 @@ again, its set-aside for bridged records removed; only the set-aside of Q-1071 r
 is read for the positions lost ranges cover, never as a list of losses, so overlapping entries change nothing.
 Records already acknowledged under a higher identity no longer match the folded loss, which then needs a new
 acknowledgement, as a loss that grows does.
+The model's starts never meet a range across two identities (corrupting a batch clears it, and a scrub passes
+positions already lost), so the lowest-identity choice in `record_lost_ranges` and in self-repair's records is kept
+for agreement but no model history reaches it; the fold in `losses` is pinned.
 **Pinned by.** `kvik/src/durable/read/latest/histories.rs`
 `a_start_s_range_across_two_recorded_losses_is_one_loss_under_the_lower_identity` (the records, the writer's and a
 whole reader's reports, after a power loss and a restart too); `kvik/src/durable/loss/tests.rs`
