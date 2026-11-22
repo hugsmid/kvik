@@ -162,6 +162,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
+| Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4605,6 +4606,40 @@ records.
 `acknowledgements_of_two_losses_carry_over_a_bridge_that_adds_no_position`,
 `an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`.
 
+## Q-1109 — Delivery before durability: an automation may act on a reading later withdrawn
+Recorded by the lead with the fast path; for the owner. Built as option (b), the lead's decision until ruled.
+**Scenario.** The log syncs once a second to spare the disk (`sync_interval_floor` and `min_sync_interval` at 1 s).
+An automation that waits for durability reacts up to a second late. Delivered at acceptance instead, it reacts
+within a millisecond, but a reading it acted on can then be withdrawn: the sync fails, the writer stops or the
+power goes before the mark covers it. Until now every delivery kvik made was durable or, for a series at
+`Durability::Written`, acknowledged once written; nothing told a reader that a reading it had seen was gone.
+**Options.**
+(a) None: every delivery waits for durability. The promise stays simple; reaction is bounded below by the gathering
+window, which the purpose of the store (reaction must not wait for the disk) rules out for automations.
+(b) Opt-in provisional streams beside the durable ones (as built): a stream asks for it; each call is delivered
+marked durable or provisional, a watermark later covers the provisional ones, and any that will not become durable
+are withdrawn by range with the writer's own outcome (unknown or not stored). Consumers, cursors, live reads and
+acknowledgements keep every promise they had; a provisional fact has no position, so no cursor can cover one. The
+cost is a second kind of delivery to explain, and that an action taken on a withdrawn reading cannot be undone by
+the store; the automation decides whether a reading is worth acting on before it is durable.
+(c) Provisional delivery as the default for live reads and consumers, with durability opt-in. Fastest for every
+reader, but it changes the meaning of every existing delivery, and of a cursor that covers one.
+**Within (b).** Withdrawal is told only within the open: after a restart `seq` starts afresh, and a stream that kept
+a provisional reading outside the process treats what no watermark covered as withdrawn by the stop. A withdrawn
+reading whose sync failed may still be found after a reboot (§9 row 7a); it then arrives through every durable
+path as any recorded fact does. A slow stream lags rather than holding the ring: it is told the calls it missed and
+a position below them, as a lagging live read is.
+**Recommendation.** (b): the fast path is for reaction and the durable paths are for record, and only the reader
+knows which a reading is for. Built so (`kvik/src/durable/fast.rs`, `kvik/src/provisional.rs`,
+`model/src/provisional.rs`).
+**Pinned by.** `kvik/tests/provisional.rs`
+`every_provisional_reading_ends_durable_or_withdrawn_across_crashes_and_failed_syncs`,
+`a_provisional_stream_changes_nothing_a_durable_consumer_receives`,
+`with_a_one_second_gathering_window_readings_arrive_within_milliseconds`; `kvik/src/durable/fast/tests.rs`
+`the_stream_says_what_the_reference_model_says`; `model/tests/provisional.rs`
+`s4_every_provisional_call_ends_durable_or_withdrawn_and_durable_ones_survive`,
+`s4_provisional_streams_change_nothing_a_consumer_receives`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4801,6 +4836,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
+| Q-1109 | 9.0d | Open, for the owner: provisional delivery opt-in per stream, labelled, withdrawn when lost (as built, recommended), none, or by default |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

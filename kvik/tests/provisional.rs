@@ -1,4 +1,4 @@
-//! The fast path (spec §4 Fast path, `api.md` Fast path, Q-1109): provisional delivery before the sync, the
+//! The fast path (spec §4 Provisional streams, `api.md` Provisional streams, Q-1109): provisional delivery before the sync, the
 //! watermark, withdrawal across failed syncs, crashes and power losses, isolation of a slow stream, and durable
 //! consumers left as they were.
 
@@ -431,6 +431,8 @@ fn a_provisional_stream_changes_nothing_a_durable_consumer_receives() {
 fn with_a_one_second_gathering_window_readings_arrive_within_milliseconds() {
     let mut env = Env::test(kvik::env::ManualClock::new(start()));
     env.clock = Arc::new(SystemClock::default());
+    let fs = Arc::new(MemFs::new());
+    env.fs = fs.clone();
     let mut log = LogConfig::default();
     log.segment_size = 16 << 20;
     log.min_sync_interval = Duration::from_secs(1);
@@ -442,6 +444,14 @@ fn with_a_one_second_gathering_window_readings_arrive_within_milliseconds() {
     let s = block_on(Store::open(config)).unwrap();
     let id = define(&s, "site/a/power");
     let mut p = s.provisional(ProvisionalOptions::default()).unwrap();
+    let syncs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = syncs.clone();
+    fs.set_sync_hook(Some(Arc::new(move |path: &Path| {
+        if path.extension().is_some_and(|e| e == "open") {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
+    let began = Instant::now();
     let now = || s.now().0;
     let mut late = Vec::new();
     let mut acks = Vec::new();
@@ -491,6 +501,10 @@ fn with_a_one_second_gathering_window_readings_arrive_within_milliseconds() {
             > waited.len() / 2,
         "acknowledgements should wait for the gathering window"
     );
+    // Spec §3 Group commit: at most the window's length over the interval, plus four, batch syncs.
+    let most = began.elapsed().as_secs() as usize + 1 + 4;
+    let n = syncs.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(n <= most, "{n} log syncs for 56 calls, at most {most}");
     block_on(s.shutdown()).unwrap();
 }
 

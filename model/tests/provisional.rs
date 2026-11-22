@@ -1,4 +1,4 @@
-//! The fast path (spec §4 Fast path, Q-1109): calls handed to provisional streams before they are durable, the
+//! The fast path (spec §4 Provisional streams, Q-1109): calls handed to provisional streams before they are durable, the
 //! watermark, and withdrawal across crashes, power losses, remounts and failed syncs; consumers unaffected.
 
 mod common;

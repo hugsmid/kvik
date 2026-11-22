@@ -1,4 +1,4 @@
-//! The fast path (spec §4 Fast path, Q-1109): each accepted call goes, before it is durable, into one ring shared by
+//! The fast path (spec §4 Provisional streams, Q-1109): each accepted call goes, before it is durable, into one ring shared by
 //! every provisional stream; a stream learns each call's fate from its completion and the durable position.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};

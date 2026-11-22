@@ -241,7 +241,7 @@ pub(crate) struct Writer {
     registry_written: derived::RegistryWritten,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,
-    /// The provisional streams' ring (spec §4 Fast path).
+    /// The provisional streams' ring (spec §4 Provisional streams).
     fast: Arc<fast::Fast>,
 }
 
@@ -320,7 +320,7 @@ impl Writer {
         self.log().as_ref().map(Log::watch)
     }
 
-    /// A provisional stream from the next accepted call (spec §4 Fast path).
+    /// A provisional stream from the next accepted call (spec §4 Provisional streams).
     pub(crate) fn provisional(
         &self,
         o: &crate::provisional::ProvisionalOptions,

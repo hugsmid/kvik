@@ -388,7 +388,7 @@ impl Store {
         }
     }
 
-    /// A stream of readings as the writer accepts them, before they are durable (spec §4 Fast path). The model
+    /// A stream of readings as the writer accepts them, before they are durable (spec §4 Provisional streams). The model
     /// backend has none: [`QueryError::NotAvailable`].
     pub fn provisional(&self, options: ProvisionalOptions) -> Result<Provisional, QueryError> {
         by_backend!(self,

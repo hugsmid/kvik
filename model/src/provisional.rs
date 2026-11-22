@@ -1,4 +1,4 @@
-//! The fast path (spec §4 Fast path, Q-1109): each accepted call is handed to the open provisional streams before it
+//! The fast path (spec §4 Provisional streams, Q-1109): each accepted call is handed to the open provisional streams before it
 //! is durable, then settled as durable, under a watermark, or withdrawn. Unbounded: the engine's `max_behind` lag is
 //! not modelled, as group commit's pacing is not.
 

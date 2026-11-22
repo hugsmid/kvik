@@ -576,6 +576,39 @@ pub fn select(&self, s: &Selection) -> Result<Vec<SeriesId>, QueryError>;      /
   the session cancels them all. The model backend computes each batch again from its head; it has no resets or
   losses and no pacing.
 
+### Provisional streams (Q-1109)
+
+```rust
+pub fn provisional(&self, o: ProvisionalOptions) -> Result<Provisional, QueryError>;   // on Store
+pub struct ProvisionalOptions { pub series: Vec<SeriesId>, pub max_behind: usize }    // empty: every series; 65,536
+pub const PROVISIONAL_MAX_BEHIND: usize = 1 << 20;                                    // max_behind is 1 to this
+impl Provisional { pub fn next(&mut self, timeout: Duration) -> Option<ProvisionalEvent>;
+                   pub fn try_next(&mut self) -> Option<ProvisionalEvent>; }
+pub enum ProvisionalEvent { Accepted(Accepted), Durable { through: u64, mark: Position },
+                            Withdrawn { first: u64, last: u64, cause: Withdrawal },
+                            Lagged { first: u64, last: u64, after: Position }, Closed }      // #[non_exhaustive]
+impl Accepted { pub fn seq(&self) -> u64; pub fn durable(&self) -> bool;
+                pub fn facts(&self) -> impl Iterator<Item = &ProvisionalFact>; }       // Clone; shared, not copied
+pub struct ProvisionalFact { series, t, value, quality, supplied_quality, flags, changed_at }  // a Fact with no position
+pub enum Withdrawal { OutcomeUnknown, NotStored }                                       // the writer's EmitError
+```
+- Opt-in: nothing changes for consumers, live reads or acknowledgements, and a store with no stream open does no
+  fast-path work. Spec §4 Provisional streams gives the promises. The model backend and reader processes have no fast path
+  (`QueryError::NotAvailable`); `max_behind` out of bounds is `QueryError::Invalid`.
+- A stream opens at the next accepted call. `next` computes what is due when called (no thread, no queue of its own)
+  and returns events in this order: `Lagged`, `Withdrawn`, `Durable`, `Accepted`, then `Closed` alone. A call is
+  delivered as soon as its writer queues it; `durable()` says whether it already was. `Durable { through }` covers
+  every call delivered with `seq ≤ through` and not withdrawn; `mark` is the durable position read. `Withdrawn`
+  names a range: drop the calls delivered in it that no watermark covered. `Lagged` names the calls missed and
+  `after`, below every fact among them; once durable they can be read there.
+- `seq` is per open of the store: after a restart a stream starts afresh, and anything kept from a provisional
+  reading that no watermark covered was withdrawn by the stop (Q-1109).
+- A stream holding a call acknowledged ahead of its sync (`Durability::Written`) reads the durable position every
+  5 ms while it waits; otherwise a waiting stream is woken only by a call accepted or settled, or a shutdown.
+- With a long gathering window (`log.sync_interval_floor` and `log.min_sync_interval` both at, say, 1 s), a
+  provisional stream still sees each call within about a millisecond; acknowledgements, consumers and watermarks
+  follow the window.
+
 ## Health and statistics (types accepted at gate 3.3)
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }

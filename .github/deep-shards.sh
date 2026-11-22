@@ -36,6 +36,7 @@ self_repair     model self_repair
 model           model model
 labels          model labels
 names           model names
+provisional     model provisional
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
@@ -58,6 +59,7 @@ kvik-patterns   kvik  patterns
 kvik-differential kvik durable_differential --rest
 kvik-differential-small kvik durable_differential small_windows_decide_
 kvik-loss-open  kvik  durable_losses_open
+kvik-provisional kvik provisional
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
@@ -86,6 +88,7 @@ kvik-pmap       kvik  lib         durable::read::pmap::
 kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
 kvik-latest     kvik  lib         durable::read::latest::tests::
 kvik-live       kvik  lib         durable::read::live::differential::
+kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 '
 
 cd "$(dirname "$0")/.."

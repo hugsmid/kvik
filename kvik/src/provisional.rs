@@ -1,4 +1,4 @@
-//! The fast path's public types (`docs/api.md` Fast path, spec §4 Fast path, Q-1109).
+//! The fast path's public types (`docs/api.md` Provisional streams, spec §4 Provisional streams, Q-1109).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +43,7 @@ impl ProvisionalOptions {
     }
 }
 
-/// A fact as the writer accepted it, before it has a position (spec §4 Fast path).
+/// A fact as the writer accepted it, before it has a position (spec §4 Provisional streams).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct ProvisionalFact {
@@ -106,7 +106,7 @@ impl Accepted {
     }
 }
 
-/// What a provisional stream delivers (spec §4 Fast path).
+/// What a provisional stream delivers (spec §4 Provisional streams).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ProvisionalEvent {
@@ -143,7 +143,7 @@ pub enum ProvisionalEvent {
     Closed,
 }
 
-/// A stream of readings as the writer accepts them, before they are durable (spec §4 Fast path). It has no
+/// A stream of readings as the writer accepts them, before they are durable (spec §4 Provisional streams). It has no
 /// thread: [`Provisional::next`] computes what is due when called. Dropping it ends it.
 #[derive(Debug)]
 pub struct Provisional {

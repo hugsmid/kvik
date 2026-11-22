@@ -2038,7 +2038,7 @@ pub struct Model {
     pub tzdb: Tzdb,
     /// Calendar rebuilds, logged (§5.7, row 21).
     pub calendar_log: Vec<CalendarRebuild>,
-    /// The fast path of each start, the last that of the running store (§4 Fast path).
+    /// The fast path of each start, the last that of the running store (§4 Provisional streams).
     pub provisional: Vec<Provisional<Fact>>,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
@@ -3129,7 +3129,7 @@ impl Model {
         }
     }
 
-    /// Opens a provisional stream on the running store (§4 Fast path): its start and its id. `None` selects every
+    /// Opens a provisional stream on the running store (§4 Provisional streams): its start and its id. `None` selects every
     /// series.
     pub fn provisional_open(
         &mut self,
