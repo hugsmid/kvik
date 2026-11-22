@@ -57,24 +57,49 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  test-shards:
+    # The test job's shards, from the table in .github/test-shards.sh, checked to hold each default member once.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: shards
+        run: |
+          shards=$(bash .github/test-shards.sh matrix)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
   test:
-    name: test (${{ matrix.os }})
+    # One job per OS and shard: the whole run on one Windows job outgrew the job limit. Each shard aims at 20 minutes;
+    # the limit leaves room for a slow runner.
+    name: test (${{ matrix.os }}, ${{ matrix.shard }})
+    needs: test-shards
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        shard: ${{ fromJSON(needs.test-shards.outputs.shards) }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test --locked
+        with:
+          key: test-${{ matrix.shard }}
+      - run: bash .github/test-shards.sh run ${{ matrix.shard }}
         env:
           PROPTEST_CASES: "1024"
-      - run: cargo run --locked --example basic
-      - run: cargo run --locked -p kvik --example quickstart
-      - run: cargo test --locked -p kvik --features jiff
+      - if: matrix.shard == 'model'
+        run: cargo run --locked --example basic
+      - if: matrix.shard == 'kvik'
+        run: cargo run --locked -p kvik --example quickstart
+      - if: matrix.shard == 'kvik'
+        run: cargo test --locked -p kvik --features jiff
 
   model-check:
     # The single-flight refresh of the durable reader under the loom model checker (Q-901): its tests alone, with the
