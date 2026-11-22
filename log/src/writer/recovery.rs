@@ -1339,8 +1339,17 @@ pub(super) fn start(
     if let Err(e) = repair_manifest(&*mfile, &manifest_bytes, &manifest) {
         return ro(fault(FaultOp::Sync, &manifest_path, &e), report);
     }
+    let mut written = Vec::new();
     for (k, l) in losses.iter().enumerate() {
-        match record_loss(&*mfile, &manifest, l, &mut epoch, wall, &manifest_path) {
+        match record_loss(
+            &*mfile,
+            &manifest,
+            &mut written,
+            l,
+            &mut epoch,
+            wall,
+            &manifest_path,
+        ) {
             Ok(r) => report.losses[k].recorded = r,
             Err(f) => return ro(f, report),
         }
@@ -1635,7 +1644,15 @@ pub(super) fn start(
                 )
             };
             generation.place(&mut l);
-            match record_loss(&*mfile, &manifest, &l, &mut epoch, wall, &manifest_path) {
+            match record_loss(
+                &*mfile,
+                &manifest,
+                &mut written,
+                &l,
+                &mut epoch,
+                wall,
+                &manifest_path,
+            ) {
                 Ok(r) => report.losses.push(found(&l, LossKind::DataLost, r)),
                 Err(f) => return ro(f, report),
             }
@@ -1838,15 +1855,17 @@ fn repair_manifest(f: &dyn FsFile, bytes: &[u8], m: &ManifestRead) -> io::Result
 }
 
 /// Appends a lost-range record unless one holds every position of `l`; returns whether a record holds it.
+/// `written` holds the records this start appended before, which the manifest as read does not.
 fn record_loss(
     f: &dyn FsFile,
     m: &ManifestRead,
+    written: &mut Vec<LostRange>,
     l: &LostRange,
     epoch: &mut u64,
     wall: i64,
     path: &std::path::Path,
 ) -> Result<bool, Fault> {
-    let recorded: Vec<&LostRange> = m.lost_ranges().collect();
+    let recorded: Vec<&LostRange> = m.lost_ranges().chain(written.iter()).collect();
     let span = |identity: (u32, u64)| {
         recorded
             .iter()
@@ -1867,13 +1886,18 @@ fn record_loss(
         if span(lowest).is_some_and(|(lo, hi)| lo <= l.first && l.last <= hi) {
             return Ok(true);
         }
-        let (first, last) = overlapped
-            .iter()
-            .filter_map(|&i| span(i))
-            .fold((l.first, l.last), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        // Each end takes the commit time of the range or record that sets it (Q-1102).
+        for r in recorded.iter().filter(|r| overlapped.contains(&r.identity)) {
+            if r.first < rec.first {
+                rec.first = r.first;
+                rec.time_before = r.time_before;
+            }
+            if r.last > rec.last {
+                rec.last = r.last;
+                rec.time_after = r.time_after;
+            }
+        }
         rec.identity = lowest;
-        rec.first = first;
-        rec.last = last;
         rec.extends = true;
     }
     // A lease may name any epoch: with none left above it, the start stays read-only rather than wrapping.
@@ -1889,6 +1913,7 @@ fn record_loss(
     f.write_at(&bytes, at)
         .and_then(|()| f.sync_data())
         .map_err(|e| fault(FaultOp::Sync, path, &e))?;
+    written.push(rec);
     Ok(true)
 }
 

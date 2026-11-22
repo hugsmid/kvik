@@ -373,46 +373,65 @@ impl Model {
             .collect();
         let holds = |f: FileId, p: Position| self.disk.files[&f].entries().any(|e| e.position == p);
         let records = self.disk.lost_records();
-        for l in self.losses().into_iter().filter(|l| {
-            l.kind == LossKind::DataLost
-                && matches!(l.cause, LossCause::Corruption | LossCause::LostInBucket)
-        }) {
-            let mut causes: Vec<Corruption> = records
-                .iter()
-                .filter(|r| r.identity == l.identity)
-                .filter_map(|r| {
-                    out.iter()
-                        .filter_map(|c| match c.id {
-                            Corruption::File(f, Some(e)) if e < r.epoch && holds(f, r.from) => {
-                                Some((e, c.id))
-                            }
-                            _ => None,
-                        })
-                        .max()
-                        .map(|(_, id)| id)
-                })
-                .collect();
-            if let Some(first) = l.first.filter(|_| causes.is_empty()) {
-                causes.extend(
-                    out.iter()
-                        .map(|c| c.id)
-                        .filter(|id| matches!(id, Corruption::File(f, None) if holds(*f, first))),
-                );
-            }
-            if causes.is_empty() {
-                let id = Corruption::Range(l.identity);
-                out.push(CorruptionReport {
-                    id,
-                    loss: Some(l.identity),
-                    seen: seen.contains(&id),
-                    at: records
+        let corrupt = |c: LossCause| matches!(c, LossCause::Corruption | LossCause::LostInBucket);
+        for l in self
+            .losses()
+            .into_iter()
+            .filter(|l| l.kind == LossKind::DataLost)
+        {
+            // Each identity folded into the loss keeps its own corruption
+            // (Q-1108).
+            let absorbed = l.absorbed.iter().filter(|id| {
+                records
+                    .iter()
+                    .find(|r| r.identity == **id)
+                    .is_some_and(|r| corrupt(r.cause))
+            });
+            let own = corrupt(l.cause).then_some(l.identity);
+            for id in own.into_iter().chain(absorbed.copied()) {
+                let mut causes: Vec<Corruption> = records
+                    .iter()
+                    .filter(|r| r.identity == id)
+                    .filter_map(|r| {
+                        out.iter()
+                            .filter_map(|c| match c.id {
+                                Corruption::File(f, Some(e)) if e < r.epoch && holds(f, r.from) => {
+                                    Some((e, c.id))
+                                }
+                                _ => None,
+                            })
+                            .max()
+                            .map(|(_, id)| id)
+                    })
+                    .collect();
+                let first = if id == l.identity {
+                    l.first
+                } else {
+                    records
                         .iter()
-                        .find(|r| r.identity == l.identity)
-                        .map(|r| r.at),
-                });
-            }
-            for c in out.iter_mut().filter(|c| causes.contains(&c.id)) {
-                c.loss = Some(l.identity);
+                        .filter(|r| r.identity == id)
+                        .map(|r| r.from)
+                        .min()
+                };
+                if let Some(first) = first.filter(|_| causes.is_empty()) {
+                    causes.extend(
+                        out.iter()
+                            .map(|c| c.id)
+                            .filter(|c| matches!(c, Corruption::File(f, None) if holds(*f, first))),
+                    );
+                }
+                if causes.is_empty() {
+                    let c = Corruption::Range(id);
+                    out.push(CorruptionReport {
+                        id: c,
+                        loss: Some(l.identity),
+                        seen: seen.contains(&c),
+                        at: records.iter().find(|r| r.identity == id).map(|r| r.at),
+                    });
+                }
+                for c in out.iter_mut().filter(|c| causes.contains(&c.id)) {
+                    c.loss = Some(l.identity);
+                }
             }
         }
         out.sort_by_key(|c| c.id);

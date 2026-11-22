@@ -1655,6 +1655,7 @@ impl Slot {
                 cursors_missing: Vec::new(),
                 recorded: true,
                 acknowledged: self.acknowledged.contains(&pos(a)),
+                absorbed: Vec::new(),
             })
             .collect()
     }

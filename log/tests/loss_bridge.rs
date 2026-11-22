@@ -145,6 +145,22 @@ impl Rig {
         self.open()
     }
 
+    /// The commit times before and after of the last lost-range record.
+    fn last_times(&self) -> (Option<i64>, Option<i64>) {
+        let bytes = self.fs.read(&dir().join("MANIFEST")).unwrap();
+        let m = read_manifest(&bytes, &STORE_ID).unwrap();
+        let l = m.lost_ranges().last().unwrap();
+        (l.time_before, l.time_after)
+    }
+
+    /// Spoils the last manifest record's final bytes, as a write torn by a power loss.
+    fn tear_last_record(&self) {
+        let path = dir().join("MANIFEST");
+        let m = read_manifest(&self.fs.read(&path).unwrap(), &STORE_ID).unwrap();
+        let end = m.records.last().unwrap().end as usize;
+        self.fs.poke(&path, end - 8, &[0xa5; 8]);
+    }
+
     /// `(identity, first, last, extends)` of each lost-range record, in the manifest's order.
     fn records(&self) -> Vec<(u64, u64, u64, bool)> {
         let bytes = self.fs.read(&dir().join("MANIFEST")).unwrap();
@@ -155,8 +171,20 @@ impl Rig {
             .collect()
     }
 
-    /// Appends a lost-range record for `first..=last` under `identity`, with no writer open.
+    /// Appends a lost-range record for `first..=last` under `identity`, with no writer open. The batches it names
+    /// may be intact: a hand-written record stands in for a loss no natural history here reaches.
     fn record(&self, identity: u64, first: u64, last: u64) {
+        self.record_timed(identity, first, last, (None, None));
+    }
+
+    /// As `record`, with the commit times before and after.
+    fn record_timed(
+        &self,
+        identity: u64,
+        first: u64,
+        last: u64,
+        times: (Option<i64>, Option<i64>),
+    ) {
         let path = dir().join("MANIFEST");
         let bytes = self.fs.read(&path).unwrap();
         let m = read_manifest(&bytes, &STORE_ID).unwrap();
@@ -170,8 +198,8 @@ impl Rig {
             cause: LossCause::Corruption,
             boot_id: [0; 16],
             id_floor: 0,
-            time_before: None,
-            time_after: None,
+            time_before: times.0,
+            time_after: times.1,
             extends: identity != first,
             stamp: None,
         };
@@ -299,4 +327,53 @@ fn a_bridge_recorded_under_the_higher_identity_is_recorded_once_more_under_the_l
     assert_eq!(r.records().len(), 4);
     r.restart();
     assert_eq!(r.records().len(), 4);
+}
+
+#[test]
+fn a_bridging_record_takes_each_end_s_commit_time_from_the_record_that_sets_it() {
+    let mut r = Rig::new();
+    r.record_timed(10, 10, 12, (Some(9), Some(13)));
+    r.record_timed(4, 4, 5, (Some(3), Some(6)));
+    for p in 5..=10 {
+        r.damage(p);
+    }
+    r.restart();
+    assert_eq!(r.records().last(), Some(&(4, 4, 12, true)));
+    assert_eq!(r.last_times(), (Some(3), Some(13)));
+}
+
+#[test]
+fn two_ranges_of_one_start_over_one_recorded_loss_leave_nothing_for_the_next_start() {
+    let mut r = Rig::new();
+    r.record(3, 3, 5);
+    r.record(6, 6, 8);
+    for p in [5, 6, 8, 9] {
+        r.damage(p);
+    }
+    let rep = r.restart();
+    assert_eq!(
+        found(&rep),
+        [(Some(5), Some(6), true), (Some(8), Some(9), true)]
+    );
+    let after = r.records();
+    assert_eq!(&after[2..], [(3, 3, 8, true), (3, 3, 9, true)]);
+    r.restart();
+    assert_eq!(r.records(), after);
+}
+
+#[test]
+fn a_torn_bridging_record_is_written_again_once() {
+    let mut r = bridged();
+    r.restart();
+    r.stop();
+    r.tear_last_record();
+    let rep = r.restart();
+    assert_eq!(found(&rep), [(Some(8), Some(10), true)]);
+    let after = r.records();
+    assert_eq!(
+        after,
+        [(10, 10, 10, false), (8, 8, 8, false), (8, 8, 10, true)]
+    );
+    r.restart();
+    assert_eq!(r.records(), after);
 }

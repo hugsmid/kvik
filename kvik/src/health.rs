@@ -325,6 +325,8 @@ pub struct LossReport {
     pub recorded: bool,
     /// Acknowledged.
     pub acknowledged: bool,
+    /// Identities of recorded losses folded into this one, ascending (Q-1102, Q-1108).
+    pub absorbed: Vec<Position>,
 }
 
 /// A jump of the wall clock measured against the monotonic clock.

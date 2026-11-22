@@ -602,6 +602,7 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
     pub readable_commit_blocks: u32, pub mark_state: MarkState /* Readable | Missing | Unreadable | Stale */,
     pub boot_id: Option<[u8; 16]>, pub commit_time_before: Option<Timestamp>, pub commit_time_after: Option<Timestamp>,
     pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool /* closed, by any outcome */,
+    pub absorbed: Vec<Position> /* recorded losses folded into it, Q-1108 */,
     pub state: Option<LossState> /* None for a PossibleLoss */ }
 pub enum LossState { Found, Copying, AwaitingResend { until: Timestamp }, AwaitingOperator, Closed(Closed) }
 pub enum Closed { Restored { positions: u64 }, ResendEnded, Operator }
@@ -653,7 +654,10 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   after the next start that can write (spec §3 Recovery rule 2, Q-200); one found next to or over a reported loss
   grows that loss under its identity, `recorded` false and not acknowledged until a record and a new acknowledgement
   cover its whole range. One over two or more losses is one loss under the lowest of their identities, recorded or
-  not (Q-940, Q-1102). When the loss reports cannot be read (the
+  not (Q-940, Q-1102); a recorded loss folded in stays listed in its `absorbed`. Acknowledgements and closing records
+  of every identity folded into a loss close it while together they cover its whole range, and each such identity
+  keeps its own corruption in the repeated-corruption count (Q-1108). `acknowledge_losses` names a loss by its
+  `identity`; an identity in `absorbed` acknowledges nothing. When the loss reports cannot be read (the
   mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
   `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A sealed segment that disappears with no
   manifest record naming its removal is a loss only where a reader of the process had read from it: that reader's

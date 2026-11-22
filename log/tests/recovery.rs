@@ -703,6 +703,52 @@ fn a_position_named_by_the_manifest_raises_the_recovery_entry_and_its_gap_is_rec
 }
 
 #[test]
+fn a_recovery_entry_s_gap_across_two_recorded_losses_is_one_record_under_the_lower_identity() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.shutdown().unwrap();
+    r.w = None;
+    let path = dir().join("MANIFEST");
+    for (identity, first, last) in [(8, 8, 10), (5, 5, 6)] {
+        let m = read_manifest(&r.fs.read(&path).unwrap(), &STORE_ID).unwrap();
+        let rec = kvik_log::manifest::LostRange {
+            identity: (0, identity),
+            first: (0, first),
+            last: (0, last),
+            file_id: 1,
+            offset: 0,
+            length: 0,
+            cause: LossCause::Corruption,
+            boot_id: [0; 16],
+            id_floor: 0,
+            time_before: None,
+            time_after: None,
+            extends: false,
+            stamp: None,
+        };
+        let bytes = encode_record(RECORD_LOST_RANGE, m.last_epoch() + 1, 0, T0, Some(&rec));
+        r.fs.poke(&path, m.valid_end as usize, &bytes);
+    }
+    r.power_loss(None);
+    r.open().unwrap();
+    let fs = r.fs.clone();
+    let ranges = || {
+        read_manifest(&fs.read(&path).unwrap(), &STORE_ID)
+            .unwrap()
+            .lost_ranges()
+            .map(|l| (l.identity.1, l.first.1, l.last.1))
+            .collect::<Vec<_>>()
+    };
+    let after = ranges();
+    assert_eq!(after, [(8, 8, 10), (5, 5, 6), (5, 2, 10)]);
+    r.shutdown().unwrap();
+    r.kill();
+    r.open().unwrap();
+    assert_eq!(ranges(), after);
+}
+
+#[test]
 fn a_registry_file_raises_f_and_the_id_floor_and_gives_the_segment_index_its_reach() {
     use kvik_log::entries::{Definition, IntervalLength, Kind, Retention, Timing, Versioning};
     use kvik_log::registry::{RegistryFile, write};

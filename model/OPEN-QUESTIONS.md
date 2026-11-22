@@ -161,6 +161,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
 | Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
+| Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4462,15 +4463,22 @@ recorded losses, under the lowest identity it overlaps, spanning every loss it b
 that find the range again (`log/src/writer/recovery.rs` `record_loss`; spec §3 Order of a start step 4). The writer
 and every reader fold records of identities whose ranges overlap into the lowest identity
 (`kvik/src/durable/loss.rs` `fold_recorded`), so records written under the higher identity before the ruling read
-the same (the next start that finds such a range again writes the record under the lowest identity once); ranges
-that only touch stay two losses. A found report over several losses makes them one under the lowest identity
-(`merge`), and the model's losses and its start records follow the same rule (`model/src/recovery.rs` `losses`,
-`model/src/engine/recovery.rs` `record_lost_ranges`). The latest values' property compares every loss report whole
+the same (a start that finds such a range again writes the record under the lowest identity once where the range
+reaches the lower identity's own records, and nothing where it lies within the higher one's, which the fold reads the
+same); ranges that only touch stay two losses. A found report over several losses makes them one under the lowest
+identity (`merge`), and the model's losses, found ranges included, and its start records follow the same rule
+(`model/src/recovery.rs` `losses`, `model/src/engine/recovery.rs` `record_lost_ranges`). Each end of the bridging
+record, and of a loss's report, takes the commit time of the range or record that sets it, so a bridge does not keep
+the time of a batch now lost. A start counts the records it wrote before each range, so two ranges of one start over
+one recorded loss leave nothing for the next start. The latest values' property compares every loss report whole
 again, its set-aside for bridged records removed; only the set-aside of Q-1071 remains.
-**Not changed.** The root of the log directory carries one lost range per identity as before (`format.md` A.18): it
-is read for the positions lost ranges cover, never as a list of losses, so overlapping entries change nothing.
-Records already acknowledged under a higher identity no longer match the folded loss, which then needs a new
-acknowledgement, as a loss that grows does.
+**What the fold leaves unchanged.** The root of the log directory carries one lost range per identity as before
+(`format.md` A.18): it is read for the positions lost ranges cover, never as a list of losses, so overlapping entries
+change nothing. The `files` crate's catalogue keeps one entry per identity a record names, with no fold: backup,
+restore and the manifest rebuild use it for the positions records cover and to carry records as written, never as a
+list of losses for a user (its per-identity `acknowledged` has no reader outside its tests), and the engine folds
+what they carry when it reads it; a rebuild restates a range under the lowest identity it overlaps, which the fold
+reads the same. Acknowledgements, closing records, the listing of a folded loss and its corruptions are Q-1108.
 The model's starts never meet a range across two identities (corrupting a batch clears it, and a scrub passes
 positions already lost), so the lowest-identity choice in `record_lost_ranges` and in self-repair's records is kept
 for agreement but no model history reaches it; the fold in `losses` is pinned.
@@ -4480,9 +4488,15 @@ whole reader's reports, after a power loss and a restart too); `kvik/src/durable
 `records_of_two_identities_that_overlap_are_one_loss_under_the_lower_identity`,
 `records_of_one_identity_or_of_two_that_only_touch_are_not_folded`,
 `a_found_range_over_two_recorded_losses_is_one_loss_under_the_lower_identity_not_recorded`;
-`log/tests/loss_bridge.rs` (one record under the lower identity, three losses bridged, one identity extended once, a
-range beside a loss, a bridge recorded under the higher identity, durability across power losses and restarts); `model/src/recovery.rs`
-`records_of_identities_whose_ranges_overlap_are_one_loss_under_the_lowest`.
+`a_folded_loss_takes_each_end_s_commit_time_from_the_record_that_sets_it_and_the_largest_byte_count`,
+`a_record_that_extends_a_loss_gives_it_the_commit_time_of_the_end_it_moves`,
+`equal_and_nested_ranges_of_two_identities_fold_into_the_lower`; `log/tests/loss_bridge.rs` (one record under the
+lower identity, three losses bridged, one identity extended once, a range beside a loss, a bridge recorded under the
+higher identity, durability across power losses and restarts, a torn bridging record, the commit times of a bridging
+record, two ranges of one start over one loss); `log/tests/recovery.rs`
+`a_recovery_entry_s_gap_across_two_recorded_losses_is_one_record_under_the_lower_identity`; `model/src/recovery.rs`
+`records_of_identities_whose_ranges_overlap_are_one_loss_under_the_lowest`,
+`a_found_range_over_two_recorded_losses_folds_them_as_the_engine_does`.
 
 ## Q-1103 — The first call's memory bound and the refresh within it
 Decided by the lead (a technical decision on a test: no engine or promise changes).
@@ -4541,6 +4555,36 @@ one batch's scan and the fold: measured 26,981,000 bytes above the segment in ev
 the followed segment plus the larger of the two (Q-1103's form before it). With `PART` doubled the part holds all four
 batches and the refresh assertion fails; with the cap doubled or ignored the first `facts` assertion fails.
 **Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
+
+## Q-1108 — Acknowledgements, listing and corruption counts across a fold
+Recorded by the lead with the Q-1102 fix round; for the owner. Built as option (a), the lead's decision until ruled.
+**Scenario.** Losses 8 (8..9) and 10 (10..11) are recorded, each acknowledged or closed (say 10 restored in full) and
+each counted as a corruption. A start finds 9..10 and, under Q-1102, writes 8: 8..11, after which 10 is folded into 8.
+So is a bridge 10: 8..10 written under the higher identity before Q-1102 and acknowledged there for its whole range.
+As first built (3e3a4153), an acknowledgement or closing record naming 10 matched no loss once folded, so loss 8 was
+degraded again though no position was newly lost; loss 10 left the list, against §8 "stays in the list of losses for
+ever", its closing outcome with it; and its corruption was read as loss 8's, so the repeated-corruption count fell, and
+`storage_suspect` could clear, at the moment more damage was found.
+**Options.**
+(a) Carry over. A folded loss lists the recorded identities it absorbed (`LossReport::absorbed`, `api.md`). The latest
+acknowledgement or closing record of each identity folded in, its own included, closes it while together they cover
+its present range (positions follow one another within a generation); a fold that adds a position none of them covers
+needs a new acknowledgement, as a loss that grows does. The outcome is that of the latest of those records; one
+"restored in full" closes nothing once a later lost-range record of an identity folded in overlaps it. Each absorbed
+identity whose records are a corruption keeps its own corruption, named by its own first record, so the count and
+`storage_suspect` never fall at a fold; `acknowledge_losses` naming the folded loss marks them all seen. About 250
+lines with tests.
+(b) Lapse, as in 3e3a4153: records naming the higher identity close nothing, the higher loss leaves the list and its
+corruption is the folded loss's.
+**Recommendation.** (a): a fold is a change in how records are read, not new damage, so it should take nothing away
+that a user already had. Built so (`kvik/src/durable/loss.rs` `absorb`, `acknowledged`; `kvik/src/durable/status.rs`
+`loss_reports`; `model/src/recovery.rs` `losses`; `model/src/engine/repair.rs` `corruptions`). In the engine the
+acknowledgements are held in memory for the process until roadmap 8.5c writes their record; the model holds them as
+records. `acknowledge_losses` names a loss by its `identity`: an identity in `absorbed` acknowledges nothing.
+**Pinned by.** `kvik/src/durable/loss/tests.rs` `a_folded_loss_names_every_recorded_identity_it_absorbed`,
+`acknowledgements_of_the_identities_folded_in_close_the_loss_only_while_they_cover_it`; `model/src/recovery.rs`
+`closing_records_of_the_identities_folded_in_carry_over_while_they_cover_the_loss`; `model/tests/self_repair.rs`
+`a_fold_keeps_each_absorbed_loss_s_corruption_and_the_count`.
 
 ## Open at v0.2
 
@@ -4737,6 +4781,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1068 | 9.0g | Decided by the lead with 9.0f's fix round: one key splits by position, the current view folded; for review |
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
+| Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

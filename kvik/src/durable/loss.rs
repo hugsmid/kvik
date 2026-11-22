@@ -16,6 +16,7 @@ pub(crate) use watch::Watch;
 
 use super::index::log_pos;
 use crate::health::{LossKind, LossReport};
+use crate::types::Position;
 
 #[derive(Debug, Default)]
 struct State {
@@ -161,12 +162,54 @@ pub(crate) fn widen(into: &mut LossReport, by: &LossReport) -> bool {
     true
 }
 
+/// Whether ranges acknowledged under the identities folded into `l`, its own included, cover every position of
+/// it (Q-1108); positions follow one another within a generation.
+pub(crate) fn acknowledged(
+    l: &LossReport,
+    range: impl Fn(Position) -> Option<(Position, Position)>,
+) -> bool {
+    let (Some(first), Some(last)) = (l.first, l.last) else {
+        return false;
+    };
+    let mut ranges: Vec<_> = std::iter::once(l.identity)
+        .chain(l.absorbed.iter().copied())
+        .filter_map(range)
+        .collect();
+    ranges.sort();
+    let mut need = first;
+    for (a, b) in ranges {
+        if a > need {
+            return false;
+        }
+        if b >= last {
+            return true;
+        }
+        if b >= need {
+            let Some(s) = b.sequence.checked_add(1) else {
+                return false;
+            };
+            need = Position::new(b.generation, s);
+        }
+    }
+    false
+}
+
+/// Notes in `into` that `by`, a recorded loss or one that absorbed some, is folded into it (Q-1108).
+fn absorb(into: &mut LossReport, by: &LossReport) {
+    let own = by.recorded && by.identity != into.identity;
+    into.absorbed.extend(own.then_some(by.identity));
+    into.absorbed.extend(by.absorbed.iter().copied());
+    into.absorbed.retain(|i| *i != into.identity);
+    into.absorbed.sort();
+    into.absorbed.dedup();
+}
+
 /// Recorded lost data of identities whose ranges overlap, as one loss under the lowest identity (Q-1102); the rest
-/// unchanged, ordered by identity.
+/// unchanged, in no particular order.
 pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
-    let (mut data, mut out): (Vec<_>, Vec<_>) = reports.into_iter().partition(|l| {
-        l.kind == LossKind::DataLost && l.recorded && l.first.is_some() && l.last.is_some()
-    });
+    let (mut data, mut out): (Vec<_>, Vec<_>) = reports
+        .into_iter()
+        .partition(|l| l.kind == LossKind::DataLost && l.recorded);
     data.sort_by_key(|l| l.first);
     let mut folded: Vec<LossReport> = Vec::with_capacity(data.len());
     for l in data {
@@ -186,12 +229,12 @@ pub(crate) fn fold_recorded(reports: Vec<LossReport>) -> Vec<LossReport> {
                     f.commit_time_after = by.commit_time_after;
                 }
                 f.bytes = f.bytes.max(by.bytes);
+                absorb(f, &by);
             }
             _ => folded.push(l),
         }
     }
     out.extend(folded);
-    out.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
     out
 }
 
@@ -210,6 +253,7 @@ pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = 
         };
         for by in it.chain(std::iter::once(l)) {
             widen(&mut kept, &by);
+            absorb(&mut kept, &by);
         }
         into.push(kept);
     }

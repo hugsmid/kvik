@@ -135,6 +135,7 @@ impl Finder {
             cursors_missing: Vec::new(),
             recorded: false,
             acknowledged: false,
+            absorbed: Vec::new(),
         };
         let at = |sequence| LogPos {
             generation: g,
@@ -224,10 +225,18 @@ impl Finder {
                 cursors_missing: Vec::new(),
                 recorded: true,
                 acknowledged: false,
+                absorbed: Vec::new(),
             });
-            // A record that extends a loss widens its range; the loss is counted once.
-            e.first = e.first.min(Some(first));
-            e.last = e.last.max(Some(last));
+            // A record that extends a loss widens its range, counted once, with the times of the record that sets
+            // each end.
+            if Some(first) < e.first {
+                e.first = Some(first);
+                e.commit_time_before = l.time_before.map(Timestamp);
+            }
+            if Some(last) > e.last {
+                e.last = Some(last);
+                e.commit_time_after = l.time_after.map(Timestamp);
+            }
         }
         // A recovery entry is a possible loss when it names a non-empty tail, a mark not readable or stale, or a
         // missing or unreadable cursor file; its identity is its own position (`spec.md` §11 Health, §3 step 4).
@@ -258,6 +267,7 @@ impl Finder {
                     cursors_missing: r.consumers.clone(),
                     recorded: true,
                     acknowledged: false,
+                    absorbed: Vec::new(),
                 },
             );
         }

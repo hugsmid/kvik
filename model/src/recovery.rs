@@ -240,6 +240,8 @@ pub struct Loss {
     pub acknowledged: bool,
     /// Its self-repair state; `None` for a `possible_loss`.
     pub state: Option<LossState>,
+    /// Identities of recorded losses folded into it, ascending (Q-1102, Q-1108).
+    pub absorbed: Vec<Position>,
 }
 
 impl Loss {
@@ -286,12 +288,13 @@ pub struct Acknowledged {
 /// The list of losses (§11 Health), from the manifest's lost-range records,
 /// the ranges found but not yet recorded, the recovery entries and the
 /// acknowledgements. Each loss is listed once, under its identity, with the
-/// union of the ranges its records name; records of identities whose ranges
-/// overlap are one loss under the lowest identity (Q-1102). A recovery entry's gap is a
-/// `data_lost` of cause truncated tail; the entry itself is a `possible_loss`
-/// when it names a tail, a mark not readable or stale, or a missing cursor
-/// file. A `data_lost` is closed by the latest closing record covering its
-/// present range; `stage` gives the self-repair stage of one recorded and open.
+/// union of the ranges its records name; losses whose ranges overlap are one
+/// under the lowest identity, naming the others it absorbed (Q-1102). A
+/// recovery entry's gap is a `data_lost` of cause truncated tail; the entry
+/// itself is a `possible_loss` when it names a tail, a mark not readable or
+/// stale, or a missing cursor file. A `data_lost` is closed when the latest
+/// closing records of the identities folded into it cover its present range
+/// (Q-1108); `stage` gives the self-repair stage of one recorded and open.
 pub fn losses(
     recorded: &[LostRecord],
     found: &[(Position, Position)],
@@ -323,6 +326,7 @@ pub fn losses(
                 recorded,
                 acknowledged: false,
                 state: None,
+                absorbed: Vec::new(),
             });
         }
     };
@@ -333,61 +337,85 @@ pub fn losses(
     // lowest identity (Q-1102).
     out.sort_by_key(|l| l.first);
     let mut folded: Vec<Loss> = Vec::with_capacity(out.len());
-    let mut into: Vec<(Position, Position)> = Vec::new();
     for l in out.drain(..) {
         match folded.last_mut() {
-            Some(f) if l.first <= f.last => {
-                let by = if l.identity < f.identity {
-                    std::mem::replace(f, l)
-                } else {
-                    l
-                };
-                f.first = f.first.min(by.first);
-                f.last = f.last.max(by.last);
-                into.push((by.identity, f.identity));
-            }
+            Some(f) if l.first <= f.last => fold(f, l),
             _ => folded.push(l),
         }
     }
     out = folded;
-    let folded_into = |mut i: Position| {
-        while let Some(&(_, to)) = into.iter().find(|(from, _)| *from == i) {
-            i = to;
-        }
-        i
-    };
     let mut found_again = Vec::new();
     for (from, to) in found {
-        // A range found again before it is recorded is the same loss.
-        let identity = recorded
-            .iter()
-            .filter(|r| r.from <= *to && *from <= r.to)
-            .map(|r| folded_into(r.identity))
-            .min()
-            .unwrap_or(*from);
-        found_again.push(identity);
-        add(&mut out, identity, LossCause::Corruption, *from, *to, false);
+        // A range found again before it is recorded is the same loss; one
+        // over several losses makes them one under the lowest identity,
+        // recorded only if one recorded loss covered it all (Q-1102).
+        let (mut same, rest): (Vec<Loss>, Vec<Loss>) = out
+            .drain(..)
+            .partition(|l| l.first.is_some_and(|f| f <= *to) && l.last.is_some_and(|t| *from <= t));
+        out = rest;
+        same.sort_by_key(|l| l.identity);
+        let mut it = same.into_iter();
+        let mut l = it.next().unwrap_or_else(|| Loss {
+            identity: *from,
+            kind: LossKind::DataLost,
+            cause: LossCause::Corruption,
+            first: Some(*from),
+            last: Some(*to),
+            tail: Tail::default(),
+            mark_state: MarkState::Readable,
+            cursors_missing: Vec::new(),
+            recorded: false,
+            acknowledged: false,
+            state: None,
+            absorbed: Vec::new(),
+        });
+        let parts: Vec<_> = std::iter::once(&l)
+            .chain(it.as_slice())
+            .filter(|x| x.recorded)
+            .map(|x| (x.first, x.last))
+            .collect();
+        for by in it {
+            fold(&mut l, by);
+        }
+        l.first = l.first.min(Some(*from));
+        l.last = l.last.max(Some(*to));
+        l.recorded = parts.iter().any(|(a, b)| *a <= l.first && l.last <= *b);
+        found_again.push(l.identity);
+        out.push(l);
     }
+    let restored_after = |ids: &[Position], epoch: u64, a: &Acknowledged| {
+        recorded.iter().any(|r| {
+            ids.contains(&r.identity) && r.epoch > epoch && r.from <= a.to && a.from <= r.to
+        })
+    };
     for l in &mut out {
-        // The latest closing record that covers the present range; one
-        // "restored in full" no longer closes a loss whose positions were
-        // lost again after it (§8 Self-repair stage 1).
-        let closed = acknowledged
+        // Per identity folded into it, its own included, the latest closing
+        // record; one "restored in full" no longer closes a loss whose
+        // positions were lost again after it (§8 Self-repair stage 1). They
+        // close the loss when together they cover its present range
+        // (Q-1108).
+        let ids: Vec<Position> = std::iter::once(l.identity)
+            .chain(l.absorbed.iter().copied())
+            .collect();
+        let latest: Vec<(usize, &Acknowledged)> = ids
             .iter()
-            .rev()
-            .find(|(_, a)| {
-                a.identity == l.identity
-                    && l.first.is_some_and(|f| a.from <= f)
-                    && l.last.is_some_and(|t| t <= a.to)
+            .filter_map(|id| {
+                acknowledged
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, (_, a))| a.identity == *id)
+                    .filter(|(_, (epoch, a))| {
+                        !matches!(a.outcome, Outcome::Restored(_))
+                            || !(found_again.contains(&l.identity)
+                                || restored_after(&ids, *epoch, a))
+                    })
+                    .map(|(k, (_, a))| (k, a))
             })
-            .filter(|(epoch, a)| {
-                !matches!(a.outcome, Outcome::Restored(_))
-                    || !(found_again.contains(&l.identity)
-                        || recorded
-                            .iter()
-                            .any(|r| r.identity == l.identity && r.epoch > *epoch))
-            })
-            .map(|(_, a)| a);
+            .collect();
+        let closed = covers(l, latest.iter().map(|(_, a)| (a.from, a.to)))
+            .then(|| latest.iter().max_by_key(|(k, _)| *k).map(|(_, a)| *a))
+            .flatten();
         l.acknowledged = closed.is_some();
         l.state = Some(match closed {
             Some(a) => LossState::Closed(a.outcome),
@@ -408,10 +436,53 @@ pub fn losses(
             recorded: true,
             acknowledged: false,
             state: None,
+            absorbed: Vec::new(),
         });
     }
     out.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
     out
+}
+
+/// Folds loss `by` into `f`; the lower identity names the loss and the
+/// other's recorded identity is absorbed (Q-1102, Q-1108).
+fn fold(f: &mut Loss, mut by: Loss) {
+    if by.identity < f.identity {
+        std::mem::swap(f, &mut by);
+    }
+    f.first = f.first.min(by.first);
+    f.last = f.last.max(by.last);
+    f.absorbed.extend(by.recorded.then_some(by.identity));
+    f.absorbed.extend(by.absorbed);
+    let own = f.identity;
+    f.absorbed.retain(|i| *i != own);
+    f.absorbed.sort();
+    f.absorbed.dedup();
+}
+
+/// Whether `ranges` together hold every position of `l`'s range;
+/// positions follow one another within a generation.
+fn covers(l: &Loss, ranges: impl Iterator<Item = (Position, Position)>) -> bool {
+    let (Some(first), Some(last)) = (l.first, l.last) else {
+        return false;
+    };
+    let mut ranges: Vec<_> = ranges.collect();
+    ranges.sort();
+    let mut need = first;
+    for (a, b) in ranges {
+        if a > need {
+            return false;
+        }
+        if b >= last {
+            return true;
+        }
+        if b >= need {
+            let Some(s) = b.sequence.checked_add(1) else {
+                return false;
+            };
+            need = Position::new(b.generation, s);
+        }
+    }
+    false
 }
 
 /// A position kept for later use with the stamp of the mark it was read under
@@ -700,6 +771,90 @@ mod tests {
             brief(&under_the_higher, &[(p(9), p(10))]),
             [(8, 8, 10, true)],
             "a range found again over the higher identity is the folded loss"
+        );
+    }
+
+    #[test]
+    fn a_found_range_over_two_recorded_losses_folds_them_as_the_engine_does() {
+        let apart = [record(10, 10, 10), record(8, 8, 8)];
+        assert_eq!(brief(&apart, &[(p(8), p(10))]), [(8, 8, 10, false)]);
+        let touching = [record(8, 8, 9), record(10, 10, 11)];
+        assert_eq!(brief(&touching, &[(p(9), p(10))]), [(8, 8, 11, false)]);
+        assert_eq!(
+            brief(&[record(8, 8, 10)], &[(p(9), p(9))]),
+            [(8, 8, 10, true)]
+        );
+        let l = losses(&touching, &[(p(9), p(10))], &[], &[], |_| LossState::Found);
+        assert_eq!(l[0].absorbed, [p(10)]);
+    }
+
+    fn ack(identity: u64, from: u64, to: u64, outcome: Outcome) -> Acknowledged {
+        Acknowledged {
+            identity: p(identity),
+            from: p(from),
+            to: p(to),
+            outcome,
+        }
+    }
+
+    /// The one loss's state for `records` and the closing records `acks`, in order, each at `epoch`.
+    fn state(records: &[LostRecord], acks: &[(u64, Acknowledged)]) -> Option<LossState> {
+        let l = losses(records, &[], &[], acks, |_| LossState::Found);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(
+            l[0].acknowledged,
+            matches!(l[0].state, Some(LossState::Closed(_)))
+        );
+        l[0].state
+    }
+
+    #[test]
+    fn closing_records_of_the_identities_folded_in_carry_over_while_they_cover_the_loss() {
+        let bridged = |epoch| {
+            let mut b = record(8, 8, 11);
+            b.epoch = epoch;
+            [record(8, 8, 9), record(10, 10, 11), b]
+        };
+        let both = [
+            (2, ack(8, 8, 9, Outcome::Operator)),
+            (3, ack(10, 10, 11, Outcome::ResendEnded)),
+        ];
+        let closed = |o| Some(LossState::Closed(o));
+        assert_eq!(state(&bridged(4), &both), closed(Outcome::ResendEnded));
+        assert_eq!(state(&bridged(4), &both[..1]), Some(LossState::Found));
+        assert_eq!(state(&bridged(4), &both[1..]), Some(LossState::Found));
+        let gap = [record(8, 8, 8), record(10, 10, 10), record(8, 8, 10)];
+        let apart = [
+            (2, ack(8, 8, 8, Outcome::Operator)),
+            (3, ack(10, 10, 10, Outcome::Operator)),
+        ];
+        assert_eq!(
+            state(&gap, &apart),
+            Some(LossState::Found),
+            "position 9 is new"
+        );
+        let old_bridge = [record(10, 10, 10), record(8, 8, 8), record(10, 8, 10)];
+        assert_eq!(
+            state(&old_bridge, &[(3, ack(10, 8, 10, Outcome::Operator))]),
+            closed(Outcome::Operator)
+        );
+        let restored = [
+            (2, ack(8, 8, 9, Outcome::Operator)),
+            (3, ack(10, 10, 11, Outcome::Restored(2))),
+        ];
+        assert_eq!(
+            state(&bridged(4), &restored),
+            Some(LossState::Found),
+            "lost again after its restore"
+        );
+        assert_eq!(state(&bridged(1), &restored), closed(Outcome::Restored(2)));
+        let mut late = record(10, 9, 11);
+        late.epoch = 4;
+        let under_the_higher = [record(8, 8, 9), record(10, 10, 11), late];
+        assert_eq!(
+            state(&under_the_higher, &restored),
+            Some(LossState::Found),
+            "lost again under the absorbed identity"
         );
     }
 }

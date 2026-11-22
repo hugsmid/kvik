@@ -33,9 +33,10 @@ impl Writer {
         loss::merge(&mut out, found);
         loss::merge(&mut out, self.latch.found());
         for l in &mut out {
-            l.acknowledged = acked
-                .get(&l.identity)
-                .is_some_and(|(first, last)| *first <= l.first && l.last <= *last);
+            l.acknowledged = loss::acknowledged(l, |i| match acked.get(&i) {
+                Some((Some(a), Some(b))) => Some((*a, *b)),
+                _ => None,
+            });
         }
         (out, error)
     }
