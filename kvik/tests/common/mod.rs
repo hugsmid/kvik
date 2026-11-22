@@ -152,3 +152,11 @@ pub fn store_on(backend: Backend, name: &str) -> (Store, ManualClock) {
 pub fn at(secs: i64) -> Timestamp {
     start() + Span::from_secs(secs)
 }
+
+/// Waits until a seeded start's scan of the log below its seed has ended (Q-1110): damage made after it is met by the
+/// store's own reads, not by the scan.
+pub fn scanned(s: &kvik::Store) {
+    while s.stats().ingest.start_scanning {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}

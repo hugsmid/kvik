@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use kvik_log::directory::series::{Candidate, CandidateValue, Pending, SeriesEntry};
+use kvik_log::directory::series::{Candidate, CandidateValue, Pending, SeriesEntry, StartCounts};
 use kvik_log::facts::{FactRow, Quality, Value};
 use kvik_log::writer::Position as LogPos;
 
@@ -46,6 +46,10 @@ pub(crate) struct State {
     /// may lie at or below this `t`.
     bad: BTreeMap<i64, (Option<u64>, LogPos)>,
     bad_unknown: Option<i64>,
+    /// The start counts as of the last fact folded (A.18 fields 96 to 120).
+    counts: StartCounts,
+    /// Continued from an entry without start counts: the entries it gives carry none.
+    counts_unknown: bool,
 }
 
 /// The most bad facts above the candidate a versioned series' state keeps.
@@ -134,9 +138,20 @@ impl State {
         self.ahead_lost || (self.pending.is_none() && self.pending_more)
     }
 
-    pub(crate) fn apply(&mut self, f: &FactRow, position: LogPos, versioned: bool, horizon: i64) {
+    pub(crate) fn apply(
+        &mut self,
+        f: &FactRow,
+        position: LogPos,
+        received_at: i64,
+        versioned: bool,
+        horizon: i64,
+    ) {
         self.promote(horizon, versioned);
         self.facts += 1;
+        self.counts.late += u64::from(f.flags.late);
+        self.counts.future += u64::from(f.flags.future);
+        self.counts.last_received_at = received_at;
+        self.counts.last_revisable = f.changed_at.is_some();
         self.latest_t = Some(self.latest_t.map_or(f.t, |t| t.max(f.t)));
         if !f.flags.future && !f.flags.unsynced_clock {
             self.reference = Some(self.reference.map_or(f.t, |t| t.max(f.t)));
@@ -294,6 +309,7 @@ impl State {
                     .pending
                     .zip(self.last_ahead)
                     .is_some_and(|(p, l)| p.t != l.t),
+            counts: (!self.counts_unknown).then_some(self.counts),
         }
     }
 
@@ -324,6 +340,8 @@ impl State {
             ahead_lost: e.pending_more,
             bad: BTreeMap::new(),
             bad_unknown: e.latest_t,
+            counts: e.counts.unwrap_or_default(),
+            counts_unknown: e.counts.is_none(),
         }
     }
 }

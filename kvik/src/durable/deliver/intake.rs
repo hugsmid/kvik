@@ -195,6 +195,16 @@ impl Deliverer {
             match item {
                 Item::Fact(row) => {
                     let key = (row.series_id, row.t);
+                    // An earlier fact of this batch may have moved the window's floor past a key it held when the
+                    // batch's keys were looked at.
+                    if row.changed_at.is_some()
+                        && self.recent.key(key).is_none()
+                        && !read.contains_key(&key)
+                    {
+                        let found = self.read_keys(&[key]);
+                        let facts = found.facts.get(&key).cloned().unwrap_or_default();
+                        read.insert(key, (facts, found.unreadable.contains(&key)));
+                    }
                     let (outranked, unchecked) = match row.changed_at {
                         Some(c) => self.outranked(key, p, c, read),
                         None => (false, false),

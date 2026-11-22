@@ -231,6 +231,39 @@ impl Index {
         }
     }
 
+    /// An index without facts holding what a seeded start takes from the files (`spec.md` §3 Order of a start): the
+    /// registry entries up to the seed, with their batches' receive times, and each series' summary from its series
+    /// directory entry.
+    pub(crate) fn seeded<'a>(
+        entries: impl IntoIterator<Item = (LogPos, i64, &'a Entry)>,
+        series: &[kvik_log::directory::series::SeriesEntry],
+    ) -> Self {
+        let mut index = Index::without_facts();
+        for (p, t, e) in entries {
+            index.registry.apply(e);
+            index.entries.insert(p, (t, e.clone()));
+        }
+        for e in series {
+            index.registry.note_fact(e.series_id);
+            if let Some(latest) = e.latest_t {
+                index.summary.insert(
+                    e.series_id,
+                    Summary {
+                        first: LogPos::default(),
+                        latest,
+                        reference: e.lateness_reference,
+                    },
+                );
+            }
+        }
+        index
+    }
+
+    /// Gives up the fold, if any.
+    pub(crate) fn take_fold(&mut self) -> Option<std::sync::Arc<super::derived::SeriesFold>> {
+        self.fold.take()
+    }
+
     /// Hands every batch taken from now on, and every void, to `fold`.
     pub(crate) fn set_fold(&mut self, fold: std::sync::Arc<super::derived::SeriesFold>) {
         self.fold = Some(fold);
@@ -447,12 +480,18 @@ impl Index {
     }
 
     /// The last position whose batch's commit time is at or before `at` (spec §2.3 As-of time).
+    #[cfg(test)]
     pub(crate) fn position_at(&self, at: i64) -> LogPos {
+        self.commit_at(at).unwrap_or_default()
+    }
+
+    /// [`Index::position_at`] among the batches taken, `None` when none qualifies.
+    pub(crate) fn commit_at(&self, at: i64) -> Option<LogPos> {
         self.commits
             .iter()
             .rev()
             .find(|(_, t)| **t <= at)
-            .map_or(LogPos::default(), |(p, _)| *p)
+            .map(|(p, _)| *p)
     }
 
     /// The facts of a series with `t` in `range`, in a view (spec §2.3), in `t` order (and position order in the

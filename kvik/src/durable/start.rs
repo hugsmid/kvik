@@ -25,8 +25,10 @@ use super::index::Index;
 use super::ingest::Decider;
 use super::keys::{LocalFacts, LogFacts};
 use super::loss::{Finder, Latch, Regions, Watch};
+use super::seed::Seed;
 use crate::env::Env;
 use crate::health::SeriesStats;
+use crate::types::Position;
 
 /// Items a start takes from the log at a time.
 pub(crate) const PART: usize = 1 << 16;
@@ -180,6 +182,152 @@ pub(crate) fn read_whole(
         recorded,
         watch: Watch::from_start(reader, finder),
     })
+}
+
+/// Why a seeded start gives way to a start from the whole log (`spec.md` §3 Order of a start).
+#[derive(Debug)]
+pub(crate) enum GiveWay {
+    /// The log does not show the seed's batch first, or the reader cannot start there.
+    Seed,
+    /// A void: a recovery entry voided batches the pass took, or what the seed describes.
+    Void,
+    /// A region at or below the seed, which the files describe as intact.
+    Below,
+    /// A read failed; the start from the whole log reports it.
+    Read,
+}
+
+/// The writer's part of a seeded start: the state at the seed from the files, fed the log above it one part at a time
+/// (`spec.md` §3 Order of a start).
+pub(crate) struct Tail {
+    index: Index,
+    decider: Decider,
+    counters: ById<SeriesStats>,
+    lost: Regions,
+    finder: Finder,
+    through: kvik_log::writer::Position,
+}
+
+impl Tail {
+    /// The state at `seed`, with decision windows of at most `budget` bytes.
+    pub(crate) fn new(seed: &Seed, budget: usize) -> Tail {
+        let index = Index::seeded(seed.entries(), &seed.series);
+        let mut decider = Decider::with_budget(budget);
+        let mut counters = ById::default();
+        for e in &seed.series {
+            let c = e.counts.unwrap_or_default();
+            counters.insert(
+                e.series_id,
+                SeriesStats {
+                    recorded: e.fact_count,
+                    late: c.late,
+                    future: c.future,
+                    ..SeriesStats::default()
+                },
+            );
+            if let Some(latest) = e.latest_t {
+                let span = span_of(index.registry(), e.series_id);
+                decider
+                    .history
+                    .seed(e.series_id, latest, e.lateness_reference, span);
+            }
+        }
+        let mut finder = Finder::default();
+        finder.seed_recoveries(seed.recoveries());
+        Tail {
+            index,
+            decider,
+            counters,
+            lost: Regions::default(),
+            finder,
+            through: seed.through,
+        }
+    }
+
+    /// Takes the first event of the pass, which must be the batch ending at the seed, for its commit time alone.
+    pub(crate) fn at_seed(&mut self, first: &ReadEvent) -> Result<(), GiveWay> {
+        match first {
+            ReadEvent::Batch(b) if b.last == self.through => {
+                let _ = self.finder.apply(std::slice::from_ref(first), self.through);
+                Ok(())
+            }
+            _ => Err(GiveWay::Seed),
+        }
+    }
+
+    /// Takes a part of the log above the seed, noting the losses it finds in `latch`.
+    pub(crate) fn take(
+        &mut self,
+        events: &[ReadEvent],
+        durable: kvik_log::writer::Position,
+        latch: &Latch,
+    ) -> Result<(), GiveWay> {
+        if events.iter().any(|e| matches!(e, ReadEvent::Void { .. })) {
+            return Err(GiveWay::Void);
+        }
+        let found = self.finder.apply(events, durable);
+        let through = Position::new(self.through.generation, self.through.sequence);
+        if found
+            .iter()
+            .any(|f| f.report.first.is_some_and(|p| p <= through))
+        {
+            return Err(GiveWay::Below);
+        }
+        if !found.is_empty() {
+            latch.note(&found);
+        }
+        for e in events {
+            match e {
+                ReadEvent::Batch(b) => {
+                    self.index.batch(b);
+                    for item in &b.content.items {
+                        if let Item::Fact(row) = item {
+                            count(&mut self.counters, row);
+                            let index = &self.index;
+                            self.decider
+                                .note_kept(row, || span_of(index.registry(), row.series_id));
+                        }
+                    }
+                }
+                ReadEvent::Corruption { file_id, region } => {
+                    self.lost.insert(*file_id, region.start, region.end);
+                }
+                ReadEvent::Void { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The start's state once the pass reached the mark with `reader`, which becomes the loss watch.
+    pub(crate) fn finish(
+        self,
+        mut reader: LogReader,
+        open: impl Fn() -> Result<LogReader, ReaderError>,
+        latch: &Arc<Latch>,
+    ) -> Result<Kept, ReaderError> {
+        let Tail {
+            index,
+            mut decider,
+            counters,
+            lost,
+            finder,
+            ..
+        } = self;
+        decider.registry = index.registry().clone();
+        let recorded = reader.lost_ranges().to_vec();
+        reader.release_bytes();
+        latch.started();
+        Ok(Kept {
+            counters: defined(counters, &index),
+            index,
+            decider,
+            local: Box::new(LogFacts::new(open()?, lost.clone(), latch.clone())),
+            read_whole: false,
+            passed: lost,
+            recorded,
+            watch: Watch::from_start(reader, finder),
+        })
+    }
 }
 
 #[cfg(test)]

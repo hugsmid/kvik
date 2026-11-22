@@ -128,6 +128,7 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     ));
     assert_eq!(s.stats().ingest.slow_path, 3);
     // Damage while the store runs, in the batch of the first readings: never read as "no such key".
+    common::scanned(&s);
     flip(&w, &facts);
     let ack = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
     assert!(
@@ -152,6 +153,8 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     // A start passes over the damaged region as lost (spec §3 Recovery rule 2): its facts are out of the log.
     // It passes over the damaged region, which no lost range records: health stays degraded (Q-755).
     let s = open();
+    // A seeded start scans below its seed after the open returns (Q-1110).
+    common::scanned(&s);
     assert_eq!(unreadable(&s), Some((0, 0, 0, 1)));
     let ack = block_on(s.emit(&[num(g, 1, 2.0)])).unwrap();
     assert!(
@@ -289,6 +292,7 @@ fn a_fact_whose_earlier_facts_cannot_be_read_is_delivered_unchecked() {
     block_on(s.emit(&[version(3_600, 2.0, 5)])).unwrap();
     sealed(&w, 3);
     drain(&mut c);
+    common::scanned(&s);
     flip(&w, &facts);
     // A lower version of the first key: outranked, but the fact that outranks it cannot be read.
     let ack = block_on(s.emit(&[version(0, 3.0, 3)])).unwrap();
@@ -333,6 +337,7 @@ fn a_fact_whose_earlier_facts_were_found_lost_is_delivered_checked() {
     block_on(s.emit(&[version(3_600, 2.0, 5)])).unwrap();
     sealed(&w, 3);
     drain(&mut c);
+    common::scanned(&s);
     flip(&w, &facts);
     assert_eq!(s.losses().len(), 1);
     let ack = block_on(s.emit(&[version(0, 3.0, 3)])).unwrap();
@@ -415,6 +420,7 @@ fn an_evaluation_without_its_facts_is_counted_although_it_delivers_nothing() {
     sealed(&w, 3);
     drain(&mut c);
     assert_eq!(s.stats().delivery.evaluations_unchecked, 0);
+    common::scanned(&s);
     flip(&w, &facts);
     block_on(s.emit(&[num(g, 3_601, f64::NAN)])).unwrap();
     let ds = drain(&mut c);
@@ -448,6 +454,7 @@ fn a_region_a_consumers_read_meets_after_the_open_is_counted() {
     let s = open();
     assert_eq!(unreadable(&s), None);
     // Damage after the open, in records the consumer has still to be sent: its read of the log passes over it.
+    common::scanned(&s);
     flip(&w, &facts);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     drain(&mut c);
@@ -476,6 +483,7 @@ fn a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_i
     block_on(s.shutdown()).unwrap();
     drop((c, s));
     let s = open();
+    common::scanned(&s);
     flip(&w, &facts);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     drain(&mut c);

@@ -25,6 +25,7 @@ mod hub;
 mod intake;
 mod recent;
 mod resync;
+mod seeded;
 mod take;
 
 pub(crate) use hub::Hub;
@@ -265,6 +266,11 @@ pub(crate) struct Deliverer {
     pending: VecDeque<ReadBatch>,
     /// Per series, the receive time of its last fact that was not outranked (`spec.md` §6 Restart and resume).
     last_arrival: crate::durable::by_id::ById<i64>,
+    /// Series whose last fact at a seeded start's seed may have been outranked: their last arrival is read from the
+    /// log when first needed, unless one was taken since (`None` until read).
+    arrival_unknown: RefCell<BTreeMap<u32, Option<Option<i64>>>>,
+    /// The seed of a seeded start: commit times below it are read from the log when needed.
+    seeded: Option<LogPos>,
     view: View,
     head: LogPos,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
@@ -339,6 +345,33 @@ impl Deliverer {
         fold: Option<Arc<super::derived::SeriesFold>>,
         generation: u32,
     ) -> io::Result<Deliverer> {
+        let mut d = Deliverer::new(
+            dir,
+            env,
+            store_id,
+            capacity,
+            max_consumers,
+            window_budget,
+            latch,
+            fold,
+        )?;
+        d.load(dir, env, clocks)?;
+        d.finish(dir, env, generation);
+        Ok(d)
+    }
+
+    /// A deliverer with its log reader open and nothing taken.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        dir: &Path,
+        env: &Env,
+        store_id: [u8; 16],
+        capacity: usize,
+        max_consumers: usize,
+        window_budget: usize,
+        latch: Arc<LossLatch>,
+        fold: Option<Arc<super::derived::SeriesFold>>,
+    ) -> io::Result<Deliverer> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
         let mut cfg = LogReaderConfig::new(
@@ -373,6 +406,8 @@ impl Deliverer {
             entries: BTreeMap::new(),
             pending: VecDeque::new(),
             last_arrival: crate::durable::by_id::ById::default(),
+            arrival_unknown: RefCell::new(BTreeMap::new()),
+            seeded: None,
             view: View::default(),
             head: LogPos::default(),
             resets: BTreeMap::new(),
@@ -393,8 +428,12 @@ impl Deliverer {
         if let Some(f) = fold {
             d.index.set_fold(f);
         }
-        // `now` places the recent window while the log is taken (roadmap 11.0).
-        let ctx = Ctx {
+        Ok(d)
+    }
+
+    /// The context the open takes the log with: `now` places the recent window (roadmap 11.0).
+    pub(crate) fn loading_ctx<'a>(dir: &'a Path, env: &'a Env, clocks: &'a Clocks) -> Ctx<'a> {
+        Ctx {
             watch: None,
             env,
             dir,
@@ -402,10 +441,14 @@ impl Deliverer {
             now: clocks.now(),
             wall: 0,
             mono: 0,
-        };
-        // The kept log, read in parts before anything is delivered: a read that fails stops the open.
+        }
+    }
+
+    /// Takes the whole kept log, in parts, before anything is delivered: a read that fails stops the open.
+    fn load(&mut self, dir: &Path, env: &Env, clocks: &Clocks) -> io::Result<()> {
+        let ctx = Deliverer::loading_ctx(dir, env, clocks);
         loop {
-            let read = d
+            let read = self
                 .reader
                 .get_mut()
                 .as_mut()
@@ -413,12 +456,19 @@ impl Deliverer {
                 .transpose()
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let Some((u, more)) = read else { break };
-            d.take_events(u.events, u.state.durable);
-            d.take_pending(&ctx);
+            self.take_events(u.events, u.state.durable);
+            self.take_pending(&ctx);
             if !more {
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// Ends the open once the log is taken: the reset points of the manifest's lost ranges and the registry file's
+    /// recovery entries, and every consumer with or without a cursor file set up to resume.
+    pub(crate) fn finish(&mut self, dir: &Path, env: &Env, generation: u32) {
+        let d = self;
         d.loading = false;
         // Lost ranges not described by a recovery entry are reset points: `forget_above` the position before, id
         // its last position (`spec.md` §4 Resync).
@@ -428,6 +478,7 @@ impl Deliverer {
             .as_ref()
             .map(|r| r.lost_ranges().to_vec())
             .unwrap_or_default();
+        let store_id = d.store_id;
         if let Ok(Some((_, file))) = kvik_log::registry::read_latest(&*env.fs, dir, &store_id) {
             for (p, after, consumers) in kept_resets(&file, generation, &lost) {
                 d.resets.entry(p).or_insert(after);
@@ -486,7 +537,6 @@ impl Deliverer {
             });
         }
         d.prune();
-        Ok(d)
     }
 
     /// The routes and registry in force.

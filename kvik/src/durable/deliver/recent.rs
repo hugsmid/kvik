@@ -131,6 +131,24 @@ impl Recent {
         self.keep_budget();
     }
 
+    /// Takes in a series as a seeded start finds it below the seed: its latest `t`, with a floor above it, so that
+    /// every fact at or below it is read from the log (`spec.md` §3 Order of a start).
+    pub(super) fn seed(&mut self, series: u32, latest: i64, span: i64) {
+        if !self.series.contains_key(&series) {
+            self.order.push(series);
+        }
+        let old = self.series.insert(
+            series,
+            Win {
+                latest,
+                floor: latest.saturating_add(1),
+                span,
+                facts: VecDeque::new(),
+            },
+        );
+        self.bytes -= old.map_or(0, |w| w.facts.iter().map(|f| fact_bytes(f)).sum());
+    }
+
     /// Takes each series' oldest key in turn until the bytes held are within the budget.
     fn keep_budget(&mut self) {
         let mut idle = 0;
@@ -256,7 +274,7 @@ fn stored(f: FoundFact) -> Stored {
 }
 
 impl Deliverer {
-    fn local(&self) -> Option<std::cell::RefMut<'_, kvik_log::reader::LogReader>> {
+    pub(super) fn local(&self) -> Option<std::cell::RefMut<'_, kvik_log::reader::LogReader>> {
         std::cell::RefMut::filter_map(self.reader.borrow_mut(), Option::as_mut).ok()
     }
 

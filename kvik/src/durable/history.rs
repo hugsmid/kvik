@@ -243,6 +243,26 @@ impl History {
         }
     }
 
+    /// Takes in a series as a seeded start finds it below the seed (`spec.md` §3 Order of a start): its latest `t`
+    /// and exact lateness reference, with a floor above every `t`, so that each key at or below it takes the slow
+    /// path.
+    pub(crate) fn seed(&mut self, id: u32, latest: i64, reference: Option<i64>, span: i64) {
+        if !self.series.contains_key(&id) {
+            self.order.push(id);
+        }
+        let mut s = Series::new(self.span.unwrap_or(span));
+        s.latest = Some(latest);
+        s.reference = Reference::Exact(reference);
+        s.floor = Floor::above(latest);
+        if let Some(old) = self.series.insert(id, s) {
+            self.bytes -= old
+                .window
+                .iter()
+                .map(|(_, k)| window_bytes(k))
+                .sum::<usize>();
+        }
+    }
+
     /// The facts of a key, or that the slow path must read it.
     pub(crate) fn facts(&self, key: Key) -> Facts<'_> {
         let Some(s) = self.series.get(&key.0) else {

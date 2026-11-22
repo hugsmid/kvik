@@ -663,7 +663,9 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
                    pub delivery: DeliveryStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max },
 //               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */,
-//               start_whole /* the start read the log whole into memory, Q-752 */ }
+//               start_whole /* the start read the log whole into memory, Q-752 */,
+//               start_seeded /* the start continued from the registry file and the series directory, spec §3 Order of a start */,
+//               start_scanning /* its scan of the log below the seed for damage still runs, Q-1110 */ }
 // LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
 //            manifest_rebuilds, loss_identities_rebuilt, orphaned_label_entries /* spec §2.1 Labels */ }   ClockStats { jumps, last: Option<ClockJump> }

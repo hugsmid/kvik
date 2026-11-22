@@ -16,10 +16,10 @@ impl Deliverer {
     /// last position committed before `T` for `start: time` (the position before the first fact at or after `T`),
     /// and for `start: position` the saved point judged against the resets since it was read: kept, its position;
     /// void above X, X. An unknown point refuses the registration.
-    pub(super) fn start_point(&self, start: Start) -> Result<LogPos, Error> {
+    pub(super) fn start_point(&self, start: Start, ctx: &Ctx<'_>) -> Result<LogPos, Error> {
         match start {
             Start::Now => Ok(self.head),
-            Start::Time(t) => Ok(self.index.position_at(t.0.saturating_sub(1)).min(self.head)),
+            Start::Time(t) => Ok(self.commit_at(t.0.saturating_sub(1), ctx).min(self.head)),
             Start::Position(p) => self.judge(p),
         }
     }
@@ -113,7 +113,7 @@ impl Deliverer {
         let head = self.head;
         let lost = !new && self.consumers[name].dormant;
         let point = if new || lost {
-            Some(self.start_point(start)?)
+            Some(self.start_point(start, ctx)?)
         } else {
             None
         };

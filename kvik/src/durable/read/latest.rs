@@ -200,7 +200,7 @@ impl Latest {
         self.folded = self.folded.max(s.position);
         let held = Arc::make_mut(self.series.get_or_insert_with(id, Arc::default));
         held.state
-            .apply(&s.row, s.position, versioned, self.horizon);
+            .apply(&s.row, s.position, s.received_at, versioned, self.horizon);
         let named: Vec<LogPos> = held.named().map(|k| k.position).collect();
         held.rows.retain(|r| named.contains(&r.position));
         if named.contains(&s.position) {

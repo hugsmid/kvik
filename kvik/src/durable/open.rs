@@ -1,5 +1,6 @@
 //! Opening and shutting down the durable store (`docs/api.md` Opening, `spec.md` §3 Order of a start).
 
+use super::seed::Seed;
 use super::*;
 
 impl Writer {
@@ -47,21 +48,46 @@ impl Writer {
         let start_fault = writer.fault().cloned();
         let start_losses = start_losses(&writer, env.boot.current());
         let latch = Arc::new(Latch::default());
-        // The kept log, read once in parts: the registry, the decision state, the counters and the losses passed over
-        // (roadmap 11.0, Q-947); its reader then becomes the loss watch (Q-927).
-        let kept = match start::log_reader(&dir, &env) {
-            Ok(r) => start::read_kept(
-                r,
-                || start::log_reader(&dir, &env),
-                start::PART,
-                window_budget(&config.limits),
-                &latch,
-            )
-            .map_err(|e| OpenError::Io {
-                path: dir.clone(),
-                source: io::Error::other(e.to_string()),
-            })?,
-            Err(e) => return Err(reader::open_error(&dir, e)),
+        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
+        // A seeded start where the files allow it (`spec.md` §3 Order of a start); otherwise the kept log, read once
+        // in parts: the registry, the decision state, the counters and the losses passed over (roadmap 11.0, Q-947);
+        // its reader then becomes the loss watch (Q-927).
+        let seeded = start_fault
+            .is_none()
+            .then(|| Seed::find(&writer, &*env.fs, &dir, &descriptor.store_id))
+            .flatten()
+            .and_then(|seed| {
+                let through = seed.through;
+                start_seeded(
+                    config,
+                    &writer,
+                    &env,
+                    &clocks,
+                    &latch,
+                    descriptor.store_id,
+                    seed,
+                )
+                .map(|s| (s, through))
+            });
+        let (kept, seeded) = match seeded {
+            Some((s, through)) => (s.kept, Some((s.hook, s.deliverer, through))),
+            None => {
+                let kept = match start::log_reader(&dir, &env) {
+                    Ok(r) => start::read_kept(
+                        r,
+                        || start::log_reader(&dir, &env),
+                        start::PART,
+                        window_budget(&config.limits),
+                        &latch,
+                    )
+                    .map_err(|e| OpenError::Io {
+                        path: dir.clone(),
+                        source: io::Error::other(e.to_string()),
+                    })?,
+                    Err(e) => return Err(reader::open_error(&dir, e)),
+                };
+                (kept, None)
+            }
         };
         let start::Kept {
             index,
@@ -91,14 +117,15 @@ impl Writer {
         let counters = Counters {
             series: series_counters,
             start_whole: read_whole,
+            start_seeded: seeded.is_some(),
             start_regions: passed.unrecorded(&recorded, &standing),
             ..Counters::default()
         };
-        // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
-        // the kept log at every start, and the file, which must equal what the kept log gives up to the last synced
-        // mark with the recovery entries of the file read carried forward (Q-1033), is written again whenever it does
-        // not. Its id floor is the writer's, which recovery folded in from
-        // the mark, the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
+        // The derived check of the registry file (Q-33): the registry is rebuilt at every start, from the kept log or,
+        // in a seeded start, from the file up to the seed and the log above it, and the file, which must equal that
+        // up to the last synced mark with the recovery entries of the file read carried forward (Q-1033), is
+        // written again whenever it does not. Its id floor is the writer's, which recovery folded in from the mark,
+        // the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
         let mut start_fault = start_fault;
         let registry_written: derived::RegistryWritten = Arc::default();
         if start_fault.is_none() {
@@ -119,28 +146,37 @@ impl Writer {
                 *lock(&registry_written) = Some(stats.mark_synced);
             }
         }
-        let hook = derived::hook(
-            &writer,
-            &*env.fs,
-            &dir,
-            descriptor.store_id,
-            &latch,
-            &recorded,
-        );
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
-        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
-        let hub = match deliver::Deliverer::open(
-            &dir,
-            &env,
-            &clocks,
-            descriptor.store_id,
-            config.limits.consumer_queue,
-            config.limits.max_consumers,
-            window_budget(&config.limits),
-            latch.clone(),
-            Some(hook.fold.clone()),
-            writer.generation(),
-        ) {
+        let (hook, delivering, seed_through) = match seeded {
+            Some((hook, mut d, through)) => {
+                d.finish(&dir, &env, writer.generation());
+                (hook, Ok(d), Some(through))
+            }
+            None => {
+                let hook = derived::hook(
+                    &writer,
+                    &*env.fs,
+                    &dir,
+                    descriptor.store_id,
+                    &latch,
+                    &recorded,
+                );
+                let d = deliver::Deliverer::open(
+                    &dir,
+                    &env,
+                    &clocks,
+                    descriptor.store_id,
+                    config.limits.consumer_queue,
+                    config.limits.max_consumers,
+                    window_budget(&config.limits),
+                    latch.clone(),
+                    Some(hook.fold.clone()),
+                    writer.generation(),
+                );
+                (hook, d, None)
+            }
+        };
+        let hub = match delivering {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
             Err(source) => {
@@ -161,6 +197,19 @@ impl Writer {
         hook.fold.follow(move || watch_log.mark_synced());
         let counters = Arc::new(Mutex::new(counters));
         let own_fault = Arc::new(Mutex::new(start_fault));
+        let scan = seed_through.map(|through| {
+            let c = counters.clone();
+            scan::Scan::spawn(
+                &dir,
+                &env,
+                through,
+                latch.clone(),
+                passed.clone(),
+                recorded.clone(),
+                standing.clone(),
+                move |n| lock(&c).start_regions += n,
+            )
+        });
         hook.share(
             log.watch(),
             counters.clone(),
@@ -202,6 +251,7 @@ impl Writer {
             watch: Mutex::new(watch),
             start_losses,
             registry_written,
+            scan: Mutex::new(scan),
             bucket_warning: config.log.bucket_warning(),
             fast: Arc::default(),
             env,
@@ -224,6 +274,14 @@ impl Writer {
             })?;
         }
         Ok(w)
+    }
+
+    /// Waits for a seeded start's damage scan to end.
+    #[cfg(test)]
+    pub(crate) fn wait_scan(&self) {
+        if let Some(s) = lock(&self.scan).as_mut() {
+            s.wait();
+        }
     }
 
     /// Clean shutdown: final commit and mark sync, threads joined, lock released.
@@ -262,8 +320,9 @@ impl Writer {
                 None => Ok(()),
             }
         });
-        // The loss watch gives up its reader; its reports stay (Q-926).
+        // The loss watch gives up its reader; its reports stay (Q-926). A damage scan still running stops.
         lock(&self.watch).close();
+        drop(lock(&self.scan).take());
         // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
         if let Some(h) = &self.hub {
             h.closed.store(true, Ordering::SeqCst);
@@ -291,6 +350,106 @@ impl Writer {
             None => Ok(()),
         }
     }
+}
+
+/// What a seeded start built before the registry check: the writer's state, the series directory hook and the
+/// deliverer, which still has to read the cursor files.
+struct Seeded {
+    kept: start::Kept,
+    hook: Arc<derived::Hook>,
+    deliverer: deliver::Deliverer,
+}
+
+/// A seeded start (`spec.md` §3 Order of a start): the writer and the deliverer start from the registry file and the
+/// series directory at `seed`, then share one pass over the log above it. `None` when it gives way to the start from
+/// the whole log ([`start::GiveWay`]); what it noted in `latch` that start finds again.
+fn start_seeded(
+    config: &StoreConfig,
+    writer: &LogWriter,
+    env: &Env,
+    clocks: &Arc<clock::Clocks>,
+    latch: &Arc<Latch>,
+    store_id: [u8; 16],
+    seed: Seed,
+) -> Option<Seeded> {
+    let dir = &config.dir;
+    if scan::scan_order(dir) == scan::ScanOrder::BeforeOpen {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let found = scan::scan_below(dir, env, seed.through, latch, &never).ok()??;
+        if found.below {
+            return None;
+        }
+    }
+    let budget = window_budget(&config.limits);
+    let hook = derived::seeded_hook(writer, &seed);
+    let mut d = deliver::Deliverer::new(
+        dir,
+        env,
+        store_id,
+        config.limits.consumer_queue,
+        config.limits.max_consumers,
+        budget,
+        latch.clone(),
+        Some(hook.fold.clone()),
+    )
+    .ok()?;
+    d.seed(&seed);
+    let mut tail = start::Tail::new(&seed, budget);
+    let reader = start::log_reader(dir, env).ok();
+    let passed = reader.and_then(|mut r| {
+        let ctx = deliver::Deliverer::loading_ctx(dir, env, clocks);
+        let pass = (|| {
+            if !r.start_after(seed.reader_after()).unwrap_or(false) {
+                return Err(start::GiveWay::Seed);
+            }
+            let mut first = true;
+            loop {
+                let (u, more) = r
+                    .refresh_some(start::PART)
+                    .map_err(|_| start::GiveWay::Read)?;
+                let mut events = u.events;
+                if first && !events.is_empty() {
+                    let e = events.remove(0);
+                    tail.at_seed(&e)?;
+                    d.seed_commit(&e);
+                    first = false;
+                }
+                tail.take(&events, u.state.durable, latch)?;
+                d.take_shared(events, u.state.durable, &ctx);
+                if !more {
+                    return if first {
+                        Err(start::GiveWay::Seed)
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+        })();
+        match pass {
+            Ok(()) if d.resume_after_pass() => Some(r),
+            _ => {
+                let _ = r.close();
+                None
+            }
+        }
+    });
+    let Some(reader) = passed else {
+        d.close();
+        return None;
+    };
+    let kept = match tail.finish(reader, || start::log_reader(dir, env), latch) {
+        Ok(k) => k,
+        Err(_) => {
+            d.close();
+            return None;
+        }
+    };
+    derived::settle(&hook, latch, &kept.recorded);
+    Some(Seeded {
+        kept,
+        hook,
+        deliverer: d,
+    })
 }
 
 /// The losses a start found and did not record, as reports (`spec.md` §3 Order of a start, step 3).

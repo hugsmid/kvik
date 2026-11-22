@@ -163,6 +163,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (ruled by the owner) |
+| Q-1110 | §3 Order of a start, Recovery rule 2; Q-947 | A seeded start scans for damage below its seed after the open returns (OWNER) |
+| Q-1111 | §3 Order of a start; `format.md` A.16, A.18; Q-33, Q-1001 | What a seeded start continues from, and when it reads the whole log (decided by the lead) |
+| Q-1112 | `format.md` A.18 Writing; Q-1111 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4642,6 +4645,85 @@ knows which a reading is for. Built so (`kvik/src/durable/fast.rs`, `kvik/src/pr
 `s4_every_provisional_call_ends_durable_or_withdrawn_and_durable_ones_survive`,
 `s4_provisional_streams_change_nothing_a_consumer_receives`.
 
+## Q-1110 — A seeded start scans for damage below its seed after the open returns
+Recorded with the seeded start. For the owner: it changes a promise users see.
+**Scenario.** A store a week old opens. Until now the start read the whole log, so a segment damaged since it was
+written (a bit flip in a sealed segment, below every mark) was found before `Store::open` returned: the loss was in
+`losses()` and `health()` from the first call, the series directory was set aside, and the decisions and counts
+were built without the lost facts. A seeded start reads only the log above its series directory's `through`; the
+damage below it is found only by reading that part of the log, which is what makes the open cost O(store).
+**Options.**
+(a) Scan before the open returns (`ScanOrder::BeforeOpen`, built and tested): the open still reads the whole log
+once, though only for damage, without decoding every fact into the decision and delivery state; damage below the
+seed makes the start read the whole log as before. Every promise stays as it was; the open stays O(store), about
+half of today's cost by the profile in the reopen research (the two replays' decode and window work go, the read
+stays).
+(b) Scan after the open returns, on a thread of its own (`ScanOrder::Background`, the default as built): the open is
+O(recent data). A loss the scan finds is reported through `losses()` and `health()` as a loss found while the store
+is open is (Recovery rule 2): the writer's decisions forget the facts the log shows (Q-921) and decide those keys
+from the log, which skips the region; the deliverer's summaries are rebuilt (Q-930); the series directory fold
+breaks and the directories on disk are removed (Q-1002), so the next start reads the whole log and finds the
+damage before it returns. Until the scan reaches the region, a read or a decision that meets it reports it as any
+read does (Q-928), and `IngestStats::start_scanning` says the scan runs. What differs from (a): the counts of §11
+(`recorded`, `late`, `future`) of a series with facts in the region still count them until the next start, and a
+reading decided before the scan reached the region was decided with the region still read as intact.
+(c) Scan in the background but hold writes until it ends: O(recent) to readable, O(store) to writable. It keeps the
+decisions' promise but not the open's time for an adapter, which writes at once.
+**Recommendation.** (b), as built: the purpose of the store is reaction (decision of 22 November), a restart must
+resume within a second at any age, and the damage it delays finding is rare (it needs media that corrupt data after
+a successful sync) and still reported, with the store setting itself right at the next start. The seam is one
+constant (`kvik/src/durable/scan.rs` `SCAN_ORDER`); setting it to `BeforeOpen` restores the old order with the
+seeded start's other savings, and both orders are pinned by the equivalence test.
+**Pinned by.** `kvik/src/durable/seed/tests.rs`
+`a_seeded_start_gives_what_the_start_from_the_whole_log_gives` (both orders; under `Background` a loss found after
+the open is compared by its reports only), `a_store_with_a_directory_starts_seeded_and_gives_what_the_whole_log_gives`.
+
+## Q-1111 — What a seeded start continues from, and when it reads the whole log
+Decided by the lead with the seeded start.
+**Scenario.** A start continues from the newest series directory that is still a function of the kept log (A.18
+Validation, as the writer judges it, `kept_series`) and the registry file, then reads the log after the directory's
+`through` S once, for the writer and the deliverer together. What else must the files hold, and when does it give
+way to the whole log?
+**Decision.** The directory's entries carry the start counts (A.18 fields 96 to 120: late and future counts and the
+last receive time, with bit 7 when the last fact carries a `changed_at`); a v1 directory, or one continued from a v1
+directory, has none, and the writer continues no fold from one without them, so after an upgrade the first start
+reads the whole log and the next directory carries them. S is at or below the mark, in the mark's generation, above
+0, and no series' latest `t` is `i64::MAX` (no floor lies above it). The registry file of S's generation supplies
+the entries up to S; Q-1001 makes them every one, and the Derived check (Q-33) compares the file with the file's
+entries up to S plus the log's after it. Each series' decision window and recent window start empty with a floor
+above its latest `t`, so keys at or below it are decided from the log, as keys that left the windows are; counts,
+lateness reference and last arrival continue from the entry; a series whose last fact may have been outranked has
+its last arrival read from the log when a stale-for condition first needs it; commit times below S, for `start:
+time`, are read from the log when asked; a consumer below S reads the log below S as one behind does. The pass reads
+the batch ending at S first, for the commit time a loss just above S reports (Q-1090), and gives way to the whole
+log when that batch is not first, on a void, on a region holding a position at or below S, or on a read error.
+**Why.** Each rule keeps the start's result equal to the whole read's, which the equivalence test pins over random
+histories; where the files cannot say (a revision outranked, a commit time below S) the log is read, as the bounded
+history already does for what left memory (roadmap 11.0).
+**Found on the way.** The deliverer decided whether a late revision was outranked against a window that an earlier
+fact of the same batch had just moved past the revision's key: it then delivered it unchecked although its key
+could be read. It now reads the key when the window no longer holds it
+(`a_late_revision_behind_a_fact_that_moves_the_window_is_checked_against_its_whole_key`).
+**Pinned by.** `kvik/src/durable/seed/tests.rs` (all), `log/src/directory/series.rs`
+`a_v1_entry_carries_no_start_counts_whatever_its_flags_say`, `log/tests/directory_golden.rs`
+`a_v1_series_directory_reads_as_before_with_no_start_counts`.
+
+## Q-1112 — A power loss can take the seed with the unsynced series directory
+Decided by the lead with the seeded start, provisional.
+**Scenario.** Derived files are renamed into place and never synced (A.18 Writing). After a power loss the newest
+series directory may be absent or invalid, and the previous one may be behind the start's reset (Q-776), so the
+start finds no seed and reads the whole log: the restart after a power loss can take seconds on a large store,
+where one after a process crash or a clean stop takes under one.
+**Decision (provisional).** Leave the files unsynced: on Linux the page cache writes a renamed file back within
+about 30 seconds, so only a directory written in the last moments before the loss is at risk, and the previous one
+is then still a seed unless the start's reset falls below its `through`. If restarts after power losses must be fast
+too, the cheap change is to sync the series directory and its directory once per write (at most every 15 minutes or
+32 MiB of seals, about a hundred syncs a day), which costs no measurable wear; it is one line in
+`log/src/writer/directories.rs` and changes no format.
+**Pinned by.** `kvik/src/durable/seed/tests.rs`
+`a_store_with_a_directory_starts_seeded_and_gives_what_the_whole_log_gives` (a power loss reads the whole log and
+gives the same result).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4839,6 +4921,9 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 | Q-1109 | 9.0d | Settled by the owner, 22 November: provisional delivery is acceptable, opt-in per stream and labelled, withdrawn when lost (as built) |
+| Q-1110 | 9.0e | Open, for the owner: the seeded start's damage scan below its seed runs after the open returns (as built, recommended) or before it (`ScanOrder::BeforeOpen`, one constant) |
+| Q-1111 | 9.0e | Decided by the lead with the seeded start: the start counts in A.18, the rules for giving way to the whole log; for review |
+| Q-1112 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

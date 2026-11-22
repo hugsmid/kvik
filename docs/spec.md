@@ -472,6 +472,23 @@ A.10) is treated as a different boot. The rules apply in this order:
 
 A failed sync in any step leaves the engine read-only (§3 Write or sync failure); the next start begins at step 1.
 
+**Seeded start.** Step 7, and the writer's state for the decisions of §2.4 and the counts of §11, come from the log
+read whole, or, when the files allow it, from a **seed**: the newest series directory that is still a function of
+the kept log (§7 Derived files, as the writer judges it), whose `through` S is at or below the mark and every entry
+of which carries the start counts (`format.md` A.18), with the registry file's entries up to S (A.16: every one,
+Q-1001). The writer and the deliverer then take one pass over the log after S, reading the batch ending at S first
+for its commit time (Q-1090). Each series' recent window and decision window start empty with a floor above its
+latest `t`, so a key at or below it is decided from the log as one that left the window is (§2.4), and the lateness
+reference, counts and last arrival continue from its entry; a consumer whose position is below S reads the log
+below S as one behind does (§4 Overflow); commit times below S, for `start: time`, are read from the log when
+asked. The start reads the whole log instead when there is no seed, when the pass meets a void, a region holding a
+position at or below S or a read error, or when the batch ending at S is not the first it reads. Either way the
+start gives the same state, reads, deliveries and loss reports (Q-1111). The rest of the log, below S, is scanned
+for damage after the open returns, as the derived files' start work is (A.18): a loss found there is reported as one
+found while the store is open (Recovery rule 2, Q-921, Q-930), and the start-scan flag of the statistics says the
+scan runs. Damage below S is therefore found after the open returns, not before (Q-1110). The registry file is
+checked against the file plus the log after S (A.16, Q-33).
+
 ## 4. Delivery (funnels)
 | Rule | |
 |---|---|
@@ -823,7 +840,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   still finds the rewrite.
 - **Derived files** (`format.md` A.18): the log directory (the sealed segments, with their sequence and commit-time
   ranges, checked against the catalogue), the series directory (per series, as of a position: the latest recorded
-  `t`, the lateness reference, counts, the live candidate and the next pending fact) and the status file (the
+  `t`, the lateness reference, counts, the live candidate and the next pending fact, and what a seeded start
+  continues, §3 Order of a start) and the status file (the
   writer's counters, health and pressure flag). Only the writer writes them, on its maintenance thread; they are
   checksummed, renamed into place and never synced or backed up, and none names a position above the last synced
   mark. A reader treats a missing, invalid or behind one as absent and reads the log instead, up to an allowance of

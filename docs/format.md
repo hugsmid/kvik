@@ -838,7 +838,10 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   the kept log's registry entries other than label changes up to the last synced mark, and the recovery entries the
   file read holds that the kept log does not, with an id floor at least the writer's; if it does not, it is written
   again from the kept log and those recovery entries, with the writer's id floor, so the id of a lost definition stays
-  assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
+  assigned. A seeded start (`spec.md` §3 Order of a start) reads the log only above its series directory's
+  `through`: its registry is the file's entries up to that `through` (Q-1001 makes them every one) and the log's
+  above it, and the file is checked against that, file plus tail, by the same rule (Q-33, Q-1111).
+  The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
   a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
   (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log
   segments can leave the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry but a
@@ -1081,7 +1084,7 @@ root names is not that root's. A part not used is read from the segments by a re
 generation at or below it that the root's lost ranges (the manifest's, merged by identity) covered when it was
 written, saturating at `u32::MAX`; 16 the mark's reset stamp when written; 32 `judged_at` `i64`, the
 time the candidates and pending facts are judged at (the later of the write time and every `received_at` the entries
-cover); 40 count `u32`; 44 `record_size` `u16` (96 in v1); 46 reserved. Entries are in strictly ascending series id
+cover); 40 count `u32`; 44 `record_size` `u16` (96 in v1, 120 with the start counts); 46 reserved. Entries are in strictly ascending series id
 and hold the series' state as of `through` (`spec.md` §7 Derived files). A file is a function of the kept log only
 while no position at or below `through` has been lost since (more covered now than `lost`, a loss extended under its
 identity included) and `lost` is not saturated: a reader and the writer drop it otherwise. A candidate whose `t` is above the reader's `now` (after a clock step back) is found again by
@@ -1091,7 +1094,7 @@ deliverer's index); a refresh it skips (Q-704) delays it, never falsifies it.
 | Offset | Size | Entry field (96 bytes) |
 |---:|---:|---|
 | 0 | 4 | `series_id` |
-| 4 | 2 | flags: bit 0 `latest_t` present; 1 `lateness_reference` present; 2 candidate present; 3 candidate unsure; 4 pending fact present; 5 more pending facts may exist |
+| 4 | 2 | flags: bit 0 `latest_t` present; 1 `lateness_reference` present; 2 candidate present; 3 candidate unsure; 4 pending fact present; 5 more pending facts may exist; 6 start counts present; 7 the last fact carries a `changed_at` |
 | 6 | 1 | the candidate's value kind: 0 read at the position (value and quality: a candidate continued from a pending fact), 1 `f64`, 2 decimal, 3 state, 4 boolean, 5 text (read at the candidate's position) |
 | 7 | 1 | the candidate's adapter-supplied quality (A.5 codes, never bad; 0 for kind 0) |
 | 8 | 8 | latest recorded `t` (`spec.md` §2.2) |
@@ -1104,6 +1107,17 @@ deliverer's index); a refresh it skips (Q-704) delays it, never falsifies it.
 | 64 | 8 | its value: `f64` bits, decimal units (`i64`), state index, boolean 0 or 1; 0 for text |
 | 72 | 8 | the **next pending fact**'s `t`: the earliest good current fact ahead of the write time |
 | 80 | 12 | its position; 4 reserved |
+| 96 | 8 | **start counts** (bit 6): facts flagged `late` |
+| 104 | 8 | facts flagged `future` |
+| 112 | 8 | the receive time of the series' last fact by position |
+
+**Start counts.** A writer's seeded start (`spec.md` §3 Order of a start) continues the counts of §11 and each
+series' last arrival (§6 Restart and resume) from fields 96 to 120; bit 7 says the last fact by position carries a
+`changed_at`, so it may have been outranked and the last arrival is read from the log instead. A reader takes start
+counts only from a record of 120 bytes or more with bit 6 set; a shorter record (v1, or a writer before them) gives
+none, whatever its flags say. A writer starts seeded only from a directory every entry of which carries them, and
+continues no fold from one that lacks them, so the first directory it writes after a start from the whole log
+carries them (Q-1111).
 
 Checks: a known value kind and a quality up to 2 when the candidate is present (0 for kind 0), a decimal scale at most 18, a state
 index that fits `u16`, a boolean 0 or 1. Bit 3 means the candidate may not be the live fact (it was corrected to bad,

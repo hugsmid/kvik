@@ -39,6 +39,8 @@ pub(crate) mod reader;
 mod registering;
 mod registry;
 mod routing;
+mod scan;
+mod seed;
 mod start;
 mod status;
 mod summary;
@@ -191,6 +193,8 @@ struct Counters {
     series: BTreeMap<u32, SeriesStats>,
     /// The start read the kept log whole into memory (Q-752).
     start_whole: bool,
+    /// The start was seeded (`spec.md` §3 Order of a start).
+    start_seeded: bool,
     /// Damaged regions the start passed over that no lost range records (Q-755).
     start_regions: u64,
     /// Readings recorded unchecked because local data could not be read (Q-750).
@@ -239,6 +243,8 @@ pub(crate) struct Writer {
     start_losses: Vec<LossReport>,
     /// The registry file's `through` as last written, and the lock of every write of the file (Q-1001).
     registry_written: derived::RegistryWritten,
+    /// A seeded start's damage scan of the log below its seed, while it runs (Q-1110).
+    scan: Mutex<Option<scan::Scan>>,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,
     /// The provisional streams' ring (spec §4 Provisional streams).

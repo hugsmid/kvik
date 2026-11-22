@@ -73,6 +73,7 @@ impl Fold {
                     self.series.entry(f.series_id).or_default().apply(
                         f,
                         *p,
+                        received_at,
                         versioned,
                         self.horizon,
                     );
@@ -165,6 +166,20 @@ impl SeriesFold {
             .iter()
             .map(|e| (e.series_id, State::of_entry(e, written_at)))
             .collect();
+    }
+
+    /// Takes the registry entries at or below a seeded start's seed, which the fold is not given as batches: the
+    /// series defined and the last entry (`spec.md` §3 Order of a start).
+    pub(crate) fn seed_entries<'a>(&self, entries: impl IntoIterator<Item = (LogPos, &'a Entry)>) {
+        let mut f = lock(&self.fold);
+        for (p, e) in entries {
+            if let Entry::Definition(d) = e {
+                f.defined.insert(d.id, d.versioning != Versioning::None);
+            }
+            if !matches!(e, Entry::Ignored { .. }) {
+                f.last_entry = f.last_entry.max(Some(p));
+            }
+        }
     }
 
     /// Follows the writer's synced mark from now on, as `synced` reads it.
@@ -413,9 +428,9 @@ impl SealHook for Hook {
 }
 
 /// The seal hook of a store opening: its fold continues from the newest series directory that is still a function of
-/// the kept log (A.18 Validation, as the writer applies it), or starts empty. When the start met a region that no lost
-/// range of the manifest holds (`latch`, `recorded`), the run writes no series directory and removes those on disk
-/// (Q-952, Q-1002). The fold then watches `latch` for losses found later.
+/// the kept log (A.18 Validation, as the writer applies it) and carries the start counts, or starts empty. When the
+/// start met a region that no lost range of the manifest holds (`latch`, `recorded`), the run writes no series
+/// directory and removes those on disk (Q-952, Q-1002). The fold then watches `latch` for losses found later.
 pub(crate) fn hook(
     writer: &kvik_log::writer::LogWriter,
     fs: &dyn kvik_log::fs::Fs,
@@ -426,23 +441,55 @@ pub(crate) fn hook(
 ) -> Arc<Hook> {
     let fold = SeriesFold::new(writer.stats().mark_synced);
     let start = writer.directory_start();
-    let end = LogPos {
-        generation: u32::MAX,
-        sequence: u64::MAX,
-    };
-    if lost_since(&latch.found(), recorded, end) {
-        // Below every series directory this run could write: none is written, and those on disk are removed, so that
-        // no reader continuing one passes over the loss unreported (Q-1002).
-        lock(&fold.fold).broken = true;
-    } else if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
-        fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
+    if !lost_since(&latch.found(), recorded, END) {
+        // A directory without the start counts is not continued: the fold, given the whole log, writes them.
+        if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start)
+            .filter(|(_, d)| d.entries.iter().all(|e| e.counts.is_some()))
+        {
+            fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
+        }
     }
-    fold.watch_losses(latch.clone());
+    of_fold(fold, latch, recorded)
+}
+
+/// The seal hook of a seeded start: its fold continues from the seed's directory, with the registry entries at or
+/// below it. [`settle`] completes it once the pass over the log above the seed has run.
+pub(crate) fn seeded_hook(
+    writer: &kvik_log::writer::LogWriter,
+    seed: &super::seed::Seed,
+) -> Arc<Hook> {
+    let fold = SeriesFold::new(writer.stats().mark_synced);
+    fold.seed(seed.through, seed.judged_at, &seed.series);
+    fold.seed_entries(seed.entries().map(|(p, _, e)| (p, e)));
     Arc::new(Hook {
         fold: Arc::new(fold),
         parts: OnceLock::new(),
         registry: OnceLock::new(),
     })
+}
+
+/// Completes a seeded start's hook as [`hook`] makes it: broken when the pass met a region that no lost range of the
+/// manifest holds, and watching `latch` from now on.
+pub(crate) fn settle(hook: &Hook, latch: &Arc<Latch>, recorded: &[LostRange]) {
+    if lost_since(&latch.found(), recorded, END) {
+        lock(&hook.fold.fold).broken = true;
+    }
+    hook.fold.watch_losses(latch.clone());
+}
+
+const END: LogPos = LogPos {
+    generation: u32::MAX,
+    sequence: u64::MAX,
+};
+
+fn of_fold(fold: SeriesFold, latch: &Arc<Latch>, recorded: &[LostRange]) -> Arc<Hook> {
+    let hook = Arc::new(Hook {
+        fold: Arc::new(fold),
+        parts: OnceLock::new(),
+        registry: OnceLock::new(),
+    });
+    settle(&hook, latch, recorded);
+    hook
 }
 
 /// Whether a lost range in `found` begins at or below `through` and no lost range of the manifest holds it.

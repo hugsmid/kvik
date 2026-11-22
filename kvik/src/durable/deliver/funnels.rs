@@ -139,7 +139,7 @@ impl Deliverer {
                 h.above_for = start.map_or(0, |t| ctx.now - t);
             }
             RouteCondition::StaleFor { .. } => {
-                h.since_arrival = self.last_arrival.get(s).map(|r| (ctx.wall - r).max(0));
+                h.since_arrival = self.last_arrival_of(s).map(|r| (ctx.wall - r).max(0));
             }
             RouteCondition::Threshold { .. } | RouteCondition::OnChange { .. } => {}
         }

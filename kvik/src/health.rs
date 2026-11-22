@@ -376,6 +376,12 @@ pub struct IngestStats {
     /// The store's start read the kept log whole into memory, its read in parts having met a part that voids an
     /// earlier one (Q-752; false with the model backend).
     pub start_whole: bool,
+    /// The store's start continued from the registry file and the series directory and read only the log above
+    /// them (`spec.md` §3 Order of a start, seeded start; false with the model backend).
+    pub start_seeded: bool,
+    /// A seeded start's scan of the log below its seed for damage is still running: a loss there may still be
+    /// reported (Q-1110; false with the model backend).
+    pub start_scanning: bool,
 }
 
 /// How the mark is synced.

@@ -145,6 +145,8 @@ impl Writer {
                 },
                 slow_path: c.slow_path,
                 start_whole: c.start_whole,
+                start_seeded: c.start_seeded,
+                start_scanning: lock(&self.scan).as_ref().is_some_and(|s| !s.done()),
             },
             log: LogStats {
                 durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
