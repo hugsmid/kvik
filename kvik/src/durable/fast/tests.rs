@@ -451,3 +451,23 @@ fn lagged_names_the_floor_of_the_last_call_taken() {
     };
     assert_eq!((*first, *last, after.sequence), (2, 2, 7));
 }
+
+#[test]
+fn a_stream_opened_later_sees_only_calls_accepted_after_it() {
+    let fast = Arc::new(Fast::default());
+    let mut first = fast.open(&ProvisionalOptions::default(), Box::new(Script::default()));
+    accept(&fast, &[(1, 1)], 0);
+    let mut second = fast.open(&ProvisionalOptions::default(), Box::new(Script::default()));
+    accept(&fast, &[(1, 2)], 0);
+    let seqs = |s: &mut Stream| -> Vec<u64> {
+        drain(s)
+            .iter()
+            .filter_map(|e| match e {
+                ProvisionalEvent::Accepted(a) => Some(a.seq()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(seqs(&mut first), [1, 2]);
+    assert_eq!(seqs(&mut second), [2]);
+}

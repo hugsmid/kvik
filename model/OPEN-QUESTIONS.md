@@ -162,7 +162,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
-| Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (OWNER) |
+| Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (ruled by the owner) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4607,7 +4607,7 @@ records.
 `an_absorbed_identity_given_to_acknowledge_losses_acknowledges_nothing`.
 
 ## Q-1109 — Delivery before durability: an automation may act on a reading later withdrawn
-Recorded by the lead with the fast path; for the owner. Built as option (b), the lead's decision until ruled.
+Recorded by the lead with the fast path. Ruled by the owner on 22 November: option (b).
 **Scenario.** The log syncs once a second to spare the disk (`sync_interval_floor` and `min_sync_interval` at 1 s).
 An automation that waits for durability reacts up to a second late. Delivered at acceptance instead, it reacts
 within a millisecond, but a reading it acted on can then be withdrawn: the sync fails, the writer stops or the
@@ -4629,7 +4629,9 @@ a provisional reading outside the process treats what no watermark covered as wi
 reading whose sync failed may still be found after a reboot (§9 row 7a); it then arrives through every durable
 path as any recorded fact does. A slow stream lags rather than holding the ring: it is told the calls it missed and
 a position below them, as a lagging live read is.
-**Recommendation.** (b): the fast path is for reaction and the durable paths are for record, and only the reader
+**Ruling.** Acceptable: an automation acts on the information it has at the time, and a reading later withdrawn is
+reported as withdrawn, which is enough. The fast path stays opt-in and labelled.
+**Recommendation (the lead's, before the ruling).** (b): the fast path is for reaction and the durable paths are for record, and only the reader
 knows which a reading is for. Built so (`kvik/src/durable/fast.rs`, `kvik/src/provisional.rs`,
 `model/src/provisional.rs`).
 **Pinned by.** `kvik/tests/provisional.rs`
@@ -4836,7 +4838,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1069 | 9.0g | Decided by the lead with 9.0f's fix round: only wanted rows decoded, counted as kept; measured peak and fixed allowance; for review |
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
-| Q-1109 | 9.0d | Open, for the owner: provisional delivery opt-in per stream, labelled, withdrawn when lost (as built, recommended), none, or by default |
+| Q-1109 | 9.0d | Settled by the owner, 22 November: provisional delivery is acceptable, opt-in per stream and labelled, withdrawn when lost (as built) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -5169,6 +5171,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-892 | Label entries held in immutable label parts, not in the registry file, with the `has_labels` flag (series labels design) | §2.1, `format.md` A.8, A.16, Label parts |
 | Q-893 | Labels kept out of the series directory, the chunk index and chunk headers (series labels design) | §2.1 Labels |
 | Q-1102 | A start's lost range across two recorded losses | §3 Order of a start step 4, `format.md` A.14 lost range, `api.md` Health (ruled by the owner, 2026-11-21: one loss under the lower identity, option (a)) |
+| Q-1109 | Delivery before durability: an automation may act on a reading later withdrawn | §4 Provisional streams, `api.md` Provisional streams (ruled by the owner, 2026-11-22: acceptable; opt-in per stream, each delivery labelled provisional or durable, a loss reported as withdrawn) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
