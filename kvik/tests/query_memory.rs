@@ -8,9 +8,13 @@
 
 mod common;
 
+use std::path::Path;
+
 use common::block_on;
 use common::durable::World;
 use kvik::{Kind, Reader, ReaderConfig, Reading, SeriesSpec, Timestamp, Value, View};
+use kvik_log::directory::Family;
+use kvik_log::fs::Fs as _;
 use peak_alloc::PeakAlloc;
 
 #[global_allocator]
@@ -23,9 +27,15 @@ const PER_BATCH: i64 = 26_000;
 const OVERHEAD: usize = 1 << 20;
 /// What the lookups' log reader keeps at most (`kvik_log::reader::LOOKUP_CACHE_BYTES`), in the cache's share.
 const LOOKUPS: usize = 8 << 20;
-/// What the first refresh takes above the segment bytes it keeps, measured at 9.9 MiB with 8 MiB batches; over before
-/// the first pass is admitted, and under the grant of one pass at either cap.
-const REFRESH: usize = 12 << 20;
+/// Batches one refresh part holds: a part ends at the batch that brings it to `durable::start::PART` items (Q-1107).
+const PART_BATCHES: usize = (1usize << 16).div_ceil(PER_BATCH as usize);
+/// A batch's rows as a refresh part holds them: each text's 255 bytes and its 64-byte item.
+const ROWS: usize = PER_BATCH as usize * (255 + 64);
+/// What the first refresh takes above the segment bytes it keeps and one part's rows: one batch's scan and the latest
+/// values' fold, measured at 2.0 MiB.
+const SCAN: usize = 3 << 20;
+/// What the first refresh takes above the segment bytes it keeps; over before the first pass is admitted (Q-1069).
+const REFRESH: usize = SCAN + PART_BATCHES * ROWS;
 
 /// The grant one pass takes alone at `cap` (Q-1063): the cap less the cache's share, all of it under two least
 /// grants of 17 MiB, else half.
@@ -67,6 +77,13 @@ fn facts_and_at_allocate_within_the_memory_cap() {
         block_on(s.emit(&readings)).unwrap();
     }
     block_on(s.shutdown()).unwrap();
+    // No series directory: the first refresh folds the log from its start, a whole part, whatever the directory
+    // written at the seal had reached (Q-1107).
+    for (family, _, p) in kvik_log::directory::list(&*w.fs, Path::new(&w.dir)).unwrap() {
+        if family == Family::Series {
+            w.fs.remove_file(&p).unwrap();
+        }
+    }
     // The log reader keeps the bytes of the last segment it read between refreshes, so that a refresh reads only
     // what is new: here the sealed segment holding the four batches; the open ones after it are preallocated.
     let followed = w
@@ -80,7 +97,6 @@ fn facts_and_at_allocate_within_the_memory_cap() {
     let last = Timestamp(first + (PER_BATCH * BATCHES - 1) * 1_000_000);
     for cap in [32u64 << 20, 64 << 20] {
         let grant = lone_pass(cap as usize);
-        assert!(REFRESH <= grant + OVERHEAD);
         let alone = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(cap)).unwrap();
         let refresh = peak_of(|| drop(alone.live(id).unwrap()));
         eprintln!(
@@ -105,7 +121,7 @@ fn facts_and_at_allocate_within_the_memory_cap() {
         eprintln!("first facts at {} MiB: peak {first} bytes", cap >> 20);
         // The lookups' cache fills in this call, within the cap's share: two segments' maps, a few KiB here.
         assert!(
-            first <= followed + grant + OVERHEAD,
+            first <= followed + (grant + OVERHEAD).max(REFRESH),
             "first facts at {} MiB: {first} bytes, the followed segment {followed}",
             cap >> 20
         );
