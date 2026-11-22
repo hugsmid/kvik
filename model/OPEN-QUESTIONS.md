@@ -160,6 +160,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1102 | §3 Order of a start step 4, §11 Health; Q-940 | A start's lost range across two recorded losses (ruled by the owner) |
 | Q-1103 | query design §1 Memory; Q-1069 | The first call's memory bound and the refresh within it (decided by the lead) |
 | Q-1104 | §11 Health; Q-1002, Q-1071 | A series directory the store wrote over damage no start has met (decided by the lead) |
+| Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4520,6 +4521,26 @@ each pauses past the seal interval before the clean stop and repeats until an at
 attempt must pass), `kvik/src/durable/read/latest/histories.rs`
 `only_a_directory_the_store_wrote_counts_as_the_store_s_own`, and `latest_values_equal_the_models_at_every_check`,
 whose histories must never skip.
+
+## Q-1107 — The first refresh's bound and the series directory written at the seal
+Decided by the lead (a technical decision on a test: no engine or promise changes).
+**Scenario.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap` failed in most runs on a busy
+host: the first refresh measured 33,000,184 bytes against the followed segment (14,300,808) plus Q-1103's 12 MiB. When
+the segment holding the four batches seals, the store writes its series directory through what the deliverer has
+taken by then, which depends on thread timing: seen through the second batch and through the third. A reader continues
+it, so its first refresh folds only the batches above it, each held within a part as 8,294,704 bytes of rows. Q-1069's
+9.9 MiB was measured over a directory through the third; one batch fewer covered is one batch more held, the failure.
+No cap is exceeded: the cap does not count the refresh (`api.md` Reader, Q-1069), which is over before the first pass
+is admitted.
+**Decided.** The test removes the series directory after the clean shutdown, so every reader's first refresh folds the
+log from its start. A refresh holds one part's batches at a time (`take` in `kvik/src/durable/reader.rs`), and a part
+ends at the batch that brings it to `durable::start::PART` (65,536) items: three batches of 26,000 here. The refresh
+is bounded by the followed segment plus three batches' rows (each text's 255 bytes and its 64-byte item) plus 3 MiB for
+one batch's scan and the fold: measured 26,981,000 bytes above the segment in every run (2,096,888 plus three times
+8,294,704). That allowance is above one pass's grant with its overhead, so the first `facts` call is again bounded by
+the followed segment plus the larger of the two (Q-1103's form before it). With `PART` doubled the part holds all four
+batches and the refresh assertion fails; with the cap doubled or ignored the first `facts` assertion fails.
+**Pinned by.** `kvik/tests/query_memory.rs` `facts_and_at_allocate_within_the_memory_cap`.
 
 ## Open at v0.2
 
