@@ -40,9 +40,10 @@ fn share(r: &IndexRecord, from: i64, to: i64) -> f64 {
 
 impl LogReader {
     /// About how many facts a lookup of `wanted` would find in the segments the last lookup listed, from the sealed
-    /// segments' indexes and the tallies of the segments lookups mapped (segments listed since, and facts appended
-    /// since a map's last scan, are not counted); `None` before a lookup has listed them, or when a listed segment has
-    /// neither. A guide for sizing lookups, never a bound.
+    /// segments' indexes and the tallies of the segments lookups mapped. Segments listed since, and facts appended
+    /// since a map's last scan, are not counted; facts voided since, or after a batch that failed to decode, still
+    /// are. `None` before a lookup has listed them, or when a listed segment has neither. A guide for sizing lookups,
+    /// never a bound.
     pub fn estimate(&self, wanted: &[Wanted]) -> Option<u64> {
         let listed = self.caches.listed.as_ref()?;
         let mut n = 0.0;
@@ -59,5 +60,17 @@ impl LogReader {
             }
         }
         Some(n.ceil() as u64)
+    }
+
+    /// The greatest `t` of `series_id` in the sealed segments whose indexes this reader holds.
+    #[cfg(test)]
+    pub(in crate::reader) fn sealed_max_t(&self, series_id: u32) -> Option<i64> {
+        self.caches
+            .index
+            .values()
+            .filter_map(|c| c.value.as_ref())
+            .filter_map(|records| records.iter().find(|r| r.series_id == series_id))
+            .map(|r| r.max_t)
+            .max()
     }
 }
