@@ -4865,7 +4865,11 @@ of which polled, found nothing and waited again: wakes grew as consumers times d
 **Decision (provisional).** An acknowledged `emit` notes the clocks at its acknowledgement and returns; the
 `kvik-deliver` thread, woken by the writer's turn, or the next call that takes batches, reads the batch back and
 takes it as of the earliest acknowledgement inside it (never before an instant already taken as of), so what
-consumers receive, conditions included, is what they received when the emit read it back itself. A consumer's
+consumers receive, conditions included, is what they received when the emit read it back itself. Every call on the
+deliverer keeps the acknowledgements noted before it, whether or not it takes batches. The `kvik-deliver` thread can
+take a batch a moment before its emitter notes the acknowledgement, which then has nothing left to time: "as of its
+acknowledgement" means as of the acknowledgement or the deliverer's read of the clocks, whichever came first (with a
+manual clock the same instant). A consumer's
 waiting poll is woken only when something it may take changed for it: a fact queued or a catch-up running, a
 condition transition, a resync, an entry in a batch (any consumer), or its own confirmation. Consequences: (a) the
 Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with consumers registered too; (b) an
@@ -4874,7 +4878,8 @@ Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with co
 each consumer's file is still synced up to once a second.
 **Pinned by.** `kvik/src/durable/registering.rs`
 `with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it`,
-`a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement`; the consumer
+`a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement`,
+`an_acknowledgement_noted_before_a_call_that_does_not_take_batches_still_times_its_batch`; the consumer
 properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
 ## Open at v0.2

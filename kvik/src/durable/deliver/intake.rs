@@ -60,13 +60,17 @@ impl Deliverer {
             .count() as u64
     }
 
+    /// Keeps the instants of acknowledgements noted since the last call ([`super::hub::Hub::acked`]).
+    pub(crate) fn note_acked(&mut self, acked: Vec<(LogPos, Stamp)>) {
+        // An acknowledgement noted after its batch was taken has nothing left to time (Q-1119).
+        for (p, s) in acked.into_iter().filter(|(p, _)| *p > self.head) {
+            let e = self.stamps.entry(p).or_insert(s);
+            *e = (*e).min(s);
+        }
+    }
+
     /// Takes the batches read that are acknowledged.
     pub(super) fn take_pending(&mut self, ctx: &Ctx<'_>) {
-        // An acknowledgement noted after its batch was taken has nothing left to time.
-        for (p, s) in ctx.acked.iter().filter(|(p, _)| *p > self.head) {
-            let e = self.stamps.entry(*p).or_insert(*s);
-            *e = (*e).min(*s);
-        }
         let stats = ctx.watch.map(Watch::stats);
         let mut read: HashMap<
             crate::durable::history::Key,
@@ -100,7 +104,6 @@ impl Deliverer {
                 now: at.now,
                 wall: at.wall,
                 mono: at.mono,
-                acked: Vec::new(),
                 ..*ctx
             };
             self.take_batch(b, &c, &mut read);

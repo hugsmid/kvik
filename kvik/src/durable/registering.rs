@@ -245,3 +245,23 @@ fn a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement() 
     drop(held);
     w.shutdown().unwrap();
 }
+
+#[test]
+fn an_acknowledgement_noted_before_a_call_that_does_not_take_batches_still_times_its_batch() {
+    let (w, id, dir, t, clock) = open_clock("stats-between");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &Funnel::facts(Select::All)).unwrap();
+    let held = Hold::new(&dir, Point::DeliverThread);
+    let p = emit(&w, id, t, 0);
+    let acked = w.clocks.now();
+    let _ = w.consumer_stats("c");
+    clock.advance(Duration::from_secs(60));
+    let stamped = w.hub.clone().unwrap().run_quiet(|d, c| {
+        d.pump(c);
+        d.stamped()
+    });
+    assert!(taken(&w) >= p.sequence);
+    assert_eq!(stamped.now, acked);
+    drop(held);
+    w.shutdown().unwrap();
+}
