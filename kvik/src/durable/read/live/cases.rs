@@ -320,7 +320,11 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next_with_the_fan_out_t
     let s = w.open();
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     let r = s.reader();
-    let (mut session, _, _, mut held) = watched(&r, LiveOptions::default());
+    // A `Tail` alone: no `Latest` falls due to end the wait without a ring.
+    let mut session = r.session();
+    session.open(tail_all(), LiveOptions::default()).unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    apply(&mut held, &session.next(Duration::ZERO).unwrap().unwrap());
     let sealed = |text: &[u8]| {
         for _ in 0..500 {
             if w.segments().iter().any(|(p, b)| {
