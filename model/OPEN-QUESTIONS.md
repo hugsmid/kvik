@@ -170,6 +170,15 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1117 | `format.md` A.18 Writing; Q-1116 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
 | Q-1118 | query design §3.6; `api.md` Live reads; Q-1013, Q-1015 | Selective fan-out of live sessions: what a session passed over no longer counts (decided by the lead, provisional) |
 | Q-1119 | §4 Delivery; `api.md` Consuming; Q-706 | Consumer deliveries taken off the emit's path, and wakes per consumer (decided by the lead, provisional) |
+| Q-1140 | §6 Gates; `api.md` Gates (proposal) | Gates beside today's condition funnels, and what the model leaves to later steps (decided by the lead, provisional) |
+| Q-1141 | §6 Gates | When a gate's input has no value (decided by the lead, provisional) |
+| Q-1142 | §6 Gates; `api.md` Gates (proposal) | A transition's identity names the instance's series, not an instance number (decided by the lead, provisional) |
+| Q-1143 | §6 Gates | An `Each` past its 256 instances (decided by the lead, provisional) |
+| Q-1144 | §6 Gates | A timer due at an entry's commit time (decided by the lead, provisional) |
+| Q-1145 | §6 Gates | A gate's state when it starts (decided by the lead, provisional) |
+| Q-1146 | §6 Gates | Holds across `Unknown` and `Stale` (decided by the lead, provisional) |
+| Q-1147 | §6 Gates, Windows | Window inputs in the model: sampling and the reading at `now` (decided by the lead, provisional) |
+| Q-1148 | §6 Gates; §4 Future facts, Outranked facts; Q-16 | What counts as an arrival for a gate's staleness (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4903,6 +4912,101 @@ registered too.
 consumer
 properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
+## Q-1140 — Gates beside today's condition funnels, and what the model leaves to later steps
+Decided by the lead with the gates model (conditions step 1), provisional.
+**Scenario.** Gates (spec §6 Gates) are specified and judged by the model's `gate` module, but no backend delivers
+them yet, and today's condition funnels (§6 Conditions) keep their rules, identities `(funnel, sequence)` and
+resume. A reset point or lost range met during a gate's replay, correction notices for superseded cause facts,
+provisional evaluation and calendar windows are in the design but not in this step.
+**Decision (provisional).** The model is the definition of gates until the durable engine (conditions step 2)
+compares itself with it. Losses during a replay: the consumer forgets transition ids whose `at` is above the reset
+point's `forget_above`, as it forgets positions, and the instance's state is rebuilt from the view now; recorded
+here, specified and modelled with exact resume in the durable backend (conditions step 4). Corrections, provisional
+evaluation and calendar windows follow their own steps (7, 8, 5).
+**Pinned by.** Nothing yet: the `gate` module has no reset point in its histories.
+
+## Q-1141 — When a gate's input has no value
+Decided by the lead with the gates model, provisional.
+**Scenario.** A gate is watched on a series with no live-state fact yet; a Levels gate meets a code; a window holds
+no reading its aggregate can use (min, max, sum and count over an empty window, spec §6 Aggregates), or covers less
+than `min_coverage` of its width.
+**Options.** (a) `Unknown`, its own state, as a restore's unknown (§6 Conditions); (b) the lowest level or no match;
+(c) `Stale`.
+**Decision (provisional).** (a): a hub combining gates must not read "no data" as "low"; `Stale` stays for silence
+after readings, which is what the owner asked it to mean. Pending holds break (Q-1146).
+**Pinned by.** `tests/gates.rs` `unknown_until_the_first_reading`,
+`a_window_below_its_min_coverage_is_unknown_and_known_once_covered`.
+
+## Q-1142 — A transition's identity names the instance's series, not an instance number
+Decided by the lead with the gates model, provisional.
+**Scenario.** The design gave `TransitionId` an `instance: u16`. Under `Each`, instance numbers depend on the order
+series joined, so a series that leaves and joins again, or a definition committed in a different order, renumbers
+instances, and an id must be a function of the log alone.
+**Decision (provisional).** `TransitionId = (at, due, condition, series)`: the series id is stable for the series'
+life and is the same for a single-series gate's one instance. Four more bytes per id.
+**Pinned by.** `tests/gate_properties.rs` `judging_a_prefix_gives_the_same_transitions_as_the_whole_history_up_to_its_horizon`.
+
+## Q-1143 — An `Each` past its 256 instances
+Decided by the lead with the gates model, provisional.
+**Scenario.** A pattern matches a 257th series.
+**Decision (provisional).** The series is refused, not instantiated, and counted once (`instances_refused`) each
+time it starts to match while the gate is full; it joins at the first definition entry or watch that finds room,
+including one where another series leaves. Refusing the watch would make a running gate fail when an unrelated
+series is defined.
+**Pinned by.** `tests/gates.rs` `each_takes_at_most_its_instance_limit_and_counts_the_series_refused`.
+
+## Q-1144 — A timer due at an entry's commit time
+Decided by the lead with the gates model, provisional.
+**Scenario.** A hold completes at 6 s and a fact that breaks it commits at 6 s.
+**Options.** (a) Timers due at or before an entry's commit time are judged first; (b) the entry first.
+**Decision (provisional).** (a): the value held for the whole hold, `[since, since + hold]` closed at its end as the
+staleness limit is (a gate is `Stale` once silent for `stale_after`, not longer), and the timer's id then names the
+last position before the entry, so it does not depend on what the entry holds.
+**Pinned by.** `tests/gates.rs` `a_timer_due_at_an_entrys_commit_time_fires_before_that_entry`.
+
+## Q-1145 — A gate's state when it starts
+Decided by the lead with the gates model, provisional.
+**Scenario.** A Levels gate with `hold_up` 5 min is watched (or its series joins an `Each`) while the value has been
+above its level for an hour.
+**Options.** (a) Boundaries start uncrossed and holds count from the start, so the state at the watch is the lower
+side and rises after the hold; (b) judge the holds over the facts before the start (the history is in the store).
+**Decision (provisional).** (a): it is the conservative reading of a hold (nothing is claimed for time before the
+gate existed), it needs no history scan at a watch, and it matches today's rule that a threshold resumes on its
+lower side between its levels (§6 Restart and resume). A hub that needs (b) can read the window itself.
+**Pinned by.** `tests/gates.rs` `a_hold_counts_from_the_watch_not_from_before_it`,
+`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now`.
+
+## Q-1146 — Holds across `Unknown` and `Stale`
+Decided by the lead with the gates model, provisional.
+**Scenario.** A hold is pending when the series falls stale (or a window drops below its coverage); readings
+return with the same value.
+**Decision (provisional).** Entering `Unknown` or `Stale` breaks every pending hold, which starts again at the
+first evaluation with a value; crossings already made are kept, so hysteresis continues from the last known level
+and the transition out of `Stale` goes to the level the value gives from there.
+**Pinned by.** `tests/gates.rs` `stale_breaks_a_pending_hold_which_starts_again_after_the_arrival`,
+`stale_after_silence_on_a_timer_and_left_at_the_next_arrival`.
+
+## Q-1147 — Window inputs in the model: sampling and the reading at `now`
+Decided by the lead with the gates model, provisional.
+**Scenario.** A window `[now − w, now)` is evaluated as a fact commits at `now` with `t = now`.
+**Decision (provisional).** The window is the §6 window evaluated at the instant (`oracle::window`), so a reading
+at `now` is outside it until the next evaluation; windows are sampled on each fact of their series and on ticks at
+whole multiples of the cadence (default 1 s) on the commit clock. A time-weighted aggregate between ticks is not
+judged. Calendar windows and their boundary timers come with the window step on the live-bucket module.
+**Pinned by.** `tests/gates.rs`
+`a_window_sum_rises_on_the_tick_its_readings_enter_and_falls_on_the_tick_they_leave`.
+
+## Q-1148 — What counts as an arrival for a gate's staleness
+Decided by the lead with the gates model, provisional.
+**Scenario.** A bad-quality reading, an outranked one, and a future one arrive while a gate's series is quiet.
+**Decision (provisional).** An arrival is a fact not outranked at commit (§4 Outranked facts), at its commit time,
+or for a future fact at its `t` (§4 Future facts: ignored by staleness until `t ≤ now`). A bad-quality fact is an
+arrival but does not change the value (live state excludes it, §2.3). This follows Q-16's reading of live
+staleness for gates only; today's stale-for conditions are unchanged.
+**Pinned by.** `tests/gates.rs` `a_bad_quality_fact_refreshes_staleness_but_not_the_value`,
+`an_outranked_fact_neither_moves_the_value_nor_refreshes_staleness`,
+`a_future_fact_refreshes_staleness_only_once_it_takes_effect`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -4916,7 +5020,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -5108,6 +5212,15 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1117 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
 | Q-1118 | 9.0d | Decided by the lead, provisional: sessions passed over rounds they select nothing of; those rounds no longer count to their backlog; a waiting session is polled; losses found elsewhere within a second; a read reaches anything from its `open` until answered; the lead accepted fewer `Lagged`, the 1 s loss reach and an error gone by a session's turn not being returned |
 | Q-1119 | 5.2 | Decided by the lead, provisional: an emit leaves its batch to the `kvik-deliver` thread, taken as of its acknowledgement; wakes per consumer; Q-706's counts may lag with consumers too; the lead accepted that the backends differ on when a consumer is woken after `emit` (`api.md` Consuming) |
+| Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
+| Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |
+| Q-1142 | conditions step 3 | Decided by the lead, provisional: ids name the series; for review with the public API |
+| Q-1143 | conditions step 6 | Decided by the lead, provisional: refused and counted, joining when there is room |
+| Q-1144 | conditions step 2 | Decided by the lead, provisional: timers first; the engine is compared with the model on it |
+| Q-1145 | conditions step 3 | Decided by the lead, provisional: boundaries start uncrossed; for review with the public API |
+| Q-1146 | conditions step 2 | Decided by the lead, provisional: `Unknown` and `Stale` break holds, crossings kept |
+| Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
+| Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
