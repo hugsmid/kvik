@@ -72,7 +72,7 @@ fn publish(s: &Shared, w: &mut LogWriter) {
         i.progress += 1;
         i.sealed.extend(w.take_sealed());
     }
-    s.progress_cv.notify_all();
+    s.progressed();
     let mut f = lock(&s.front);
     f.read_only = w.fault().is_some();
     f.waiting = w.waiting();
@@ -100,7 +100,7 @@ impl Drop for PanicGuard<'_> {
             i.fault = s.halt.fault();
             i.stopped = true;
         }
-        s.progress_cv.notify_all();
+        s.progressed();
         let slots: Vec<_> = {
             let mut f = lock(&s.front);
             f.read_only = true;
@@ -197,7 +197,7 @@ pub(super) fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, L
     let r = w.shutdown(s.clock.monotonic());
     publish(s, &mut w);
     lock(&s.info).stopped = true;
-    s.progress_cv.notify_all();
+    s.progressed();
     (r, w)
 }
 

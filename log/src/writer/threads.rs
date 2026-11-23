@@ -3,7 +3,7 @@
 //! [`Pending`] is runtime-neutral: the writer thread completes it, and it can be awaited on any executor or blocked
 //! on.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -188,6 +188,8 @@ struct Shared {
     maint_cv: Condvar,
     info: Mutex<Info>,
     progress_cv: Condvar,
+    /// Woken with `progress_cv`, by id ([`Watch::on_progress`]).
+    progress_wakers: Mutex<(u64, BTreeMap<u64, Waker>)>,
     /// A shutdown has begun: no description is handed out and one in flight is dropped (Q-221 (b)).
     stopping: AtomicBool,
     halt: Arc<Halt>,
@@ -199,6 +201,14 @@ struct Shared {
 }
 
 impl Shared {
+    /// Wakes the progress waiters and wakers once `info` names the new turn.
+    fn progressed(&self) {
+        self.progress_cv.notify_all();
+        for w in lock(&self.progress_wakers).1.values() {
+            w.wake_by_ref();
+        }
+    }
+
     fn wake_writer(&self) {
         lock(&self.front).wake = true;
         self.writer_cv.notify_one();
@@ -260,6 +270,22 @@ impl Watch {
     /// Whether the writer thread has ended.
     pub fn stopped(&self) -> bool {
         lock(&self.shared.info).stopped
+    }
+
+    /// Wakes `waker` at every turn the writer publishes and when it stops, until [`Watch::off_progress`] with the id
+    /// returned: one thread can then wake whom a turn concerns, rather than every waiter waking on the condition
+    /// variable.
+    pub fn on_progress(&self, waker: Waker) -> u64 {
+        let mut w = lock(&self.shared.progress_wakers);
+        w.0 += 1;
+        let id = w.0;
+        w.1.insert(id, waker);
+        id
+    }
+
+    /// Stops waking the waker registered as `id`.
+    pub fn off_progress(&self, id: u64) {
+        lock(&self.shared.progress_wakers).1.remove(&id);
     }
 
     /// As [`Log::stats`].
@@ -413,6 +439,7 @@ impl Log {
                 sealed: Vec::new(),
             }),
             progress_cv: Condvar::new(),
+            progress_wakers: Mutex::new((0, BTreeMap::new())),
             stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),

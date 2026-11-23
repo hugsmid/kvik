@@ -543,3 +543,35 @@ fn a_mark_sync_on_request_and_progress_for_watchers() {
     assert_eq!(log.stats().mark_synced, ack.last);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn a_progress_waker_is_woken_at_each_published_turn_and_at_the_stop_until_taken_off() {
+    struct Count(std::sync::atomic::AtomicU64);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let log = start(fs, Path::new("store"), cfg());
+    let watch = log.watch();
+    let on = Arc::new(Count(Default::default()));
+    let off = Arc::new(Count(Default::default()));
+    watch.on_progress(Waker::from(on.clone()));
+    let gone = watch.on_progress(Waker::from(off.clone()));
+    watch.off_progress(gone);
+    let woken = || on.0.load(Ordering::SeqCst);
+    let seen = log.wait_progress(0, Duration::ZERO);
+    let before = woken();
+    log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    assert!(log.wait_progress(seen, Duration::from_secs(5)) > seen);
+    assert!(woken() > before);
+    let before = woken();
+    log.shutdown().unwrap();
+    assert!(watch.stopped());
+    assert!(woken() > before);
+    assert_eq!(off.0.load(Ordering::SeqCst), 0);
+}
