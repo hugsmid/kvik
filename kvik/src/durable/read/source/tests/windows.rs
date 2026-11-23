@@ -304,7 +304,6 @@ fn windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_ev
         failure_persistence: None,
         ..ProptestConfig::default()
     });
-    let _chunks = ChunkOverride::set(3);
     let log = LogConfig {
         seal_interval: Duration::from_millis(20),
         ..LogConfig::default()
@@ -312,8 +311,13 @@ fn windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_ev
     let compared = std::cell::Cell::new(0);
     runner
         .run(
-            &(acts(), prop::sample::select(vec![6u64, 24])),
-            |(history, small)| {
+            &(
+                acts(),
+                prop::sample::select(vec![6u64, 24]),
+                prop::sample::select(vec![1usize, 2, 3]),
+            ),
+            |(history, small, chunk)| {
+                let _chunks = ChunkOverride::set(chunk);
                 let mut rig = Rig::with_log("windows", log.clone());
                 for spec in extra_specs() {
                     let store = rig.store.as_ref().expect("an open store");

@@ -10,9 +10,9 @@ use common::{at, block_on, start};
 use kvik::env::{Env, ManualClock, MemFs};
 use kvik::{
     Aggregate, Backend, CalendarPeriod, CalendarWindow, ChangedAtKind, ChartData, CounterRules,
-    Intent, IntervalLength, Kind, Live, LocalDate, LogConfig, Position, Quality, Reader,
-    ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues, Store, StoreConfig,
-    Timestamp, Timing, Value, ValueType, Window, ZoneName,
+    Intent, IntervalLength, Kind, Live, LocalDate, LogConfig, Position, Quality, QueryError,
+    Reader, ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues, Store,
+    StoreConfig, Timestamp, Timing, Value, ValueType, Window, ZoneName,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -728,24 +728,32 @@ fn many_series_calls_equal_one_call_per_series_and_the_model() {
             )
             .is_err()
         );
-        // Of several unknown ids the call fails as the least one fails alone, whatever order they come in.
+        // Of several failing ids the call fails as the least id fails alone, whatever order they come in. Two
+        // unknown ids fail alike; an unknown id after a series that fails on its own does not decide the error.
         let (low, high) = (SeriesId(9_998), SeriesId(9_999));
         let res = Resolution::Auto { max_points: 3 };
-        let alone = format!("{:?}", r.buckets(low, range.clone(), res).unwrap_err());
-        let w = Window::rolling(Duration::from_secs(100));
-        let alone_window = format!(
-            "{:?}",
-            r.window(low, w.clone(), Aggregate::Last).unwrap_err()
-        );
         let view = kvik::View::Current;
-        let alone_facts = format!("{:?}", r.facts(low, range.clone(), view).err().unwrap());
-        for ids in [[g, high, low], [low, g, high], [high, low, g]] {
+        let unknown = format!("{:?}", QueryError::UnknownSeries);
+        for ids in [[high, low], [low, high]] {
             let got = r.buckets_of(&ids, range.clone(), res).unwrap_err();
-            assert_eq!(format!("{got:?}"), alone, "{backend:?} {ids:?}");
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
             let got = r.window_of(&ids, w.clone(), Aggregate::Last).unwrap_err();
-            assert_eq!(format!("{got:?}"), alone_window, "{backend:?} {ids:?}");
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
             let got = r.facts_of(&ids, range.clone(), view).err().unwrap();
-            assert_eq!(format!("{got:?}"), alone_facts, "{backend:?} {ids:?}");
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
+        }
+        let inverted = at(130)..at(-20);
+        let alone = format!("{:?}", r.buckets(g, inverted.clone(), res).unwrap_err());
+        assert_ne!(alone, unknown, "{backend:?}");
+        let alone_window = format!("{:?}", r.window(i, w.clone(), Aggregate::Avg).unwrap_err());
+        assert_ne!(alone_window, unknown, "{backend:?}");
+        for ids in [[high, g], [g, high]] {
+            let got = r.buckets_of(&ids, inverted.clone(), res).unwrap_err();
+            assert_eq!(format!("{got:?}"), alone, "{backend:?} {ids:?}");
+        }
+        for ids in [[high, i], [i, high]] {
+            let got = r.window_of(&ids, w.clone(), Aggregate::Avg).unwrap_err();
+            assert_eq!(format!("{got:?}"), alone_window, "{backend:?} {ids:?}");
         }
         block_on(s.shutdown()).unwrap();
         shown.push(out);
