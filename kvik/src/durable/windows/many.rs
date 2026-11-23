@@ -129,7 +129,7 @@ impl Member<'_> {
 }
 
 /// The distinct series of `ids`, ascending, and where each id's result is among them.
-fn distinct(ids: &[SeriesId]) -> (Vec<SeriesId>, Vec<usize>) {
+pub(crate) fn distinct(ids: &[SeriesId]) -> (Vec<SeriesId>, Vec<usize>) {
     let mut set = ids.to_vec();
     set.sort_unstable();
     set.dedup();
@@ -158,19 +158,16 @@ fn members<'a>(
     let mut lasts = vec![None; series.len()];
     if !wanted.is_empty() {
         let plan = plan(r, v, &wanted, ReadView::Current)?;
-        let states = |id: SeriesId| {
+        // `series` is in ascending id order, as `distinct` gives it.
+        let at = |id: u32| {
             series
-                .iter()
-                .find(|(s, _)| s.def.id == id.0)
-                .map_or(0, |(s, _)| s.def.state_names.len())
+                .binary_search_by_key(&id, |(s, _)| s.def.id)
+                .expect("a series asked for")
         };
+        let states = |id: SeriesId| series[at(id.0)].0.def.state_names.len();
         let found = search_back_each(r, v, &plan, from - 1, &|f| readable(states(f.series), f))?;
         for ((id, _), f) in plan.series.iter().zip(found) {
-            let k = series
-                .iter()
-                .position(|(s, _)| s.def.id == *id)
-                .expect("a series asked for");
-            lasts[k] = f.and_then(|f| reading(states(SeriesId(*id)), f));
+            lasts[at(*id)] = f.and_then(|f| reading(states(SeriesId(*id)), f));
         }
     }
     Ok(series

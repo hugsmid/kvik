@@ -84,7 +84,7 @@ pub(crate) use read::latest::{fact_count as fact_count_at, live as live_at, seri
 pub(crate) use read::view::View as SnapshotView;
 pub(crate) use reader::DurableReader;
 pub(crate) use reader::{copy as copy_error, losses_of as losses_at};
-pub(crate) use windows::{buckets, buckets_of, live, window, window_of};
+pub(crate) use windows::{buckets, buckets_of, distinct, live, window, window_of};
 
 /// The most readings in one call, whatever the ingest queue (`docs/api.md` Writing).
 const CALL_READINGS: usize = 65_536;

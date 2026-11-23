@@ -19,6 +19,39 @@ use crate::types::{Fact, Quality, Value};
 /// fold exactly (spec §5.3, invariant 6), so the core needs no more than this many at once.
 pub(super) const CHUNK: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn chunk_size() -> usize {
+    #[cfg(test)]
+    if let Some(n) = CHUNK_OVERRIDE.with(std::cell::Cell::get) {
+        return n;
+    }
+    CHUNK
+}
+
+/// Sets, for this thread until dropped, the readings every new [`Core`] folds at a time, so that tests cross chunk
+/// boundaries with few readings.
+#[cfg(test)]
+pub(crate) struct ChunkOverride;
+
+#[cfg(test)]
+impl ChunkOverride {
+    pub(crate) fn set(chunk: usize) -> Self {
+        CHUNK_OVERRIDE.with(|c| c.set(Some(chunk.max(1))));
+        ChunkOverride
+    }
+}
+
+#[cfg(test)]
+impl Drop for ChunkOverride {
+    fn drop(&mut self) {
+        CHUNK_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
 /// Whether a current fact gives a summarised reading, as [`super::has_reading`] judges a stored one: not of bad
 /// supplied quality, and a value of a summarised type, a state index among the series' `states` declared names.
 pub(super) fn readable(states: usize, f: &Fact) -> bool {
@@ -110,7 +143,7 @@ impl Core {
         Core {
             np: fold::node_params(&p),
             now,
-            chunk: CHUNK,
+            chunk: chunk_size(),
             last,
             reaching: VecDeque::new(),
             held_most: 0,

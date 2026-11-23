@@ -78,6 +78,18 @@ impl Reader {
         }
     }
 
+    /// As [`Reader::on`], with the durable reader's handle.
+    fn on_arc<R>(
+        &self,
+        model: impl FnOnce(&Shared) -> Result<R, QueryError>,
+        durable: impl FnOnce(Arc<DurableReader>) -> Result<R, QueryError>,
+    ) -> Result<R, QueryError> {
+        match &self.inner {
+            ReaderInner::Model(s) => model(s),
+            _ => durable(self.durable().expect("a durable reader")?),
+        }
+    }
+
     /// The store's id (`format.md` A.1), as read at open: no file is read and
     /// the lease is not renewed. The model backend draws one when the
     /// store is created, from the environment's entropy.
@@ -109,13 +121,14 @@ impl Reader {
     /// Static reads at one cut: live state, series and losses as of one durable position, with `now` taken once
     /// (`docs/api.md` Snapshot).
     pub fn snapshot(&self) -> Result<Snapshot, QueryError> {
-        match &self.inner {
-            ReaderInner::Model(s) => s
-                .with(|s| s.snapshot())
-                .map(Snapshot::model)
-                .map_err(|e| e.query()),
-            _ => Snapshot::durable(self.durable().expect("a durable reader")?),
-        }
+        self.on_arc(
+            |s| {
+                s.with(|s| s.snapshot())
+                    .map(Snapshot::model)
+                    .map_err(|e| e.query())
+            },
+            Snapshot::durable,
+        )
     }
 
     /// A session of live reads with the default pacing (`docs/api.md` Live reads).
@@ -143,17 +156,13 @@ impl Reader {
         window: Window,
         aggregate: Aggregate,
     ) -> Result<WindowResult, QueryError> {
-        match &self.inner {
-            ReaderInner::Model(s) => s
-                .with(|s| s.window(id, &window, &aggregate))
-                .map_err(|e| e.query()),
-            _ => durable::window(
-                &self.durable().expect("a durable reader")?,
-                id,
-                &window,
-                &aggregate,
-            ),
-        }
+        self.on_arc(
+            |s| {
+                s.with(|s| s.window(id, &window, &aggregate))
+                    .map_err(|e| e.query())
+            },
+            |r| durable::window(&r, id, &window, &aggregate),
+        )
     }
 
     /// A chart query: raw facts or buckets with count, min, max, mean and
@@ -165,17 +174,13 @@ impl Reader {
         resolution: Resolution,
     ) -> Result<ChartData, QueryError> {
         let range = range.into();
-        match &self.inner {
-            ReaderInner::Model(s) => s
-                .with(|s| s.buckets(id, range, resolution))
-                .map_err(|e| e.query()),
-            _ => durable::buckets(
-                &self.durable().expect("a durable reader")?,
-                id,
-                range,
-                resolution,
-            ),
-        }
+        self.on_arc(
+            |s| {
+                s.with(|s| s.buckets(id, range, resolution))
+                    .map_err(|e| e.query())
+            },
+            |r| durable::buckets(&r, id, range, resolution),
+        )
     }
 
     /// Facts with `t` in a range, in a view (spec §2.3).
@@ -186,10 +191,10 @@ impl Reader {
         view: View,
     ) -> Result<Facts, QueryError> {
         let range = range.into();
-        match &self.inner {
-            ReaderInner::Model(s) => s.with(|s| s.facts(id, range, view)).map_err(|e| e.query()),
-            _ => durable::facts(self.durable().expect("a durable reader")?, id, range, view),
-        }
+        self.on_arc(
+            |s| s.with(|s| s.facts(id, range, view)).map_err(|e| e.query()),
+            |r| durable::facts(r, id, range, view),
+        )
     }
 
     /// Facts of several series with `t` in a range, in a view, streamed in
@@ -202,28 +207,27 @@ impl Reader {
         view: View,
     ) -> Result<Facts, QueryError> {
         let range = range.into();
-        match &self.inner {
-            ReaderInner::Model(s) => s
-                .with(|s| {
-                    let mut set = ids.to_vec();
-                    set.sort_unstable();
-                    set.dedup();
-                    let mut all = Vec::new();
-                    for id in set {
-                        all.extend(s.facts(id, range, view)?.map(|f| f.expect("held facts")));
+        self.on_arc(
+            |s| {
+                let (set, _) = durable::distinct(ids);
+                let held = s
+                    .with(|s| {
+                        set.iter()
+                            .map(|id| s.facts(*id, range, view))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map_err(|e| e.query())?;
+                let mut all = Vec::new();
+                for facts in held {
+                    for f in facts {
+                        all.push(f?);
                     }
-                    all.sort_by_key(|f| (f.t, f.series, f.position));
-                    Ok(Facts::new(all))
-                })
-                .map_err(|e: crate::backend::Error| e.query()),
-            _ => crate::durable::facts_of(
-                self.durable().expect("a durable reader")?,
-                ids,
-                range,
-                view,
-            )
-            .map(Facts::stream),
-        }
+                }
+                all.sort_by_key(|f| (f.t, f.series, f.position));
+                Ok(Facts::new(all))
+            },
+            |r| durable::facts_of(r, ids, range, view).map(Facts::stream),
+        )
     }
 
     /// Chart queries of several series over one range, each as
@@ -235,21 +239,20 @@ impl Reader {
         resolution: Resolution,
     ) -> Result<Vec<ChartData>, QueryError> {
         let range = range.into();
-        match &self.inner {
-            ReaderInner::Model(s) => ids
-                .iter()
-                .map(|id| {
-                    s.with(|s| s.buckets(*id, range, resolution))
-                        .map_err(|e| e.query())
-                })
-                .collect(),
-            _ => durable::buckets_of(
-                &self.durable().expect("a durable reader")?,
-                ids,
-                range,
-                resolution,
-            ),
-        }
+        self.on_arc(
+            |s| {
+                let (set, at) = durable::distinct(ids);
+                let charts = s
+                    .with(|s| {
+                        set.iter()
+                            .map(|id| s.buckets(*id, range, resolution))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map_err(|e| e.query())?;
+                Ok(at.iter().map(|&k| charts[k].clone()).collect())
+            },
+            |r| durable::buckets_of(&r, ids, range, resolution),
+        )
     }
 
     /// Window results of several series over one window, each as
@@ -260,21 +263,20 @@ impl Reader {
         window: Window,
         aggregate: Aggregate,
     ) -> Result<Vec<WindowResult>, QueryError> {
-        match &self.inner {
-            ReaderInner::Model(s) => ids
-                .iter()
-                .map(|id| {
-                    s.with(|s| s.window(*id, &window, &aggregate))
-                        .map_err(|e| e.query())
-                })
-                .collect(),
-            _ => durable::window_of(
-                &self.durable().expect("a durable reader")?,
-                ids,
-                &window,
-                &aggregate,
-            ),
-        }
+        self.on_arc(
+            |s| {
+                let (set, at) = durable::distinct(ids);
+                let results = s
+                    .with(|s| {
+                        set.iter()
+                            .map(|id| s.window(*id, &window, &aggregate))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map_err(|e| e.query())?;
+                Ok(at.iter().map(|&k| results[k].clone()).collect())
+            },
+            |r| durable::window_of(&r, ids, &window, &aggregate),
+        )
     }
 
     /// The latest fact at or before `t` that a window can credit (not bad

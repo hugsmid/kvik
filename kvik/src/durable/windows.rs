@@ -255,11 +255,13 @@ pub(crate) fn buckets(
     Ok(many::buckets_of(r, &[id], range, resolution)?.remove(0))
 }
 
-pub(crate) use many::{buckets_of, window_of};
+pub(crate) use many::{buckets_of, distinct, window_of};
 
 #[cfg(test)]
 pub(crate) mod indexed;
 mod many;
 mod stream;
+#[cfg(test)]
+pub(crate) use stream::ChunkOverride;
 #[cfg(test)]
 mod tests;

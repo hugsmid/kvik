@@ -14,7 +14,7 @@ use crate::durable::read::cache::{LEAST_MEMORY, Sizes};
 use crate::durable::read::latest::tests::{Rig, S, Step, quality, value};
 use crate::durable::reader::DurableReader;
 use crate::durable::tests::block_on;
-use crate::durable::windows::indexed;
+use crate::durable::windows::{ChunkOverride, indexed};
 use crate::error::QueryError;
 use crate::read::{
     Aggregate, CalendarPeriod, CalendarWindow, ChartData, Resolution, Window, WindowResult,
@@ -137,10 +137,11 @@ fn aggregates(i: usize) -> Vec<Aggregate> {
     a
 }
 
-fn resolutions() -> [Resolution; 4] {
+fn resolutions() -> [Resolution; 5] {
     [
         Resolution::Auto { max_points: 3 },
         Resolution::Auto { max_points: 2_000 },
+        Resolution::Step(Duration::from_secs(2)),
         Resolution::Step(Duration::from_secs(7)),
         Resolution::Step(Duration::from_secs(60)),
     ]
@@ -303,6 +304,7 @@ fn windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_ev
         failure_persistence: None,
         ..ProptestConfig::default()
     });
+    let _chunks = ChunkOverride::set(3);
     let log = LogConfig {
         seal_interval: Duration::from_millis(20),
         ..LogConfig::default()
