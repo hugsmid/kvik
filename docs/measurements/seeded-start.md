@@ -24,8 +24,8 @@ was built by the build it is opened with.
 
   | Store | Recovery before | Recovery after | Open before | Open after |
   |---|---:|---:|---:|---:|
-  | W0, 1 day | 0.34–0.37 s | 0.34–0.35 s | 0.41–0.50 s | 0.45–0.48 s |
-  | W0, 7 days | 0.51–0.56 s | 0.34–0.36 s | 0.55–0.60 s | 0.46 s |
+  | W0, 1 day | 0.34–0.37 s | 0.34–0.35 s | 0.41–0.50 s | 0.44–0.46 s |
+  | W0, 7 days | 0.51–0.56 s | 0.34–0.36 s | 0.55–0.60 s | 0.40–0.44 s |
 
   What is left is the decode of the unsealed segment (0.14–0.15 s), the read of it and of the empty segment created
   ahead (0.03 s each, the zeros checked for Q-125), and building the writer's state (about 0.09 s). Going lower needs
@@ -34,7 +34,7 @@ was built by the build it is opened with.
 - At live rates a seal every 5 minutes and a series directory every 15 keep the log after the seed short; a clean
   stop writes a directory through the mark, so the next open reads almost nothing of the log.
 - The first `latest` overlaps the damage scan of the log below the seed, which runs after the open returns. The scan
-  itself ends 2.0–2.4 s after the open at 1 day and 11.6–15.6 s after it at 7 days, so `start_scanning` reads true
+  itself ends 2.0–2.4 s after the open at 1 day and 11.6–15.6 s after it at 7 days (13.3–14.3 s at this head), so `start_scanning` reads true
   that long; it reads more slowly per byte than a start from the whole log, which read the 7-day store in 7.1–7.6 s,
   and why is not yet known (Q-1114).
 - Probe: the reopen research's probe (`probe build <dir> <days> [scale]`, `probe open <dir> [scale]`), with a
