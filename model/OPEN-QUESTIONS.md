@@ -4830,8 +4830,10 @@ the session is moved past them.
 **Decision (provisional).** In the writer's process one `kvik-fanout` thread, woken by the writer's turns and by
 refreshes of live staleness, runs one refresh round for what the writer published; each session keeps its own
 `min_batch_interval` (one rung inside it sleeps out the rest). Each session states what can give it a batch: the members of its opened `Latest`s and the series its
-opened `Tail`s select by the registry at its last batch or at the `Tail`'s position; anything while a read is not
-yet opened. A round reaches a session if it holds a fact of such a series, or anything else (an entry, a void, a gap,
+opened `Tail`s select by the registry at its last batch or at the `Tail`'s position; anything from a read's `open`
+until the batch that opens it is taken, so that a round ending between that batch's cut and its advance is never
+passed over by what the session reached before (otherwise a `Tail` could miss a fact above its `Opened` cut with
+nothing said, against Q-1011). A round reaches a session if it holds a fact of such a series, or anything else (an entry, a void, a gap,
 or more facts than the backlog keeps). A round rings the sessions it reaches and those with an earlier round still to
 take; a session that took every earlier round and is not reached passes over it, its cursor moved past without a
 turn. Consequences: (a) the backlog of Q-1013 counts the rounds a session must take, so a session whose series are
@@ -4846,7 +4848,11 @@ thread meets it. Reader processes are unchanged. Batches, their contents, order 
 `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive` (against sessions
 rung by every round, the old path kept as the oracle, and the model backend); `kvik/src/durable/read/hub.rs`
 `a_round_rings_only_the_subscribers_it_reaches_and_the_others_caught_up_pass_over_it`,
-`a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series`; `kvik/src/durable/read/live/waits.rs`
+`a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series`,
+`a_round_ending_between_an_open_and_the_batch_that_answers_it_is_not_passed_over`;
+`kvik/src/durable/read/live/fanout.rs` `a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it`;
+`kvik/src/durable/read/live/races.rs` `tails_opened_beside_a_busy_writer_hold_every_fact_above_their_opened_cut`;
+`kvik/src/durable/read/live/waits.rs`
 `a_ring_inside_the_batch_interval_is_taken_once_the_interval_passes`,
 `a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone`. Measured in
 `docs/measurements/fanout.md`.

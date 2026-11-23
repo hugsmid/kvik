@@ -109,6 +109,25 @@ pub(crate) struct Session {
     /// Rung by every round, as before Q-1118 ([`super::hub::Hub::every`]).
     #[cfg(test)]
     pub(crate) every: bool,
+    /// Run once by the next turn that computed a batch, between its view and its advance.
+    #[cfg(test)]
+    pub(crate) before_advance: Hook,
+}
+
+/// A test's action inside a turn ([`Session::before_advance`]).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Hook(pub(crate) Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Hook(armed)"
+        } else {
+            "Hook"
+        })
+    }
 }
 
 impl Drop for Session {
@@ -299,6 +318,8 @@ impl Session {
             turns: 0,
             #[cfg(test)]
             every: false,
+            #[cfg(test)]
+            before_advance: Hook::default(),
         }
     }
 
@@ -322,7 +343,7 @@ impl Session {
         };
         self.reads.insert(id, read);
         if let Some(s) = self.sub {
-            self.reader.hub().set_cap(s, self.cap());
+            self.reader.hub().open(s, self.cap());
         }
     }
 
@@ -533,6 +554,10 @@ impl Session {
         self.named = next.named;
         self.refreshes = next.refreshes;
         self.judged = mono;
+        #[cfg(test)]
+        if let Some(f) = self.before_advance.0.take() {
+            f();
+        }
         if next.idle {
             self.leave();
         } else {
@@ -688,6 +713,8 @@ mod differential;
 mod fanout;
 #[cfg(test)]
 mod lags;
+#[cfg(test)]
+mod races;
 #[cfg(test)]
 mod stops;
 #[cfg(test)]
