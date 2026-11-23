@@ -628,9 +628,7 @@ impl Deliverer {
 
     /// Notes that something consumer `name` may be waiting for changed.
     pub(super) fn changed(&mut self, name: &str) {
-        if !self.notify.contains(name) {
-            self.notify.insert(name.to_owned());
-        }
+        self.notify.insert(name.to_owned());
     }
 
     /// The handle was dropped.

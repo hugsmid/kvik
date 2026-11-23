@@ -23,6 +23,14 @@ fn open(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp) {
 }
 
 fn open_clock(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
+    open_queue(name, crate::config::Limits::default().consumer_queue)
+}
+
+/// [`open_clock`] with each consumer's queue holding `queue` deliveries.
+fn open_queue(
+    name: &str,
+    queue: usize,
+) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
     let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
     let mut env = Env::test(clock.clone());
     env.fs = Arc::new(MemFs::new());
@@ -32,10 +40,15 @@ fn open_clock(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualC
         ..LogConfig::default()
     };
     let dir = PathBuf::from(format!("durable-unit/registering/{name}"));
+    let limits = crate::config::Limits {
+        consumer_queue: queue,
+        ..crate::config::Limits::default()
+    };
     let config = StoreConfig::new(&dir, "Europe/London")
         .create_if_missing(true)
         .env(env)
-        .log(log);
+        .log(log)
+        .limits(limits);
     let w = Writer::open(&config).unwrap();
     let spec = SeriesSpec::new(
         "a/b/c",
@@ -262,6 +275,90 @@ fn an_acknowledgement_noted_before_a_call_that_does_not_take_batches_still_times
     });
     assert!(taken(&w) >= p.sequence);
     assert_eq!(stamped.now, acked);
+    drop(held);
+    w.shutdown().unwrap();
+}
+
+fn waker() -> (Arc<Woken>, Waker) {
+    let w = Arc::new(Woken::default());
+    (w.clone(), Waker::from(w))
+}
+
+#[test]
+fn a_confirm_wakes_its_own_consumer_and_not_another_waiting() {
+    let (w, id, dir, t, _) = open_queue("confirm-wakes", 1);
+    for c in ["c", "d"] {
+        w.take_consumer(c, Start::Now, &Select::None).unwrap();
+        w.route(c, &Funnel::facts(Select::All)).unwrap();
+    }
+    let held = Hold::new(&dir, Point::DeliverThread);
+    emit(&w, id, t, 0);
+    emit(&w, id, t, 1);
+    let first = w.poll_delivery("c", None).unwrap().unwrap();
+    let (c_woken, c_waker) = waker();
+    assert!(w.poll_delivery("c", Some(&c_waker)).unwrap().is_none());
+    while let Some(x) = w.poll_delivery("d", None).unwrap() {
+        w.confirm("d", x.id).unwrap();
+    }
+    let (d_woken, d_waker) = waker();
+    assert!(w.poll_delivery("d", Some(&d_waker)).unwrap().is_none());
+    w.confirm("c", first.id).unwrap();
+    assert!(c_woken.0.load(Ordering::SeqCst), "the confirm woke nobody");
+    assert!(!d_woken.0.load(Ordering::SeqCst));
+    assert!(w.poll_delivery("c", None).unwrap().is_some());
+    drop(held);
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn an_entry_wakes_a_consumer_with_nothing_queued() {
+    let (w, id, _, _) = open("entry-wakes");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &Funnel::facts(Select::Ids(vec![id]))).unwrap();
+    let (woken, waker) = waker();
+    assert!(w.poll_delivery("c", Some(&waker)).unwrap().is_none());
+    let other = SeriesSpec::new(
+        "a/b/d",
+        Kind::Gauge {
+            value: ValueType::F64,
+        },
+        "W",
+    );
+    w.define(&other).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !woken.0.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the entry woke nobody");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn a_batch_acknowledged_earlier_than_one_before_it_is_not_taken_as_of_an_earlier_instant() {
+    let (w, id, dir, t, clock) = open_clock("instants");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &Funnel::facts(Select::All)).unwrap();
+    let held = Hold::new(&dir, Point::DeliverThread);
+    emit(&w, id, t, 0);
+    let first = w.clocks.now();
+    clock.advance(Duration::from_secs(60));
+    let p = emit(&w, id, t, 1);
+    let last = kvik_log::writer::Position {
+        generation: p.generation,
+        sequence: p.sequence,
+    };
+    let early = super::deliver::Stamp {
+        now: first - 120_000_000_000,
+        wall: first - 120_000_000_000,
+        mono: 0,
+    };
+    let stamped = w.hub.clone().unwrap().run_quiet(|d, c| {
+        d.note_acked(vec![(last, early)]);
+        d.pump(c);
+        d.stamped()
+    });
+    assert!(taken(&w) >= p.sequence);
+    assert_eq!(stamped.now, first);
     drop(held);
     w.shutdown().unwrap();
 }
