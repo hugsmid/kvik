@@ -4846,7 +4846,10 @@ thread meets it. Reader processes are unchanged. Batches, their contents, order 
 `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive` (against sessions
 rung by every round, the old path kept as the oracle, and the model backend); `kvik/src/durable/read/hub.rs`
 `a_round_rings_only_the_subscribers_it_reaches_and_the_others_caught_up_pass_over_it`,
-`a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series`. Measured in `docs/measurements/fanout.md`.
+`a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series`; `kvik/src/durable/read/live/waits.rs`
+`a_ring_inside_the_batch_interval_is_taken_once_the_interval_passes`,
+`a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone`. Measured in
+`docs/measurements/fanout.md`.
 
 ## Q-1119 — Consumer deliveries taken off the emit's path, and wakes per consumer
 Decided by the lead with the fan-out change, provisional.
@@ -4864,7 +4867,8 @@ Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with co
 (c) a confirmation wakes nobody but its own consumer. One cursor-file sync per tick for all consumers is not built:
 each consumer's file is still synced up to once a second.
 **Pinned by.** `kvik/src/durable/registering.rs`
-`with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it`; the consumer
+`with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it`,
+`a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement`; the consumer
 properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
 ## Open at v0.2

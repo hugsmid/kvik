@@ -322,7 +322,7 @@ impl Session {
         };
         self.reads.insert(id, read);
         if let Some(s) = self.sub {
-            self.reader.hub().opened(s, self.cap());
+            self.reader.hub().set_cap(s, self.cap());
         }
     }
 

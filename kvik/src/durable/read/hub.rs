@@ -414,13 +414,11 @@ impl Hub {
         }
     }
 
-    /// Sets a subscriber's backlog limit, and has every round reach it until its next [`Hub::advance`]: a read just
-    /// opened takes its batch at its next turn.
-    pub(crate) fn opened(&self, sub: u64, cap: (u64, u64)) {
+    /// Sets a subscriber's backlog limit. Its reach stays until its next [`Hub::advance`]: a read just opened is
+    /// answered at the cut of the session's next batch, so a round passed over before then owes it nothing.
+    pub(crate) fn set_cap(&self, sub: u64, cap: (u64, u64)) {
         if let Some(x) = self.lock().subs.get_mut(&sub) {
             x.cap = cap;
-            x.reach = Reach::All;
-            x.fresh = Reach::All;
         }
     }
 

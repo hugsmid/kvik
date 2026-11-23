@@ -179,3 +179,80 @@ fn an_acknowledgement_after_the_batch_that_carried_its_fact_makes_latest_fresh_a
     );
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn a_ring_inside_the_batch_interval_is_taken_once_the_interval_passes() {
+    let w = World::new("ring-in-interval");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = s.reader();
+    // A `Tail` alone: no refresh of live staleness rings it a second time.
+    let mut session = r.session();
+    let t = session
+        .open(super::tests::tail_all(), LiveOptions::default())
+        .unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    apply(&mut held, &session.next(Duration::ZERO).unwrap().unwrap());
+    let rung = |s: &mut crate::LiveSession| s.durable_mut().and_then(|d| d.rung());
+    let before = rung(&mut session);
+    emit(&w, &s, id, 2.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rung(&mut session) == before {
+        assert!(
+            Instant::now() < deadline,
+            "the fan-out thread never rang the session"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(rung(&mut session), before.map(|b| b + 1));
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            w.clock.advance(TICK);
+        });
+        let started = Instant::now();
+        let b = session.next(Duration::from_secs(3)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the ring was lost inside the interval"
+        );
+        apply(&mut held, &b.unwrap());
+    });
+    assert_eq!(held[&t].tail.len(), 1);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone() {
+    use crate::durable::read::fanout;
+    let w = World::new("refresh-ring");
+    let s = w.open();
+    let g =
+        block_on(s.define_series(gauge("a/b/power").staleness(Duration::from_secs(30)))).unwrap();
+    emit(&w, &s, g, 1.0);
+    let r = s.reader();
+    let d = r.durable().unwrap().unwrap();
+    // The test runs the fan-out thread's pass itself.
+    d.fanout.store(true, std::sync::atomic::Ordering::SeqCst);
+    d.clocks().on_refresh(std::task::Waker::noop().clone());
+    let (mut latest, ..) = watched(&r, LiveOptions::default());
+    let mut tail = r.session();
+    tail.open(super::tests::tail_all(), LiveOptions::default())
+        .unwrap();
+    w.clock.advance(TICK);
+    tail.next(Duration::ZERO).unwrap();
+    for s in [&mut latest, &mut tail] {
+        w.clock.advance(TICK);
+        while s.next(Duration::ZERO).unwrap().is_some() {
+            w.clock.advance(TICK);
+        }
+    }
+    let rung = |s: &mut crate::LiveSession| s.durable_mut().and_then(|d| d.rung()).unwrap();
+    let (l0, t0) = (rung(&mut latest), rung(&mut tail));
+    d.clocks().refresh(&[g.0]);
+    fanout::pass(&d);
+    assert!(rung(&mut latest) > l0);
+    assert_eq!(rung(&mut tail), t0);
+    block_on(s.shutdown()).unwrap();
+}

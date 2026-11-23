@@ -18,6 +18,11 @@ use crate::time::Timestamp;
 use crate::types::{Intent, Outcome, Position, Reading, SeriesId, Value};
 
 fn open(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp) {
+    let (w, id, dir, t, _) = open_clock(name);
+    (w, id, dir, t)
+}
+
+fn open_clock(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
     let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
     let mut env = Env::test(clock.clone());
     env.fs = Arc::new(MemFs::new());
@@ -40,7 +45,8 @@ fn open(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp) {
         "W",
     );
     let id = w.define(&spec).unwrap();
-    (w, id, dir, clock.wall())
+    let t = clock.wall();
+    (w, id, dir, t, clock)
 }
 
 fn emit(w: &Arc<Writer>, id: SeriesId, t: Timestamp, secs: i64) -> Position {
@@ -217,5 +223,25 @@ fn with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_th
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(facts(&w, "c"), vec![p.sequence]);
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement() {
+    let (w, id, dir, t, clock) = open_clock("stamped");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &Funnel::facts(Select::All)).unwrap();
+    let held = Hold::new(&dir, Point::DeliverThread);
+    let p = emit(&w, id, t, 0);
+    let acked = w.clocks.now();
+    clock.advance(Duration::from_secs(60));
+    let hub = w.hub.clone().unwrap();
+    let stamped = hub.run_quiet(|d, c| {
+        d.pump(c);
+        d.stamped()
+    });
+    assert!(taken(&w) >= p.sequence);
+    assert_eq!(stamped.now, acked);
+    drop(held);
     w.shutdown().unwrap();
 }

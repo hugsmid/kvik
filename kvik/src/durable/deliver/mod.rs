@@ -623,6 +623,12 @@ impl Deliverer {
         true
     }
 
+    /// The latest instant a batch was taken as of.
+    #[cfg(test)]
+    pub(crate) fn stamped(&self) -> Stamp {
+        self.stamped
+    }
+
     /// Notes that something consumer `name` may be waiting for changed.
     pub(super) fn changed(&mut self, name: &str) {
         if !self.notify.contains(name) {
