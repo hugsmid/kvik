@@ -4845,6 +4845,14 @@ due (rechecked at least once a second while one is due, as `now` follows the wal
 waiting session at the thread's next pass, within a second, where the 100 ms re-poll found it before; (f) the shared
 tail is read when the writer commits, not at a session's call, so an error of that read reaches a session when the
 thread meets it. Reader processes are unchanged. Batches, their contents, order and cuts are otherwise as before.
+A fan-out thread that panics is noticed: every session is then rung by every round, as when the thread could not be
+started, and none waits on a bell nobody rings.
+**Lead rulings (23 November, provisional).** On what users can now observe: (a) fewer `Lagged` events, rounds of
+other series no longer counting to a session's backlog, are accepted as the intended behaviour; (e) a loss found
+by another read reaching a waiting session within 1 s rather than 100 ms is accepted; (f) an error of the shared
+read that the thread meets and that is gone by the session's own turn is not returned to that session, which
+`api.md`'s "returned by every `next` it lasts" allows. The pass-over rule is invisible to users only with the
+widening at `open` above.
 **Pinned by.** `kvik/src/durable/read/live/fanout.rs`
 `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive` (against sessions
 rung by every round, the old path kept as the oracle, and the model backend); `kvik/src/durable/read/hub.rs`
@@ -4853,9 +4861,12 @@ rung by every round, the old path kept as the oracle, and the model backend); `k
 `a_round_ending_between_an_open_and_the_batch_that_answers_it_is_not_passed_over`;
 `kvik/src/durable/read/live/fanout.rs` `a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it`;
 `kvik/src/durable/read/live/races.rs` `tails_opened_beside_a_busy_writer_hold_every_fact_above_their_opened_cut`;
+`kvik/src/durable/read/live/cases.rs`
+`a_missing_segment_under_the_tail_is_an_error_at_every_next_with_the_fan_out_thread_running`;
 `kvik/src/durable/read/live/waits.rs`
 `a_ring_inside_the_batch_interval_is_taken_once_the_interval_passes`,
 `the_rest_of_a_round_a_row_limit_cut_is_taken_once_the_interval_passes_with_no_new_ring`,
+`a_fan_out_thread_that_panics_rings_every_session_and_leaves_them_rung_by_every_round`,
 `a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone`. Measured in
 `docs/measurements/fanout.md`.
 
@@ -4878,10 +4889,18 @@ Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with co
 `emit` returns before the consumers it feeds are woken, which the `kvik-deliver` thread does shortly after;
 (c) a confirmation wakes nobody but its own consumer. One cursor-file sync per tick for all consumers is not built:
 each consumer's file is still synced up to once a second.
+**Lead rulings (23 November, provisional).** Accepted: an `emit` returns before the consumers it fed are woken; the
+durable backend wakes them shortly after, from `kvik-deliver`, while the model backend still wakes them inside
+`emit`, which `api.md` Consuming now says; a consumer that polls after `emit` returns still sees the delivery,
+because `poll` takes the acknowledged batches first; the Q-706 counts may lag an emit's return with consumers
+registered too.
 **Pinned by.** `kvik/src/durable/registering.rs`
 `with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it`,
 `a_batch_read_back_after_the_clock_moved_is_taken_as_of_its_acknowledgement`,
-`an_acknowledgement_noted_before_a_call_that_does_not_take_batches_still_times_its_batch`; the consumer
+`an_acknowledgement_noted_before_a_call_that_does_not_take_batches_still_times_its_batch`,
+`a_batch_acknowledged_earlier_than_one_before_it_is_not_taken_as_of_an_earlier_instant`,
+`a_confirm_wakes_its_own_consumer_and_not_another_waiting`, `an_entry_wakes_a_consumer_with_nothing_queued`; the
+consumer
 properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
 ## Open at v0.2
@@ -5087,8 +5106,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1115 | 9.0e | Settled by the owner, 23 November: the damage scan below the seed runs after the open returns (as built); `ScanOrder::BeforeOpen` stays the way back |
 | Q-1116 | 9.0e | Decided by the lead with the seeded start: the start counts in A.18, the rules for giving way to the whole log; for review |
 | Q-1117 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
-| Q-1118 | 9.0d | Decided by the lead, provisional: sessions passed over rounds they select nothing of; those rounds no longer count to their backlog; a waiting session is polled; losses found elsewhere within a second |
-| Q-1119 | 5.2 | Decided by the lead, provisional: an emit leaves its batch to the `kvik-deliver` thread, taken as of its acknowledgement; wakes per consumer; Q-706's counts may lag with consumers too |
+| Q-1118 | 9.0d | Decided by the lead, provisional: sessions passed over rounds they select nothing of; those rounds no longer count to their backlog; a waiting session is polled; losses found elsewhere within a second; a read reaches anything from its `open` until answered; the lead accepted fewer `Lagged`, the 1 s loss reach and an error gone by a session's turn not being returned |
+| Q-1119 | 5.2 | Decided by the lead, provisional: an emit leaves its batch to the `kvik-deliver` thread, taken as of its acknowledgement; wakes per consumer; Q-706's counts may lag with consumers too; the lead accepted that the backends differ on when a consumer is woken after `emit` (`api.md` Consuming) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
