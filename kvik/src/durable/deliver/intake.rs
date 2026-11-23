@@ -25,6 +25,8 @@ impl Deliverer {
 
     /// Takes the batches acknowledged since the last call.
     pub(crate) fn pump(&mut self, ctx: &Ctx<'_>) {
+        // Ranges found lost before the batches are taken apply to them, wherever and whenever they are read back.
+        self.forget_latched();
         let Some(r) = self.reader.get_mut().as_mut() else {
             return;
         };
@@ -60,7 +62,8 @@ impl Deliverer {
 
     /// Takes the batches read that are acknowledged.
     pub(super) fn take_pending(&mut self, ctx: &Ctx<'_>) {
-        for (p, s) in &ctx.acked {
+        // An acknowledgement noted after its batch was taken has nothing left to time.
+        for (p, s) in ctx.acked.iter().filter(|(p, _)| *p > self.head) {
             let e = self.stamps.entry(*p).or_insert(*s);
             *e = (*e).min(*s);
         }
@@ -82,7 +85,9 @@ impl Deliverer {
             // already taken as of (a condition runner created later would otherwise fire early).
             let kept = self.stamps.split_off(&next(b.last));
             let at = std::mem::replace(&mut self.stamps, kept)
-                .into_values()
+                .into_iter()
+                .filter(|(p, _)| *p >= b.first)
+                .map(|(_, s)| s)
                 .min()
                 .unwrap_or(Stamp {
                     now: ctx.now,
