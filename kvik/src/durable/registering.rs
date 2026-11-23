@@ -11,7 +11,7 @@ use super::pause::{Gate, Hold, Point};
 use super::tests::wait;
 use super::{Emitted, Writer};
 use crate::config::{LogConfig, StoreConfig};
-use crate::consume::{DeliveryKind, Funnel, Select, Start};
+use crate::consume::{Condition, DeliveryKind, Funnel, Select, Start};
 use crate::env::{Env, ManualClock, MemFs};
 use crate::series::{Kind, SeriesSpec, ValueType};
 use crate::time::Timestamp;
@@ -361,4 +361,56 @@ fn a_batch_acknowledged_earlier_than_one_before_it_is_not_taken_as_of_an_earlier
     assert_eq!(stamped.now, first);
     drop(held);
     w.shutdown().unwrap();
+}
+
+#[test]
+fn a_timer_armed_by_an_emit_the_deliverer_has_not_taken_fires_at_the_position_the_model_gives() {
+    let (w, _, dir, t, clock) = open_clock("timer-position");
+    let id = w
+        .define(
+            &SeriesSpec::new(
+                "a/b/timed",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+            .expected_interval(Duration::from_secs(1)),
+        )
+        .unwrap();
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route(
+        "c",
+        &Funnel {
+            series: Select::Ids(vec![id]),
+            operator: None,
+            condition: Some(Condition::stale_for(Duration::from_secs(1))),
+        },
+    )
+    .unwrap();
+    w.route("c", &Funnel::facts(Select::Ids(vec![id]))).unwrap();
+    let held = Hold::new(&dir, Point::DeliverThread);
+    let armed = emit(&w, id, t, 0);
+    assert!(taken(&w) < armed.sequence);
+    clock.advance(Duration::from_secs(60));
+    let next = emit(&w, id, t, 10);
+    drop(held);
+    let mut order = Vec::new();
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        match d.kind {
+            DeliveryKind::Fact(f) => order.push(("fact", f.position.sequence)),
+            DeliveryKind::Trigger(_) => order.push(("trigger", d.position.sequence)),
+            k => panic!("{k:?}"),
+        }
+    }
+    w.shutdown().unwrap();
+    // The deliverer's own timers may raise more triggers after these three, depending on its thread.
+    assert_eq!(
+        order[..3],
+        [
+            ("fact", armed.sequence),
+            ("trigger", armed.sequence),
+            ("fact", next.sequence)
+        ]
+    );
 }

@@ -4887,7 +4887,7 @@ waiting poll is woken only when something it may take changed for it: a fact que
 condition transition, a resync, an entry in a batch (any consumer), or its own confirmation. Consequences: (a) the
 Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with consumers registered too; (b) an
 `emit` returns before the consumers it feeds are woken, which the `kvik-deliver` thread does shortly after;
-(c) a confirmation wakes nobody but its own consumer. One cursor-file sync per tick for all consumers is not built:
+(c) a confirmation wakes nobody but its own consumer. Timers pump first: the timers due when a call is decided run after the acknowledged batches are taken, so that a condition fires at the same position as on the model backend whatever the deliverer's thread has taken; this gives up the small saving of leaving those batches to it. One cursor-file sync per tick for all consumers is not built:
 each consumer's file is still synced up to once a second.
 **Lead rulings (23 November, provisional).** Accepted: an `emit` returns before the consumers it fed are woken; the
 durable backend wakes them shortly after, from `kvik-deliver`, while the model backend still wakes them inside
