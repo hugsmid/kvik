@@ -168,9 +168,10 @@ fn corruptions_after_damage(name: &str, consumer: bool) -> (u64, u64) {
 
 #[test]
 fn the_delivery_counters_reach_the_same_counts_with_or_without_a_consumer() {
+    // With a consumer too the count may lag the emit's return (Q-1119); never more than once.
     let (with_now, with_later) = corruptions_after_damage("counted-with", true);
     let (_, without_later) = corruptions_after_damage("counted-without", false);
-    assert_eq!(with_now, 1, "counted when the emit returns");
-    assert_eq!(with_later, 1);
+    assert!(with_now <= 1);
+    assert_eq!(with_later, 1, "counted later by the delivery thread");
     assert_eq!(without_later, 1, "counted later by the delivery thread");
 }
