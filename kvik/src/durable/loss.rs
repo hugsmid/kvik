@@ -71,6 +71,22 @@ impl Latch {
         }
     }
 
+    /// Fills the commit times before and after a held loss that a reader learnt after noting it: the batch after a
+    /// region is read after the region is found.
+    pub(crate) fn complete(&self, reports: &[LossReport]) {
+        let mut s = self.lock();
+        for r in reports {
+            for f in s.found.iter_mut().filter(|f| f.kind == r.kind) {
+                if f.first == r.first && f.commit_time_before.is_none() {
+                    f.commit_time_before = r.commit_time_before;
+                }
+                if f.last == r.last && f.commit_time_after.is_none() {
+                    f.commit_time_after = r.commit_time_after;
+                }
+            }
+        }
+    }
+
     /// Marks the end of the start's read; the ranges the start found are not for the decisions, which it built
     /// without them.
     pub(crate) fn started(&self) {

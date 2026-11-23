@@ -185,7 +185,7 @@ pub(crate) fn read_whole(
 }
 
 /// Why a seeded start gives way to a start from the whole log (`spec.md` §3 Order of a start).
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GiveWay {
     /// The log does not show the seed's batch first, or the reader cannot start there.
     Seed,
@@ -267,6 +267,7 @@ impl Tail {
         }
         let found = self.finder.apply(events, durable);
         let through = Position::new(self.through.generation, self.through.sequence);
+        // Every find names `first`; a region that lost no position (`last < first`) gives no find, so it is not below.
         if found
             .iter()
             .any(|f| f.report.first.is_some_and(|p| p <= through))

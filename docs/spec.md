@@ -481,9 +481,10 @@ for its commit time (Q-1090). Each series' recent window and decision window sta
 latest `t`, so a key at or below it is decided from the log as one that left the window is (§2.4), and the lateness
 reference, counts and last arrival continue from its entry; a consumer whose position is below S reads the log
 below S as one behind does (§4 Overflow); commit times below S, for `start: time`, are read from the log when
-asked. The start reads the whole log instead when there is no seed, when the pass meets a void, a region holding a
-position at or below S or a read error, or when the batch ending at S is not the first it reads. Either way the
-start gives the same state, reads, deliveries and loss reports (Q-1111). The rest of the log, below S, is scanned
+asked. The start reads the whole log instead when there is no seed or the registry file does not reach S, when the
+pass meets a void, a region holding a position at or below S or a read error, or when the batch ending at S is not
+the first it reads. Either way the start gives the same state, reads, deliveries and loss reports (Q-1111). The rest
+of the log, below S, is scanned
 for damage after the open returns, as the derived files' start work is (A.18): a loss found there is reported as one
 found while the store is open (Recovery rule 2, Q-921, Q-930), and the start-scan flag of the statistics says the
 scan runs. Damage below S is therefore found after the open returns, not before (Q-1110). The registry file is

@@ -14,6 +14,34 @@ use kvik_log::writer::{LogWriter, Position as LogPos};
 thread_local! {
     /// Set by tests: a start on this thread reads the whole log.
     pub(crate) static WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the last seeded start on this thread met, for tests that measure their reach.
+    pub(crate) static PROBE: std::cell::Cell<Probe> = const { std::cell::Cell::new(Probe::NONE) };
+}
+
+/// What a seeded start met: why it gave way, if it did, and the recovery entries at or below its seed that name a
+/// consumer.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Probe {
+    pub(crate) gave_way: Option<crate::durable::start::GiveWay>,
+    pub(crate) resume_failed: bool,
+    pub(crate) recoveries_naming: usize,
+}
+
+#[cfg(test)]
+impl Probe {
+    const NONE: Probe = Probe {
+        gave_way: None,
+        resume_failed: false,
+        recoveries_naming: 0,
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn probe(f: impl FnOnce(&mut Probe)) {
+    let mut p = PROBE.get();
+    f(&mut p);
+    PROBE.set(p);
 }
 
 /// See the module documentation.
@@ -52,7 +80,8 @@ impl Seed {
             return None;
         }
         let (_, registry) = kvik_log::registry::read_latest(fs, dir, store_id).ok()??;
-        if registry.generation != d.through.generation {
+        // Q-1001 keeps the file at or above every directory's `through`; a seeded start trusts it up to there.
+        if registry.generation != d.through.generation || registry.through < d.through.sequence {
             return None;
         }
         Some(Seed {

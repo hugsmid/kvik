@@ -108,6 +108,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct LogClock {
     env: Arc<dyn Clock>,
     origin: Instant,
+    #[cfg(test)]
+    skew: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests: nanoseconds added to the log's monotonic clock of a store opened on this thread, so that a test
+    /// can seal a segment by time without waiting.
+    pub(crate) static LOG_SKEW: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl LogClock {
@@ -115,12 +125,19 @@ impl LogClock {
         LogClock {
             env,
             origin: Instant::now(),
+            #[cfg(test)]
+            skew: LOG_SKEW.with_borrow(Clone::clone),
         }
     }
 }
 
 impl kvik_log::writer::Clock for LogClock {
     fn monotonic(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(s) = &self.skew {
+            let skew = Duration::from_nanos(s.load(std::sync::atomic::Ordering::SeqCst));
+            return self.origin.elapsed() + skew;
+        }
         self.origin.elapsed()
     }
     fn wall(&self) -> i64 {

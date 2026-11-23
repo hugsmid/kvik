@@ -3,7 +3,11 @@
 //! as the derived files' start work does; [`ScanOrder::BeforeOpen`] restores the order in which a damaged store is
 //! found before the open returns.
 
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -32,17 +36,55 @@ pub(crate) const SCAN_ORDER: ScanOrder = ScanOrder::Background;
 
 /// Orders tests set for the store in a directory, in place of [`SCAN_ORDER`].
 #[cfg(test)]
-pub(crate) static SCAN_ORDERS: Mutex<Vec<(std::path::PathBuf, ScanOrder)>> = Mutex::new(Vec::new());
+pub(crate) static SCAN_ORDERS: Mutex<BTreeMap<PathBuf, ScanOrder>> = Mutex::new(BTreeMap::new());
+
+/// Gates tests set for the store in a directory: its background scan starts once the gate opens.
+#[cfg(test)]
+pub(crate) static SCAN_GATES: Mutex<BTreeMap<PathBuf, Arc<Gate>>> = Mutex::new(BTreeMap::new());
+
+/// A gate a test holds a background scan at.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Gate {
+    open: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl Gate {
+    pub(crate) fn open(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.cv.notify_all();
+    }
+
+    /// Waits until the gate opens or `stop` is set.
+    fn wait(&self, stop: &AtomicBool) {
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open && !stop.load(Ordering::SeqCst) {
+            open = self
+                .cv
+                .wait_timeout(open, std::time::Duration::from_millis(5))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+#[cfg(test)]
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The order for the store in `dir`.
 pub(crate) fn scan_order(dir: &Path) -> ScanOrder {
     #[cfg(test)]
-    if let Some((_, o)) = SCAN_ORDERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|(d, _)| d == dir)
-    {
+    if let Some(o) = locked(&SCAN_ORDERS).get(dir) {
         return *o;
     }
     let _ = dir;
@@ -78,6 +120,7 @@ pub(crate) fn scan_below(
             Err(e) => break Err(e),
         };
         let found = finder.apply(&u.events, u.state.durable);
+        // Every find names `first`; a region that lost no position (`last < first`) gives no find, so it is not below.
         out.below |= found
             .iter()
             .any(|f| f.report.first.is_some_and(|p| p <= at));
@@ -95,7 +138,25 @@ pub(crate) fn scan_below(
         }
     };
     let _ = reader.close();
+    latch.complete(finder.found());
     Ok(read?.map(|()| out))
+}
+
+/// How many of the regions a scan met (`found`) the start's pass did not (`passed`) and no lost range of `recorded`
+/// holds (Q-755).
+pub(crate) fn unmet(
+    found: &Regions,
+    passed: &Regions,
+    recorded: &[LostRange],
+    standing: &[u64],
+) -> u64 {
+    let mut own = Regions::default();
+    for (f, a, z) in found.spans() {
+        if !passed.covers(f, a, z) {
+            own.insert(f, a, z);
+        }
+    }
+    own.unrecorded(recorded, standing)
 }
 
 /// A background scan, stopped and joined when dropped.
@@ -120,19 +181,19 @@ impl Scan {
         start_regions: impl FnOnce(u64) + Send + 'static,
     ) -> Scan {
         let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let gate = locked(&SCAN_GATES).get(dir).cloned();
         let (dir, env) = (dir.to_path_buf(), env.clone());
         let s = stop.clone();
         let thread = std::thread::Builder::new()
             .name("kvik-scan".into())
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(g) = gate {
+                    g.wait(&s);
+                }
                 if let Ok(Some(found)) = scan_below(&dir, &env, through, &latch, &s) {
-                    let mut own = Regions::default();
-                    for (f, a, z) in found.regions.spans() {
-                        if !passed.covers(f, a, z) {
-                            own.insert(f, a, z);
-                        }
-                    }
-                    start_regions(own.unrecorded(&recorded, &standing));
+                    start_regions(unmet(&found.regions, &passed, &recorded, &standing));
                 }
             })
             .ok();

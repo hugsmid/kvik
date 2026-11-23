@@ -845,8 +845,10 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
   (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log
   segments can leave the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry but a
-  recovery entry in a segment that cannot be read, so the file is checked, never trusted over the log, apart from
-  those.
+  recovery entry in a segment that cannot be read, so a start from the whole log checks the file and never trusts it
+  over the log, apart from those. A seeded start trusts the file up to its seed's `through`, the part it does not
+  read: Q-1001 makes the file hold every entry there, and the start gives way to the whole log when the file's
+  `through` is below the seed's or its generation differs (Q-1111).
 
 ## A.17 Deep tier: object keys, uploaded forms, claim marker, envelope
 Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below), with two exceptions: claim

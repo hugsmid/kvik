@@ -77,6 +77,7 @@ fn run(name: &str, n: usize, at: usize, place: Place, meets: Meets, small: bool)
     }
     if matches!(place, Place::Kept) {
         s = restart(&w, s, small, sealed);
+        common::scanned(&s);
     }
     damage(&w, text(at).as_bytes());
     if meets != Meets::Restart {
@@ -91,6 +92,8 @@ fn run(name: &str, n: usize, at: usize, place: Place, meets: Meets, small: bool)
     }
     if meets != Meets::Open {
         s = restart(&w, s, small, sealed);
+        // A replay decided before a seeded start's scan reaches the damage meets it unrecorded (Q-1110 (b)).
+        common::scanned(&s);
     }
     let mut outcomes = Vec::new();
     for k in (0..n).chain([n + 10]) {

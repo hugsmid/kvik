@@ -1,5 +1,6 @@
 //! Opening and shutting down the durable store (`docs/api.md` Opening, `spec.md` §3 Order of a start).
 
+use super::loss::Regions;
 use super::seed::Seed;
 use super::*;
 
@@ -70,7 +71,7 @@ impl Writer {
                 .map(|s| (s, through))
             });
         let (kept, seeded) = match seeded {
-            Some((s, through)) => (s.kept, Some((s.hook, s.deliverer, through))),
+            Some((s, through)) => (s.kept, Some((s.hook, s.deliverer, through, s.scanned))),
             None => {
                 let kept = match start::log_reader(&dir, &env) {
                     Ok(r) => start::read_kept(
@@ -114,11 +115,17 @@ impl Writer {
             });
         }
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
+        // Under `ScanOrder::BeforeOpen` the scan below the seed has run: its regions the pass did not meet count here,
+        // as the background scan counts them when it ends.
+        let scanned_regions = match &seeded {
+            Some((_, _, _, Some(scanned))) => scan::unmet(scanned, &passed, &recorded, &standing),
+            _ => 0,
+        };
         let counters = Counters {
             series: series_counters,
             start_whole: read_whole,
             start_seeded: seeded.is_some(),
-            start_regions: passed.unrecorded(&recorded, &standing),
+            start_regions: passed.unrecorded(&recorded, &standing) + scanned_regions,
             ..Counters::default()
         };
         // The derived check of the registry file (Q-33): the registry is rebuilt at every start, from the kept log or,
@@ -148,9 +155,9 @@ impl Writer {
         }
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
         let (hook, delivering, seed_through) = match seeded {
-            Some((hook, mut d, through)) => {
+            Some((hook, mut d, through, scanned)) => {
                 d.finish(&dir, &env, writer.generation());
-                (hook, Ok(d), Some(through))
+                (hook, Ok(d), scanned.is_none().then_some(through))
             }
             None => {
                 let hook = derived::hook(
@@ -366,6 +373,8 @@ struct Seeded {
     kept: start::Kept,
     hook: Arc<derived::Hook>,
     deliverer: deliver::Deliverer,
+    /// The regions the scan below the seed met, when it ran before the open (Q-1110 (a)).
+    scanned: Option<Regions>,
 }
 
 /// A seeded start (`spec.md` §3 Order of a start): the writer and the deliverer start from the registry file and the
@@ -381,13 +390,24 @@ fn start_seeded(
     seed: Seed,
 ) -> Option<Seeded> {
     let dir = &config.dir;
+    let mut scanned = None;
     if scan::scan_order(dir) == scan::ScanOrder::BeforeOpen {
         let never = std::sync::atomic::AtomicBool::new(false);
         let found = scan::scan_below(dir, env, seed.through, latch, &never).ok()??;
         if found.below {
+            #[cfg(test)]
+            seed::probe(|p| p.gave_way = Some(start::GiveWay::Below));
             return None;
         }
+        scanned = Some(found.regions);
     }
+    #[cfg(test)]
+    seed::probe(|p| {
+        p.recoveries_naming = seed
+            .recoveries()
+            .filter(|(_, r)| !r.consumers.is_empty())
+            .count();
+    });
     let budget = window_budget(&config.limits);
     let hook = derived::seeded_hook(writer, &seed);
     let mut d = deliver::Deliverer::new(
@@ -433,12 +453,17 @@ fn start_seeded(
                 }
             }
         })();
-        match pass {
-            Ok(()) if d.resume_after_pass() => Some(r),
-            _ => {
-                let _ = r.close();
-                None
-            }
+        let resumed = pass.is_ok() && d.resume_after_pass();
+        #[cfg(test)]
+        seed::probe(|p| {
+            p.gave_way = pass.err();
+            p.resume_failed = pass.is_ok() && !resumed;
+        });
+        if resumed {
+            Some(r)
+        } else {
+            let _ = r.close();
+            None
         }
     });
     let Some(reader) = passed else {
@@ -457,6 +482,7 @@ fn start_seeded(
         kept,
         hook,
         deliverer: d,
+        scanned,
     })
 }
 

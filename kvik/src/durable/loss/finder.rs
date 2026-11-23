@@ -72,6 +72,11 @@ impl Finder {
         found.into_iter().map(|(f, _)| f).collect()
     }
 
+    /// The lost ranges this finder's reads found, with the commit times learnt since each was found.
+    pub(crate) fn found(&self) -> &[LossReport] {
+        &self.found
+    }
+
     /// Takes the recovery entries a registry file holds, with their positions (spec §2.1: it keeps every one), for a
     /// reader that reads the log only above it.
     pub(crate) fn seed_recoveries(
