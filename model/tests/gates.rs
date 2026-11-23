@@ -157,7 +157,8 @@ fn set_matches_after_hold_on_and_leaves_after_hold_off() {
         .num(1, 0.0)
         .num(2, 3.0)
         .num(3, 4.0)
-        .num(10, 0.0);
+        .num(10, 0.0)
+        .num(12, 0.0);
     let j = run(&h);
     assert_eq!(
         moves(&j.transitions)[1..],

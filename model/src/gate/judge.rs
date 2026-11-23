@@ -378,29 +378,19 @@ fn step(kind: &Kind, i: &mut Instance, v: &Value, now: Nanos) -> GateState {
                 return GateState::Unknown;
             };
             for (k, l) in ls.iter().enumerate() {
-                let (toward, hold) = if i.on[k] {
-                    (x < l.clear, l.hold_down)
-                } else {
-                    (x > l.at, l.hold_up)
-                };
-                cross(&mut i.on[k], &mut i.pending[k], toward, hold, now);
+                let toward = if i.on[k] { x < l.clear } else { x > l.at };
+                let h = hold(kind, k, i.on[k]);
+                cross(&mut i.on[k], &mut i.pending[k], toward, h, now);
             }
             // The level counts boundaries from the lowest while each is crossed (spec §6 Gates, Levels).
             let level = i.on.iter().take_while(|on| **on).count();
             GateState::Level(u8::try_from(level).expect("at most 16 levels"))
         }
-        Kind::Set {
-            members,
-            hold_on,
-            hold_off,
-        } => {
+        Kind::Set { members, .. } => {
             let inside = members.iter().any(|m| m.identical(v));
-            let (toward, hold) = if i.on[0] {
-                (!inside, *hold_off)
-            } else {
-                (inside, *hold_on)
-            };
-            cross(&mut i.on[0], &mut i.pending[0], toward, hold, now);
+            let toward = inside != i.on[0];
+            let h = hold(kind, 0, i.on[0]);
+            cross(&mut i.on[0], &mut i.pending[0], toward, h, now);
             GateState::Match(i.on[0])
         }
         Kind::Change { deadband } => {
@@ -414,6 +404,17 @@ fn step(kind: &Kind, i: &mut Instance, v: &Value, now: Nanos) -> GateState {
             }
             GateState::Value(i.reference.clone().expect("reference set"))
         }
+    }
+}
+
+/// The hold boundary `k` needs before it flips from `on`.
+fn hold(kind: &Kind, k: usize, on: bool) -> Nanos {
+    match kind {
+        Kind::Levels(ls) if on => ls[k].hold_down,
+        Kind::Levels(ls) => ls[k].hold_up,
+        Kind::Set { hold_off, .. } if on => *hold_off,
+        Kind::Set { hold_on, .. } => *hold_on,
+        Kind::Change { .. } => 0,
     }
 }
 
@@ -469,26 +470,13 @@ fn next_due(gate: &Gate, i: &Instance, sd: &SeriesData) -> Option<(Nanos, TimerK
     {
         cands.push((a + lim, TimerKind::Stale));
     }
-    let holds: Vec<Nanos> = match &gate.kind {
-        Kind::Levels(ls) => ls
+    cands.extend(
+        i.pending
             .iter()
             .enumerate()
-            .filter_map(|(k, l)| {
-                i.pending[k].map(|p| p + if i.on[k] { l.hold_down } else { l.hold_up })
-            })
-            .collect(),
-        Kind::Set {
-            hold_on, hold_off, ..
-        } => i.pending[0]
-            .map(|p| p + if i.on[0] { *hold_off } else { *hold_on })
-            .into_iter()
-            .collect(),
-        Kind::Change { .. } => Vec::new(),
-    };
-    cands.extend(holds.into_iter().map(|d| (d, TimerKind::Hold)));
-    if let Some(t) = sd.current.range(after + 1..).next().map(|(t, _)| *t) {
-        cands.push((t, TimerKind::Mature));
-    }
+            .filter_map(|(k, p)| p.map(|p| (p + hold(&gate.kind, k, i.on[k]), TimerKind::Hold))),
+    );
+    // A future fact not outranked is an arrival at its `t`, so this also schedules its taking effect.
     if let Some(a) = sd.arrivals.iter().copied().filter(|a| *a > after).min() {
         cands.push((a, TimerKind::Mature));
     }
