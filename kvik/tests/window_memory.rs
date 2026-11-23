@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use common::block_on;
 use common::durable::World;
 use kvik::{
-    Aggregate, CalendarPeriod, Kind, LocalDate, Reader, ReaderConfig, Reading, Resolution,
-    SeriesId, SeriesSpec, Span, Timestamp, Value, ValueType, Window,
+    Aggregate, CalendarPeriod, ChartData, Kind, LocalDate, Reader, ReaderConfig, Reading,
+    Resolution, SeriesId, SeriesSpec, Span, Timestamp, Value, ValueType, Window,
 };
 use peak_alloc::PeakAlloc;
 
@@ -115,6 +115,35 @@ fn reads(w: &World, id: SeriesId, end: Timestamp, date: LocalDate) -> Reads {
     Reads { first, each, held }
 }
 
+/// A fresh reader's chart query of every series over the last day at once (Q-1110), after a first read that fills the
+/// lookups' cache: its peak, its time and the bytes of its results.
+fn many(w: &World, ids: &[SeriesId], end: Timestamp) -> (usize, Duration, usize) {
+    let r = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(CAP as u64)).unwrap();
+    let day = end + Span::from_secs(-DAY)..end;
+    let auto = Resolution::Auto {
+        max_points: MAX_POINTS,
+    };
+    r.buckets_of(ids, day.clone(), auto).unwrap();
+    let mut out = 0;
+    let (peak, took) = measure(|| {
+        let charts = r.buckets_of(ids, day, auto).unwrap();
+        out = charts
+            .iter()
+            .map(|c| match c {
+                ChartData::Facts(f) => f.capacity() * std::mem::size_of::<kvik::FactRow>(),
+                ChartData::Buckets { buckets, .. } => {
+                    buckets.capacity() * std::mem::size_of::<kvik::Bucket>()
+                }
+                _ => 0,
+            })
+            .sum();
+    });
+    (peak, took, out)
+}
+
+/// The most points of the many-series chart query.
+const MAX_POINTS: usize = 1_500;
+
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
 }
@@ -169,6 +198,18 @@ fn bucket_window_and_calendar_reads_stay_flat_with_the_stores_age() {
             assert!(r.first.0 <= CAP + OVERHEAD, "first read at {days} days");
             warm.push((days, k, r.each.map(|e| e.0)));
         }
+        // Each series holds a chunk, its results and, with an automatic resolution, its raw facts until they pass
+        // the most points.
+        let (peak, took, out) = many(&w, &ids, end);
+        let heads = SERIES * (MAX_POINTS + 1) * std::mem::size_of::<kvik::FactRow>();
+        eprintln!(
+            "  every series' day: {peak} B {:.1} ms; results {out} B",
+            ms(took)
+        );
+        assert!(
+            peak <= CAP + OVERHEAD + heads + out,
+            "{peak} bytes for every series at {days} days"
+        );
     }
     for (days, k, peaks) in &warm {
         let first = warm.iter().find(|w| w.0 == 1 && w.1 == *k).unwrap().2;

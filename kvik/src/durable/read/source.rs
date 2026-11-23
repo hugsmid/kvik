@@ -8,7 +8,7 @@ use std::sync::{Arc, PoisonError};
 use kvik_log::writer::Position as LogPos;
 
 use super::cache::{Grant, Shelf, held};
-use super::log_source::LogTail;
+use super::log_source::{LogTail, wanted};
 use super::merge;
 use super::view::View;
 use crate::durable::index::{Stored, fact_into, fact_out};
@@ -38,8 +38,9 @@ pub(crate) enum Read {
 
 /// A stream of facts within a position bound (the query design's §2.2 One trait, two homes).
 pub(crate) trait Source {
-    /// The facts of `pass`, keeping at most `budget` bytes (`kvik_log::reader::Within`).
-    fn read(&mut self, pass: &Pass<'_>, budget: u64) -> Result<Read, QueryError>;
+    /// The facts of `pass`, keeping at most `budget` bytes, with room taken at once for the `expect` facts estimated
+    /// (`kvik_log::reader::Within`).
+    fn read(&mut self, pass: &Pass<'_>, budget: u64, expect: u64) -> Result<Read, QueryError>;
 }
 
 /// What a read selects: series with whether each is versioned, ascending by id; history or the current view; the
@@ -73,12 +74,13 @@ fn pass(
     r: &DurableReader,
     v: &View,
     p: &Pass<'_>,
+    expect: u64,
     listed: &mut Option<Vec<u64>>,
 ) -> Result<Option<(Vec<Stored>, Grant)>, QueryError> {
-    let (rows, now) = match pass_once(r, v, p) {
+    let (rows, now) = match pass_once(r, v, p, expect) {
         Err(QueryError::NotAvailable { .. }) => {
             r.find_losses()?;
-            pass_once(r, v, p)?
+            pass_once(r, v, p, expect)?
         }
         other => other?,
     };
@@ -100,14 +102,14 @@ fn still_listed(listed: &mut Option<Vec<u64>>, now: Vec<u64>) -> Result<(), Quer
 
 type Once = (Option<(Vec<Stored>, Grant)>, Vec<u64>);
 
-fn pass_once(r: &DurableReader, v: &View, p: &Pass<'_>) -> Result<Once, QueryError> {
+fn pass_once(r: &DurableReader, v: &View, p: &Pass<'_>, expect: u64) -> Result<Once, QueryError> {
     let grant = r.memory().admit();
     let mut tail = LogTail {
         reader: r,
         view: v,
         listed: Vec::new(),
     };
-    let rows = match tail.read(p, grant.rows())? {
+    let rows = match tail.read(p, grant.rows(), expect)? {
         Read::Rows(rows) => Some((merge::merge(vec![rows]), grant)),
         Read::TooMany => None,
     };
@@ -261,7 +263,22 @@ impl Parts {
                 above: p.above,
                 upto: p.upto,
             };
-            let Some((mut rows, grant)) = pass(r, v, &pass_of, &mut self.listed)? else {
+            // Sized from the facts the log reader expects, so that a part too large is split before it is read
+            // rather than after (Q-1111); a part whose estimate is wrong still meets `TooMany` below.
+            let expect = if p.narrowed(plan) {
+                0
+            } else {
+                r.estimate(&wanted(&pass_of)).unwrap_or(0)
+            };
+            let fits = r.memory().rows_hint() / (2 * std::mem::size_of::<Stored>() as u64);
+            if expect > fits
+                && let Some((first, second)) = p.halves(self.later_first)
+            {
+                self.stack.extend([second, first]);
+                continue;
+            }
+            let expect = expect.saturating_add(expect / 8);
+            let Some((mut rows, grant)) = pass(r, v, &pass_of, expect, &mut self.listed)? else {
                 let (first, second) = p.halves(self.later_first).ok_or_else(too_large)?;
                 self.stack.extend([second, first]);
                 continue;
@@ -447,8 +464,37 @@ fn beyond(history: bool, yielded: Option<(i64, u32, LogPos)>, s: &Stored) -> boo
     }
 }
 
+/// What a [`FactStream`] of `plan` from `from` to `to`, both inclusive, at `v`'s cut yields, given to `each` as each
+/// pass is read, for a caller that takes every row at once: no row waits on a shelf or is read again (Q-1111).
+pub(crate) fn each_row(
+    r: &DurableReader,
+    v: &View,
+    plan: &Plan,
+    from: i64,
+    to: i64,
+    mut each: impl FnMut(Stored),
+) -> Result<(), QueryError> {
+    if from > to || plan.series.is_empty() {
+        return Ok(());
+    }
+    let mut parts = Parts::new(Some(Part::whole(plan, from, to)), false, None);
+    while let Some(unit) = parts.next(r, v, plan)? {
+        match unit {
+            Unit::Rows(rows, grant, _) => {
+                rows.into_iter().for_each(&mut each);
+                drop(grant);
+            }
+            Unit::Folded(s) => each(s),
+        }
+    }
+    Ok(())
+}
+
 /// The span `at` first searches back over, doubled at each step.
 const FIRST_SPAN: i64 = 3_600_000_000_000;
+
+/// The facts a series' first span of [`search_back_each`] is cut to hold.
+const FIRST_FACTS: u64 = 64;
 
 /// What a probe for earlier facts may keep: past it, there are some.
 const PROBE: u64 = 4 << 10;
@@ -476,6 +522,7 @@ fn nothing_at_or_before(
         budget: PROBE.min(grant.rows()),
         above: None,
         upto: Some(plan.bound),
+        expect: 0,
     };
     match r.lookup_within(v, &wanted, within) {
         Ok((found, now)) => {
@@ -537,7 +584,9 @@ pub(crate) fn search_back(
 
 /// For each series of `plan`, in its order, the fact `pick` chooses among its view's facts at or before `t`, as
 /// [`search_back`] finds it for that series alone, from one search of them all: spans that double, each read once for
-/// the series still unfound, and after the first span one probe for each of those (Q-1110).
+/// the series still unfound, and after the first span one probe for each of those (Q-1110). The first span is cut to
+/// hold about [`FIRST_FACTS`] facts a series by the lookups' counts (Q-1111): the first span holding a series' fact
+/// holds its latest, whatever the spans.
 pub(crate) fn search_back_each(
     r: &DurableReader,
     v: &View,
@@ -552,7 +601,22 @@ pub(crate) fn search_back_each(
             .expect("a series of the plan")
     };
     let mut left = plan.clone();
-    let (mut to, mut span, mut probed, mut listed) = (t, FIRST_SPAN, false, None);
+    let first = Pass {
+        series: &plan.series.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        from: t.saturating_sub(FIRST_SPAN - 1),
+        to: t,
+        above: None,
+        upto: plan.bound,
+    };
+    let span = match r.estimate(&super::log_source::wanted(&first)) {
+        Some(n) if n > FIRST_FACTS * plan.series.len() as u64 => {
+            let cut = i128::from(FIRST_SPAN) * i128::from(FIRST_FACTS) * plan.series.len() as i128
+                / i128::from(n);
+            i64::try_from(cut).unwrap_or(FIRST_SPAN).max(1)
+        }
+        _ => FIRST_SPAN,
+    };
+    let (mut to, mut span, mut probed, mut listed) = (t, span, false, None);
     while !left.series.is_empty() {
         let from = to.saturating_sub(span - 1);
         let mut parts = Parts::new(Some(Part::whole(&left, from, to)), true, listed.take());

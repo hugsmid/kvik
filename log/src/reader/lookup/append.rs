@@ -202,7 +202,7 @@ fn take_found(
         return true;
     }
     let at = facts.len();
-    let Some(taken) = query.take(b, facts) else {
+    let Some(taken) = query.take(b, facts, Some(&mut map.tally)) else {
         facts.truncate(at);
         // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region, so that every
         // later lookup of the segment is incomplete too.

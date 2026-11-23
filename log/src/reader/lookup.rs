@@ -49,6 +49,9 @@ pub struct Within {
     pub above: Option<Position>,
     /// The position facts are kept at or below.
     pub upto: Option<Position>,
+    /// The facts expected ([`LogReader::estimate`]): room for them is taken from the budget at once, so that the
+    /// facts' vector need not grow by doubling.
+    pub expect: u64,
 }
 
 impl Default for Within {
@@ -57,6 +60,7 @@ impl Default for Within {
             budget: u64::MAX,
             above: None,
             upto: None,
+            expect: 0,
         }
     }
 }
@@ -166,6 +170,9 @@ struct SegmentMap {
     /// the batches again voids at each what it took above its `after` from the batches before it, as a scan does
     /// (Q-831).
     recoveries: Vec<(usize, Position)>,
+    /// Per series, by id, its facts in `batches` and their least and greatest `t`: an A.8 index of what is mapped,
+    /// for [`LogReader::estimate`].
+    tally: Vec<IndexRecord>,
 }
 
 impl SegmentMap {
@@ -173,7 +180,43 @@ impl SegmentMap {
         64 + self.batches.len() * std::mem::size_of::<Span>()
             + self.regions.len() * 16
             + self.recoveries.len() * std::mem::size_of::<(usize, Position)>()
+            + self.tally.len() * std::mem::size_of::<IndexRecord>()
     }
+}
+
+/// Counts a fact of `series` at `t` in `tally`.
+fn note(tally: &mut Vec<IndexRecord>, series_id: u32, t: i64) {
+    let k = match tally.binary_search_by_key(&series_id, |r| r.series_id) {
+        Ok(k) => k,
+        Err(k) => {
+            tally.insert(
+                k,
+                IndexRecord {
+                    series_id,
+                    fact_count: 0,
+                    min_t: t,
+                    max_t: t,
+                },
+            );
+            k
+        }
+    };
+    let r = &mut tally[k];
+    r.fact_count = r.fact_count.saturating_add(1);
+    r.min_t = r.min_t.min(t);
+    r.max_t = r.max_t.max(t);
+}
+
+/// A segment's facts of one series between `from` and `to`, both inclusive, taking them as spread evenly over its
+/// span.
+fn share(r: &IndexRecord, from: i64, to: i64) -> f64 {
+    let (a, z) = (from.max(r.min_t), to.min(r.max_t));
+    if a > z {
+        return 0.0;
+    }
+    let width = i128::from(r.max_t) - i128::from(r.min_t) + 1;
+    let part = i128::from(z) - i128::from(a) + 1;
+    f64::from(r.fact_count) * (part as f64 / width as f64)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,6 +247,8 @@ pub(super) struct Caches {
     /// Segments a lookup took a fact from: one gone with no record naming its removal makes every later lookup of
     /// this reader incomplete (Q-951, Q-1066).
     stood: std::collections::BTreeSet<u64>,
+    /// The segments the last lookup listed.
+    listed: Option<Vec<u64>>,
     tick: u64,
     bytes: usize,
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
@@ -220,6 +265,7 @@ impl Default for Caches {
             index: HashMap::new(),
             maps: HashMap::new(),
             stood: std::collections::BTreeSet::new(),
+            listed: None,
             tick: 0,
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
@@ -429,9 +475,49 @@ fn header(f: &dyn crate::fs::FsFile, id: &SegmentIdentity) -> Option<HeaderState
     read_header(&h, id).ok()
 }
 
+/// The wanted ranges by series: in a table by id when the ids are small, as every row of a read is looked up.
+pub(super) enum BySeries {
+    Table(Vec<u16>, Vec<Vec<(i64, i64)>>),
+    Map(BTreeMap<u32, Vec<(i64, i64)>>),
+}
+
+/// The greatest series id [`BySeries`] keeps a table for.
+const TABLE_IDS: u32 = 4_096;
+
+impl BySeries {
+    pub(super) fn new(map: BTreeMap<u32, Vec<(i64, i64)>>) -> Self {
+        match map.keys().next_back() {
+            Some(&max) if max <= TABLE_IDS => {
+                let mut table = vec![u16::MAX; max as usize + 1];
+                let mut lists = Vec::with_capacity(map.len());
+                for (k, (id, ranges)) in map.into_iter().enumerate() {
+                    table[id as usize] = k as u16;
+                    lists.push(ranges);
+                }
+                BySeries::Table(table, lists)
+            }
+            _ => BySeries::Map(map),
+        }
+    }
+
+    fn wants(&self, series: u32, t: i64) -> bool {
+        let ranges = match self {
+            BySeries::Table(table, lists) => match table.get(series as usize) {
+                Some(&k) if k != u16::MAX => &lists[usize::from(k)],
+                _ => return false,
+            },
+            BySeries::Map(map) => match map.get(&series) {
+                Some(r) => r,
+                None => return false,
+            },
+        };
+        ranges.iter().any(|(a, z)| (*a..=*z).contains(&t))
+    }
+}
+
 /// What one segment's read is for: the wanted ranges by series, the mark, and the regions taken as lost.
 pub(super) struct Query<'a> {
-    pub(super) by_series: BTreeMap<u32, Vec<(i64, i64)>>,
+    pub(super) by_series: BySeries,
     pub(super) ranges: Vec<(i64, i64)>,
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
@@ -455,14 +541,21 @@ impl Query<'_> {
             && self.upto.is_none_or(|u| pos(s.first) <= u)
     }
 
-    /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget; `None` if a body does
-    /// not decode.
-    fn take(&self, b: &crate::batch::Batch<'_>, facts: &mut Vec<FoundFact>) -> Option<Taken> {
+    /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget, counting every fact
+    /// in `tally` if given; `None` if a body does not decode.
+    fn take(
+        &self,
+        b: &crate::batch::Batch<'_>,
+        facts: &mut Vec<FoundFact>,
+        tally: Option<&mut Vec<IndexRecord>>,
+    ) -> Option<Taken> {
         let g = b.commit.generation;
+        let tally = tally.map(std::cell::RefCell::new);
         let wants = |series: u32, t: i64| {
-            self.by_series
-                .get(&series)
-                .is_some_and(|rs| rs.iter().any(|(a, z)| (*a..=*z).contains(&t)))
+            if let Some(c) = &tally {
+                note(&mut c.borrow_mut(), series, t);
+            }
+            self.by_series.wants(series, t)
         };
         let mut keep = |sequence: u64, received_at: i64, row: FactRow| {
             let position = Position {
@@ -525,6 +618,13 @@ impl LogReader {
         if wanted.is_empty() {
             return Ok(out);
         }
+        if within.expect > 0 {
+            let record = std::mem::size_of::<FoundFact>() as u64;
+            let n = within.expect.min(within.budget / record);
+            if budget.charge(n * record) {
+                out.facts.reserve_exact(usize::try_from(n).unwrap_or(0));
+            }
+        }
         let mut names = self.segments()?;
         names.retain(|n| n.file_id > 0 && n.file_id <= mark.file_id);
         if mark.file_id > 0 && names.last().is_none_or(|n| n.file_id != mark.file_id) {
@@ -538,6 +638,7 @@ impl LogReader {
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
         out.listed = names.iter().map(|n| n.file_id).collect();
+        self.caches.listed = Some(out.listed.clone());
         if self.caches.keep_listed(&listed) {
             out.complete.fill(false);
             return Ok(out);
@@ -580,7 +681,7 @@ impl LogReader {
                     .push((w.from, w.to));
             }
             let query = Query {
-                by_series,
+                by_series: BySeries::new(by_series),
                 ranges: candidates
                     .iter()
                     .map(|&i| (wanted[i].from, wanted[i].to))
@@ -663,7 +764,7 @@ impl LogReader {
                 continue;
             }
             let at = facts.len();
-            if read_batch_at(&*f, &id, s, |b| query.take(b, facts)).is_none() {
+            if read_batch_at(&*f, &id, s, |b| query.take(b, facts, None)).is_none() {
                 facts.truncate(at);
                 stale = true;
             }
@@ -690,6 +791,28 @@ impl LogReader {
                 .all(|(a, z)| (query.lost)(file_id, *a, *z));
         self.caches.put_map(file_id, map);
         whole
+    }
+
+    /// About how many facts a lookup of `wanted` would find in the segments the last lookup listed, from the sealed
+    /// segments' indexes and the tallies of the segments lookups mapped (segments listed since, and facts appended
+    /// since a map's last scan, are not counted); `None` before a lookup has listed them, or when a listed segment has
+    /// neither. A guide for sizing lookups, never a bound.
+    pub fn estimate(&self, wanted: &[Wanted]) -> Option<u64> {
+        let listed = self.caches.listed.as_ref()?;
+        let mut n = 0.0;
+        for id in listed {
+            let records = match (self.caches.index.get(id), self.caches.maps.get(id)) {
+                (Some(Cached { value: Some(r), .. }), _) => r,
+                (_, Some(m)) if m.value.resume.is_some() => &m.value.tally,
+                _ => return None,
+            };
+            for w in wanted {
+                if let Ok(k) = records.binary_search_by_key(&w.series_id, |r| r.series_id) {
+                    n += share(&records[k], w.from, w.to);
+                }
+            }
+        }
+        Some(n.ceil() as u64)
     }
 
     /// A sealed segment's index, read from its seal blocks.

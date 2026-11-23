@@ -25,21 +25,26 @@ pub(crate) struct LogTail<'a> {
     pub(crate) listed: Vec<u64>,
 }
 
+/// The lookup ranges of `pass`.
+pub(crate) fn wanted(pass: &Pass<'_>) -> Vec<Wanted> {
+    pass.series
+        .iter()
+        .map(|&series_id| Wanted {
+            series_id,
+            from: pass.from,
+            to: pass.to,
+        })
+        .collect()
+}
+
 impl Source for LogTail<'_> {
-    fn read(&mut self, pass: &Pass<'_>, budget: u64) -> Result<Read, QueryError> {
-        let wanted: Vec<Wanted> = pass
-            .series
-            .iter()
-            .map(|&series_id| Wanted {
-                series_id,
-                from: pass.from,
-                to: pass.to,
-            })
-            .collect();
+    fn read(&mut self, pass: &Pass<'_>, budget: u64, expect: u64) -> Result<Read, QueryError> {
+        let wanted = wanted(pass);
         let within = Within {
             budget,
             above: pass.above,
             upto: Some(pass.upto),
+            expect,
         };
         let (found, listed) = self.reader.lookup_within(self.view, &wanted, within)?;
         self.listed = listed;
@@ -54,7 +59,8 @@ impl Source for LogTail<'_> {
                 row: f.row,
             })
             .collect();
-        merge::sort(&mut rows);
+        let room = budget.saturating_sub(super::cache::held(&rows));
+        merge::sort(&mut rows, room);
         Ok(Read::Rows(rows))
     }
 }

@@ -957,3 +957,76 @@ fn a_lookup_within_positions_keeps_only_the_facts_between_them() {
     assert_eq!(some.facts, whole.facts[2..=3].to_vec());
     log.shutdown().unwrap();
 }
+
+#[test]
+fn an_estimate_counts_what_a_lookup_finds_from_seal_indexes_and_the_tallies_of_unsealed_segments() {
+    let (fs, log) = store(200);
+    let mut r = reader(&fs, 3);
+    let wanted = [
+        Wanted {
+            series_id: 7,
+            from: 50,
+            to: 149,
+        },
+        Wanted {
+            series_id: 11,
+            from: 0,
+            to: 199,
+        },
+    ];
+    assert_eq!(r.estimate(&wanted), None);
+    let found = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    let n = found.facts.len() as u64;
+    assert_eq!(n, 300);
+    assert!(names(&fs).iter().any(|s| !s.sealed) && names(&fs).iter().any(|s| s.sealed));
+    let e = r.estimate(&wanted).unwrap();
+    assert!(e.abs_diff(n) <= n / 20, "{e} for {n}");
+    let none = Wanted {
+        series_id: 500,
+        from: 0,
+        to: 199,
+    };
+    assert_eq!(r.estimate(&[none]), Some(0));
+    log.shutdown().unwrap();
+}
+
+#[test]
+fn room_for_the_expected_facts_is_taken_at_once_so_a_budget_doubling_overflows_holds_them() {
+    let (fs, log) = store(60);
+    let wanted = [Wanted {
+        series_id: 5,
+        from: 0,
+        to: 59,
+    }];
+    let mut r = reader(&fs, 3);
+    let whole = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    let n = whole.facts.len() as u64;
+    assert_eq!(n, 60);
+    let budget = n * std::mem::size_of::<FoundFact>() as u64;
+    let doubling = r
+        .lookup_within(
+            &wanted,
+            &|_, _, _| false,
+            Within {
+                budget,
+                ..Within::default()
+            },
+        )
+        .unwrap();
+    assert!(doubling.overflowed);
+    let expected = r
+        .lookup_within(
+            &wanted,
+            &|_, _, _| false,
+            Within {
+                budget,
+                expect: n,
+                ..Within::default()
+            },
+        )
+        .unwrap();
+    assert!(!expected.overflowed);
+    assert_eq!(expected.facts, whole.facts);
+    assert_eq!(expected.facts.capacity() as u64, n);
+    log.shutdown().unwrap();
+}

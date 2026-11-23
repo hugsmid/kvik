@@ -164,6 +164,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-1109 | §6 Chart buckets; `api.md` Reader; Q-1000, Q-1060 | Windows, chart buckets and calendar results from the sources (decided by the lead) |
 | Q-1110 | §6 Chart buckets; `api.md` Reading; Q-1062, Q-1109 | Several series' windows, buckets and facts from one read (decided by the lead) |
+| Q-1111 | query design §2.2; Q-1063, Q-1068 | Passes sized from counts before they are read (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4637,7 +4638,7 @@ reader's fact index, the evaluation before 9.0h, and the model); `kvik/src/durab
 ## Q-1110 — Several series' windows, buckets and facts from one read
 Decided by the lead with roadmap 9.0h, for review.
 **Scenario.** A dashboard reads every series over the same range. One call per series reads the log once per series,
-and in the W0 layout every batch holds every series, so a query over 37 series decoded each batch 37 times: 23 s for a
+and when every batch holds every series, so a query over 37 series decoded each batch 37 times: 23 s for a
 day's charts of a one-day store, 45 s for a week's (`docs/measurements/9.0h-bucket-reads.md`). `Resolution::Auto` read
 the range twice, once for its first `max_points` + 1 facts and once to fold.
 **Decided.** `Reader::buckets_of`, `window_of` and `facts_of` take several series (in any order, repeats allowed) and
@@ -4654,6 +4655,35 @@ results until it ends; a caller wanting fewer at once splits the call.
 `windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (every series at once, in
 reverse with one repeated, against each series' own result and its first failure); `kvik/tests/windows.rs`
 `many_series_calls_equal_one_call_per_series_on_both_backends`.
+
+## Q-1111 — Passes sized from counts before they are read
+Decided by the lead with roadmap 9.0h, for review.
+**Scenario.** A pass that would pass its grant was read until its rows filled it, then halved and read again (Q-1063),
+so on a week-old store of 37 series at a reading a second, a week of one series read the log 4.3 times, and an
+unsealed segment, with no index, was read again at each narrowed pass. Rows were sorted in place, about 100 bytes moved at each
+step, and each row a lookup decoded was looked up in an ordered map of the wanted series.
+**Decided.** The lookups' log reader keeps, for each segment it maps, a tally of what it mapped: per series the facts,
+their least and greatest `t` (the fields of an A.8 record), in its cache's share. `LogReader::estimate` sums, over the
+segments its last lookup listed, the sealed segments' indexes and the tallies, taking each record's facts as spread
+evenly over its span; `None` before a lookup has listed them or when a listed segment has neither. A part not narrowed
+to one key's positions whose estimate takes more than half the rows an admission would grant is halved before it is
+read; a pass takes room for its estimate and an eighth at once (`Within::expect`), so its vector does not grow by
+doubling. An estimate is a guide: a pass that still passes its grant halves and reads again as before (Q-1068), and
+results are unchanged. Texts' bytes are not estimated, so a text series meets the fallback more. Windows and buckets
+take each pass's rows as it is read (`each_row`), with the grant held while they fold, rather than through a stream's
+shelf, whose rows wait on a caller (Q-1067). A pass's rows are sorted by their keys `(t, series, position)` with each
+row then moved once, when the room left in its grant holds 36 bytes a row; else in place. A lookup finds a row's wanted
+ranges in a table by series id when the greatest id is at most 4,096. Every batch a pass reads is still verified
+(Q-1063): checking each once per reader would let damage after a first read go unseen, and once passes stop reading
+again CRC32C is about 3% of a read; a hardware CRC32C, a new dependency, would take most of that (not built). Not built
+either: a span of event times per segment for a fresh reader's first read (Q-1109). Provisional: half a grant as the
+target and an eighth as the margin, which keep a wrong estimate of up to a third from meeting the fallback.
+**Pinned by.** `log/src/reader/tests/parts_and_lookup.rs`
+`an_estimate_counts_what_a_lookup_finds_from_seal_indexes_and_the_tallies_of_unsealed_segments`,
+`room_for_the_expected_facts_is_taken_at_once_so_a_budget_doubling_overflows_holds_them`;
+`kvik/src/durable/read/source/tests.rs` `a_read_again_is_sized_from_counts_so_no_pass_passes_its_grant`;
+`kvik/src/durable/read/merge.rs` `a_sort_by_keys_equals_a_sort_in_place_and_holds_to_the_room_given`; the facts' and
+the windows' differentials at every cap (Q-1060, Q-1109, Q-1110).
 
 ## Open at v0.2
 
@@ -4853,6 +4883,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 | Q-1109 | 6.2 | Decided by the lead with 9.0h: windows, buckets and calendar results from the sources, chunked fold, `Bucket` sum, increase, resets and regressions; the first read's segment index reads wait on per-segment spans; for review |
 | Q-1110 | 6.2 | Decided by the lead with 9.0h: several series' windows, buckets and facts from one read; results held per series until the call ends; for review |
+| Q-1111 | 6.2 | Decided by the lead with 9.0h: passes sized from the lookups' counts, rows sorted by keys; half a grant as the target; for review |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

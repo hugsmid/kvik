@@ -464,7 +464,7 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
   `OpenError::Config`), a stream's rows not yet taken by the caller included: a read that needs more works in more
   passes over narrower event-time ranges, down to one key's positions, with equal results at any cap (Q-1063,
-  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
+  Q-1067, Q-1068), sized before they are read from the counts the reader's lookups hold (Q-1111). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
   keeps, to find damage a read met (Q-1060, Q-1069), and the bytes of the last segment the reader's refresh read, up to
   `log.segment_size`, kept so that the next refresh reads only what is new (Q-1069). Rows a stream holds give way to
   another read that needs the room, and the stream reads that part again: at 32 MiB a held part above about 7 MiB

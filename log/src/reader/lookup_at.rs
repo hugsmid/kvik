@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::files::read_at_full;
-use super::lookup::Query;
+use super::lookup::{BySeries, Query};
 use super::{LogReader, ReaderError};
 use crate::header::HEADER_LEN;
 use crate::name::SegmentName;
@@ -86,7 +86,7 @@ impl LogReader {
                     .push((wanted[i].t, wanted[i].t));
             }
             let query = Query {
-                by_series,
+                by_series: BySeries::new(by_series),
                 ranges: at.iter().map(|&i| (wanted[i].t, wanted[i].t)).collect(),
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,

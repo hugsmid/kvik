@@ -92,7 +92,8 @@ enum Mode {
     Point {
         before: Option<Reading>,
         until: i64,
-        core: kt::Node,
+        /// The chunks folded so far; `None` before the first, as merging into an empty node only costs.
+        core: Option<kt::Node>,
         chunk: Vec<Reading>,
         from: i64,
         /// The last reading in `[until, end)`, which the span does not credit.
@@ -145,7 +146,7 @@ impl Core {
             Mode::Point {
                 before: self.last.clone(),
                 until: p.credit_limit(end, now).max(start),
-                core: kt::Node::empty(np.kind, start, start),
+                core: None,
                 chunk: Vec::with_capacity(self.chunk.min(64)),
                 from: start,
                 passed: None,
@@ -180,7 +181,11 @@ impl Core {
                 self.held_most = self.held_most.max(chunk.len());
                 if chunk.len() == self.chunk {
                     let to = chunk[chunk.len() - 1].0 + 1;
-                    *core = kt::merge(&np, core, &kt::fold(&np, *from, to, chunk));
+                    let folded = kt::fold(&np, *from, to, chunk);
+                    *core = Some(match core.take() {
+                        Some(c) => kt::merge(&np, &c, &folded),
+                        None => folded,
+                    });
                     *from = to;
                     self.last = chunk.pop();
                     chunk.clear();
@@ -214,7 +219,11 @@ impl Core {
                 from,
                 passed,
             } => {
-                let core = kt::merge(&self.np, &core, &kt::fold(&self.np, from, until, &chunk));
+                let folded = kt::fold(&self.np, from, until, &chunk);
+                let core = match core {
+                    Some(c) => kt::merge(&self.np, &c, &folded),
+                    None => folded,
+                };
                 if let Some(r) = chunk.pop() {
                     self.last = Some(r);
                 }

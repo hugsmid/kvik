@@ -8,13 +8,14 @@ use km::summary::Params;
 use kvik_model as km;
 use kvik_tree as kt;
 
-use super::super::read::source::{FactStream, search_back_each};
+use super::super::index::{Stored, fact_into};
+use super::super::read::source::{each_row, search_back_each};
 use super::super::read::view::View;
 use super::super::reader::DurableReader;
 use super::super::reader::facts::plan;
 use super::super::registry::Series;
 use super::stream::{Core, needs_last, readable, reading};
-use super::{params, series_in, span_in};
+use super::{params, reading_of, series_in, span_in};
 use crate::backend::{Error, convert};
 use crate::error::QueryError;
 use crate::fold::{self, Reading};
@@ -52,16 +53,16 @@ struct Member<'a> {
 }
 
 impl Member<'_> {
-    fn take(&mut self, f: Fact) {
-        if f.t.0 < self.reach {
+    fn take(&mut self, s: Stored) {
+        if s.row.t < self.reach {
             return;
         }
         if let Some(h) = &mut self.head {
-            if f.t.0 < h.a {
-                h.before.extend(reading(self.states, f));
+            if s.row.t < h.a {
+                h.before.extend(reading_of(self.series, &s));
                 return;
             }
-            h.facts.push(f);
+            h.facts.push(fact_into(s));
             if h.facts.len() > h.max {
                 let h = self.head.take().expect("a head");
                 for r in h.before {
@@ -75,7 +76,7 @@ impl Member<'_> {
             }
             return;
         }
-        if let Some(r) = reading(self.states, f) {
+        if let Some(r) = reading_of(self.series, &s) {
             self.feed(r);
         }
     }
@@ -191,11 +192,12 @@ fn drive(
     let from = members.iter().map(|m| m.reach).min().unwrap_or(to);
     if from < to {
         let plan = plan(r, v, &ids, ReadView::Current)?;
-        for f in FactStream::new(r.clone(), v.clone(), plan, from, to - 1) {
-            let f = f?;
-            let k = ids.binary_search(&f.series).expect("a series of the read");
-            members[k].take(f);
-        }
+        each_row(r, v, &plan, from, to - 1, |s| {
+            let k = ids
+                .binary_search(&SeriesId(s.row.series_id))
+                .expect("a series of the read");
+            members[k].take(s);
+        })?;
     }
     for m in members.iter_mut() {
         m.finish();

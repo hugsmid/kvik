@@ -49,9 +49,18 @@ impl DurableReader {
         }
         let listed = std::mem::take(&mut l.listed);
         if l.overflowed {
+            #[cfg(test)]
+            self.overflows.fetch_add(1, Ordering::Relaxed);
             return Ok((None, listed));
         }
         Ok((Some(complete(l, v)?), listed))
+    }
+
+    /// About how many facts a lookup of `wanted` would find ([`LogReader::estimate`]); `None` before the lookups' log
+    /// reader has listed the segments.
+    pub(crate) fn estimate(&self, wanted: &[Wanted]) -> Option<u64> {
+        let g = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
+        g.as_ref()?.estimate(wanted)
     }
 
     /// The last position at or below `v`'s cut whose batch was committed at or before `at` (`spec.md` §2.3 As-of
