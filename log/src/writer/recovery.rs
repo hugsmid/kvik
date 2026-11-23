@@ -31,7 +31,7 @@ use crate::scan::{
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
-use super::generation::{Gen, scan_sealed};
+use super::generation::{Gen, SealedScan, scan_sealed};
 use super::maint::{AheadSegment, CreateError, SealJob, SegmentRequest, create_segment};
 use super::{Fault, FaultOp, Halt, OpenSegment, StartOptions, WriterConfig, reach};
 
@@ -862,8 +862,16 @@ pub(super) fn start(
     let own_sealed: Vec<&(SegmentName, PathBuf)> =
         sealed.iter().filter(|(n, _)| n.generation == g).collect();
     // The last sealed segment's last position and commit time.
-    let sealed_last = match own_sealed.last() {
-        Some((name, path)) => {
+    // Its trailer, read positionally, when the seal holds one; else a scan of the whole file.
+    let trailer = own_sealed.last().and_then(|(name, path)| {
+        Some((
+            name.file_id,
+            crate::directory::catalogue::read_trailer(&*fs, path)?.1,
+        ))
+    });
+    let sealed_last = match (own_sealed.last(), trailer) {
+        (Some(_), Some((id, t))) => Some((id, t.last_sequence, t.last_commit_time)),
+        (Some((name, path)), None) => {
             let bytes = store.read_file(path)?;
             let id = SegmentIdentity {
                 store_id,
@@ -886,7 +894,7 @@ pub(super) fn start(
                         .map(|b| (name.file_id, b.commit.last_sequence, b.commit.commit_time))
                 })
         }
-        None => None,
+        (None, _) => None,
     };
     let empty_log = segs.iter().all(|s| !s.in_use()) && own_sealed.is_empty();
     // Unused segments: the highest one of the configured size with a valid header is kept as created ahead.
@@ -936,12 +944,22 @@ pub(super) fn start(
     // too, past what is set aside (Q-262). The file is written at a start, a clean shutdown and each routing change,
     // so after a crash this reads every segment sealed since the last of those (possibly the whole previous run), and
     // with no registry file of this generation every sealed segment; the cost is Q-116 (n).
-    let sealed_scan = scan_sealed(
-        store,
-        &sealed,
-        registry.as_ref().map(|f| (g, f.through)),
-        &generation,
-    );
+    // When the newest sealed segment ends at or below the file's `through`, nothing sealed lies above it: the scan
+    // would read that segment only to stop there.
+    let covered = registry.as_ref().is_some_and(|f| {
+        let newest = sealed.iter().map(|(n, _)| n.file_id).max();
+        sealed_last.is_some_and(|(id, last, _)| Some(id) == newest && last <= f.through)
+    });
+    let sealed_scan = if covered {
+        SealedScan::default()
+    } else {
+        scan_sealed(
+            store,
+            &sealed,
+            registry.as_ref().map(|f| (g, f.through)),
+            &generation,
+        )
+    };
     let first_mark = match &mark {
         MarkRead::Readable { slot, .. } => generation.is_first_mark(slot),
         _ => true,

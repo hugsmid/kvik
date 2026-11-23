@@ -4805,6 +4805,8 @@ the seed once more in the background, O(store) I/O per open.
 break or an upgrade, finds the damage. (b) Record how far the scan got (status file) and continue from there at the
 next open: one more durable write. (c) Record whether the last scan finished; if not, scan before the next open once
 (`ScanOrder::BeforeOpen` for that open).
+Measured: at 7 days of the home workload the scan ends 12–16 s after the open, longer than a start from the whole
+log takes to read the same store (7–8 s); why it reads more slowly is not yet known.
 **Provisional default.** (a): both other options add a durable record, which a fix round does not. (c) is the
 smaller change if short-lived processes turn out to matter.
 

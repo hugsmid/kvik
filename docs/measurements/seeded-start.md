@@ -16,11 +16,26 @@ was built by the build it is opened with.
 
 - After, the open is flat with age: the stores differ by a factor of seven in size and the open by 0.2 s. The first
   open of a 7-day store after other work had pushed it out of the page cache took 1.3–1.4 s.
-- Of a replayed store's 0.55–0.69 s, recovery takes 0.40–0.56 s: it decodes the batches of the unsealed segment,
-  which a replayed build fills to 64 MiB, to rebuild that segment's index for its seal. Scanning only to the mark
-  (the research's F6) would save the read of the zero-filled rest, which is small here; it was not built.
+- Of a replayed store's 0.55–0.69 s, recovery took 0.40–0.56 s, growing with age: it decodes the batches of the
+  unsealed segment, which a replayed build fills to 64 MiB, to rebuild that segment's index for its seal, and it read
+  the newest sealed segment twice, whole, once for its last position and once to find nothing sealed above the
+  registry file. It now takes that position from the segment's trailer and skips the second read when the registry
+  file covers every sealed position, which leaves recovery at 0.34–0.36 s at 1 and 7 days:
+
+  | Store | Recovery before | Recovery after | Open before | Open after |
+  |---|---:|---:|---:|---:|
+  | W0, 1 day | 0.34–0.37 s | 0.34–0.35 s | 0.41–0.50 s | 0.45–0.48 s |
+  | W0, 7 days | 0.51–0.56 s | 0.34–0.36 s | 0.55–0.60 s | 0.46 s |
+
+  What is left is the decode of the unsealed segment (0.14–0.15 s), the read of it and of the empty segment created
+  ahead (0.03 s each, the zeros checked for Q-125), and building the writer's state (about 0.09 s). Going lower needs
+  the unsealed segment's index kept on disk or decoded lazily, a new mechanism. Scanning only to the mark (the
+  research's F6) would save little: the scan already stops at the last non-zero byte.
 - At live rates a seal every 5 minutes and a series directory every 15 keep the log after the seed short; a clean
   stop writes a directory through the mark, so the next open reads almost nothing of the log.
-- The first `latest` overlaps the damage scan of the log below the seed, which runs after the open returns.
+- The first `latest` overlaps the damage scan of the log below the seed, which runs after the open returns. The scan
+  itself ends 2.0–2.4 s after the open at 1 day and 11.6–15.6 s after it at 7 days, so `start_scanning` reads true
+  that long; it reads more slowly per byte than a start from the whole log, which read the 7-day store in 7.1–7.6 s,
+  and why is not yet known (Q-1114).
 - Probe: the reopen research's probe (`probe build <dir> <days> [scale]`, `probe open <dir> [scale]`), with a
   `live <dir> <minutes>` step that emits the arrivals after the build each second at wall time.
