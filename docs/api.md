@@ -595,16 +595,24 @@ pub enum Withdrawal { OutcomeUnknown, NotStored }                               
 - Opt-in: nothing changes for consumers, live reads or acknowledgements, and a store with no stream open does no
   fast-path work. Spec §4 Provisional streams gives the promises. The model backend and reader processes have no fast path
   (`QueryError::NotAvailable`); `max_behind` out of bounds is `QueryError::Invalid`.
-- A stream opens at the next accepted call. `next` computes what is due when called (no thread, no queue of its own)
-  and returns events in this order: `Lagged`, `Withdrawn`, `Durable`, `Accepted`, then `Closed` alone. A call is
-  delivered as soon as its writer queues it; `durable()` says whether it already was. `Durable { through }` covers
-  every call delivered with `seq ≤ through` and not withdrawn; `mark` is the durable position read. `Withdrawn`
-  names a range: drop the calls delivered in it that no watermark covered. `Lagged` names the calls missed and
-  `after`, below every fact among them; once durable they can be read there.
+- A stream opens at the next accepted call; a call already being decided when it opens is either before it or seen
+  by it. `next` computes what is due when called (no thread, no queue of its own) and returns events in this order:
+  `Lagged`, `Withdrawn`, `Durable`, `Accepted`, then `Closed` alone. A call is delivered as soon as its writer queues
+  it; `durable()` says whether it already was. `Durable { through }` covers every call delivered with
+  `seq ≤ through` and not withdrawn; `mark` is the durable position read; it is sent only when it covers a call
+  delivered provisional, and `through` may also cover calls missed in a `Lagged`. `Withdrawn` names a range: drop
+  the calls delivered in it that no watermark covered; its cause is the outcome the writer was given (`Withdrawal`).
+  `Lagged` names the calls missed and `after`, below every fact among them; once durable they can be read there. A
+  call larger than `max_behind` on its own is delivered whole, the lag ending before it (Q-1113).
+- `Closed` follows a shutdown or the store's drop once the writer has stopped. A writer that stops without either (a
+  panic) withdraws every call delivered, and `Closed` waits for the shutdown or drop (Q-1113).
 - `seq` is per open of the store: after a restart a stream starts afresh, and anything kept from a provisional
   reading that no watermark covered was withdrawn by the stop (Q-1109).
-- A stream holding a call acknowledged ahead of its sync (`Durability::Written`) reads the durable position every
-  5 ms while it waits; otherwise a waiting stream is woken only by a call accepted or settled, or a shutdown.
+- A waiting stream is woken by a call accepted or settled that holds a series it selects, or by a shutdown. It reads
+  the durable position every 5 ms while it holds a call acknowledged ahead of its sync (`Durability::Written`) and
+  while the store is closing and its writer has not yet stopped.
+- A stream takes at most 4,096 calls from the ring per hold of the ring's lock, which the writer also takes to
+  publish a call: a stream catching up holds the writer up by at most that much (`docs/measurements/fast-path.md`).
 - With a long gathering window (`log.sync_interval_floor` and `log.min_sync_interval` both at, say, 1 s), a
   provisional stream still sees each call within about a millisecond; acknowledgements, consumers and watermarks
   follow the window.

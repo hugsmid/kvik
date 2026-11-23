@@ -332,6 +332,9 @@ impl Writer {
         o: &crate::provisional::ProvisionalOptions,
     ) -> Result<fast::Stream, QueryError> {
         o.check()?;
+        // Under the decision lock, as a call is checked, offered and published: a call in flight is then either
+        // published before the stream's cursor and above its floor, or seen by it.
+        let _d = lock(&self.decider);
         let watch = self.progress().ok_or_else(|| QueryError::NotAvailable {
             reason: "the store is closed".into(),
         })?;

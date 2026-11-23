@@ -38,7 +38,8 @@ pub enum Event<F> {
         /// Its selected facts.
         facts: Vec<F>,
     },
-    /// Every call delivered with `seq ≤ through` and not withdrawn is durable.
+    /// Every call delivered with `seq ≤ through` and not withdrawn is durable; sent when it covers a call delivered
+    /// provisional.
     Durable {
         /// The watermark.
         through: u64,
@@ -156,8 +157,10 @@ impl<F: Clone> Provisional<F> {
     fn state(&self, seq: u64) -> State {
         match self.calls[&seq].outcome {
             Outcome::Acknowledged(last) if last <= self.mark => State::Durable,
+            Outcome::Acknowledged(_) if self.ended => State::Withdrawn(Withdrawal::OutcomeUnknown),
             Outcome::Failed(w) => State::Withdrawn(w),
-            _ if self.ended => State::Withdrawn(Withdrawal::OutcomeUnknown),
+            // A failed writer still settles its open calls; only a stopped one leaves them unknown.
+            Outcome::Open if self.closed => State::Withdrawn(Withdrawal::OutcomeUnknown),
             _ => State::Open,
         }
     }
@@ -179,6 +182,7 @@ impl<F: Clone> Provisional<F> {
             .filter(|q| !s.settled.contains(q))
             .collect();
         let mut groups: Vec<(u64, u64, Option<Withdrawal>)> = Vec::new();
+        let mut settled_durable = false;
         let mut rest = outstanding.as_slice();
         while let Some((&q, tail)) = rest.split_first() {
             let w = match self.state(q) {
@@ -186,6 +190,7 @@ impl<F: Clone> Provisional<F> {
                 State::Durable => None,
                 State::Withdrawn(w) => Some(w),
             };
+            settled_durable |= w.is_none();
             match groups.last_mut() {
                 Some((_, last, g)) if w.is_some() && *g == w => *last = q,
                 _ => groups.push((q, q, w)),
@@ -204,10 +209,13 @@ impl<F: Clone> Provisional<F> {
             .max(s.through);
         if through > s.through {
             s.through = through;
-            out.push(Event::Durable {
-                through,
-                mark: self.mark,
-            });
+            // A watermark only when it covers a call delivered provisional.
+            if settled_durable {
+                out.push(Event::Durable {
+                    through,
+                    mark: self.mark,
+                });
+            }
         }
         let next = self.calls.len() as u64;
         for q in s.looked + 1..=next {

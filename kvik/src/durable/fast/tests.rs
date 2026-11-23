@@ -56,11 +56,11 @@ fn fact(series: u32, t: i64) -> ProvisionalFact {
 }
 
 fn accept(fast: &Fast, facts: &[(u32, i64)], floor: u64) -> Arc<Entry> {
-    fast.push(
-        facts.iter().map(|&(s, t)| fact(s, t)).collect(),
-        at(floor),
-        Outcome::Set(Mutex::new(None)),
-    )
+    let facts: Box<[ProvisionalFact]> = facts.iter().map(|&(s, t)| fact(s, t)).collect();
+    let series = series_of(&facts);
+    let e = fast.push(facts, at(floor), Outcome::Set(Mutex::new(None)));
+    fast.ring_for(&series);
+    e
 }
 
 fn set(e: &Entry, r: Result<LogAck, CommitError>) {
@@ -431,7 +431,6 @@ fn a_slow_stream_lags_to_within_max_behind_and_others_miss_nothing() {
             Said::Lagged(1, 6),
             Said::Accepted(7, false, vec![(1, 6)]),
             Said::Accepted(8, false, vec![(1, 7)]),
-            Said::Durable(6, 0),
         ]
     );
 }
@@ -470,4 +469,286 @@ fn a_stream_opened_later_sees_only_calls_accepted_after_it() {
     };
     assert_eq!(seqs(&mut first), [1, 2]);
     assert_eq!(seqs(&mut second), [2]);
+}
+
+#[test]
+fn a_call_larger_than_max_behind_is_delivered_whole_without_a_lag() {
+    let fast = Arc::new(Fast::default());
+    let mut s = fast.open(&behind(1), Box::new(Script::default()));
+    accept(&fast, &[(1, 1), (1, 2)], 0);
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(ev, [Said::Accepted(1, false, vec![(1, 1), (1, 2)])]);
+}
+
+#[test]
+fn a_lag_ends_at_a_call_larger_than_max_behind_and_delivers_it_whole() {
+    let fast = Arc::new(Fast::default());
+    let mut s = fast.open(&behind(2), Box::new(Script::default()));
+    accept(&fast, &[(1, 1)], 0);
+    accept(&fast, &[(1, 2), (1, 3), (1, 4)], 0);
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(
+        ev,
+        [
+            Said::Lagged(1, 1),
+            Said::Accepted(2, false, vec![(1, 2), (1, 3), (1, 4)])
+        ]
+    );
+}
+
+#[test]
+fn a_stream_takes_at_most_one_batch_per_hold_of_the_ring_and_misses_nothing() {
+    let fast = Arc::new(Fast::default());
+    let mut s = fast.open(&behind(PROVISIONAL_MAX_BEHIND), Box::new(Script::default()));
+    let n = 2 * BATCH + 7;
+    for t in 0..n as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    let first = s.take_fresh();
+    assert_eq!(first.len(), BATCH);
+    assert!(s.more);
+    let seqs: Vec<u64> = first
+        .iter()
+        .map(|e| e.seq)
+        .chain(drain(&mut s).iter().map(|e| match e {
+            ProvisionalEvent::Accepted(a) => a.seq(),
+            other => panic!("{other:?}"),
+        }))
+        .collect();
+    assert_eq!(seqs, (1..=n as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_stream_with_calls_left_past_one_batch_does_not_close() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut o = behind(PROVISIONAL_MAX_BEHIND);
+    o.series = vec![SeriesId(2)];
+    let mut s = fast.open(&o, Box::new(script.clone()));
+    for t in 0..BATCH as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    let last = accept(&fast, &[(2, 0)], 0);
+    set(&last, Err(CommitError::ShutDown));
+    let mut st = lock(&script.0);
+    (st.ended, st.stopped) = (true, true);
+    drop(st);
+    fast.close();
+    s.poll();
+    assert!(!s.closed, "closed with a call not yet looked at");
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(ev, [Said::Closed]);
+}
+
+#[test]
+fn closed_waits_for_the_writer_to_stop_after_a_shutdown() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut s = fast.open(&ProvisionalOptions::default(), Box::new(script.clone()));
+    fast.close();
+    assert!(drain(&mut s).is_empty());
+    assert!(s.next(Duration::from_millis(20)).is_none());
+    lock(&script.0).stopped = true;
+    let started = Instant::now();
+    assert!(matches!(s.next(WAIT_LONG), Some(ProvisionalEvent::Closed)));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a closing stream rechecks"
+    );
+}
+
+#[test]
+fn a_writer_that_stopped_without_a_shutdown_closes_no_stream() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut s = fast.open(&ProvisionalOptions::default(), Box::new(script.clone()));
+    let e = accept(&fast, &[(1, 1)], 0);
+    drain(&mut s);
+    let mut st = lock(&script.0);
+    (st.ended, st.stopped) = (true, true);
+    drop(st);
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(ev, [Said::Withdrawn(1, 1, "withdrawn unknown")]);
+    set(&e, Err(CommitError::OutcomeUnknown));
+    assert!(s.next(Duration::from_millis(20)).is_none());
+    fast.close();
+    assert_eq!(
+        drain(&mut s).iter().map(said).collect::<Vec<_>>(),
+        [Said::Closed]
+    );
+}
+
+#[test]
+fn a_failed_writer_leaves_a_call_open_until_its_writer_is_given_an_outcome() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut s = fast.open(&ProvisionalOptions::default(), Box::new(script.clone()));
+    let a = accept(&fast, &[(1, 1)], 0);
+    let b = accept(&fast, &[(1, 2)], 0);
+    drain(&mut s);
+    lock(&script.0).ended = true;
+    assert!(
+        drain(&mut s).is_empty(),
+        "withdrawn before its writer was told"
+    );
+    set(&a, Err(CommitError::OutcomeUnknown));
+    set(&b, Err(CommitError::ReadOnly));
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(
+        ev,
+        [
+            Said::Withdrawn(1, 1, "withdrawn unknown"),
+            Said::Withdrawn(2, 2, "withdrawn not stored"),
+        ]
+    );
+}
+
+#[test]
+fn an_acknowledged_call_the_failed_writer_never_synced_is_withdrawn_unknown() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut s = fast.open(&ProvisionalOptions::default(), Box::new(script.clone()));
+    let a = accept(&fast, &[(1, 1)], 0);
+    set(
+        &a,
+        Ok(LogAck {
+            first: at(1),
+            last: at(1),
+        }),
+    );
+    drain(&mut s);
+    lock(&script.0).ended = true;
+    let ev: Vec<Said> = drain(&mut s).iter().map(said).collect();
+    assert_eq!(ev, [Said::Withdrawn(1, 1, "withdrawn unknown")]);
+}
+
+#[test]
+fn a_call_rings_only_the_streams_that_select_its_series() {
+    let fast = Arc::new(Fast::default());
+    let one = fast.open(
+        &ProvisionalOptions {
+            series: vec![SeriesId(1)],
+            ..ProvisionalOptions::default()
+        },
+        Box::new(Script::default()),
+    );
+    let two = fast.open(
+        &ProvisionalOptions {
+            series: vec![SeriesId(2)],
+            ..ProvisionalOptions::default()
+        },
+        Box::new(Script::default()),
+    );
+    let every = fast.open(&ProvisionalOptions::default(), Box::new(Script::default()));
+    let rung = |s: &Stream| *lock(&s.bell.rung);
+    accept(&fast, &[(1, 1)], 0);
+    assert_eq!((rung(&one), rung(&two), rung(&every)), (1, 0, 1));
+    fast.ring_for(&[2, 3]);
+    assert_eq!((rung(&one), rung(&two), rung(&every)), (1, 1, 2));
+    fast.close();
+    assert_eq!((rung(&one), rung(&two), rung(&every)), (2, 2, 3));
+}
+
+const WAIT_LONG: Duration = Duration::from_secs(5);
+
+#[test]
+#[ignore = "a timing probe: run in release with --ignored --nocapture"]
+fn take_fresh_hold_of_the_ring_with_a_full_backlog() {
+    let fast = Arc::new(Fast::default());
+    let mut s = fast.open(&behind(PROVISIONAL_MAX_BEHIND), Box::new(Script::default()));
+    for t in 0..PROVISIONAL_MAX_BEHIND as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    let mut holds = Vec::new();
+    loop {
+        let started = Instant::now();
+        let n = s.take_fresh().len();
+        holds.push(started.elapsed());
+        if n == 0 {
+            break;
+        }
+    }
+    holds.sort_unstable();
+    eprintln!(
+        "take_fresh of {} calls in {} holds: max hold {:?}, median {:?}",
+        PROVISIONAL_MAX_BEHIND,
+        holds.len() - 1,
+        holds.last().unwrap(),
+        holds[holds.len() / 2]
+    );
+}
+
+#[test]
+fn a_call_acknowledged_ahead_of_its_sync_is_rechecked_without_a_bell() {
+    let fast = Arc::new(Fast::default());
+    let script = Script::default();
+    let mut s = fast.open(&ProvisionalOptions::default(), Box::new(script.clone()));
+    let e = accept(&fast, &[(1, 1)], 0);
+    set(
+        &e,
+        Ok(LogAck {
+            first: at(3),
+            last: at(3),
+        }),
+    );
+    assert_eq!(
+        drain(&mut s).iter().map(said).collect::<Vec<_>>(),
+        [Said::Accepted(1, false, vec![(1, 1)])]
+    );
+    let synced = script.clone();
+    let syncer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        lock(&synced.0).mark = 3;
+    });
+    let started = Instant::now();
+    let ev = s.next(WAIT_LONG).map(|e| said(&e));
+    syncer.join().unwrap();
+    assert_eq!(ev, Some(Said::Durable(1, 3)));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn next_reads_past_a_batch_the_selection_filters_out_in_one_call() {
+    let fast = Arc::new(Fast::default());
+    let mut o = behind(PROVISIONAL_MAX_BEHIND);
+    o.series = vec![SeriesId(2)];
+    let mut s = fast.open(&o, Box::new(Script::default()));
+    for t in 0..2 * BATCH as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    accept(&fast, &[(2, 0)], 0);
+    let seq = 2 * BATCH as u64 + 1;
+    let ev = s.next(Duration::ZERO).map(|e| said(&e));
+    assert_eq!(ev, Some(Said::Accepted(seq, false, vec![(2, 0)])));
+}
+
+#[test]
+fn a_waiting_stream_is_closed_at_once_by_a_shutdown() {
+    for o in [
+        ProvisionalOptions::default(),
+        ProvisionalOptions {
+            series: vec![SeriesId(1)],
+            ..ProvisionalOptions::default()
+        },
+    ] {
+        let fast = Arc::new(Fast::default());
+        let script = Script::default();
+        lock(&script.0).stopped = true;
+        let mut s = fast.open(&o, Box::new(script));
+        let closer = fast.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let e = s.next(WAIT_LONG).map(|e| said(&e));
+            (e, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        closer.close();
+        let (e, waited) = waiter.join().unwrap();
+        assert_eq!(e, Some(Said::Closed));
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+    }
 }

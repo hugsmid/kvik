@@ -64,6 +64,8 @@ impl Writer {
                 provisional = fast::facts_of(&self.fast, &plan.items, clock.wall)
                     .map(|f| (f, log.watch().durable()));
                 let items = std::mem::take(&mut plan.items);
+                #[cfg(test)]
+                pause::at(&self.dir, pause::Point::BeforeOffer);
                 if wait {
                     log.offer(items)
                 } else {
@@ -102,13 +104,14 @@ impl Writer {
         #[cfg(test)]
         tests::before_tracking(&self.dir);
         let mut inflight = lock(&self.inflight);
+        let mut ring = None;
         let tracked = match queued {
             Some(pending) => {
                 let (clocks, ids) = (self.clocks.clone(), refreshes);
                 let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
                 inflight.insert(call, c.clone());
                 if let Some((facts, floor)) = provisional.take() {
-                    self.fast.publish(facts, floor, c.clone());
+                    ring = Some(self.fast.publish(facts, floor, c.clone()));
                 }
                 Some((c, true))
             }
@@ -121,6 +124,9 @@ impl Writer {
         };
         drop(inflight);
         drop(d);
+        if let Some(series) = ring {
+            self.fast.ring_for(&series);
+        }
         #[cfg(test)]
         pause::at(&self.dir, pause::Point::AfterDecision);
         self.count(readings, &plan);
@@ -476,5 +482,201 @@ mod tests {
         }
         emit(50);
         assert!(w.inflight.lock().unwrap().len() <= 1);
+    }
+
+    fn store(name: &str) -> (Arc<Writer>, ManualClock, PathBuf, crate::types::SeriesId) {
+        let fs = MemFs::new();
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(fs);
+        let dir = PathBuf::from(format!("durable-unit/{name}"));
+        let config = StoreConfig::new(&dir, "Etc/UTC")
+            .create_if_missing(true)
+            .env(env)
+            .log(LogConfig::default());
+        let w = Writer::open(&config).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let id = w.define(&spec).unwrap();
+        (w, clock, dir, id)
+    }
+
+    fn settle(e: Result<Emitted, EmitError>) {
+        if let Emitted::Queued(q) = e.unwrap() {
+            wait(q).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stream_opened_with_a_call_in_flight_never_names_a_lag_floor_above_a_call_it_missed() {
+        use crate::provisional::{ProvisionalEvent, ProvisionalOptions};
+        let (w, clock, dir, id) = store("open-lag-floor");
+        let _helper = w.provisional(&ProvisionalOptions::default()).unwrap();
+        let (paused_tx, paused) = mpsc::channel::<()>();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let pause_armed = AtomicBool::new(true);
+        *BEFORE_TRACKING.lock().unwrap() = Some((
+            dir.clone(),
+            Arc::new(move || {
+                if pause_armed.swap(false, Ordering::SeqCst) {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                }
+            }),
+        ));
+        let before = w.progress().unwrap().durable();
+        let w2 = w.clone();
+        let x = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+        let original = std::thread::spawn(move || settle(w2.emit(&x, Intent::Normal, false)));
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        let watch = w.progress().unwrap();
+        for _ in 0..500 {
+            if watch.durable() > before {
+                break;
+            }
+            clock.advance(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            watch.durable() > before,
+            "the call in flight did not sync while paused"
+        );
+        let w3 = w.clone();
+        let (opened_tx, opened) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let s = w3.provisional(&ProvisionalOptions {
+                max_behind: 1,
+                ..ProvisionalOptions::default()
+            });
+            opened_tx.send(()).unwrap();
+            s.unwrap()
+        });
+        assert!(
+            opened.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a stream opened while a call held the decision lock"
+        );
+        resume.send(()).unwrap();
+        original.join().unwrap();
+        let mut s = opener.join().unwrap();
+        *BEFORE_TRACKING.lock().unwrap() = None;
+        let floor = w.progress().unwrap().durable();
+        for k in 1..=2 {
+            clock.advance(Duration::from_secs(1));
+            let r = [Reading::new(id, clock.wall(), Value::F64(k as f64))];
+            settle(w.emit(&r, Intent::Normal, false));
+        }
+        let mut lags = Vec::new();
+        while let Some(e) = s.next(Duration::from_millis(50)) {
+            if let ProvisionalEvent::Lagged { first, after, .. } = e {
+                lags.push((first, after));
+            }
+        }
+        assert!(!lags.is_empty(), "the stream did not lag");
+        for (first, after) in lags {
+            assert!(
+                first > 1 || after.sequence <= before.sequence,
+                "Lagged from call {first} names after {after:?}, above the call in flight"
+            );
+            assert!(
+                after.sequence <= floor.sequence,
+                "after {after:?} above {floor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_opened_while_a_call_is_checked_waits_for_its_offer() {
+        use crate::durable::pause::{Gate, Point};
+        use crate::provisional::{ProvisionalEvent, ProvisionalOptions};
+        let (w, clock, dir, id) = store("open-silent-miss");
+        let gate = Gate::new(&dir, Point::BeforeOffer);
+        let w2 = w.clone();
+        let x = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+        let original = std::thread::spawn(move || settle(w2.emit(&x, Intent::Normal, false)));
+        gate.reached();
+        let w3 = w.clone();
+        let (opened_tx, opened) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            let s = w3.provisional(&ProvisionalOptions::default());
+            opened_tx.send(()).unwrap();
+            s.unwrap()
+        });
+        assert!(
+            opened.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a stream opened between a call's check for streams and its offer, so it would miss the call"
+        );
+        gate.release();
+        opened.recv_timeout(Duration::from_secs(5)).unwrap();
+        original.join().unwrap();
+        let mut s = opener.join().unwrap();
+        clock.advance(Duration::from_secs(1));
+        let y = [Reading::new(id, clock.wall(), Value::F64(2.0))];
+        settle(w.emit(&y, Intent::Normal, false));
+        let mut values = Vec::new();
+        while let Some(e) = s.next(Duration::from_millis(50)) {
+            if let ProvisionalEvent::Accepted(a) = e {
+                values.extend(a.facts().map(|f| f.value.clone()));
+            }
+        }
+        assert_eq!(values, [Value::F64(2.0)]);
+    }
+
+    #[test]
+    fn a_shutdown_lets_a_call_offered_before_it_reach_the_streams_before_closed() {
+        use crate::provisional::{ProvisionalEvent, ProvisionalOptions};
+        let (w, clock, dir, id) = store("shutdown-barrier");
+        let mut s = w.provisional(&ProvisionalOptions::default()).unwrap();
+        let (paused_tx, paused) = mpsc::channel::<()>();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let pause_armed = AtomicBool::new(true);
+        *BEFORE_TRACKING.lock().unwrap() = Some((
+            dir.clone(),
+            Arc::new(move || {
+                if pause_armed.swap(false, Ordering::SeqCst) {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                }
+            }),
+        ));
+        let w2 = w.clone();
+        let x = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+        let original = std::thread::spawn(move || settle(w2.emit(&x, Intent::Normal, false)));
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        let w3 = w.clone();
+        let shut = std::thread::spawn(move || w3.shutdown());
+        let mut early = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            early.extend(s.next(Duration::from_millis(20)));
+        }
+        assert!(
+            early.is_empty(),
+            "{early:?} while a call offered before the shutdown was unpublished"
+        );
+        resume.send(()).unwrap();
+        original.join().unwrap();
+        shut.join().unwrap().unwrap();
+        *BEFORE_TRACKING.lock().unwrap() = None;
+        let mut said = Vec::new();
+        while let Some(e) = s.next(Duration::from_secs(5)) {
+            let closed = matches!(e, ProvisionalEvent::Closed);
+            said.push(match e {
+                ProvisionalEvent::Accepted(a) => {
+                    format!("accepted {:?}", a.facts().next().map(|f| f.value.clone()))
+                }
+                other => format!("{other:?}"),
+            });
+            if closed {
+                break;
+            }
+        }
+        assert_eq!(said, ["accepted Some(F64(1.0))", "Closed"]);
     }
 }

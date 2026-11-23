@@ -342,6 +342,9 @@ impl Writer {
             }
             h.run(|_, _| ());
         }
+        // A call offered before the log shut down is published under the decision lock: once it is free, every
+        // such call is in the ring before the streams are told to close.
+        drop(lock(&self.decider));
         self.fast.close();
         let written = shut.map_err(|f| WriteError::ReadOnly(fault_out(&f)))?;
         if let Some(f) = hub_fault() {
