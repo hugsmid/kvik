@@ -487,7 +487,8 @@ start gives the same state, reads, deliveries and loss reports (Q-1111). The res
 for damage after the open returns, as the derived files' start work is (A.18): a loss found there is reported as one
 found while the store is open (Recovery rule 2, Q-921, Q-930), and the start-scan flag of the statistics says the
 scan runs. Damage below S is therefore found after the open returns, not before (Q-1110). The registry file is
-checked against the file plus the log after S (A.16, Q-33).
+checked against the file plus the log after S (A.16, Q-33). A clean shutdown writes the series directory through
+the mark when more than 65,536 positions follow the last one (A.18 Cadence), so the next start reads little of the log.
 
 ## 4. Delivery (funnels)
 | Rule | |

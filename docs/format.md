@@ -1142,7 +1142,9 @@ after which it writes no file; a reader ignores its pressure flag and its level.
 
 **Cadence** (the writer's; a reader relies only on the allowance). The log directory: the open group and the root at
 each seal, once the mark is synced past it. The series directory: once the sealed bytes it does not cover, plus the
-largest of the last 16 seals, would pass 32 MiB, and otherwise at least every 15 minutes; so between writes they stay
+largest of the last 16 seals, would pass 32 MiB, and otherwise at least every 15 minutes, and at a clean shutdown,
+after the last mark sync, through what the deliverer took, when more than 65,536 positions follow the last one's
+`through` (so the next start's seed is near the head, `spec.md` §3 Order of a start); so between writes they stay
 at most 32 MiB, and while a due write waits for the mark sync (or for the deliverer to take the batches) at most 32
 MiB plus the seals since. Segments that seal by size (the default 64 MiB) are covered at every seal; small timed
 seals at the 15-minute rule. A reader whose uncovered sealed bytes pass its 64 MiB allowance waits one mark-sync

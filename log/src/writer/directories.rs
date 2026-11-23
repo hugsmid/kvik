@@ -645,6 +645,19 @@ impl Directories {
         if self.starting.is_none() {
             self.backoff.clear();
             self.run(synced, now, wall);
+            // A.18 Cadence: a clean shutdown with more than a part of the log after the last series directory writes
+            // one through the mark, so that the next start reads little of it (`spec.md` §3 Order of a start).
+            if self.opts.hook.is_some()
+                && !self.refused.contains(&Family::Series)
+                && self.series_through.is_none_or(|t| {
+                    t.generation != synced.generation
+                        || synced.sequence.saturating_sub(t.sequence)
+                            > crate::directory::cadence::SHUTDOWN_POSITIONS
+                })
+                && synced.sequence > crate::directory::cadence::SHUTDOWN_POSITIONS
+            {
+                self.write_series(synced, now, wall);
+            }
         }
     }
 

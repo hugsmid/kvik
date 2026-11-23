@@ -75,8 +75,10 @@ fn specs() -> Vec<SeriesSpec> {
     };
     vec![
         gauge("a/one/v"),
-        gauge("a/two/v").versioned(ChangedAtKind::Version),
-        gauge("a/three/v"),
+        gauge("a/two/v")
+            .versioned(ChangedAtKind::Version)
+            .staleness(Duration::from_secs(10)),
+        gauge("a/three/v").staleness(Duration::from_secs(10)),
     ]
 }
 
@@ -113,7 +115,7 @@ fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         12 => (readings(), prop::bool::weighted(0.1)).prop_map(|(r, v)| Step::Emit(r, v)),
         3 => prop_oneof![1u64..5, 290u64..400, 900u64..1_200].prop_map(Step::Advance),
-        2 => (0usize..2, 0u8..5).prop_map(|(c, k)| Step::Route(c, k)),
+        2 => (0usize..2, 0u8..6).prop_map(|(c, k)| Step::Route(c, k)),
         3 => (0usize..2, 0usize..6).prop_map(|(c, n)| Step::Drain(c, n)),
         1 => Just(Step::Restart),
         1 => Just(Step::Kill),
@@ -295,7 +297,8 @@ fn funnel(k: u8) -> Funnel {
         1 => Funnel::facts(Select::Ids(vec![SeriesId(2)])),
         2 => cond(1, Condition::above(50.0).clear_below(30.0)),
         3 => cond(3, Condition::stale_for(Duration::from_secs(30))),
-        _ => cond(2, Condition::held_for(40.0, Duration::from_secs(5))),
+        4 => cond(2, Condition::held_for(40.0, Duration::from_secs(5))),
+        _ => cond(2, Condition::stale_for(Duration::from_secs(20))),
     }
 }
 
@@ -548,6 +551,10 @@ fn compare(
         End::Shutdown => w.shut(),
         End::Kill => w.kill(),
         End::PowerLoss => w.power_loss(),
+        End::KillAt(k) => {
+            w.step(&Step::Directory(k));
+            w.kill();
+        }
     }
     let at = w.clock.wall().0;
     let start_at = at.saturating_sub(start_back * S);
@@ -572,10 +579,17 @@ enum End {
     Shutdown,
     Kill,
     PowerLoss,
+    /// A series directory as of the batch chosen, then the process stops: a seed with the log after it.
+    KillAt(usize),
 }
 
 fn end() -> impl Strategy<Value = End> {
-    prop_oneof![Just(End::Shutdown), Just(End::Kill), Just(End::PowerLoss)]
+    prop_oneof![
+        Just(End::Shutdown),
+        Just(End::Kill),
+        Just(End::PowerLoss),
+        any::<usize>().prop_map(End::KillAt),
+    ]
 }
 
 static SEEDED: AtomicU64 = AtomicU64::new(0);
@@ -667,6 +681,46 @@ fn a_consumer_behind_the_seed_with_no_batch_after_it_is_replayed_from_the_log() 
         e(1, 0, false),
         e(1, 1, false),
         e(1, 0, true),
+        Step::Directory(usize::MAX),
+    ];
+    for order in [ScanOrder::Background, ScanOrder::BeforeOpen] {
+        assert!(compare(&steps, End::Shutdown, order, &[(1, 0, 0, 0, false)], 0).unwrap());
+    }
+}
+
+#[test]
+fn a_clean_shutdown_leaves_a_series_directory_through_the_mark() {
+    let mut w = World::new();
+    let n = kvik_log::directory::cadence::SHUTDOWN_POSITIONS as i64 + 10;
+    let readings: Vec<Reading> = (0..n)
+        .map(|k| Reading::new(SeriesId(1), Timestamp(T0 - n * S + k * S), Value::F64(1.0)))
+        .collect();
+    for chunk in readings.chunks(20_000) {
+        block_on(w.store().emit(chunk)).unwrap();
+    }
+    w.shut();
+    let store_id = kvik_log::store::read_descriptor(&*w.env.fs, &w.dir)
+        .unwrap()
+        .store_id;
+    let (_, d) = kvik_log::directory::read_latest(&*w.env.fs, &w.dir, Family::Series, |b| {
+        SeriesDirectory::decode(b, &store_id)
+    })
+    .unwrap()
+    .unwrap();
+    let mut log = reader(&w.env, &w.dir);
+    let mark = log.refresh().unwrap().state.durable;
+    let _ = log.close();
+    assert_eq!(d.through, mark);
+    assert!(d.entries.iter().all(|e| e.counts.is_some()));
+}
+
+#[test]
+fn a_stale_for_condition_on_an_outranked_last_fact_resumes_from_the_last_arrival_that_counts() {
+    let steps = vec![
+        Step::Route(0, 5),
+        Step::Emit(vec![(2, 0, 3, 3, false)], false),
+        Step::Advance(40),
+        Step::Emit(vec![(2, -40, 1, 1, false)], false),
         Step::Directory(usize::MAX),
     ];
     for order in [ScanOrder::Background, ScanOrder::BeforeOpen] {

@@ -4704,7 +4704,13 @@ history already does for what left memory (roadmap 11.0).
 fact of the same batch had just moved past the revision's key: it then delivered it unchecked although its key
 could be read. It now reads the key when the window no longer holds it
 (`a_late_revision_behind_a_fact_that_moves_the_window_is_checked_against_its_whole_key`).
-**Pinned by.** `kvik/src/durable/seed/tests.rs` (all), `log/src/directory/series.rs`
+**Cadence.** A clean shutdown also writes the series directory, after the last mark sync, through what the deliverer
+took, when more than 65,536 positions (one part of a start's read) follow the last one's `through` (A.18 Cadence), so
+the next start's seed is the mark; a store whose segments seal by size alone, or none (a
+day of a replayed build fits one unsealed segment), would otherwise have no seed near the head.
+**Pinned by.** `kvik/src/durable/seed/tests.rs` (all, among them
+`a_stale_for_condition_on_an_outranked_last_fact_resumes_from_the_last_arrival_that_counts` and
+`a_clean_shutdown_leaves_a_series_directory_through_the_mark`), `log/src/directory/series.rs`
 `a_v1_entry_carries_no_start_counts_whatever_its_flags_say`, `log/tests/directory_golden.rs`
 `a_v1_series_directory_reads_as_before_with_no_start_counts`.
 

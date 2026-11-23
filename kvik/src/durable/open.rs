@@ -296,6 +296,11 @@ impl Writer {
             return Ok(());
         };
         let hub_fault = || self.hub.as_ref().and_then(|h| lock(&h.fault).clone());
+        // The deliverer takes what is acknowledged, so that the series directory the shutdown writes covers it (A.18
+        // Cadence).
+        if let Some(h) = &self.hub {
+            h.run(|d, c| d.pump(c));
+        }
         // The registry file again, up to the mark the clean shutdown synced, while the store's lock is held: from the
         // deliverer's index once it has taken the log up to that mark.
         let shut = log.shutdown_then(|w| {

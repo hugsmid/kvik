@@ -13,6 +13,8 @@ use crate::writer::Position;
 pub const SERIES_BYTES: u64 = 32 << 20;
 /// Sealed bytes no directory covers that a reader reads directly before it fails with `DirectoryUnavailable`.
 pub const READER_ALLOWANCE: u64 = 64 << 20;
+/// Positions after the last series directory's `through` above which a clean shutdown writes one through the mark.
+pub const SHUTDOWN_POSITIONS: u64 = 1 << 16;
 /// The longest time between two series directory writes while segments seal.
 pub const SERIES_INTERVAL: Duration = Duration::from_secs(15 * 60);
 

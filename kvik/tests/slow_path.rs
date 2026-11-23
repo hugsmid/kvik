@@ -392,7 +392,12 @@ fn a_restart_across_several_parts_of_the_log_decides_as_before() {
         .map(|o| matches!(o, Outcome::Duplicate))
         .collect();
     assert_eq!(got, [true, true, true, false, false]);
-    assert_eq!(s.stats().ingest.slow_path, 3);
+    // The clean stop wrote a series directory through the mark, so the start is seeded and its decision windows
+    // hold no fact at or below each series' latest `t`: every probe reads its key from the log (spec §3 Order of a
+    // start, seeded start). A start from the whole log finds the two recent ones in its windows.
+    let seeded = s.stats().ingest.start_seeded;
+    assert!(seeded);
+    assert_eq!(s.stats().ingest.slow_path, 5);
     block_on(s.shutdown()).unwrap();
 }
 
