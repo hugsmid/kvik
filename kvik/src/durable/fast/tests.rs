@@ -710,3 +710,45 @@ fn a_call_acknowledged_ahead_of_its_sync_is_rechecked_without_a_bell() {
         started.elapsed()
     );
 }
+
+#[test]
+fn next_reads_past_a_batch_the_selection_filters_out_in_one_call() {
+    let fast = Arc::new(Fast::default());
+    let mut o = behind(PROVISIONAL_MAX_BEHIND);
+    o.series = vec![SeriesId(2)];
+    let mut s = fast.open(&o, Box::new(Script::default()));
+    for t in 0..2 * BATCH as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    accept(&fast, &[(2, 0)], 0);
+    let seq = 2 * BATCH as u64 + 1;
+    let ev = s.next(Duration::ZERO).map(|e| said(&e));
+    assert_eq!(ev, Some(Said::Accepted(seq, false, vec![(2, 0)])));
+}
+
+#[test]
+fn a_waiting_stream_is_closed_at_once_by_a_shutdown() {
+    for o in [
+        ProvisionalOptions::default(),
+        ProvisionalOptions {
+            series: vec![SeriesId(1)],
+            ..ProvisionalOptions::default()
+        },
+    ] {
+        let fast = Arc::new(Fast::default());
+        let script = Script::default();
+        lock(&script.0).stopped = true;
+        let mut s = fast.open(&o, Box::new(script));
+        let closer = fast.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let e = s.next(WAIT_LONG).map(|e| said(&e));
+            (e, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        closer.close();
+        let (e, waited) = waiter.join().unwrap();
+        assert_eq!(e, Some(Said::Closed));
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+    }
+}

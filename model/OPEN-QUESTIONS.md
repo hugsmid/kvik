@@ -4681,7 +4681,8 @@ hold is in `docs/measurements/fast-path.md`. A call wakes only the streams whose
 `a_call_larger_than_max_behind_is_delivered_whole_without_a_lag`,
 `a_lag_ends_at_a_call_larger_than_max_behind_and_delivers_it_whole`, `a_slow_stream_lags_to_within_max_behind_and_others_miss_nothing`,
 `a_stream_takes_at_most_one_batch_per_hold_of_the_ring_and_misses_nothing`,
-`a_call_rings_only_the_streams_that_select_its_series`; `kvik/tests/provisional.rs`
+`a_call_rings_only_the_streams_that_select_its_series`, `next_reads_past_a_batch_the_selection_filters_out_in_one_call`,
+`a_waiting_stream_is_closed_at_once_by_a_shutdown`; `kvik/tests/provisional.rs`
 `a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable_and_no_watermark`.
 
 ## Open at v0.2
