@@ -264,7 +264,7 @@ impl Parts {
                 upto: p.upto,
             };
             // Sized from the facts the log reader expects, so that a part too large is split before it is read
-            // rather than after (Q-1111); a part whose estimate is wrong still meets `TooMany` below.
+            // rather than after (Q-1132); a part whose estimate is wrong still meets `TooMany` below.
             let expect = if p.narrowed(plan) {
                 0
             } else {
@@ -465,7 +465,7 @@ fn beyond(history: bool, yielded: Option<(i64, u32, LogPos)>, s: &Stored) -> boo
 }
 
 /// What a [`FactStream`] of `plan` from `from` to `to`, both inclusive, at `v`'s cut yields, given to `each` as each
-/// pass is read, for a caller that takes every row at once: no row waits on a shelf or is read again (Q-1111).
+/// pass is read, for a caller that takes every row at once: no row waits on a shelf or is read again (Q-1132).
 pub(crate) fn each_row(
     r: &DurableReader,
     v: &View,
@@ -584,8 +584,8 @@ pub(crate) fn search_back(
 
 /// For each series of `plan`, in its order, the fact `pick` chooses among its view's facts at or before `t`, as
 /// [`search_back`] finds it for that series alone, from one search of them all: spans that double, each read once for
-/// the series still unfound, and after the first span one probe for each of those (Q-1110). The first span is cut to
-/// hold about [`FIRST_FACTS`] facts a series by the lookups' counts (Q-1111): the first span holding a series' fact
+/// the series still unfound, and after the first span one probe for each of those (Q-1131). The first span is cut to
+/// hold about [`FIRST_FACTS`] facts a series by the lookups' counts (Q-1132): the first span holding a series' fact
 /// holds its latest, whatever the spans.
 pub(crate) fn search_back_each(
     r: &DurableReader,

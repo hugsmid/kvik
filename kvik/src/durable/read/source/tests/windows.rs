@@ -170,7 +170,7 @@ fn shown_chart(r: Result<ChartData, QueryError>, model: bool) -> String {
 
 /// Every query of every series from `got` equals the fact index's, and the model's while no batch is damaged; a
 /// tiny cap may refuse only with `NotAvailable`. The many-series calls over every series at once, in another order and
-/// with one repeated, equal each series' own result, or fail as the first failing series in id order does (Q-1110).
+/// with one repeated, equal each series' own result, or fail as the first failing series in id order does (Q-1131).
 /// Returns the queries compared.
 fn check(rig: &Rig, small: u64) -> Result<u64, TestCaseError> {
     let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));

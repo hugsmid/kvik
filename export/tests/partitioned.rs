@@ -1,5 +1,5 @@
 //! The partitioned layout's exports on both backends: one file per UTC month with facts, as-of views, interval
-//! starts, option and open failures, and several series from one read (Q-196 as amended, Q-670, Q-1110).
+//! starts, option and open failures, and several series from one read (Q-196 as amended, Q-670, Q-1131).
 
 mod common;
 

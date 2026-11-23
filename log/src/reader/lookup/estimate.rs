@@ -1,5 +1,5 @@
 //! What lookups count of the segments they map, and the estimate of a lookup's facts from those counts and the sealed
-//! segments' indexes (Q-1111).
+//! segments' indexes (Q-1132).
 
 use super::*;
 

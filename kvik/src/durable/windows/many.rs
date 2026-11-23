@@ -1,5 +1,5 @@
 //! Windows and chart buckets of several series folded from one stream of their current facts at one cut, in `t`
-//! order then series: the log is read once for all of them (roadmap 9.0h, Q-1110). Each series holds its [`Core`]'s
+//! order then series: the log is read once for all of them (roadmap 9.0h, Q-1131). Each series holds its [`Core`]'s
 //! chunk and, for an automatic resolution, its raw facts until they pass the most points.
 
 use std::sync::Arc;

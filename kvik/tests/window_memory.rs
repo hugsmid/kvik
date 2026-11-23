@@ -115,7 +115,7 @@ fn reads(w: &World, id: SeriesId, end: Timestamp, date: LocalDate) -> Reads {
     Reads { first, each, held }
 }
 
-/// A fresh reader's chart query of every series over the last day at once (Q-1110), after a first read that fills the
+/// A fresh reader's chart query of every series over the last day at once (Q-1131), after a first read that fills the
 /// lookups' cache: its peak, its time and the bytes of its results.
 fn many(w: &World, ids: &[SeriesId], end: Timestamp) -> (usize, Duration, usize) {
     let r = Reader::open(ReaderConfig::new(&w.dir).env(w.env()).memory(CAP as u64)).unwrap();

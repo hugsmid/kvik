@@ -1,4 +1,4 @@
-//! A lookup's wanted ranges by series, looked up for every row a lookup decodes (Q-1111).
+//! A lookup's wanted ranges by series, looked up for every row a lookup decodes (Q-1132).
 
 use std::collections::BTreeMap;
 

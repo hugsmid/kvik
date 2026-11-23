@@ -118,7 +118,7 @@ polars:  lazy.filter(polars.col("metric") == "power").collect()
 
 Consistency and cost: the range is read once, in event-time order at one cut, and each month's file is written as
 the read passes the month, so the files of one call are one cut of the store. `export_partitioned_of` does the same
-for several series from one read (Q-1110): a series' file for a month is open from its first fact in the month until
+for several series from one read (Q-1131): a series' file for a month is open from its first fact in the month until
 the read passes it, so every series with facts in a month has its file open at once, each within `row_group_rows` and
 `batch_rows`, and the files come in month order, then in the order of the ids given. A periodic export should pass
 the months it means to refresh.

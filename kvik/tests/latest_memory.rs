@@ -1,6 +1,6 @@
 //! A reader process's memory does not grow with the facts it folds (roadmap 9.0c): the heap a reader holds after
 //! catching up over seven times the facts it had; a reader that also answers windows holds no more, since windows
-//! read the sources rather than build the fact index (roadmap 9.0h, Q-1109). Alone in its binary, so that the
+//! read the sources rather than build the fact index (roadmap 9.0h, Q-1130). Alone in its binary, so that the
 //! allocator counts this test only, and with the store shut down while it counts.
 
 #![forbid(unsafe_code)]

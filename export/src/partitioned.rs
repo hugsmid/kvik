@@ -1,6 +1,6 @@
 //! The partitioned layout's exports (`docs/export.md` Partitioned layout, Q-196): one read of the range for every
 //! series asked for, in event-time order, so that each month's files are written as the read passes the month
-//! (Q-1110).
+//! (Q-1131).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -29,7 +29,7 @@ where
     export_partitioned_of(reader, &[id], options, open)
 }
 
-/// Several series' [`export_partitioned`] from one read of the range (Q-1110): a series' file for a month is open from
+/// Several series' [`export_partitioned`] from one read of the range (Q-1131): a series' file for a month is open from
 /// its first fact in the month until the read passes the month, so every series with facts in a month has its file
 /// open at once, each within the options' bounds. `open` is called in the order of each series' first fact in the
 /// month, not of `ids`; the returned files come in month order, then in the order of `ids`, a repeated id once. Every

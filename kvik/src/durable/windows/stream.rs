@@ -1,5 +1,5 @@
 //! Windows, chart buckets and calendar results folded from current facts in the range, streamed at one cut through
-//! the sources of roadmap 9.0f within the reader's memory cap; no fact index (roadmap 9.0h, Q-1109).
+//! the sources of roadmap 9.0f within the reader's memory cap; no fact index (roadmap 9.0h, Q-1130).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -98,7 +98,7 @@ pub(super) fn on_view<R>(
 
 /// Windows over spans taken in ascending order, each starting where the last ended, from readings offered in `t`
 /// order: a span is opened, takes the readings below its end and is closed. It holds a chunk of the core and, for an
-/// interval series, the readings whose intervals reach past the span it last folded (Q-1109). [`Folder`] pulls its
+/// interval series, the readings whose intervals reach past the span it last folded (Q-1130). [`Folder`] pulls its
 /// readings from one series' stream; [`super::many`] pushes each series' readings from one stream of several.
 pub(super) struct Core {
     p: Params,
@@ -108,7 +108,7 @@ pub(super) struct Core {
     /// The last reading taken, else the last before the range: the next span's reading before its start.
     last: Option<Reading>,
     reaching: VecDeque<Reading>,
-    /// The most readings held at once: a chunk, or an interval series' readings reaching past a span (Q-1109).
+    /// The most readings held at once: a chunk, or an interval series' readings reaching past a span (Q-1130).
     held_most: usize,
     open: Option<Open>,
 }

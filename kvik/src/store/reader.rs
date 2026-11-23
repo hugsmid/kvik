@@ -199,7 +199,7 @@ impl Reader {
 
     /// Facts of several series with `t` in a range, in a view, streamed in
     /// event-time order, then series, then position: one read of the log
-    /// for them all (Q-1062, Q-1110).
+    /// for them all (Q-1062, Q-1131).
     pub fn facts_of(
         &self,
         ids: &[SeriesId],
@@ -231,7 +231,7 @@ impl Reader {
     }
 
     /// Chart queries of several series over one range, each as
-    /// [`Reader::buckets`] answers it, from one read of the range (Q-1110).
+    /// [`Reader::buckets`] answers it, from one read of the range (Q-1131).
     pub fn buckets_of(
         &self,
         ids: &[SeriesId],
@@ -256,7 +256,7 @@ impl Reader {
     }
 
     /// Window results of several series over one window, each as
-    /// [`Reader::window`] answers it, from one read of its span (Q-1110).
+    /// [`Reader::window`] answers it, from one read of its span (Q-1131).
     pub fn window_of(
         &self,
         ids: &[SeriesId],
