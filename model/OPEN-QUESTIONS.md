@@ -4829,7 +4829,8 @@ nothing it selects, so either the shared tail keeps them for it (memory, and a l
 the session is moved past them.
 **Decision (provisional).** In the writer's process one `kvik-fanout` thread, woken by the writer's turns and by
 refreshes of live staleness, runs one refresh round for what the writer published; each session keeps its own
-`min_batch_interval` (one rung inside it sleeps out the rest). Each session states what can give it a batch: the members of its opened `Latest`s and the series its
+`min_batch_interval` (one rung inside it sleeps out the rest; one whose batch stopped inside a round at a row limit,
+Q-1014, takes the rest once the interval passes, with no ring). Each session states what can give it a batch: the members of its opened `Latest`s and the series its
 opened `Tail`s select by the registry at its last batch or at the `Tail`'s position; anything from a read's `open`
 until the batch that opens it is taken, so that a round ending between that batch's cut and its advance is never
 passed over by what the session reached before (otherwise a `Tail` could miss a fact above its `Opened` cut with
@@ -4854,6 +4855,7 @@ rung by every round, the old path kept as the oracle, and the model backend); `k
 `kvik/src/durable/read/live/races.rs` `tails_opened_beside_a_busy_writer_hold_every_fact_above_their_opened_cut`;
 `kvik/src/durable/read/live/waits.rs`
 `a_ring_inside_the_batch_interval_is_taken_once_the_interval_passes`,
+`the_rest_of_a_round_a_row_limit_cut_is_taken_once_the_interval_passes_with_no_new_ring`,
 `a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone`. Measured in
 `docs/measurements/fanout.md`.
 

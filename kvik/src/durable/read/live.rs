@@ -85,6 +85,9 @@ pub(crate) struct Session {
     bell: Option<Arc<Bell>>,
     /// The bell's count before the last turn that gave a batch or found nothing: nothing rung up to it is pending.
     settled: Option<u64>,
+    /// The last batch stopped inside its rounds (Q-1014): what is left was rung already, so the rest is taken once
+    /// the interval passes with no ring.
+    rest: bool,
     /// The last round taken whole, and how many pieces of the next were taken.
     at: (u64, usize),
     started: bool,
@@ -302,6 +305,7 @@ impl Session {
             sub: None,
             bell: None,
             settled: None,
+            rest: false,
             at: (0, 0),
             started: false,
             reads: BTreeMap::new(),
@@ -415,7 +419,7 @@ impl Session {
             let turn = self.try_batch()?;
             let left = until.saturating_duration_since(Instant::now());
             if !matches!(turn, Turn::Sleep(_)) {
-                self.settled = rung;
+                self.settled = rung.filter(|_| !self.rest);
             }
             let rest = match turn {
                 Turn::Batch(b) => return Ok(Some(b)),
@@ -543,6 +547,7 @@ impl Session {
             Ok(n) => reach(n.reads.as_ref().unwrap_or(&self.reads), &v),
             Err(_) => (Reach::All, Reach::All),
         };
+        let round = v.round();
         let live = r.end(v);
         let next = out?;
         live?;
@@ -550,6 +555,7 @@ impl Session {
             self.reads = reads;
         }
         self.at = next.at;
+        self.rest = next.at != (round, 0);
         self.recorded = next.recorded;
         self.named = next.named;
         self.refreshes = next.refreshes;
