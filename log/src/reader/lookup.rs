@@ -184,41 +184,6 @@ impl SegmentMap {
     }
 }
 
-/// Counts a fact of `series` at `t` in `tally`.
-fn note(tally: &mut Vec<IndexRecord>, series_id: u32, t: i64) {
-    let k = match tally.binary_search_by_key(&series_id, |r| r.series_id) {
-        Ok(k) => k,
-        Err(k) => {
-            tally.insert(
-                k,
-                IndexRecord {
-                    series_id,
-                    fact_count: 0,
-                    min_t: t,
-                    max_t: t,
-                },
-            );
-            k
-        }
-    };
-    let r = &mut tally[k];
-    r.fact_count = r.fact_count.saturating_add(1);
-    r.min_t = r.min_t.min(t);
-    r.max_t = r.max_t.max(t);
-}
-
-/// A segment's facts of one series between `from` and `to`, both inclusive, taking them as spread evenly over its
-/// span.
-fn share(r: &IndexRecord, from: i64, to: i64) -> f64 {
-    let (a, z) = (from.max(r.min_t), to.min(r.max_t));
-    if a > z {
-        return 0.0;
-    }
-    let width = i128::from(r.max_t) - i128::from(r.min_t) + 1;
-    let part = i128::from(z) - i128::from(a) + 1;
-    f64::from(r.fact_count) * (part as f64 / width as f64)
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Span {
     offset: u64,
@@ -473,46 +438,6 @@ fn header(f: &dyn crate::fs::FsFile, id: &SegmentIdentity) -> Option<HeaderState
     let got = read_at_full(f, &mut h, 0).ok()?;
     h.truncate(got);
     read_header(&h, id).ok()
-}
-
-/// The wanted ranges by series: in a table by id when the ids are small, as every row of a read is looked up.
-pub(super) enum BySeries {
-    Table(Vec<u16>, Vec<Vec<(i64, i64)>>),
-    Map(BTreeMap<u32, Vec<(i64, i64)>>),
-}
-
-/// The greatest series id [`BySeries`] keeps a table for.
-const TABLE_IDS: u32 = 4_096;
-
-impl BySeries {
-    pub(super) fn new(map: BTreeMap<u32, Vec<(i64, i64)>>) -> Self {
-        match map.keys().next_back() {
-            Some(&max) if max <= TABLE_IDS => {
-                let mut table = vec![u16::MAX; max as usize + 1];
-                let mut lists = Vec::with_capacity(map.len());
-                for (k, (id, ranges)) in map.into_iter().enumerate() {
-                    table[id as usize] = k as u16;
-                    lists.push(ranges);
-                }
-                BySeries::Table(table, lists)
-            }
-            _ => BySeries::Map(map),
-        }
-    }
-
-    fn wants(&self, series: u32, t: i64) -> bool {
-        let ranges = match self {
-            BySeries::Table(table, lists) => match table.get(series as usize) {
-                Some(&k) if k != u16::MAX => &lists[usize::from(k)],
-                _ => return false,
-            },
-            BySeries::Map(map) => match map.get(&series) {
-                Some(r) => r,
-                None => return false,
-            },
-        };
-        ranges.iter().any(|(a, z)| (*a..=*z).contains(&t))
-    }
 }
 
 /// What one segment's read is for: the wanted ranges by series, the mark, and the regions taken as lost.
@@ -793,28 +718,6 @@ impl LogReader {
         whole
     }
 
-    /// About how many facts a lookup of `wanted` would find in the segments the last lookup listed, from the sealed
-    /// segments' indexes and the tallies of the segments lookups mapped (segments listed since, and facts appended
-    /// since a map's last scan, are not counted); `None` before a lookup has listed them, or when a listed segment has
-    /// neither. A guide for sizing lookups, never a bound.
-    pub fn estimate(&self, wanted: &[Wanted]) -> Option<u64> {
-        let listed = self.caches.listed.as_ref()?;
-        let mut n = 0.0;
-        for id in listed {
-            let records = match (self.caches.index.get(id), self.caches.maps.get(id)) {
-                (Some(Cached { value: Some(r), .. }), _) => r,
-                (_, Some(m)) if m.value.resume.is_some() => &m.value.tally,
-                _ => return None,
-            };
-            for w in wanted {
-                if let Ok(k) = records.binary_search_by_key(&w.series_id, |r| r.series_id) {
-                    n += share(&records[k], w.from, w.to);
-                }
-            }
-        }
-        Some(n.ceil() as u64)
-    }
-
     /// A sealed segment's index, read from its seal blocks.
     fn read_seal_index(&self, name: SegmentName) -> SealIndex {
         let (f, trailer, trailer_offset) = self.read_trailer(name)?;
@@ -865,4 +768,8 @@ impl LogReader {
 }
 
 mod append;
+mod estimate;
+mod wanted;
 use append::{scan_new, void_above};
+use estimate::note;
+pub(in crate::reader) use wanted::BySeries;

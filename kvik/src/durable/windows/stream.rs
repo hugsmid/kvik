@@ -96,8 +96,6 @@ enum Mode {
         core: Option<kt::Node>,
         chunk: Vec<Reading>,
         from: i64,
-        /// The last reading in `[until, end)`, which the span does not credit.
-        passed: Option<Reading>,
     },
     Interval {
         node: kt::Node,
@@ -149,7 +147,6 @@ impl Core {
                 core: None,
                 chunk: Vec::with_capacity(self.chunk.min(64)),
                 from: start,
-                passed: None,
             }
         };
         self.open = Some(Open { start, end, mode });
@@ -170,11 +167,10 @@ impl Core {
                 core,
                 chunk,
                 from,
-                passed,
                 ..
             } => {
+                // Past the credit limit, `now`: the next span is wholly ahead of it and takes no reading before it.
                 if r.0 >= *until {
-                    *passed = Some(r);
                     return None;
                 }
                 chunk.push(r);
@@ -217,7 +213,6 @@ impl Core {
                 core,
                 mut chunk,
                 from,
-                passed,
             } => {
                 let folded = kt::fold(&self.np, from, until, &chunk);
                 let core = match core {
@@ -225,9 +220,6 @@ impl Core {
                     None => folded,
                 };
                 if let Some(r) = chunk.pop() {
-                    self.last = Some(r);
-                }
-                if let Some(r) = passed {
                     self.last = Some(r);
                 }
                 let mut n = kt::with_stretches(&self.np, core, before.as_ref(), until);

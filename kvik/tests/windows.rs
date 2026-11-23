@@ -634,8 +634,10 @@ fn buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum() {
 }
 
 #[test]
-fn many_series_calls_equal_one_call_per_series_on_both_backends() {
+fn many_series_calls_equal_one_call_per_series_and_the_model() {
+    let mut shown: Vec<Vec<String>> = Vec::new();
     for backend in [Backend::Model, Backend::Durable] {
+        let mut out = Vec::new();
         let clock = ManualClock::new(at(600));
         let mut env = Env::test(clock.clone());
         env.fs = Arc::new(MemFs::new());
@@ -649,33 +651,44 @@ fn many_series_calls_equal_one_call_per_series_on_both_backends() {
         let c = block_on(s.define_series(number(counter()).name("w/c/energy"))).unwrap();
         let g = block_on(s.define_series(number(gauge()).name("w/g/power"))).unwrap();
         let i = block_on(s.define_series(number(interval(4, 0)).name("w/i/use"))).unwrap();
+        // Its reading before the ranges lies further back than the first span searched for it; a counter's step from
+        // it is credited whatever the staleness limit.
+        let o = block_on(s.define_series(number(counter()).name("w/c/old"))).unwrap();
         let mut readings: Vec<Reading> = (0..40)
             .map(|k| Reading::new(c, at(k * 3), Value::F64((k * k % 50) as f64)))
             .collect();
         readings.extend((0..30).map(|k| Reading::new(g, at(k * 5 + 1), Value::F64(k as f64))));
-        readings.extend((0..20).map(|k| Reading::new(i, at(k * 4), Value::F64(1.0))));
-        block_on(s.emit(&readings)).unwrap();
+        readings.extend((0..20).map(|k| Reading::new(i, at(k * 4), Value::F64(1.0 + k as f64))));
+        readings.push(Reading::new(o, at(-9_000), Value::F64(100.0)));
+        readings.extend(
+            (0..10).map(|k| Reading::new(o, at(k * 10 + 10), Value::F64(110.0 + k as f64))),
+        );
+        let ack = block_on(s.emit(&readings)).unwrap();
+        assert_eq!(ack.refused().count(), 0, "{backend:?}");
         clock.advance(Duration::from_secs(30));
         let r = s.reader();
-        let ids = [g, c, i, g];
-        let range = at(-20)..at(130);
-        for res in [
-            Resolution::Auto { max_points: 3 },
-            Resolution::Auto { max_points: 35 },
-            Resolution::Auto { max_points: 2_000 },
-            Resolution::Step(Duration::from_secs(7)),
-        ] {
-            let each: Vec<String> = ids
-                .iter()
-                .map(|id| format!("{:?}", r.buckets(*id, range.clone(), res).unwrap()))
-                .collect();
-            let many: Vec<String> = r
-                .buckets_of(&ids, range.clone(), res)
-                .unwrap()
-                .iter()
-                .map(|c| format!("{c:?}"))
-                .collect();
-            assert_eq!(many, each, "{backend:?} {res:?}");
+        let ids = [g, c, i, o, g];
+        // The second range starts inside an interval, whose reading before the range reaches into it.
+        for range in [at(-20)..at(130), at(2)..at(130)] {
+            for res in [
+                Resolution::Auto { max_points: 3 },
+                Resolution::Auto { max_points: 35 },
+                Resolution::Auto { max_points: 2_000 },
+                Resolution::Step(Duration::from_secs(7)),
+            ] {
+                let each: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!("{:?}", r.buckets(*id, range.clone(), res).unwrap()))
+                    .collect();
+                let many: Vec<String> = r
+                    .buckets_of(&ids, range.clone(), res)
+                    .unwrap()
+                    .iter()
+                    .map(|c| format!("{c:?}"))
+                    .collect();
+                assert_eq!(many, each, "{backend:?} {res:?}");
+                out.extend(many.into_iter().filter(|c| c.starts_with("Buckets")));
+            }
         }
         let w = Window::rolling(Duration::from_secs(100));
         for a in [Aggregate::Last, Aggregate::Max, Aggregate::Count] {
@@ -690,9 +703,11 @@ fn many_series_calls_equal_one_call_per_series_on_both_backends() {
                 .map(|x| format!("{x:?}"))
                 .collect();
             assert_eq!(many, each, "{backend:?} {a:?}");
+            out.extend(many);
         }
         // Refused on an interval series alone, so refused for the call.
         assert!(r.window_of(&[g, i], w.clone(), Aggregate::Avg).is_err());
+        let range = at(-20)..at(130);
         let mut each: Vec<_> = [c, g, i]
             .iter()
             .flat_map(|id| r.facts(*id, range.clone(), kvik::View::Current).unwrap())
@@ -714,5 +729,7 @@ fn many_series_calls_equal_one_call_per_series_on_both_backends() {
             .is_err()
         );
         block_on(s.shutdown()).unwrap();
+        shown.push(out);
     }
+    assert_eq!(shown[0], shown[1], "the durable backend against the model");
 }

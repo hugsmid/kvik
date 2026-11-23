@@ -165,6 +165,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1109 | §6 Chart buckets; `api.md` Reader; Q-1000, Q-1060 | Windows, chart buckets and calendar results from the sources (decided by the lead) |
 | Q-1110 | §6 Chart buckets; `api.md` Reading; Q-1062, Q-1109 | Several series' windows, buckets and facts from one read (decided by the lead) |
 | Q-1111 | query design §2.2; Q-1063, Q-1068 | Passes sized from counts before they are read (decided by the lead) |
+| Q-1112 | `api.md` Reader processes; Q-1110, Q-1111 | A reader call on more than one thread (OWNER) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4656,7 +4657,7 @@ results until it ends; a caller wanting fewer at once splits the call.
 **Pinned by.** `kvik/src/durable/read/source/tests/windows.rs`
 `windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (every series at once, in
 reverse with one repeated, against each series' own result and its first failure); `kvik/tests/windows.rs`
-`many_series_calls_equal_one_call_per_series_on_both_backends`; `export/tests/layout.rs`
+`many_series_calls_equal_one_call_per_series_and_the_model`; `export/tests/layout.rs`
 `a_partitioned_export_of_several_series_writes_each_series_files_from_one_read_on_both_backends`.
 
 ## Q-1111 — Passes sized from counts before they are read
@@ -4687,6 +4688,19 @@ target and an eighth as the margin, which keep a wrong estimate of up to a third
 `kvik/src/durable/read/source/tests.rs` `a_read_again_is_sized_from_counts_so_no_pass_passes_its_grant`;
 `kvik/src/durable/read/merge.rs` `a_sort_by_keys_equals_a_sort_in_place_and_holds_to_the_room_given`; the facts' and
 the windows' differentials at every cap (Q-1060, Q-1109, Q-1110).
+
+## Q-1112 — A reader call on more than one thread
+Recorded by the lead with roadmap 9.0h; for the owner. Built as option (a) until ruled.
+**Scenario.** A long chart read of many series spends about three fifths of its time reading and decoding passes and
+two fifths folding them (37 series over a week: 3.8 s and 2.5 s, `docs/measurements/9.0h-bucket-reads.md`). Folding
+one pass while the next is read would take the read close to the reading alone, within the cap: the accountant
+admits two passes at the default cap. Every reader call so far runs on the caller's thread.
+**Options.** (a) Calls stay on the caller's thread. (b) A call whose estimate passes some millions of facts folds on a
+scoped thread of its own while the caller's thread reads the next pass; the call still blocks until it ends, and a
+reader's lookups still run one at a time. (c) As (b), on a pool the reader owns, sized by its configuration.
+**Recommended.** (a) until stored levels (7.1) are built, since they shorten exactly these reads; then (b) if long
+many-series reads still matter, as it keeps the call's contract and adds no configuration.
+**Pinned by.** Nothing yet.
 
 ## Open at v0.2
 
@@ -4887,6 +4901,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1109 | 6.2 | Decided by the lead with 9.0h: windows, buckets and calendar results from the sources, chunked fold, `Bucket` sum, increase, resets and regressions; the first read's segment index reads wait on per-segment spans; for review |
 | Q-1110 | 6.2 | Decided by the lead with 9.0h: several series' windows, buckets and facts from one read; results held per series until the call ends; for review |
 | Q-1111 | 6.2 | Decided by the lead with 9.0h: passes sized from the lookups' counts, rows sorted by keys; half a grant as the target; for review |
+| Q-1112 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
