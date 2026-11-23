@@ -87,7 +87,6 @@ fn opens(w: &World, r: &crate::Reader, quiet: SeriesId, busy: &Busy, n: usize) -
     let mut out = Vec::new();
     for _ in 0..n {
         let id = session.open(tail(busy.id), LiveOptions::default()).unwrap();
-        // A commit, and the fan-out thread's round for it, between the opening batch's view and its advance.
         let b = busy.clone();
         if let Some(d) = session.durable_mut() {
             d.before_advance.0 = Some(Box::new(move || {

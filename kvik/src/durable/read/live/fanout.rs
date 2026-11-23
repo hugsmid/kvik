@@ -199,8 +199,6 @@ impl Rig {
         .unwrap();
         let own = store.reader();
         let reader = own.durable().unwrap().unwrap();
-        // The test runs the fan-out thread's passes itself, after each step, so that every ring is in place when
-        // the sessions are looked at.
         reader.fanout.store(true, Ordering::SeqCst);
         let mut rig = Rig {
             reader,
@@ -276,7 +274,6 @@ impl Rig {
                     assert_eq!(d.is_ok(), m.is_ok(), "{d:?} {m:?}");
                     fanout::pass(&reader);
                 }));
-                // Its other two sessions answer first, so all three answer before the readings.
                 self.poll_racing(Some(usize::from(*k) % n))?;
                 // A turn that computed no batch leaves the hook unfired; nothing was emitted then.
                 if let Some(fan) = self.subs[usize::from(*k) % n].fan.durable_mut() {
