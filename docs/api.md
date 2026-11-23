@@ -385,6 +385,9 @@ enum Live { Value(Fact), None, Unknown }
   unreadable at a start) first receives a resync of cause `NoCursor` whose `forget_above` is that position, carrying
   each funnel's state, a transition since its latches are lost (Q-131). A consumer with a cursor file resumes after
   it, whatever `start`. The model backend supports only `Start::Now`.
+- A waiting `next` is woken only for its own consumer: a delivery queued for it, a catch-up, a transition, a resync,
+  an entry in a batch, or its own confirmation freeing room; another consumer's deliveries and confirmations never
+  wake it (Q-1119).
 - `confirm` is cheap and batched; the cursor is written at most once a second, at once when the confirmation changes
   a latch (it returns once the file is synced, Q-132), on shutdown and when a resync carrying `forget_above` is
   confirmed.
@@ -552,9 +555,11 @@ pub fn select(&self, s: &Selection) -> Result<Vec<SeriesId>, QueryError>;      /
 - A live read is a query opened in a session: its `Opened` is the result at the cut of the next batch, then each
   batch brings every live read of the session to one durable position and one `now`. `next` computes the batch when
   called (no thread, no queue) and returns one only when an event changed; batches are at least `min_batch_interval`
-  apart, and `next` sleeps rather than turns while it waits. The writer's process is woken when the writer publishes;
-  a reader process reads the mark once a poll interval, and refreshes in full when it moved and at least once a
-  second (Q-1010, Q-1015). Within a batch a live read's events come `Reset`, `Gap` or `Lagged`, `Opened`, `Joined`
+  apart, and `next` sleeps rather than turns while it waits. In the writer's process one thread reads each commit
+  once and wakes only the sessions whose live reads it can change; a session no
+  commit touches costs nothing until a `Latest` falls due, and rounds holding nothing it selects never count to its
+  backlog (Q-1118). A reader process reads the mark once a poll interval, and refreshes in full when it moved and at
+  least once a second (Q-1010, Q-1015). Within a batch a live read's events come `Reset`, `Gap` or `Lagged`, `Opened`, `Joined`
   and `Left`, then `Updated` and `Appended`, then `Closed`.
 - `Latest` holds each selected series' live state, as `Snapshot::live` gives it at the batch's cut and `now`:
   `Updated` replaces one, `Joined` inserts a series at `index` of the selection's order and `Left` removes one (a
@@ -744,10 +749,10 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `None`.
 - `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
   tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
-  (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). While no consumer
-  is known to the store (none taken in this run, none named by a cursor file or the log), an `emit` returns without
-  reading its batch back; the `kvik-deliver` thread reads it shortly after. These counts may then lag an emit's
-  return, and `refresh_errors` counts the failed reads, not the calls (Q-706).
+  (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). An `emit` returns
+  without reading its batch back; the `kvik-deliver` thread reads it shortly after, or the next call that takes
+  batches, as of the emit's acknowledgement (Q-1119). These counts may then lag an emit's return, and
+  `refresh_errors` counts the failed reads, not the calls (Q-706).
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,

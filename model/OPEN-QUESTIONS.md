@@ -163,11 +163,13 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (ruled by the owner) |
-| Q-1110 | §4 Provisional streams; `api.md` Provisional streams; Q-1109 | A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold (decided by the lead) |
+| Q-1110 | §4 Provisional streams; `api.md` Provisional streams; Q-1109 | A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold (ruled by the owner) |
 | Q-1114 | §3 Order of a start; Q-1115 | The damage scan below a seed starts again at every open (decided by the lead, provisional) |
 | Q-1115 | §3 Order of a start, Recovery rule 2; Q-947 | A seeded start scans for damage below its seed after the open returns (ruled by the owner) |
 | Q-1116 | §3 Order of a start; `format.md` A.16, A.18; Q-33, Q-1001 | What a seeded start continues from, and when it reads the whole log (decided by the lead) |
 | Q-1117 | `format.md` A.18 Writing; Q-1116 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
+| Q-1118 | query design §3.6; `api.md` Live reads; Q-1013, Q-1015 | Selective fan-out of live sessions: what a session passed over no longer counts (decided by the lead, provisional) |
+| Q-1119 | §4 Delivery; `api.md` Consuming; Q-706 | Consumer deliveries taken off the emit's path, and wakes per consumer (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4659,7 +4661,7 @@ knows which a reading is for. Built so (`kvik/src/durable/fast.rs`, `kvik/src/pr
 `a_stream_opened_while_a_call_is_checked_waits_for_its_offer`.
 
 ## Q-1110 — A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold
-Recorded and decided by the lead with the fast path's fix round (Q-1109). Numbered Q-1115 on the fast path's branch; renumbered where it met the seeded start, which holds Q-1115.
+Recorded and decided by the lead with the fast path's fix round (Q-1109). Numbered Q-1115 on the fast path's branch; renumbered where it met the seeded start, which holds Q-1115. **Ruled by the owner, 23 November: as built.**
 **Scenario.** (a) The writer thread panics: the log fails every queued call as unknown and the writer stops, but
 the store is neither shut down nor dropped. Every call a stream delivered is withdrawn; should `Closed` follow? A
 `Closed` pushed on the writer's stop alone could precede the publication of a call offered just before the stop,
@@ -4817,6 +4819,53 @@ too, the cheap change is to sync the series directory and its directory once per
 **Pinned by.** `kvik/src/durable/seed/tests.rs`
 `a_store_with_a_directory_starts_seeded_and_gives_what_the_whole_log_gives` (a power loss reads the whole log and
 gives the same result).
+
+## Q-1118 — Selective fan-out of live sessions: what a session passed over no longer counts
+Decided by the lead with the fan-out change, provisional.
+**Scenario.** Fifty automations each watch a few of 37 series at 1 Hz. Every commit woke every session in the
+writer's process (the writer's `notify_all`), and each ran a turn whatever it selects: CPU grew with sessions times
+commits. The fix wakes only the sessions a round reaches. A session not woken does not take the rounds that hold
+nothing it selects, so either the shared tail keeps them for it (memory, and a lag once they pass its backlog) or
+the session is moved past them.
+**Decision (provisional).** In the writer's process one `kvik-fanout` thread, woken by the writer's turns and by
+refreshes of live staleness, runs one refresh round for what the writer published; each session keeps its own
+`min_batch_interval` (one rung inside it sleeps out the rest). Each session states what can give it a batch: the members of its opened `Latest`s and the series its
+opened `Tail`s select by the registry at its last batch or at the `Tail`'s position; anything while a read is not
+yet opened. A round reaches a session if it holds a fact of such a series, or anything else (an entry, a void, a gap,
+or more facts than the backlog keeps). A round rings the sessions it reaches and those with an earlier round still to
+take; a session that took every earlier round and is not reached passes over it, its cursor moved past without a
+turn. Consequences: (a) the backlog of Q-1013 counts the rounds a session must take, so a session whose series are
+quiet no longer lags, nor holds the shared tail, because of other series' readings; (b) a session waiting in `next`
+counts as polled, so it is never closed as idle while it waits; (c) a refresh of live staleness rings only the
+sessions that select the series; (d) `next` waits on the session's bell with no re-poll, or until a `Latest` falls
+due (rechecked at least once a second while one is due, as `now` follows the wall clock); (e) a loss another read of the process found reaches a
+waiting session at the thread's next pass, within a second, where the 100 ms re-poll found it before; (f) the shared
+tail is read when the writer commits, not at a session's call, so an error of that read reaches a session when the
+thread meets it. Reader processes are unchanged. Batches, their contents, order and cuts are otherwise as before.
+**Pinned by.** `kvik/src/durable/read/live/fanout.rs`
+`sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive` (against sessions
+rung by every round, the old path kept as the oracle, and the model backend); `kvik/src/durable/read/hub.rs`
+`a_round_rings_only_the_subscribers_it_reaches_and_the_others_caught_up_pass_over_it`,
+`a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series`. Measured in `docs/measurements/fanout.md`.
+
+## Q-1119 — Consumer deliveries taken off the emit's path, and wakes per consumer
+Decided by the lead with the fan-out change, provisional.
+**Scenario.** With a consumer registered, every `emit` read its batch back through the delivery reader and waited for
+the consumers it woke, on the caller's thread; every delivery or confirmation then woke every waiting consumer, each
+of which polled, found nothing and waited again: wakes grew as consumers times deliveries.
+**Decision (provisional).** An acknowledged `emit` notes the clocks at its acknowledgement and returns; the
+`kvik-deliver` thread, woken by the writer's turn, or the next call that takes batches, reads the batch back and
+takes it as of the earliest acknowledgement inside it (never before an instant already taken as of), so what
+consumers receive, conditions included, is what they received when the emit read it back itself. A consumer's
+waiting poll is woken only when something it may take changed for it: a fact queued or a catch-up running, a
+condition transition, a resync, an entry in a batch (any consumer), or its own confirmation. Consequences: (a) the
+Q-706 counts `refresh_errors` and `corruptions` may lag an emit's return with consumers registered too; (b) an
+`emit` returns before the consumers it feeds are woken, which the `kvik-deliver` thread does shortly after;
+(c) a confirmation wakes nobody but its own consumer. One cursor-file sync per tick for all consumers is not built:
+each consumer's file is still synced up to once a second.
+**Pinned by.** `kvik/src/durable/registering.rs`
+`with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it`; the consumer
+properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
 ## Open at v0.2
 
@@ -5015,12 +5064,14 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 | Q-1109 | 9.0d | Settled by the owner, 22 November: provisional delivery is acceptable, opt-in per stream and labelled, withdrawn when lost (as built) |
-| Q-1110 | 9.0d | Decided by the lead with the fast path's fix round: `Closed` after a shutdown or drop; a call larger than `max_behind` delivered whole; a watermark only over a provisional call; a bounded ring hold; for review |
+| Q-1110 | 9.0d | Ruled by the owner, 23 November, as built: `Closed` after a shutdown or drop; a call larger than `max_behind` delivered whole; a watermark only over a provisional call; a bounded ring hold |
 | Q-1113 | 9.0e | Withdrawn: a number given at a merge to the fast path's Q-1110, which keeps its number; not reused |
 | Q-1114 | 9.0e | Open, for the lead: provisional default as built (the scan starts again at every open); carry its progress across opens if short-lived processes matter |
 | Q-1115 | 9.0e | Settled by the owner, 23 November: the damage scan below the seed runs after the open returns (as built); `ScanOrder::BeforeOpen` stays the way back |
 | Q-1116 | 9.0e | Decided by the lead with the seeded start: the start counts in A.18, the rules for giving way to the whole log; for review |
 | Q-1117 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
+| Q-1118 | 9.0d | Decided by the lead, provisional: sessions passed over rounds they select nothing of; those rounds no longer count to their backlog; a waiting session is polled; losses found elsewhere within a second |
+| Q-1119 | 5.2 | Decided by the lead, provisional: an emit leaves its batch to the `kvik-deliver` thread, taken as of its acknowledgement; wakes per consumer; Q-706's counts may lag with consumers too |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

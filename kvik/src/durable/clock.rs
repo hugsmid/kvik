@@ -4,8 +4,9 @@
 //! staleness of an observed series (spec §5.4, Q-16) is measured on the monotonic clock since the call that last
 //! refreshed it was acknowledged; a reader process, and the writer before such a call, measure it in event time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Waker;
 
 use crate::env::Clock;
 
@@ -18,6 +19,9 @@ struct State {
     refreshed: BTreeMap<u32, u64>,
     /// Calls to [`Clocks::refresh`] that refreshed a series.
     refreshes: u64,
+    /// Series refreshed since [`Clocks::take_refreshed`], kept only while a waker is registered.
+    pending: BTreeSet<u32>,
+    waker: Option<Waker>,
 }
 
 /// See the module documentation.
@@ -35,6 +39,8 @@ impl Clocks {
             mono: env.monotonic().0,
             refreshed: BTreeMap::new(),
             refreshes: 0,
+            pending: BTreeSet::new(),
+            waker: None,
         };
         Clocks {
             env,
@@ -68,6 +74,21 @@ impl Clocks {
             s.refreshed.insert(id, mono);
         }
         s.refreshes += 1;
+        if let Some(w) = s.waker.clone() {
+            s.pending.extend(ids);
+            drop(s);
+            w.wake();
+        }
+    }
+
+    /// Wakes `w` after every refresh, which [`Clocks::take_refreshed`] then names.
+    pub(crate) fn on_refresh(&self, w: Waker) {
+        self.lock().waker = Some(w);
+    }
+
+    /// The series refreshed since the last call.
+    pub(crate) fn take_refreshed(&self) -> BTreeSet<u32> {
+        std::mem::take(&mut self.lock().pending)
     }
 
     /// How many calls have refreshed a series: a live read judges the staleness of its observed series again when

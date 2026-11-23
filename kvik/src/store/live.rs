@@ -29,6 +29,8 @@ struct Durable {
     pending: Vec<(LiveId, Query, LiveOptions)>,
     session: Option<crate::durable::read::live::Session>,
     last_id: u64,
+    #[cfg(test)]
+    every: bool,
 }
 
 impl LiveSession {
@@ -42,6 +44,8 @@ impl LiveSession {
                 pending: Vec::new(),
                 session: None,
                 last_id: 0,
+                #[cfg(test)]
+                every: false,
             })),
         };
         Ok(LiveSession { inner })
@@ -95,6 +99,10 @@ impl LiveSession {
                     for (id, q, o) in d.pending.drain(..) {
                         s.open(id, q, o);
                     }
+                    #[cfg(test)]
+                    {
+                        s.every = d.every;
+                    }
                     d.session = Some(s);
                 }
                 d.session.as_mut().expect("opened above").next(timeout)
@@ -105,6 +113,21 @@ impl LiveSession {
 
 #[cfg(test)]
 impl LiveSession {
+    /// Has the durable session rung by every round, as before Q-1118; called before its first `next`.
+    pub(crate) fn every_round(&mut self) {
+        if let Inner::Durable(d) = &mut self.inner {
+            d.every = true;
+        }
+    }
+
+    /// The durable session, once a `next` opened it.
+    pub(crate) fn durable_mut(&mut self) -> Option<&mut crate::durable::read::live::Session> {
+        match &mut self.inner {
+            Inner::Durable(d) => d.session.as_mut(),
+            Inner::Model(_) => None,
+        }
+    }
+
     /// Calls of the durable session's `try_batch`.
     pub(crate) fn turns(&self) -> u64 {
         match &self.inner {

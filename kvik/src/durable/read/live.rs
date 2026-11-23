@@ -1,7 +1,8 @@
 //! A live session on the durable backend (the query design's section 3.6; roadmap 9.0d): `Latest` and `Tail` kept up
 //! to date from the reader's shared tail ([`super::hub`]). A batch is computed when `next` is called, at the cut of a
-//! view the reader published, or at a position inside its round when a `Tail` meets its row limit (Q-1014). Nothing
-//! runs between calls: the writer's process waits on the writer's progress, a reader process polls the mark.
+//! view the reader published, or at a position inside its round when a `Tail` meets its row limit (Q-1014). In the
+//! writer's process a session waits on its bell, which the fan-out thread rings only for rounds and refreshes that
+//! reach its reads ([`super::fanout`], Q-1118), or until a `Latest` falls due; a reader process polls the mark.
 //!
 //! A `Latest` judges again only the series whose facts or entries the batch brings, those due by time alone and those
 //! a call refreshed the live staleness of since the last batch; a reset or a loss opens it again. A `Tail` delivers the
@@ -11,6 +12,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use km::registry::Timing as KmTiming;
@@ -18,7 +20,7 @@ use kvik_log::entries::{Entry, Versioning};
 use kvik_log::writer::{Position as LogPos, Watch};
 use kvik_model as km;
 
-use super::hub::Piece;
+use super::hub::{Bell, Piece, Reach};
 use super::latest;
 use super::view::View;
 use crate::durable::index::{Stored, fact_out, pos};
@@ -80,6 +82,9 @@ pub(crate) struct Session {
     watch: Option<Watch>,
     opts: SessionOptions,
     sub: Option<u64>,
+    bell: Option<Arc<Bell>>,
+    /// The bell's count before the last turn that gave a batch or found nothing: nothing rung up to it is pending.
+    settled: Option<u64>,
     /// The last round taken whole, and how many pieces of the next were taken.
     at: (u64, usize),
     started: bool,
@@ -101,6 +106,9 @@ pub(crate) struct Session {
     /// Calls of `try_batch`, for the tests of waiting.
     #[cfg(test)]
     pub(crate) turns: u64,
+    /// Rung by every round, as before Q-1118 ([`super::hub::Hub::every`]).
+    #[cfg(test)]
+    pub(crate) every: bool,
 }
 
 impl Drop for Session {
@@ -145,6 +153,31 @@ fn selects(sel: &Selection, registry: &Registry, id: u32) -> bool {
         Some(s) => sel.selects(SeriesId(id), &s.names, s.retired()),
         None => sel.selects(SeriesId(id), &[], false),
     }
+}
+
+/// What can give the session its next batch: the members of its `Latest`s and the series its `Tail`s select, by
+/// the registry at `v` or at a `Tail`'s position, and the members alone, whose staleness a refresh changes; anything
+/// while a read is not yet opened.
+fn reach(reads: &BTreeMap<LiveId, Read>, v: &View) -> (Reach, Reach) {
+    let registry = v.latest().registry();
+    let mut ids = BTreeSet::new();
+    let mut members = BTreeSet::new();
+    for r in reads.values() {
+        match r {
+            Read::Latest(l) if l.opened => members.extend(l.members.iter().map(|s| s.0)),
+            Read::Tail(t) if t.opened => {
+                for s in registry.iter().chain(t.names.iter()) {
+                    let id = s.def.id;
+                    if selects(&t.sel, registry, id) || selects(&t.sel, &t.names, id) {
+                        ids.insert(id);
+                    }
+                }
+            }
+            _ => return (Reach::All, Reach::All),
+        }
+    }
+    ids.extend(&members);
+    (Reach::Series(ids), Reach::Series(members))
 }
 
 /// What a batch is computed at: the view, the cut (its durable position, or one inside its round) and `now`.
@@ -248,6 +281,8 @@ impl Session {
             watch,
             opts,
             sub: None,
+            bell: None,
+            settled: None,
             at: (0, 0),
             started: false,
             reads: BTreeMap::new(),
@@ -262,6 +297,8 @@ impl Session {
             found_lost: 0,
             #[cfg(test)]
             turns: 0,
+            #[cfg(test)]
+            every: false,
         }
     }
 
@@ -285,7 +322,7 @@ impl Session {
         };
         self.reads.insert(id, read);
         if let Some(s) = self.sub {
-            self.reader.hub().start(s, self.at.0, self.cap());
+            self.reader.hub().opened(s, self.cap());
         }
     }
 
@@ -302,6 +339,8 @@ impl Session {
         if let Some(s) = self.sub.take() {
             self.reader.hub().unsubscribe(s);
         }
+        self.bell = None;
+        self.settled = None;
         self.started = false;
     }
 
@@ -335,19 +374,52 @@ impl Session {
             .min()
     }
 
+    /// How long a session waiting on its bell may wait before a `Latest` falls due: rechecked at least once a second
+    /// while one is due, as `now` follows the wall clock, which can jump.
+    fn until_due(&self) -> Duration {
+        match self.due() {
+            None => Duration::MAX,
+            Some(d) => {
+                let ns = u64::try_from(d.saturating_sub(self.reader.now())).unwrap_or(0);
+                Duration::from_nanos(ns).min(FULL_REFRESH_EVERY)
+            }
+        }
+    }
+
     pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError> {
         let until = Instant::now() + timeout;
         loop {
+            // Read before the turn: a ring during it makes the wait below return at once.
+            let rung = self.bell.as_ref().map(|b| b.rung());
             let turn = self.try_batch()?;
             let left = until.saturating_duration_since(Instant::now());
+            if !matches!(turn, Turn::Sleep(_)) {
+                self.settled = rung;
+            }
             let rest = match turn {
                 Turn::Batch(b) => return Ok(Some(b)),
                 _ if left.is_zero() => return Ok(None),
                 Turn::Sleep(d) => d,
                 Turn::Wait => self.opts.poll_interval,
             };
-            match &self.watch {
-                Some(w) if matches!(turn, Turn::Wait) && !w.stopped() => {
+            let bell = self
+                .bell
+                .as_ref()
+                .zip(rung)
+                .filter(|_| !self.reader.fanout_failed.load(Ordering::SeqCst));
+            match (&self.watch, bell) {
+                (Some(w), Some((b, seen))) if matches!(turn, Turn::Wait) && !w.stopped() => {
+                    b.wait(seen, left.min(self.until_due()));
+                }
+                // Inside the batch interval with nothing rung since the last batch there is nothing to sleep out: the
+                // ring that brings something ends the wait, and the next turn sleeps out what is left of the interval.
+                (Some(w), Some((b, _)))
+                    if self.settled.is_some_and(|s| b.rung() == s) && !w.stopped() =>
+                {
+                    let s = self.settled.unwrap_or_default();
+                    b.wait(s, left.min(self.until_due()));
+                }
+                (Some(w), _) if matches!(turn, Turn::Wait) && !w.stopped() => {
                     w.wait_progress(self.progress, left.min(rest));
                 }
                 _ => std::thread::sleep(left.min(rest)),
@@ -378,8 +450,14 @@ impl Session {
         let sub = match self.sub {
             Some(s) => s,
             None => {
-                let s = r.hub().subscribe(self.cap(), mono);
+                let (s, bell) = r.hub().subscribe(self.cap(), mono);
                 self.sub = Some(s);
+                self.bell = Some(bell);
+                #[cfg(test)]
+                if self.every {
+                    r.hub().every(s);
+                }
+                super::fanout::ensure(&r);
                 s
             }
         };
@@ -440,6 +518,10 @@ impl Session {
             r.hub().start(sub, v.round(), self.cap());
         }
         let out = self.batch(&r, &v, sub, mono);
+        let reach = match &out {
+            Ok(n) => reach(n.reads.as_ref().unwrap_or(&self.reads), &v),
+            Err(_) => (Reach::All, Reach::All),
+        };
         let live = r.end(v);
         let next = out?;
         live?;
@@ -454,7 +536,7 @@ impl Session {
         if next.idle {
             self.leave();
         } else {
-            r.hub().advance(sub, next.at.0);
+            r.hub().advance(sub, next.at.0, reach);
         }
         Ok(match next.batch {
             Some(b) => {
@@ -463,6 +545,18 @@ impl Session {
             }
             None => Turn::Wait,
         })
+    }
+
+    /// How many times its bell has rung, once subscribed.
+    #[cfg(test)]
+    pub(crate) fn rung(&self) -> Option<u64> {
+        self.bell.as_ref().map(|b| b.rung())
+    }
+
+    /// A `Latest` falls due by time: its wait ends without a ring.
+    #[cfg(test)]
+    pub(crate) fn due_now(&self) -> bool {
+        self.due().is_some_and(|d| d <= self.reader.now())
     }
 
     /// The batch at view `v` and the session's next state, which the caller keeps once the cut proved live.
@@ -590,6 +684,8 @@ mod walk;
 mod cases;
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod fanout;
 #[cfg(test)]
 mod lags;
 #[cfg(test)]

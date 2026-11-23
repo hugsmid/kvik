@@ -50,6 +50,8 @@ pub(crate) struct View {
     current_at: Duration,
     /// [`Cuts::lost`] when the cut was taken.
     lost_seen: u64,
+    /// The process's closed lost ranges its round had taken.
+    pub(crate) closed_taken: usize,
     cuts: Arc<Cuts>,
 }
 
@@ -83,6 +85,7 @@ impl View {
             round,
             current_at,
             lost_seen,
+            closed_taken: 0,
             cuts,
         }
     }

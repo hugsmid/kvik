@@ -152,8 +152,8 @@ impl LiveOptions {
 pub struct SessionOptions {
     /// Least time between two batches (default 200 ms, at least 20 ms), so that a burst is one update.
     pub min_batch_interval: Duration,
-    /// How often a reader process reads the mark while waiting (default 100 ms, at least 10 ms); the writer's
-    /// process is woken when the mark moves.
+    /// How often a reader process reads the mark while waiting (default 100 ms, at least 10 ms); in the writer's
+    /// process a session is woken when a commit touches its live reads, and by a `Latest` falling due.
     pub poll_interval: Duration,
 }
 

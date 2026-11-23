@@ -2,6 +2,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod cut;
+pub(crate) mod fanout;
 pub(crate) mod flight;
 pub(crate) mod hub;
 pub(crate) mod latest;

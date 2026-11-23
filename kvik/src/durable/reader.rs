@@ -132,6 +132,9 @@ pub(crate) struct DurableReader {
     seeded: AtomicBool,
     /// What each round read, for the live sessions on this reader.
     hub: Hub,
+    /// The fan-out thread was started ([`super::read::fanout`]), or could not be.
+    pub(crate) fanout: AtomicBool,
+    pub(crate) fanout_failed: AtomicBool,
     /// The memory cap of its queries (Q-1063).
     memory: Arc<Accountant>,
     #[cfg(test)]
@@ -296,6 +299,8 @@ impl DurableReader {
             after_lookup: AfterLookup::default(),
             seeded: AtomicBool::new(false),
             hub: Hub::default(),
+            fanout: AtomicBool::new(false),
+            fanout_failed: AtomicBool::new(false),
             memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),
         })
     }
@@ -341,18 +346,26 @@ impl DurableReader {
 
     /// A view read after this call began ([`Flight`]).
     fn view(&self) -> Result<Arc<View>, QueryError> {
-        self.flight
-            .get(|current| self.round(current, false))
-            .map_err(unshare)
+        let v = self.flight.get(|current| self.round(current, false));
+        self.hub.ring_pending();
+        v.map_err(unshare)
     }
 
     /// [`DurableReader::view`] for a call that reads the latest values only: in the writer's process, a view at the
     /// writer's durable position is kept rather than read again (Q-1007). A call that reads facts reads the files,
     /// and with them checks again the last batch its log reader returned.
     fn view_latest(&self) -> Result<Arc<View>, QueryError> {
-        self.flight
-            .get(|current| self.round(current, true))
-            .map_err(unshare)
+        // The round's quick path without its lock: live sessions woken by one round take its view side by side.
+        if let Some(v) = self
+            .flight
+            .current()
+            .filter(|v| self.fresh(v, self.monotonic()))
+        {
+            return Ok(v);
+        }
+        let v = self.flight.get(|current| self.round(current, true));
+        self.hub.ring_pending();
+        v.map_err(unshare)
     }
 
     /// A view read after this call began that holds every fact: a later round's if the first does not, the fact
@@ -424,6 +437,11 @@ impl DurableReader {
     /// The shared tail of the live sessions on this reader.
     pub(crate) fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    /// The writer's progress, for the reader of the writer's process.
+    pub(crate) fn writer(&self) -> Option<&kvik_log::writer::Watch> {
+        self.writer.as_ref()
     }
 
     /// Whether the mark changed since the last round read it, reading the mark alone; `None` while a round runs or
@@ -528,14 +546,8 @@ impl DurableReader {
         for id in self.cuts.take_dropped() {
             log.release(id);
         }
-        // In the writer's process, a view at the writer's durable position, with every closed range taken, is what
-        // a read of the files would publish again (the manifest changes only at a start, Q-704): it is kept while
-        // young enough that no lease renewal is due (the query design's S1).
-        if let (true, Some(v), Some(watch)) = (quick, &current, &self.writer)
-            && watch.durable() == v.state().durable
-            && self.latch.closed_count() == w.closed_seen
-            && (v.index().is_some() || !self.want_facts.load(Ordering::SeqCst))
-            && v.age(began) < self.lease_refresh / 2
+        if let (true, Some(v)) = (quick, &current)
+            && self.fresh(v, began)
         {
             return Ok(v.clone());
         }
@@ -642,14 +654,29 @@ impl DurableReader {
             w.lost_ranges = log.lost_ranges().into();
         }
         let seq = self.hub.finish(tail, self.monotonic(), self.cut_max_age);
-        Ok(Arc::new(View::new(
+        let mut v = View::new(
             (latest.clone(), w.facts.as_ref().map(|f| f.index.clone())),
             st,
             w.lost_ranges.clone(),
             (cut::take(log), seq),
             began,
             self.cuts.clone(),
-        )))
+        );
+        v.closed_taken = w.closed_seen;
+        Ok(Arc::new(v))
+    }
+
+    /// In the writer's process, whether `v` is at the writer's durable position with every closed range taken: what a
+    /// read of the files would publish again (the manifest changes only at a start, Q-704), kept while young enough
+    /// that no lease renewal is due at `now` (the query design's S1).
+    fn fresh(&self, v: &View, now: Duration) -> bool {
+        self.writer.as_ref().is_some_and(|watch| {
+            !watch.stopped()
+                && watch.durable() == v.state().durable
+                && self.latch.closed_count() == v.closed_taken
+                && (v.index().is_some() || !self.want_facts.load(Ordering::SeqCst))
+                && v.age(now) < self.lease_refresh / 2
+        })
     }
 
     /// Whether the call on `v` ends under a live cut ([`View::live`]). A call as old as half `lease_refresh` may

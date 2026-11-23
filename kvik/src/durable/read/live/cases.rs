@@ -258,6 +258,9 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next() {
     let s = w.open();
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     let readers = [w.reader(), s.reader()];
+    // No fan-out thread: its round would read the tail before the segment goes, and no read would then fail.
+    let own = readers[1].durable().unwrap().unwrap();
+    own.fanout.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut sessions: Vec<_> = readers
         .iter()
         .map(|r| watched(r, LiveOptions::default()))
