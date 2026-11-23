@@ -1,6 +1,7 @@
 //! A reader process's memory does not grow with the facts it folds (roadmap 9.0c): the heap a reader holds after
-//! catching up over seven times the facts it had, against a reader that also builds the fact index. Alone in its
-//! binary, so that the allocator counts this test only, and with the store shut down while it counts.
+//! catching up over seven times the facts it had; a reader that also answers windows holds no more, since windows
+//! read the sources rather than build the fact index (roadmap 9.0h, Q-1130). Alone in its binary, so that the
+//! allocator counts this test only, and with the store shut down while it counts.
 
 #![forbid(unsafe_code)]
 
@@ -60,10 +61,10 @@ fn a_readers_heap_does_not_grow_with_the_facts_it_folds() {
     let rounds = 100;
     write(&w, &ids, 0, rounds);
     let bounded = w.reader();
-    let indexed = w.reader();
+    let windowed = w.reader();
     latest(&bounded, &ids);
-    latest(&indexed, &ids);
-    indexed
+    latest(&windowed, &ids);
+    windowed
         .window(
             ids[0],
             Window::rolling(std::time::Duration::from_secs(60)),
@@ -76,8 +77,8 @@ fn a_readers_heap_does_not_grow_with_the_facts_it_folds() {
         bounded.refresh().unwrap();
         latest(&bounded, &ids);
     });
-    let control = held(|| {
-        indexed
+    let windows = held(|| {
+        windowed
             .window(
                 ids[0],
                 Window::rolling(std::time::Duration::from_secs(60)),
@@ -87,8 +88,9 @@ fn a_readers_heap_does_not_grow_with_the_facts_it_folds() {
     });
     // At most the bytes of the one log segment it follows (16 MiB here) and a part of a lookup.
     assert!(grown < 20 << 20, "{grown} bytes");
+    // A fact index over the 280,000 facts would hold about 40 MiB.
     assert!(
-        control > 4 * grown.max(1 << 20),
-        "the control holds every fact: {control} bytes, the reader {grown}"
+        windows < grown + (4 << 20),
+        "a reader that answers windows: {windows} bytes, the reader {grown}"
     );
 }

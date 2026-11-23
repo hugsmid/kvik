@@ -10,9 +10,44 @@ fn order(a: &Stored, b: &Stored) -> Ordering {
     (a.row.t, a.row.series_id, a.position).cmp(&(b.row.t, b.row.series_id, b.position))
 }
 
-/// Sorts one source's rows into the merge's order.
-pub(crate) fn sort(rows: &mut [Stored]) {
-    rows.sort_unstable_by(order);
+/// A row's place in the merge's order, and its index.
+type Key = (i64, u32, kvik_log::writer::Position, u32);
+
+/// What sorting by keys holds for each row: its key, then its index.
+pub(crate) const KEY_BYTES: u64 = (std::mem::size_of::<Key>() + std::mem::size_of::<u32>()) as u64;
+
+/// Sorts one source's rows into the merge's order. When `room` bytes hold their keys, the keys are sorted and each
+/// row moved once to its place, as a row is several times a key's size; else the rows are sorted in place.
+pub(crate) fn sort(rows: &mut [Stored], room: u64) {
+    if rows.is_sorted_by(|a, b| order(a, b) != Ordering::Greater) {
+        return;
+    }
+    let n = rows.len();
+    if u32::try_from(n).is_err() || (n as u64).saturating_mul(KEY_BYTES) > room {
+        rows.sort_unstable_by(order);
+        return;
+    }
+    let mut keys: Vec<Key> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.row.t, s.row.series_id, s.position, i as u32))
+        .collect();
+    keys.sort_unstable();
+    let mut from: Vec<u32> = keys.iter().map(|k| k.3).collect();
+    drop(keys);
+    // Each cycle of the permutation in turn: the row for place `k` is at `from[k]`; a place done points at itself.
+    for start in 0..n {
+        let mut k = start;
+        loop {
+            let src = from[k] as usize;
+            from[k] = k as u32;
+            if src == start {
+                break;
+            }
+            rows.swap(k, src);
+            k = src;
+        }
+    }
 }
 
 /// Merges sources' rows, each already in the merge's order, into one run in that order; a position more than one
@@ -118,11 +153,11 @@ mod tests {
                     }
                 }
             }
-            for p in &mut parts {
-                sort(p);
+            for (j, p) in parts.iter_mut().enumerate() {
+                sort(p, if j == 0 { 0 } else { u64::MAX });
             }
             let mut want = all.clone();
-            sort(&mut want);
+            sort(&mut want, 0);
             prop_assert_eq!(merge(parts), want.clone());
             let mut current = want.clone();
             keep_view(&mut current, false, |s| s == 1);
@@ -138,6 +173,24 @@ mod tests {
             let mut history = want.clone();
             keep_view(&mut history, true, |_| false);
             prop_assert_eq!(history, want.clone());
+        }
+
+        #[test]
+        fn a_sort_by_keys_equals_a_sort_in_place_and_holds_to_the_room_given(
+            rows in prop::collection::btree_map(1u64..400, (0u32..4, -9i64..9), 0..120),
+            order in prop::collection::vec(any::<prop::sample::Index>(), 120),
+            room in 0usize..130,
+        ) {
+            let mut all: Vec<Stored> = rows.iter().map(|(p, (s, t))| stored(*s, *t, *p, None)).collect();
+            for (k, i) in order.iter().enumerate().take(all.len()) {
+                let j = i.index(all.len());
+                all.swap(k, j);
+            }
+            let mut by_keys = all.clone();
+            sort(&mut by_keys, room as u64 * KEY_BYTES);
+            let mut in_place = all;
+            in_place.sort_unstable_by(super::order);
+            prop_assert_eq!(by_keys, in_place);
         }
     }
 }

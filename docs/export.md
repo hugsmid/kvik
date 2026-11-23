@@ -116,16 +116,17 @@ pyarrow: dataset.to_table(filter=pyarrow.compute.field("area") == "plant")
 polars:  lazy.filter(polars.col("metric") == "power").collect()
 ```
 
-Consistency and cost: one pass over `range` finds the months, then each month is read and written on its own. Each
-file is as consistent as one `export_series` call, but the files of one call are not one cut of the store: a reader
-sees commits made while the call runs, so a later month's file can hold a fact committed after an earlier month's
-file was written, and a month whose first fact is committed between the two passes gets no file until the next
-call. The range is read twice, and the first pass holds the whole range in memory until `Reader::facts` streams
-(Options), so a call over a series' whole history reads it twice; a periodic export should pass the months it means
-to refresh.
+Consistency and cost: the range is read once, in event-time order at one cut, and each month's file is written as
+the read passes the month, so the files of one call are one cut of the store. `export_partitioned_of` does the same
+for several series from one read (Q-1131): a series' file for a month is open from its first fact in the month until
+the read passes it, so every series with facts in a month has its file open at once, each within `row_group_rows` and
+`batch_rows`, and the files come in month order, then in the order of the ids given. A periodic export should pass
+the months it means to refresh.
 
 Publishing: on success and on failure alike the writer `open` returned is dropped, with no signal between. A failure
-stops the export: the files before it are complete, the one it was writing has no footer. So `open` should hand out a
+stops the export: the files of earlier months are complete, and every file then open (one per series with facts in the
+month being read) has no footer. `open` is called in the order of each series' first fact in the month, not of the
+ids given; only the returned list is in id order. So `open` should hand out a
 temporary name or an in-memory buffer, and the caller publishes the paths in the returned list once the call returns
 `Ok`, and discards everything on `Err`; a writer that truncates the final path, or uploads when dropped, can replace
 a good file with a broken one. A per-file completion signal is left to the export call in the store's interface

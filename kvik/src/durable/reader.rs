@@ -139,6 +139,9 @@ pub(crate) struct DurableReader {
     memory: Arc<Accountant>,
     #[cfg(test)]
     lookups_made: AtomicU64,
+    /// Lookups that would have passed their budget.
+    #[cfg(test)]
+    overflows: AtomicU64,
     /// Lookups still to end with `CutExpired`, as a reset between the cut and the read ends them.
     #[cfg(test)]
     pub(crate) expire_lookups: AtomicU64,
@@ -293,6 +296,8 @@ impl DurableReader {
             searches: AtomicU64::new(0),
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
+            #[cfg(test)]
+            overflows: AtomicU64::new(0),
             #[cfg(test)]
             expire_lookups: AtomicU64::new(0),
             #[cfg(test)]
@@ -754,6 +759,12 @@ impl DurableReader {
     #[cfg(test)]
     pub(crate) fn lookups(&self) -> u64 {
         self.lookups_made.load(Ordering::Relaxed)
+    }
+
+    /// Lookups that would have passed their budget, so that their pass was split and read again.
+    #[cfg(test)]
+    pub(crate) fn overflows(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
     }
 
     /// What the reader holds: the latest values' series, full facts and entries, whether it holds a fact index, and

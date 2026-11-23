@@ -250,6 +250,15 @@ pub struct Bucket {
     pub coverage: Duration,
     /// Flags.
     pub flags: ResultFlags,
+    /// Sum of the readings starting in the bucket for a gauge, or the amount credited to it for an interval
+    /// series; `None` when there is none.
+    pub sum: Option<f64>,
+    /// A counter's increase over the bucket.
+    pub increase: Option<f64>,
+    /// A counter's resets in the bucket.
+    pub resets: Option<u64>,
+    /// A counter's regressions in the bucket.
+    pub regressions: Option<u64>,
 }
 
 /// The result of a chart query.
