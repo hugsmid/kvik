@@ -116,8 +116,9 @@ fn history(harm: Harm) -> Run {
 
     let s = open(&w, Duration::from_millis(20));
     let end_entry = nonzero_end(&w.fs.read(&seg_path).unwrap_or_default());
-    block_on(s.emit(&[note(id, 9, "FOUR-NEW")])).unwrap();
+    // The harmed segment must not hold the new fact, whatever the timed seal's race with this emit.
     let sealed = sealed_with(&w, b"P-TWO");
+    block_on(s.emit(&[note(id, 9, "FOUR-NEW")])).unwrap();
     sealed_with(&w, b"FOUR-NEW");
     block_on(s.shutdown()).unwrap();
     drop(s);
