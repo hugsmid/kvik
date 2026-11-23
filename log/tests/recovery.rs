@@ -930,6 +930,47 @@ fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
     r.check_started();
 }
 
+/// Q-130 with a registry file whose `through` is below the sealed routing change: the sealed segment is still read.
+#[test]
+fn a_routing_change_sealed_above_a_registry_files_through_names_its_consumer() {
+    use kvik_log::entries::{RouteOp, Routing, Selection};
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    let behind = kvik_log::registry::RegistryFile {
+        generation: 0,
+        through: 1,
+        max_series_id: 1,
+        entries: Vec::new(),
+    };
+    kvik_log::registry::write(&r.fs, &dir(), STORE_ID, T0, &behind).unwrap();
+    r.submit(vec![Item::from(Entry::Routing(Box::new(Routing {
+        consumer: "sealed".into(),
+        op: RouteOp::Emits,
+        funnel: None,
+        selection: None,
+        operator: None,
+        emits: Selection::None,
+        condition: None,
+    })))]);
+    r.drain();
+    r.advance(Duration::from_secs(301));
+    for _ in 0..10 {
+        r.step();
+        r.maint();
+        r.advance(10 * MS);
+    }
+    r.submit(vec![fact(1, 1)]);
+    r.drain();
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert_eq!(
+        rep.entry.unwrap().entry.consumers,
+        vec!["sealed".to_string()]
+    );
+    r.check_started();
+}
+
 #[test]
 fn a_crash_between_the_entry_and_the_mark_adopts_the_entry() {
     let mut adopted = 0;

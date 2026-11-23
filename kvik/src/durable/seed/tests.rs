@@ -53,7 +53,8 @@ fn cases() -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .map_or(32, |n: u32| (n / 4).max(8))
+        // At most 2,000 histories: the deep job's 30-minute limit.
+        .map_or(32, |n: u32| (n / 4).clamp(8, 2_000))
 }
 
 #[test]
@@ -336,5 +337,22 @@ fn a_reset_point_resync_below_the_seed_carries_the_time_of_the_call_that_deliver
             2655,
         )
         .unwrap();
+    }
+}
+
+#[test]
+fn a_consumer_starting_at_the_commit_time_of_batches_below_the_seed_starts_after_the_last_of_them()
+{
+    let steps = vec![
+        Step::Route(0, 0),
+        Step::Emit(vec![(1, 0, 1, 0, false)], false),
+        Step::Emit(vec![(3, 0, 2, 0, false)], false),
+        Step::Advance(10),
+        Step::Emit(vec![(1, 0, 3, 0, false)], false),
+        Step::Directory(usize::MAX),
+    ];
+    for order in [ScanOrder::Background, ScanOrder::BeforeOpen] {
+        let r = compare(&steps, End::Shutdown, order, &[(1, 0, 4, 0, false)], 10).unwrap();
+        assert!(r.seeded, "{order:?}");
     }
 }

@@ -420,7 +420,13 @@ pub(super) fn write_directory(env: &Env, dir: &Path, k: usize) {
             _ => None,
         })
         .collect();
-    let Some(b) = batches.get(k % batches.len().max(1)) else {
+    // `usize::MAX` picks the newest batch, so that a named test's seed is the head.
+    let i = if k == usize::MAX {
+        batches.len().saturating_sub(1)
+    } else {
+        k % batches.len().max(1)
+    };
+    let Some(b) = batches.get(i) else {
         return;
     };
     let through = b.last;
