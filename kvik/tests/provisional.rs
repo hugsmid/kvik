@@ -201,7 +201,7 @@ fn consumer(s: &Store, ids: &[SeriesId]) -> Consumer {
 }
 
 #[test]
-fn a_reading_reaches_the_stream_before_its_sync_and_the_watermark_follows_it() {
+fn a_reading_reaches_the_stream_before_its_sync_and_the_watermark_follows_it_at_once() {
     let w = World::new("fast-before-sync");
     let s = w.open();
     let id = define(&s, "site/a/power");
@@ -223,7 +223,12 @@ fn a_reading_reaches_the_stream_before_its_sync_and_the_watermark_follows_it() {
         "no watermark before the sync"
     );
     gate.set(false);
+    let synced = Instant::now();
     let ev = until(&mut p, |e| matches!(e, ProvisionalEvent::Durable { .. }));
+    assert!(
+        synced.elapsed() < WAIT / 2,
+        "the call's settling woke the stream only at its timeout"
+    );
     let ProvisionalEvent::Durable { through, mark } = ev[0] else {
         panic!("{ev:?}")
     };

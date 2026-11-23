@@ -58,7 +58,9 @@ fn fact(series: u32, t: i64) -> ProvisionalFact {
 fn accept(fast: &Fast, facts: &[(u32, i64)], floor: u64) -> Arc<Entry> {
     let facts: Box<[ProvisionalFact]> = facts.iter().map(|&(s, t)| fact(s, t)).collect();
     let series = series_of(&facts);
-    fast.push(facts, &series, at(floor), Outcome::Set(Mutex::new(None)))
+    let e = fast.push(facts, at(floor), Outcome::Set(Mutex::new(None)));
+    fast.ring_for(&series);
+    e
 }
 
 fn set(e: &Entry, r: Result<LogAck, CommitError>) {

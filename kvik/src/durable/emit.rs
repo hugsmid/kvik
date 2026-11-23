@@ -104,13 +104,14 @@ impl Writer {
         #[cfg(test)]
         tests::before_tracking(&self.dir);
         let mut inflight = lock(&self.inflight);
+        let mut ring = None;
         let tracked = match queued {
             Some(pending) => {
                 let (clocks, ids) = (self.clocks.clone(), refreshes);
                 let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
                 inflight.insert(call, c.clone());
                 if let Some((facts, floor)) = provisional.take() {
-                    self.fast.publish(facts, floor, c.clone());
+                    ring = Some(self.fast.publish(facts, floor, c.clone()));
                 }
                 Some((c, true))
             }
@@ -123,6 +124,9 @@ impl Writer {
         };
         drop(inflight);
         drop(d);
+        if let Some(series) = ring {
+            self.fast.ring_for(&series);
+        }
         #[cfg(test)]
         pause::at(&self.dir, pause::Point::AfterDecision);
         self.count(readings, &plan);
@@ -486,7 +490,7 @@ mod tests {
         let mut env = Env::test(clock.clone());
         env.fs = Arc::new(fs);
         let dir = PathBuf::from(format!("durable-unit/{name}"));
-        let config = StoreConfig::new(&dir, "Europe/London")
+        let config = StoreConfig::new(&dir, "Etc/UTC")
             .create_if_missing(true)
             .env(env)
             .log(LogConfig::default());
@@ -621,5 +625,58 @@ mod tests {
             }
         }
         assert_eq!(values, [Value::F64(2.0)]);
+    }
+
+    #[test]
+    fn a_shutdown_lets_a_call_offered_before_it_reach_the_streams_before_closed() {
+        use crate::provisional::{ProvisionalEvent, ProvisionalOptions};
+        let (w, clock, dir, id) = store("shutdown-barrier");
+        let mut s = w.provisional(&ProvisionalOptions::default()).unwrap();
+        let (paused_tx, paused) = mpsc::channel::<()>();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let pause_armed = AtomicBool::new(true);
+        *BEFORE_TRACKING.lock().unwrap() = Some((
+            dir.clone(),
+            Arc::new(move || {
+                if pause_armed.swap(false, Ordering::SeqCst) {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                }
+            }),
+        ));
+        let w2 = w.clone();
+        let x = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+        let original = std::thread::spawn(move || settle(w2.emit(&x, Intent::Normal, false)));
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        let w3 = w.clone();
+        let shut = std::thread::spawn(move || w3.shutdown());
+        let mut early = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            early.extend(s.next(Duration::from_millis(20)));
+        }
+        assert!(
+            early.is_empty(),
+            "{early:?} while a call offered before the shutdown was unpublished"
+        );
+        resume.send(()).unwrap();
+        original.join().unwrap();
+        shut.join().unwrap().unwrap();
+        *BEFORE_TRACKING.lock().unwrap() = None;
+        let mut said = Vec::new();
+        while let Some(e) = s.next(Duration::from_secs(5)) {
+            let closed = matches!(e, ProvisionalEvent::Closed);
+            said.push(match e {
+                ProvisionalEvent::Accepted(a) => {
+                    format!("accepted {:?}", a.facts().next().map(|f| f.value.clone()))
+                }
+                other => format!("{other:?}"),
+            });
+            if closed {
+                break;
+            }
+        }
+        assert_eq!(said, ["accepted Some(F64(1.0))", "Closed"]);
     }
 }

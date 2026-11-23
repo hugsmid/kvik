@@ -161,10 +161,10 @@ impl Bell {
     }
 }
 
-/// An open stream's bell and the series it selects (`None`: every series).
+/// An open stream that selects series, with its own bell.
 #[derive(Debug)]
 struct Listener {
-    series: Option<Arc<HashSet<u32>>>,
+    series: Arc<HashSet<u32>>,
     bell: Arc<Bell>,
 }
 
@@ -196,6 +196,9 @@ pub(crate) struct Fast {
     streams: AtomicUsize,
     closing: AtomicBool,
     ring: Mutex<Ring>,
+    /// Shared by the streams of every series: one wake per call for them all.
+    every: Arc<Bell>,
+    every_open: AtomicUsize,
     listeners: Mutex<BTreeMap<u64, Listener>>,
 }
 
@@ -238,29 +241,24 @@ fn series_of(facts: &[ProvisionalFact]) -> Box<[u32]> {
 
 impl Fast {
     /// Hands an accepted call to every open stream. Called in call order (under the decision lock); never waits
-    /// for a stream.
+    /// for a stream. Returns the call's series, for [`Fast::ring_for`] once the decision lock is released.
     pub(crate) fn publish(
         self: &Arc<Self>,
         facts: Box<[ProvisionalFact]>,
         floor: LogPos,
         completion: Arc<Completion>,
-    ) {
+    ) -> Box<[u32]> {
         let series = series_of(&facts);
         let settled = Waker::from(Arc::new(Settled {
             fast: Arc::downgrade(self),
             series: series.clone(),
         }));
         let _ = completion.poll(Some(&Context::from_waker(&settled)));
-        self.push(facts, &series, floor, Outcome::Completion(completion));
+        self.push(facts, floor, Outcome::Completion(completion));
+        series
     }
 
-    fn push(
-        &self,
-        facts: Box<[ProvisionalFact]>,
-        series: &[u32],
-        floor: LogPos,
-        outcome: Outcome,
-    ) -> Arc<Entry> {
+    fn push(&self, facts: Box<[ProvisionalFact]>, floor: LogPos, outcome: Outcome) -> Arc<Entry> {
         let mut r = lock(&self.ring);
         let seq = r.next_seq;
         r.next_seq += 1;
@@ -275,17 +273,16 @@ impl Fast {
         r.entries.push_back(e.clone());
         r.keep();
         drop(r);
-        self.ring_for(series);
         e
     }
 
     /// Rings every stream that selects one of `series`.
-    fn ring_for(&self, series: &[u32]) {
+    pub(crate) fn ring_for(&self, series: &[u32]) {
+        if self.every_open.load(Ordering::SeqCst) > 0 {
+            self.every.ring();
+        }
         for l in lock(&self.listeners).values() {
-            if l.series
-                .as_ref()
-                .is_none_or(|s| series.iter().any(|x| s.contains(x)))
-            {
+            if series.iter().any(|x| l.series.contains(x)) {
                 l.bell.ring();
             }
         }
@@ -294,6 +291,7 @@ impl Fast {
     /// The store is shut down or dropped.
     pub(crate) fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
+        self.every.ring();
         for l in lock(&self.listeners).values() {
             l.bell.ring();
         }
@@ -307,18 +305,25 @@ impl Fast {
     ) -> Stream {
         let series: Option<Arc<HashSet<u32>>> =
             (!o.series.is_empty()).then(|| Arc::new(o.series.iter().map(|s| s.0).collect()));
-        let bell = Arc::new(Bell::default());
         let mut r = lock(&self.ring);
         let id = r.next_stream;
         r.next_stream += 1;
         r.wants.insert(id, o.max_behind);
-        lock(&self.listeners).insert(
-            id,
-            Listener {
-                series: series.clone(),
-                bell: bell.clone(),
-            },
-        );
+        let bell = match &series {
+            None => {
+                self.every_open.fetch_add(1, Ordering::SeqCst);
+                self.every.clone()
+            }
+            Some(series) => {
+                let bell = Arc::new(Bell::default());
+                let l = Listener {
+                    series: series.clone(),
+                    bell: bell.clone(),
+                };
+                lock(&self.listeners).insert(id, l);
+                bell
+            }
+        };
         self.streams.fetch_add(1, Ordering::SeqCst);
         let cursor = r.next_seq;
         drop(r);
@@ -373,7 +378,10 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let mut r = lock(&self.fast.ring);
         r.wants.remove(&self.id);
-        lock(&self.fast.listeners).remove(&self.id);
+        match self.series {
+            None => _ = self.fast.every_open.fetch_sub(1, Ordering::SeqCst),
+            Some(_) => _ = lock(&self.fast.listeners).remove(&self.id),
+        }
         self.fast.streams.fetch_sub(1, Ordering::SeqCst);
         r.keep();
     }

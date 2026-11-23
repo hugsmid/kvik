@@ -67,8 +67,9 @@ pub struct ProvisionalFact {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Withdrawal {
-    /// [`EmitError::OutcomeUnknown`](crate::EmitError::OutcomeUnknown), or the store stopped or failed before the
-    /// call was durable: it may still be found after a reboot (spec §3 Write or sync failure, §9 row 7a).
+    /// [`EmitError::OutcomeUnknown`](crate::EmitError::OutcomeUnknown); a call acknowledged as written whose sync
+    /// failed or whose writer stopped before the mark covered it; or a call its stopped writer never settled. It may
+    /// still be found after a reboot (spec §3 Write or sync failure, §9 row 7a).
     OutcomeUnknown,
     /// [`EmitError::ReadOnly`](crate::EmitError::ReadOnly) or [`EmitError::Closed`](crate::EmitError::Closed):
     /// it was not stored.
@@ -113,6 +114,7 @@ pub enum ProvisionalEvent {
     /// A call the writer accepted.
     Accepted(Accepted),
     /// Every call delivered with `seq ≤ through` and not withdrawn is durable; `mark` is the durable position read.
+    /// Sent only when it covers a call delivered provisional.
     Durable {
         /// The watermark.
         through: u64,
@@ -130,7 +132,8 @@ pub enum ProvisionalEvent {
         cause: Withdrawal,
     },
     /// The stream fell more than `max_behind` facts behind: calls `first..=last` were not delivered. Every fact
-    /// among them lies above `after`; once durable they can be read there.
+    /// among them lies above `after`; once durable they can be read there. A call larger than `max_behind` on its
+    /// own is delivered whole.
     Lagged {
         /// The first call missed.
         first: u64,
@@ -139,7 +142,8 @@ pub enum ProvisionalEvent {
         /// A position below every missed fact.
         after: Position,
     },
-    /// The store was shut down or dropped and every call delivered is settled; nothing follows.
+    /// The store was shut down or dropped, its writer has stopped and every call delivered is settled; nothing
+    /// follows (Q-1110).
     Closed,
 }
 
