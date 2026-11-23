@@ -632,3 +632,87 @@ fn buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum() {
         block_on(s.shutdown()).unwrap();
     }
 }
+
+#[test]
+fn many_series_calls_equal_one_call_per_series_on_both_backends() {
+    for backend in [Backend::Model, Backend::Durable] {
+        let clock = ManualClock::new(at(600));
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        let s = block_on(Store::open(
+            StoreConfig::new(format!("windows/many-{}", next()), "Europe/London")
+                .create_if_missing(true)
+                .backend(backend)
+                .env(env),
+        ))
+        .unwrap();
+        let c = block_on(s.define_series(number(counter()).name("w/c/energy"))).unwrap();
+        let g = block_on(s.define_series(number(gauge()).name("w/g/power"))).unwrap();
+        let i = block_on(s.define_series(number(interval(4, 0)).name("w/i/use"))).unwrap();
+        let mut readings: Vec<Reading> = (0..40)
+            .map(|k| Reading::new(c, at(k * 3), Value::F64((k * k % 50) as f64)))
+            .collect();
+        readings.extend((0..30).map(|k| Reading::new(g, at(k * 5 + 1), Value::F64(k as f64))));
+        readings.extend((0..20).map(|k| Reading::new(i, at(k * 4), Value::F64(1.0))));
+        block_on(s.emit(&readings)).unwrap();
+        clock.advance(Duration::from_secs(30));
+        let r = s.reader();
+        let ids = [g, c, i, g];
+        let range = at(-20)..at(130);
+        for res in [
+            Resolution::Auto { max_points: 3 },
+            Resolution::Auto { max_points: 35 },
+            Resolution::Auto { max_points: 2_000 },
+            Resolution::Step(Duration::from_secs(7)),
+        ] {
+            let each: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{:?}", r.buckets(*id, range.clone(), res).unwrap()))
+                .collect();
+            let many: Vec<String> = r
+                .buckets_of(&ids, range.clone(), res)
+                .unwrap()
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect();
+            assert_eq!(many, each, "{backend:?} {res:?}");
+        }
+        let w = Window::rolling(Duration::from_secs(100));
+        for a in [Aggregate::Last, Aggregate::Max, Aggregate::Count] {
+            let each: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{:?}", r.window(*id, w.clone(), a.clone()).unwrap()))
+                .collect();
+            let many: Vec<String> = r
+                .window_of(&ids, w.clone(), a.clone())
+                .unwrap()
+                .iter()
+                .map(|x| format!("{x:?}"))
+                .collect();
+            assert_eq!(many, each, "{backend:?} {a:?}");
+        }
+        // Refused on an interval series alone, so refused for the call.
+        assert!(r.window_of(&[g, i], w.clone(), Aggregate::Avg).is_err());
+        let mut each: Vec<_> = [c, g, i]
+            .iter()
+            .flat_map(|id| r.facts(*id, range.clone(), kvik::View::Current).unwrap())
+            .map(Result::unwrap)
+            .collect();
+        each.sort_by_key(|f| (f.t, f.series, f.position));
+        let many: Vec<_> = r
+            .facts_of(&[i, c, g, c], range.clone(), kvik::View::Current)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(many, each, "{backend:?}");
+        assert!(
+            r.buckets_of(
+                &[g, SeriesId(9_999)],
+                range.clone(),
+                Resolution::Auto { max_points: 3 }
+            )
+            .is_err()
+        );
+        block_on(s.shutdown()).unwrap();
+    }
+}

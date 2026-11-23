@@ -168,7 +168,9 @@ fn shown_chart(r: Result<ChartData, QueryError>, model: bool) -> String {
 }
 
 /// Every query of every series from `got` equals the fact index's, and the model's while no batch is damaged; a
-/// tiny cap may refuse only with `NotAvailable`. Returns the queries compared.
+/// tiny cap may refuse only with `NotAvailable`. The many-series calls over every series at once, in another order and
+/// with one repeated, equal each series' own result, or fail as the first failing series in id order does (Q-1110).
+/// Returns the queries compared.
 fn check(rig: &Rig, small: u64) -> Result<u64, TestCaseError> {
     let oracle = reader_with(&rig.env, &rig.dir, Sizes::of(LEAST_MEMORY));
     let readers = [
@@ -189,12 +191,16 @@ fn check(rig: &Rig, small: u64) -> Result<u64, TestCaseError> {
     let stream = |r: &std::sync::Arc<DurableReader>, id, w: &Window, a: &Aggregate| {
         shown(crate::durable::window(r, id, w, a))
     };
+    let mut windows_got = std::collections::HashMap::new();
+    let mut charts_got = std::collections::HashMap::new();
     for (i, id) in rig.ids.iter().enumerate() {
-        for w in windows(now) {
-            for a in aggregates(i) {
+        for (wi, w) in windows(now).into_iter().enumerate() {
+            for (gi, a) in aggregates(i).into_iter().enumerate() {
                 let want = shown(indexed::window(&oracle, *id, &w, &a));
                 for (k, r) in readers.iter().enumerate() {
-                    compare(k, &want, stream(r, *id, &w, &a))?;
+                    let got = stream(r, *id, &w, &a);
+                    compare(k, &want, got.clone())?;
+                    windows_got.insert((k, wi, gi, i), got);
                 }
                 if !rig.faulted {
                     let m = shown(model.window(*id, w.clone(), a.clone()));
@@ -203,14 +209,12 @@ fn check(rig: &Rig, small: u64) -> Result<u64, TestCaseError> {
                 n += 1;
             }
         }
-        for res in resolutions() {
+        for (ri, res) in resolutions().into_iter().enumerate() {
             let want = shown_chart(indexed::buckets(&oracle, *id, range, res), false);
             for (k, r) in readers.iter().enumerate() {
-                compare(
-                    k,
-                    &want,
-                    shown_chart(crate::durable::buckets(r, *id, range, res), false),
-                )?;
+                let got = shown_chart(crate::durable::buckets(r, *id, range, res), false);
+                compare(k, &want, got.clone())?;
+                charts_got.insert((k, ri, i), got);
             }
             if !rig.faulted {
                 let want = shown_chart(indexed::buckets(&oracle, *id, range, res), true);
@@ -220,7 +224,74 @@ fn check(rig: &Rig, small: u64) -> Result<u64, TestCaseError> {
             n += 1;
         }
     }
+    let mut order: Vec<usize> = (0..rig.ids.len()).rev().collect();
+    order.push(order.len() / 2);
+    let many: Vec<_> = order.iter().map(|&i| rig.ids[i]).collect();
+    let mut by_id: Vec<usize> = (0..rig.ids.len()).collect();
+    by_id.sort_by_key(|&i| rig.ids[i]);
+    for (k, r) in readers.iter().enumerate() {
+        for (wi, w) in windows(now).into_iter().enumerate() {
+            for (gi, a) in aggregates(0).into_iter().enumerate() {
+                let each = |i: usize| windows_got[&(k, wi, gi, i)].clone();
+                let got = crate::durable::window_of(r, &many, &w, &a)
+                    .map(|v| v.into_iter().map(|x| shown(Ok(x))).collect::<Vec<_>>());
+                many_equal(k, &order, &by_id, each, got)?;
+                n += 1;
+            }
+        }
+        for (ri, res) in resolutions().into_iter().enumerate() {
+            let each = |i: usize| charts_got[&(k, ri, i)].clone();
+            let got = crate::durable::buckets_of(r, &many, range, res).map(|v| {
+                v.into_iter()
+                    .map(|x| shown_chart(Ok(x), false))
+                    .collect::<Vec<_>>()
+            });
+            many_equal(k, &order, &by_id, each, got)?;
+            n += 1;
+        }
+    }
     Ok(n)
+}
+
+/// A many-series result, shown per series, against each series' own (`each`): equal at every place of `order`, or the
+/// error of the first series in id order (`by_id`) whose own result is an error. Reader 0 may refuse with
+/// `NotAvailable` where the series' own results do not.
+fn many_equal(
+    k: usize,
+    order: &[usize],
+    by_id: &[usize],
+    each: impl Fn(usize) -> String,
+    got: Result<Vec<String>, QueryError>,
+) -> Result<(), TestCaseError> {
+    let failed = by_id
+        .iter()
+        .map(|&i| each(i))
+        .find(|s| s.starts_with("Err"));
+    if k == 0 && failed.as_ref().is_some_and(|f| f.contains("NotAvailable")) {
+        return Ok(());
+    }
+    match got {
+        Ok(v) => {
+            prop_assert!(
+                failed.is_none(),
+                "reader {}: many succeeded where {:?}",
+                k,
+                failed
+            );
+            prop_assert_eq!(v.len(), order.len());
+            for (s, &i) in v.iter().zip(order) {
+                prop_assert_eq!(s, &each(i), "reader {} series {}", k, i);
+            }
+        }
+        Err(e) => {
+            let e = shown(Err(e));
+            if k == 0 && e.contains("NotAvailable") {
+                return Ok(());
+            }
+            prop_assert_eq!(Some(e), failed, "reader {}", k);
+        }
+    }
+    Ok(())
 }
 
 #[test]

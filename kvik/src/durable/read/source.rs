@@ -535,5 +535,67 @@ pub(crate) fn search_back(
     }
 }
 
+/// For each series of `plan`, in its order, the fact `pick` chooses among its view's facts at or before `t`, as
+/// [`search_back`] finds it for that series alone, from one search of them all: spans that double, each read once for
+/// the series still unfound, and after the first span one probe for each of those (Q-1110).
+pub(crate) fn search_back_each(
+    r: &DurableReader,
+    v: &View,
+    plan: &Plan,
+    t: i64,
+    pick: &dyn Fn(&Fact) -> bool,
+) -> Result<Vec<Option<Fact>>, QueryError> {
+    let mut found: Vec<Option<Fact>> = vec![None; plan.series.len()];
+    let at = |id: u32| {
+        plan.series
+            .binary_search_by_key(&id, |(s, _)| *s)
+            .expect("a series of the plan")
+    };
+    let mut left = plan.clone();
+    let (mut to, mut span, mut probed, mut listed) = (t, FIRST_SPAN, false, None);
+    while !left.series.is_empty() {
+        let from = to.saturating_sub(span - 1);
+        let mut parts = Parts::new(Some(Part::whole(&left, from, to)), true, listed.take());
+        while let Some(unit) = parts.next(r, v, &left)? {
+            let picked: Vec<Fact> = match &unit {
+                Unit::Rows(rows, _, _) => rows.iter().map(fact_out).filter(|f| pick(f)).collect(),
+                Unit::Folded(s) => Some(fact_out(s)).filter(|f| pick(f)).into_iter().collect(),
+            };
+            for f in picked {
+                let slot = &mut found[at(f.series.0)];
+                if slot
+                    .as_ref()
+                    .is_none_or(|g| (f.t, f.position) > (g.t, g.position))
+                {
+                    *slot = Some(f);
+                }
+            }
+        }
+        listed = parts.listed;
+        left.series.retain(|(id, _)| found[at(*id)].is_none());
+        if from == i64::MIN {
+            break;
+        }
+        if !probed {
+            probed = true;
+            let mut still = Vec::with_capacity(left.series.len());
+            for &s in &left.series {
+                let one = Plan {
+                    series: vec![s],
+                    history: left.history,
+                    bound: left.bound,
+                };
+                if !nothing_at_or_before(r, v, &one, from - 1, &mut listed)? {
+                    still.push(s);
+                }
+            }
+            left.series = still;
+        }
+        to = from - 1;
+        span = span.saturating_mul(2);
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests;

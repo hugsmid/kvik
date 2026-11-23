@@ -21,7 +21,7 @@ use super::reader::DurableReader;
 use super::registry::{Registry, Series};
 use crate::backend::{Error, convert};
 use crate::error::QueryError;
-use crate::fold::{self, Reading};
+use crate::fold::Reading;
 use crate::read::{Aggregate, ChartData, Live, LiveValue, Resolution, Window, WindowResult};
 use crate::rules;
 use crate::time::TimeRange;
@@ -241,23 +241,7 @@ pub(crate) fn window(
     window: &Window,
     agg: &Aggregate,
 ) -> Result<WindowResult, QueryError> {
-    let now = r.now();
-    stream::on_view(r, |v| {
-        let series = series_in(v, id)?;
-        let p = params(&series.def);
-        let a = rules::aggregate_for(&series.spec, p.kind, agg).map_err(Error::query)?;
-        let span = span_in(r, v.latest().registry(), window, now).map_err(Error::query)?;
-        let node = stream::Folder::new(r, v, series, p, span, now)?.node(span.0, span.1)?;
-        let node = fold::model_node(node, &series.def.state_names);
-        Ok(rules::window_result(
-            Some(&series.spec),
-            &node,
-            &a,
-            span,
-            false,
-            false,
-        ))
-    })
+    Ok(many::window_of(r, &[id], window, agg)?.remove(0))
 }
 
 /// A chart query: the raw current facts of the range when there are few enough, else buckets aligned to UTC, each
@@ -268,44 +252,14 @@ pub(crate) fn buckets(
     range: TimeRange,
     resolution: Resolution,
 ) -> Result<ChartData, QueryError> {
-    let now = r.now();
-    stream::on_view(r, |v| {
-        let series = series_in(v, id)?;
-        let (a, b) = rules::chart_range(range).map_err(Error::query)?;
-        let step = match resolution {
-            Resolution::Auto { max_points } => {
-                let max = max_points.max(1);
-                let mut head = Vec::new();
-                for f in stream::current(r, v, id, a, b)?.into_iter().flatten() {
-                    head.push(f?);
-                    if head.len() > max {
-                        break;
-                    }
-                }
-                if head.len() <= max {
-                    return Ok(ChartData::Facts(head));
-                }
-                rules::auto_step(a, b, max_points)
-            }
-            Resolution::Step(d) => rules::fixed_step(d, a, b).map_err(Error::query)?,
-        };
-        let p = params(&series.def);
-        let mut folder = stream::Folder::new(r, v, series, p, (a, b), now)?;
-        let buckets = rules::bucket_spans(a, b, step)
-            .map(|(lo, hi)| {
-                let node = fold::model_node(folder.node(lo, hi)?, &series.def.state_names);
-                Ok(rules::bucket(&series.spec, &node, lo, hi, false))
-            })
-            .collect::<Result<_, QueryError>>()?;
-        Ok(ChartData::Buckets {
-            step: convert::dur(i128::from(step)),
-            buckets,
-        })
-    })
+    Ok(many::buckets_of(r, &[id], range, resolution)?.remove(0))
 }
+
+pub(crate) use many::{buckets_of, window_of};
 
 #[cfg(test)]
 pub(crate) mod indexed;
+mod many;
 mod stream;
 #[cfg(test)]
 mod tests;

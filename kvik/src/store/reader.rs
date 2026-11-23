@@ -192,6 +192,91 @@ impl Reader {
         }
     }
 
+    /// Facts of several series with `t` in a range, in a view, streamed in
+    /// event-time order, then series, then position: one read of the log
+    /// for them all (Q-1062, Q-1110).
+    pub fn facts_of(
+        &self,
+        ids: &[SeriesId],
+        range: impl Into<TimeRange>,
+        view: View,
+    ) -> Result<Facts, QueryError> {
+        let range = range.into();
+        match &self.inner {
+            ReaderInner::Model(s) => s
+                .with(|s| {
+                    let mut set = ids.to_vec();
+                    set.sort_unstable();
+                    set.dedup();
+                    let mut all = Vec::new();
+                    for id in set {
+                        all.extend(s.facts(id, range, view)?.map(|f| f.expect("held facts")));
+                    }
+                    all.sort_by_key(|f| (f.t, f.series, f.position));
+                    Ok(Facts::new(all))
+                })
+                .map_err(|e: crate::backend::Error| e.query()),
+            _ => crate::durable::facts_of(
+                self.durable().expect("a durable reader")?,
+                ids,
+                range,
+                view,
+            )
+            .map(Facts::stream),
+        }
+    }
+
+    /// Chart queries of several series over one range, each as
+    /// [`Reader::buckets`] answers it, from one read of the range (Q-1110).
+    pub fn buckets_of(
+        &self,
+        ids: &[SeriesId],
+        range: impl Into<TimeRange>,
+        resolution: Resolution,
+    ) -> Result<Vec<ChartData>, QueryError> {
+        let range = range.into();
+        match &self.inner {
+            ReaderInner::Model(s) => ids
+                .iter()
+                .map(|id| {
+                    s.with(|s| s.buckets(*id, range, resolution))
+                        .map_err(|e| e.query())
+                })
+                .collect(),
+            _ => durable::buckets_of(
+                &self.durable().expect("a durable reader")?,
+                ids,
+                range,
+                resolution,
+            ),
+        }
+    }
+
+    /// Window results of several series over one window, each as
+    /// [`Reader::window`] answers it, from one read of its span (Q-1110).
+    pub fn window_of(
+        &self,
+        ids: &[SeriesId],
+        window: Window,
+        aggregate: Aggregate,
+    ) -> Result<Vec<WindowResult>, QueryError> {
+        match &self.inner {
+            ReaderInner::Model(s) => ids
+                .iter()
+                .map(|id| {
+                    s.with(|s| s.window(*id, &window, &aggregate))
+                        .map_err(|e| e.query())
+                })
+                .collect(),
+            _ => durable::window_of(
+                &self.durable().expect("a durable reader")?,
+                ids,
+                &window,
+                &aggregate,
+            ),
+        }
+    }
+
     /// The latest fact at or before `t` that a window can credit (not bad
     /// quality, not displaced), in a view, ignoring the staleness limit; for
     /// a versioned series the version the view selects.

@@ -163,6 +163,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-1109 | §6 Chart buckets; `api.md` Reader; Q-1000, Q-1060 | Windows, chart buckets and calendar results from the sources (decided by the lead) |
+| Q-1110 | §6 Chart buckets; `api.md` Reading; Q-1062, Q-1109 | Several series' windows, buckets and facts from one read (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4617,8 +4618,8 @@ reading before the span comes from `at`'s backward search (Q-1065). A cut that a
 more under a new cut, and a second end is `CutExpired`, as for `at` (Q-1061). A window's core is folded 256 readings
 at a time and merged (`kvik_tree::merge`, associative and exact: spec §5.3, invariant 6), so a window or bucket holds
 one chunk whatever it covers; an interval series' readings are credited as they are taken and kept only while their
-interval reaches past the bucket. Buckets fold left to right from one stream of the range; `Resolution::Auto` first
-reads up to `max_points` + 1 facts from a second stream at the same cut. A tiny cap refuses as `facts` does. The fact
+interval reaches past the bucket. Buckets fold left to right from one stream of the range, `Resolution::Auto`'s
+first `max_points` + 1 facts included (Q-1110). A tiny cap refuses as `facts` does. The fact
 index is now built only to find damage (Q-1060) and for a broken state (Q-1006). `Bucket` gains `sum`, `increase`,
 `resets` and `regressions` from the bucket's node on both backends (the query design's Q-744), additive since
 `Bucket` is `#[non_exhaustive]`. Cost left: a fresh reader's first read fills the lookups' cache (Q-1069), reading
@@ -4632,6 +4633,27 @@ reader's fact index, the evaluation before 9.0h, and the model); `kvik/src/durab
 `a_streamed_fold_equals_the_one_shot_fold_and_the_model`; `kvik/tests/windows.rs`
 `buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum`; `kvik/tests/window_memory.rs`
 `bucket_window_and_calendar_reads_stay_flat_with_the_stores_age`.
+
+## Q-1110 — Several series' windows, buckets and facts from one read
+Decided by the lead with roadmap 9.0h, for review.
+**Scenario.** A dashboard reads every series over the same range. One call per series reads the log once per series,
+and in the W0 layout every batch holds every series, so a query over 37 series decoded each batch 37 times: 23 s for a
+day's charts of a one-day store, 45 s for a week's (`docs/measurements/9.0h-bucket-reads.md`). `Resolution::Auto` read
+the range twice, once for its first `max_points` + 1 facts and once to fold.
+**Decided.** `Reader::buckets_of`, `window_of` and `facts_of` take several series (in any order, repeats allowed) and
+read them in one stream at one cut, in event-time order then series (Q-1062); each result equals the one-series call's,
+and the one-series calls are the same code with one series. Checks run series by series in id order, each as its own
+call orders them (the series, then the range, resolution, aggregate or window), so the call fails as the first series
+in id order that would fail alone. The reading before the range is found for every series in one backward search
+(Q-1065): spans that double, each read once for the series still unfound, then one probe per series. Each series
+folds from a push-driven core that holds one chunk (Q-1109), so a read holds one chunk per series; with
+`Resolution::Auto` it keeps a series' facts until they pass `max_points`, then folds them and the rest, so the range
+is read once. The model backend answers series by series. Provisional: a call over many series holds each series'
+results until it ends; a caller wanting fewer at once splits the call.
+**Pinned by.** `kvik/src/durable/read/source/tests/windows.rs`
+`windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (every series at once, in
+reverse with one repeated, against each series' own result and its first failure); `kvik/tests/windows.rs`
+`many_series_calls_equal_one_call_per_series_on_both_backends`.
 
 ## Open at v0.2
 
@@ -4830,6 +4852,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 | Q-1109 | 6.2 | Decided by the lead with 9.0h: windows, buckets and calendar results from the sources, chunked fold, `Bucket` sum, increase, resets and regressions; the first read's segment index reads wait on per-segment spans; for review |
+| Q-1110 | 6.2 | Decided by the lead with 9.0h: several series' windows, buckets and facts from one read; results held per series until the call ends; for review |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
