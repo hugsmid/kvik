@@ -300,6 +300,7 @@ mod bounded {
             now,
             wall: now,
             mono: 0,
+            acked: Vec::new(),
         };
         let late: Vec<(Option<u64>, bool)> = d
             .facts_between(LogPos::default(), next(d.head), &ctx)
@@ -365,6 +366,7 @@ mod bounded {
             now,
             wall: now,
             mono: 0,
+            acked: Vec::new(),
         };
         let through = d.head;
         assert!(d.routing_registry_file(&ctx, next(through), 0).is_none());

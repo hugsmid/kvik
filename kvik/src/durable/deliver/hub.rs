@@ -1,17 +1,17 @@
 //! The deliverer of a writer with what its calls share, and the `kvik-deliver` thread.
 
-use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use kvik_log::writer::{Fault as LogFault, FaultOp, Watch};
 
-use super::{Ctx, Deliverer};
+use super::{Ctx, Deliverer, Stamp};
 use crate::durable::clock::Clocks;
 use crate::env::Env;
+use kvik_log::writer::Position as LogPos;
 
 /// The deliverer of a writer with what its calls share: the writer's progress, the clocks and a cursor file fault.
 /// The `kvik-deliver` thread holds one too, never the writer, so dropping the last `Store` clone stops the store at
@@ -34,15 +34,8 @@ pub(crate) struct Hub {
     /// for a second, so calls that run them (emits, polls, `tick`) keep the order the model backend gives; and not
     /// at all when the environment turns background timers off (`Env::background_timers`).
     last_tick: Mutex<Instant>,
-    /// Runs that took wakers, and those that have woken them: a call waits until every wake begun before it has
-    /// ended ([`Hub::wait_wakes`]).
-    wakes: Mutex<(u64, u64)>,
-    wakes_cv: Condvar,
-}
-
-thread_local! {
-    /// This thread is waking consumers: a waker that calls back into the store does not wait for itself.
-    static IN_WAKE: Cell<bool> = const { Cell::new(false) };
+    /// Emits acknowledged since the deliverer last took them, with the clocks at each ([`Hub::acked`]).
+    acked: Mutex<Vec<(LogPos, Stamp)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -61,8 +54,7 @@ impl Hub {
             fault: Mutex::new(None),
             closed: AtomicBool::new(false),
             last_tick: Mutex::new(Instant::now()),
-            wakes: Mutex::new((0, 0)),
-            wakes_cv: Condvar::new(),
+            acked: Mutex::new(Vec::new()),
         })
     }
 
@@ -70,40 +62,22 @@ impl Hub {
     pub(crate) fn run<R>(&self, f: impl FnOnce(&mut Deliverer, &Ctx<'_>) -> R) -> R {
         let r = self.run_quiet(f);
         let closed = self.closed.load(Ordering::SeqCst);
-        let wakers = {
-            let mut d = lock(&self.deliverer);
-            let w = d.take_wakers(closed);
-            if !w.is_empty() {
-                lock(&self.wakes).0 += 1;
-            }
-            w
-        };
-        if !wakers.is_empty() {
-            let was = IN_WAKE.with(|f| f.replace(true));
-            for w in wakers {
-                w.wake();
-            }
-            IN_WAKE.with(|f| f.set(was));
-            lock(&self.wakes).1 += 1;
-            self.wakes_cv.notify_all();
+        let wakers = lock(&self.deliverer).take_wakers(closed);
+        for w in wakers {
+            w.wake();
         }
         r
     }
 
-    /// Waits until every wake of consumers begun before the call has ended, so that a call whose batch another
-    /// thread delivered returns only once the consumers waiting for it are woken. A waker that calls back does not
-    /// wait.
-    pub(crate) fn wait_wakes(&self) {
-        if IN_WAKE.with(Cell::get) {
-            return;
-        }
-        let w = lock(&self.wakes);
-        let target = w.0;
-        drop(
-            self.wakes_cv
-                .wait_while(w, |w| w.1 < target)
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+    /// Notes that an emit whose call ends at `last` was acknowledged now. Its batch is read back by the
+    /// `kvik-deliver` thread or the next call that takes batches, off the emit's path, and taken as of this instant.
+    pub(crate) fn acked(&self, last: LogPos) {
+        let at = Stamp {
+            now: self.clocks.now(),
+            wall: self.env.clock.wall().0,
+            mono: i64::try_from(self.env.clock.monotonic().0).unwrap_or(i64::MAX),
+        };
+        lock(&self.acked).push((last, at));
     }
 
     /// Raised before a consumer is taken, ahead of the pumps that set it up: every batch acknowledged before an emit
@@ -133,6 +107,7 @@ impl Hub {
         let wall = self.env.clock.wall().0;
         let now = self.clocks.now();
         let mono = i64::try_from(self.env.clock.monotonic().0).unwrap_or(i64::MAX);
+        let acked = std::mem::take(&mut *lock(&self.acked));
         let ctx = Ctx {
             watch: watch.as_ref(),
             env: &self.env,
@@ -141,6 +116,7 @@ impl Hub {
             now,
             wall,
             mono,
+            acked,
         };
         f(&mut d, &ctx)
     }

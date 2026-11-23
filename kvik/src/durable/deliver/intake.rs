@@ -60,6 +60,10 @@ impl Deliverer {
 
     /// Takes the batches read that are acknowledged.
     pub(super) fn take_pending(&mut self, ctx: &Ctx<'_>) {
+        for (p, s) in &ctx.acked {
+            let e = self.stamps.entry(*p).or_insert(*s);
+            *e = (*e).min(*s);
+        }
         let stats = ctx.watch.map(Watch::stats);
         let mut read: HashMap<
             crate::durable::history::Key,
@@ -74,7 +78,27 @@ impl Deliverer {
                 }
             }
             let b = self.pending.pop_front().expect("looked at above");
-            self.take_batch(b, ctx, &mut read);
+            // As of its acknowledgement, as when the emit read its batch back itself; never before an instant
+            // already taken as of (a condition runner created later would otherwise fire early).
+            let kept = self.stamps.split_off(&next(b.last));
+            let at = std::mem::replace(&mut self.stamps, kept)
+                .into_values()
+                .min()
+                .unwrap_or(Stamp {
+                    now: ctx.now,
+                    wall: ctx.wall,
+                    mono: ctx.mono,
+                })
+                .max(self.stamped);
+            self.stamped = at;
+            let c = Ctx {
+                now: at.now,
+                wall: at.wall,
+                mono: at.mono,
+                acked: Vec::new(),
+                ..*ctx
+            };
+            self.take_batch(b, &c, &mut read);
             took = true;
         }
         if took {
@@ -186,6 +210,8 @@ impl Deliverer {
         let mut fed: Vec<u32> = Vec::new();
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();
+        // The consumers with more to take after the batch; an entry may change what any of them takes.
+        let mut more = vec![false; names.len()];
         for item in b.content.items {
             let p = LogPos {
                 generation: b.first.generation,
@@ -231,8 +257,8 @@ impl Deliverer {
                         self.last_arrival.insert(series, b.content.received_at);
                     }
                     if !self.loading {
-                        for name in &names {
-                            self.deliver_live(name, &rec);
+                        for (name, more) in names.iter().zip(more.iter_mut()) {
+                            *more |= self.deliver_live(name, &rec);
                         }
                         self.items.insert(p, Rec::Fact(rec));
                         #[cfg(test)]
@@ -256,6 +282,7 @@ impl Deliverer {
                             *l = (*l).min(after);
                         }
                     }
+                    more.fill(true);
                     let routing = matches!(e, Entry::Routing(_));
                     self.entries.insert(p, e.clone());
                     if !self.loading {
@@ -271,7 +298,9 @@ impl Deliverer {
         }
         self.head = self.head.max(b.last);
         if !self.loading {
-            self.notify = true;
+            for (name, _) in names.iter().zip(&more).filter(|(_, m)| **m) {
+                self.changed(name);
+            }
             for name in &names {
                 self.evaluate(name, Some(&fed), ctx);
             }

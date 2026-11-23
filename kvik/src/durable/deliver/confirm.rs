@@ -113,7 +113,8 @@ impl Deliverer {
             rt.cursor = rt.cursor.max(o.position);
         }
         rt.dirty = true;
-        self.notify = true;
+        // Only this consumer's own poll can wait on what a confirm frees: room in its queue or the end of a pause.
+        self.changed(name);
         if forced {
             // Nothing further is delivered until the cursor file naming the resync's id is synced.
             let r = self.write_cursor(name, Due::Now, ctx);

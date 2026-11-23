@@ -277,7 +277,7 @@ impl Deliverer {
         });
         self.unchecked += u64::from(unchecked);
         rt.emitted.insert(funnel, state);
-        self.notify = true;
+        self.changed(name);
     }
 
     /// Runs the timers of every condition funnel that is due (`spec.md` §4 Timers, §6 Cadence).

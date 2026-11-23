@@ -98,7 +98,7 @@ impl Deliverer {
         rt.runners = runners;
         rt.emitted = emitted;
         rt.resume = None;
-        self.notify = true;
+        self.changed(name);
     }
 
     /// The routes and registry as of the position before `at`, built from the entries before it.

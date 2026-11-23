@@ -1,5 +1,5 @@
-//! An emit while no consumer is registered leaves its batch to the `kvik-deliver` thread, and a consumer registering
-//! during emits is set up after every batch an emit left (Q-706).
+//! An emit leaves its batch to the `kvik-deliver` thread (Q-706, Q-1119), and a consumer registering during emits is
+//! set up after every batch an emit left.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,7 +118,7 @@ fn with_no_consumer_an_emit_never_waits_for_the_deliverer() {
 }
 
 #[test]
-fn an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch() {
+fn an_emit_while_a_consumer_is_set_up_leaves_its_batch_and_the_consumer_starts_after_it() {
     let (w, id, dir, t) = open("set-up");
     let held = Hold::new(&dir, Point::DeliverThread);
     let set_up = Gate::new(&dir, Point::TakeSetUp);
@@ -128,7 +128,7 @@ fn an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch() {
     };
     set_up.reached();
     let p = emit(&w, id, t, 0);
-    assert!(taken(&w) >= p.sequence);
+    assert!(taken(&w) < p.sequence);
     set_up.release();
     taker.join().unwrap().unwrap();
     w.route("c", &Funnel::facts(Select::All)).unwrap();
@@ -196,7 +196,7 @@ fn an_emit_waits_while_a_consumer_is_set_up_instead_of_leaving_its_batch() {
 }
 
 #[test]
-fn with_a_consumer_an_emit_returns_after_taking_its_batch_and_waking_it() {
+fn with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_thread_wakes_it() {
     let (w, id, dir, t) = open("consumer");
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
     w.route("c", &Funnel::facts(Select::All)).unwrap();
@@ -208,9 +208,14 @@ fn with_a_consumer_an_emit_returns_after_taking_its_batch_and_waking_it() {
             .is_none()
     );
     let p = emit(&w, id, t, 0);
-    assert!(woken.0.load(Ordering::SeqCst));
-    assert!(taken(&w) >= p.sequence);
-    assert_eq!(facts(&w, "c"), vec![p.sequence]);
+    assert!(!woken.0.load(Ordering::SeqCst));
+    assert!(taken(&w) < p.sequence);
     drop(held);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !woken.0.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the consumer was never woken");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(facts(&w, "c"), vec![p.sequence]);
     w.shutdown().unwrap();
 }

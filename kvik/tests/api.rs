@@ -755,7 +755,7 @@ fn next_waits_until_an_emit_on(b: Backend) {
     let mut next = std::pin::pin!(c.next());
     assert!(poll_once(next.as_mut(), &woken).is_pending());
     block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
-    assert!(woken.take(), "{b:?}");
+    assert!(woken.take_soon(), "{b:?}");
     match poll_once(next.as_mut(), &woken) {
         Poll::Ready(Some(d)) => assert!(matches!(d.kind, DeliveryKind::Fact(_))),
         other => panic!("{other:?}"),
@@ -1486,7 +1486,7 @@ fn wakers_run_outside_the_store_lock_on(b: Backend) {
         std::mem::forget(s);
         panic!("the emit did not complete: a waker ran under the store lock");
     }
-    assert!(woken.take(), "{b:?}");
+    assert!(woken.take_soon(), "{b:?}");
 }
 
 #[test]

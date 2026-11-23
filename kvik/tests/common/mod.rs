@@ -69,6 +69,19 @@ impl Flag {
     pub fn take(&self) -> bool {
         self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Whether it is woken within five seconds; clears the flag. The durable backend wakes a consumer from the
+    /// `kvik-deliver` thread, shortly after the emit that fed it returns (Q-1119).
+    pub fn take_soon(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if self.take() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
 }
 
 impl Wake for Flag {

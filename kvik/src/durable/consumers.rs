@@ -27,12 +27,11 @@ impl Writer {
             .ok_or_else(|| Error::ReadOnly("the start could not read the log".into()))
     }
 
-    /// Takes the batches acknowledged since the last call into the consumers' queues; with no consumer, left to the
-    /// `kvik-deliver` thread (Q-706).
-    pub(crate) fn deliver(&self) {
+    /// Notes an acknowledged emit for the deliverer, which takes its batch off the emit's path, as of now (Q-1119);
+    /// with no consumer there is nothing to take it for (Q-706).
+    pub(crate) fn deliver(&self, last: kvik_log::writer::Position) {
         if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
-            h.run(|d, c| d.pump(c));
-            h.wait_wakes();
+            h.acked(last);
         }
     }
 
@@ -265,7 +264,7 @@ impl Writer {
             dl.pump(c);
             let r = dl.poll(name, c);
             if let (Ok(None), Some(w)) = (&r, waker) {
-                dl.register(w);
+                dl.register(name, w);
             }
             r
         });

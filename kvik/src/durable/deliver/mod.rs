@@ -31,7 +31,7 @@ mod take;
 pub(crate) use hub::Hub;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -121,6 +121,26 @@ pub(crate) struct Ctx<'a> {
     pub(crate) now: i64,
     pub(crate) wall: i64,
     pub(crate) mono: i64,
+    /// Acknowledgements noted since the last call ([`Hub::acked`]).
+    pub(crate) acked: Vec<(LogPos, Stamp)>,
+}
+
+/// The clocks at an instant: the store's `now`, the wall clock and the monotonic clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Stamp {
+    pub(crate) now: i64,
+    pub(crate) wall: i64,
+    pub(crate) mono: i64,
+}
+
+impl Stamp {
+    fn max(self, o: Stamp) -> Stamp {
+        Stamp {
+            now: self.now.max(o.now),
+            wall: self.wall.max(o.wall),
+            mono: self.mono.max(o.mono),
+        }
+    }
 }
 
 /// A kept fact and whether it was outranked when it was committed (`spec.md` §4 Outranked facts).
@@ -264,6 +284,11 @@ pub(crate) struct Deliverer {
     entries: BTreeMap<LogPos, Entry>,
     /// Batches read and not yet taken.
     pending: VecDeque<ReadBatch>,
+    /// When emits were acknowledged, by the last position of each call: a batch is taken as of the earliest
+    /// acknowledgement inside it, wherever and whenever it is read back.
+    stamps: BTreeMap<LogPos, Stamp>,
+    /// The latest instant a batch was taken as of: instants never go back.
+    stamped: Stamp,
     /// Per series, the receive time of its last fact that was not outranked (`spec.md` §6 Restart and resume).
     last_arrival: crate::durable::by_id::ById<i64>,
     /// Series whose last fact at a seeded start's seed may have been outranked: their last arrival is read from the
@@ -283,9 +308,11 @@ pub(crate) struct Deliverer {
     sequences: BTreeMap<(String, u32), u64>,
     capacity: usize,
     max_consumers: usize,
-    wakers: Vec<Waker>,
-    /// Something a consumer may be waiting for changed since the wakers were last woken.
-    notify: bool,
+    /// Per consumer, the wakers of its polls that found nothing.
+    wakers: BTreeMap<String, Vec<Waker>>,
+    /// The consumers something they may be waiting for changed for since their wakers were last woken: only they are
+    /// woken, so a delivery or a confirm costs no wake of any other consumer.
+    notify: BTreeSet<String>,
     /// A cursor file write or sync failed: no cursor file is written again and nothing further is delivered until a
     /// restart (`spec.md` §3 Write or sync failure: a failed sync is never retried).
     failed: bool,
@@ -405,6 +432,8 @@ impl Deliverer {
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
             pending: VecDeque::new(),
+            stamps: BTreeMap::new(),
+            stamped: Stamp::default(),
             last_arrival: crate::durable::by_id::ById::default(),
             arrival_unknown: RefCell::new(BTreeMap::new()),
             seeded: None,
@@ -416,8 +445,8 @@ impl Deliverer {
             sequences: BTreeMap::new(),
             capacity,
             max_consumers,
-            wakers: Vec::new(),
-            notify: false,
+            wakers: BTreeMap::new(),
+            notify: BTreeSet::new(),
             failed: false,
             stats: DeliveryStats::default(),
             loading: true,
@@ -441,6 +470,7 @@ impl Deliverer {
             now: clocks.now(),
             wall: 0,
             mono: 0,
+            acked: Vec::new(),
         }
     }
 
@@ -566,12 +596,20 @@ impl Deliverer {
         }
     }
 
-    fn deliver_live(&mut self, name: &str, rec: &Arc<FactRec>) {
+    /// Queues a fact for a consumer it is routed to. Returns whether the consumer has more to take: the fact queued,
+    /// or a catch-up begun or still running.
+    fn deliver_live(&mut self, name: &str, rec: &Arc<FactRec>) -> bool {
         let Some(rt) = self.consumers.get_mut(name) else {
-            return;
+            return false;
         };
-        if rt.dormant || rt.behind.is_some() || !self.view.routed(name, rec.stored.row.series_id) {
-            return;
+        if rt.dormant {
+            return false;
+        }
+        if rt.behind.is_some() {
+            return true;
+        }
+        if !self.view.routed(name, rec.stored.row.series_id) {
+            return false;
         }
         if rt.queue.len() < self.capacity {
             rt.queue.push_back(Pend::Fact {
@@ -581,6 +619,14 @@ impl Deliverer {
         } else {
             // Catch up from the first position not enqueued in this session (`spec.md` §4 Overflow).
             rt.behind = Some(rec.stored.position);
+        }
+        true
+    }
+
+    /// Notes that something consumer `name` may be waiting for changed.
+    pub(super) fn changed(&mut self, name: &str) {
+        if !self.notify.contains(name) {
+            self.notify.insert(name.to_owned());
         }
     }
 
@@ -637,22 +683,32 @@ impl Deliverer {
         })
     }
 
-    /// Registers a waker to wake when deliveries may be ready.
-    pub(crate) fn register(&mut self, w: &Waker) {
-        if !self.wakers.iter().any(|x| x.will_wake(w)) {
-            self.wakers.push(w.clone());
+    /// Registers a waker of consumer `name` to wake when its deliveries may be ready.
+    pub(crate) fn register(&mut self, name: &str, w: &Waker) {
+        let ws = match self.wakers.get_mut(name) {
+            Some(ws) => ws,
+            None => self.wakers.entry(name.to_owned()).or_default(),
+        };
+        if !ws.iter().any(|x| x.will_wake(w)) {
+            ws.push(w.clone());
         }
     }
 
-    /// The wakers registered, to wake once the lock is released: all of them with `all`, else only if something
-    /// changed since they were last woken.
+    /// The wakers to wake once the lock is released: every one with `all`, else those of the consumers something
+    /// changed for since they were last woken.
     pub(crate) fn take_wakers(&mut self, all: bool) -> Vec<Waker> {
-        if all || std::mem::take(&mut self.notify) {
-            self.notify = false;
-            std::mem::take(&mut self.wakers)
-        } else {
-            Vec::new()
+        let notify = std::mem::take(&mut self.notify);
+        if all {
+            return std::mem::take(&mut self.wakers)
+                .into_values()
+                .flatten()
+                .collect();
         }
+        notify
+            .iter()
+            .filter_map(|n| self.wakers.remove(n))
+            .flatten()
+            .collect()
     }
 
     /// Closes the log reader (its lease is deleted).

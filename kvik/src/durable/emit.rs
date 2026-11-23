@@ -141,10 +141,10 @@ impl Writer {
                 if own {
                     me.note_latency(started.elapsed());
                 }
-                if r.is_ok() {
+                if let Ok(ack) = &r {
                     #[cfg(test)]
                     pause::at(&me.dir, pause::Point::AfterAck);
-                    me.deliver();
+                    me.deliver(ack.last);
                 }
                 match r {
                     Ok(ack) if own => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
