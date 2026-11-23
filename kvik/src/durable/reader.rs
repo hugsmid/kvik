@@ -135,6 +135,8 @@ pub(crate) struct DurableReader {
     /// The fan-out thread was started ([`super::read::fanout`]), or could not be.
     pub(crate) fanout: AtomicBool,
     pub(crate) fanout_failed: AtomicBool,
+    /// Wakes the fan-out thread, so that it ends as soon as the reader is dropped.
+    pub(crate) fanout_kick: Mutex<Option<std::task::Waker>>,
     /// The memory cap of its queries (Q-1063).
     memory: Arc<Accountant>,
     #[cfg(test)]
@@ -144,6 +146,18 @@ pub(crate) struct DurableReader {
     pub(crate) expire_lookups: AtomicU64,
     #[cfg(test)]
     pub(crate) after_lookup: AfterLookup,
+}
+
+impl Drop for DurableReader {
+    fn drop(&mut self) {
+        let kick = self
+            .fanout_kick
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(w) = kick.take() {
+            w.wake();
+        }
+    }
 }
 
 /// Run after each lookup of the reader's `facts` and `at`.
@@ -301,6 +315,7 @@ impl DurableReader {
             hub: Hub::default(),
             fanout: AtomicBool::new(false),
             fanout_failed: AtomicBool::new(false),
+            fanout_kick: Mutex::new(None),
             memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),
         })
     }

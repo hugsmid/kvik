@@ -302,3 +302,33 @@ fn the_rest_of_a_round_a_row_limit_cut_is_taken_once_the_interval_passes_with_no
     assert_eq!(held[&t].tail.len(), 4);
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn a_fan_out_thread_that_panics_rings_every_session_and_leaves_them_rung_by_every_round() {
+    use crate::durable::read::fanout::Guard;
+    use std::sync::atomic::Ordering;
+    let w = World::new("fanout-panics");
+    let s = w.open();
+    let r = s.reader();
+    let d = r.durable().unwrap().unwrap();
+    let mut session = r.session();
+    session
+        .open(super::tests::tail_all(), LiveOptions::default())
+        .unwrap();
+    session.next(Duration::ZERO).unwrap().unwrap();
+    let before = session.durable_mut().and_then(|x| x.rung()).unwrap();
+    let weak = std::sync::Arc::downgrade(&d);
+    let died = std::thread::spawn(move || {
+        let _guard = Guard {
+            reader: weak,
+            progress: None,
+        };
+        panic!("a round failed");
+    })
+    .join();
+    assert!(died.is_err());
+    assert!(d.fanout_failed.load(Ordering::SeqCst));
+    assert!(session.durable_mut().and_then(|x| x.rung()).unwrap() > before);
+    drop(session);
+    block_on(s.shutdown()).unwrap();
+}

@@ -311,6 +311,64 @@ fn a_missing_segment_under_the_tail_is_an_error_at_every_next() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Q-951, Q-1118 (f): with the fan-out thread running, a shared read that fails for good fails every `next` in the
+/// writer's process, a waiting one included, never silence.
+#[test]
+fn a_missing_segment_under_the_tail_is_an_error_at_every_next_with_the_fan_out_thread_running() {
+    let mut w = World::new("missing-fanout");
+    w.log.seal_interval = Duration::from_millis(20);
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let r = s.reader();
+    let (mut session, _, _, mut held) = watched(&r, LiveOptions::default());
+    let sealed = |text: &[u8]| {
+        for _ in 0..500 {
+            if w.segments().iter().any(|(p, b)| {
+                p.extension().is_some_and(|e| e == "kvl")
+                    && b.windows(text.len()).any(|x| x == text)
+            }) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("not sealed");
+    };
+    note(&w, &s, id, 0, "MF-ZERO");
+    sealed(b"MF-ZERO");
+    note(&w, &s, id, 1, "MF-ONE");
+    sealed(b"MF-ONE");
+    while poll(&w, &mut session, &mut held).is_some() {}
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"MF-ONE"))
+        .unwrap();
+    crate::env::Fs::remove_file(&*w.env.fs, &path).unwrap();
+    // The commit lands while `next` waits: the thread's failed round must ring it.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            note(&w, &s, id, 2, "MF-TWO");
+        });
+        let started = std::time::Instant::now();
+        let got = session.next(Duration::from_secs(5));
+        assert!(
+            matches!(got, Err(QueryError::NotAvailable { .. })),
+            "{got:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    });
+    for step in [TICK, Duration::ZERO, Duration::from_millis(10), TICK] {
+        w.clock.advance(step);
+        let got = session.next(Duration::ZERO);
+        assert!(
+            matches!(got, Err(QueryError::NotAvailable { .. })),
+            "{got:?}"
+        );
+    }
+    block_on(s.shutdown()).unwrap();
+}
+
 #[test]
 fn a_slow_tail_gets_lagged_to_the_mark_and_the_shared_tail_stays_within_its_backlog() {
     let w = World::new("lagged");
