@@ -310,16 +310,12 @@ impl Tail {
             index,
             mut decider,
             counters,
-            mut lost,
+            lost,
             finder,
             ..
         } = self;
         decider.registry = index.registry().clone();
         let recorded = reader.lost_ranges().to_vec();
-        // The recorded lost ranges below the seed, which the start from the whole log meets in its read.
-        for l in &recorded {
-            lost.insert(l.file_id, l.offset, l.offset.saturating_add(l.length));
-        }
         reader.release_bytes();
         latch.started();
         Ok(Kept {

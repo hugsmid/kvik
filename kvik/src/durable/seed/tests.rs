@@ -453,3 +453,18 @@ fn a_consumer_starting_below_the_seed_passes_over_a_recorded_loss_as_the_whole_l
         compare(&steps, End::Kill, ScanOrder::Background, &later, 2230).unwrap();
     }
 }
+
+#[test]
+fn a_replay_below_the_seed_over_a_recorded_loss_is_decided_as_the_whole_log_decides_it() {
+    let steps = vec![
+        Step::Emit(vec![(1, 0, 1, 0, false)], false),
+        Step::Emit(vec![(2, 0, 1, 0, false)], false),
+        Step::Damage(0),
+        Step::Emit(vec![(3, 0, 1, 0, false)], false),
+        Step::Directory(usize::MAX),
+    ];
+    for order in [ScanOrder::Background, ScanOrder::BeforeOpen] {
+        let r = compare(&steps, End::Shutdown, order, &[(1, 0, 2, 0, false)], 0).unwrap();
+        assert!(r.seeded, "{order:?}");
+    }
+}

@@ -4726,10 +4726,11 @@ its last arrival read from the log when a stale-for condition first needs it; co
 time`, are read from the log when asked; a consumer below S reads the log below S as one behind does. The pass reads
 the batch ending at S first, for the commit time a loss just above S reports (Q-1090), and gives way to the whole
 log when that batch is not first, on a void, on a region holding a position at or below S, or on a read error.
-The manifest's recorded lost ranges below S count as regions the start passed over, for the writer's and the
-deliverer's lookups, as the whole read meets them; otherwise a lookup below S that meets one reports the key
-unreadable, and a fact decided or delivered over it is marked unchecked where the whole read's is not
-(`a_consumer_starting_below_the_seed_passes_over_a_recorded_loss_as_the_whole_log_does`).
+The manifest's recorded lost ranges below S count as regions the deliverer passed over, as the whole read meets
+them; otherwise its lookups below S report a key over one unreadable and deliver the fact unchecked where the whole
+read's is not (`a_consumer_starting_below_the_seed_passes_over_a_recorded_loss_as_the_whole_log_does`). The writer's
+decisions over one already match the whole read's
+(`a_replay_below_the_seed_over_a_recorded_loss_is_decided_as_the_whole_log_decides_it`).
 Neither a void nor a region at or below S reaches the pass through the seed's own rules: a reset below a
 directory's `through` makes it no seed (`kept_series`), and recovery truncates what a reboot leaves above the mark;
 both give-ways stay as a guard. The two reads below S (a last arrival that may have been outranked, a commit time for
