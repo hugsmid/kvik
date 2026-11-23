@@ -7,6 +7,8 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Point {
+    /// Under the decision lock, after a call's facts are taken for provisional streams, before its offer.
+    BeforeOffer,
     /// Right after a call's decision.
     AfterDecision,
     /// After a call's acknowledgement, before its delivery step.

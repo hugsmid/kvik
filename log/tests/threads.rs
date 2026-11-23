@@ -229,6 +229,54 @@ fn a_failed_sync_fails_the_calls_it_covered_and_the_store_turns_read_only() {
 }
 
 #[test]
+fn a_failed_sync_resolves_every_queued_call_while_the_writer_still_runs() {
+    let fs = MemFs::new();
+    let held = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+    let log = start(Arc::new(fs.clone()), Path::new("store"), cfg());
+    log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    let h = held.clone();
+    fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        let writer = std::thread::current().name() == Some("kvik-writer");
+        if writer && p.to_string_lossy().ends_with(".open") && !h.swap(true, Ordering::SeqCst) {
+            let (entered, release) = gate.lock().unwrap().take().unwrap();
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    })));
+    let first = log.submit(vec![fact(1, 1)]).unwrap();
+    entered_rx.recv().unwrap();
+    let queued: Vec<_> = (2..6)
+        .map(|i| log.try_submit(vec![fact(2, i)]).unwrap())
+        .collect();
+    fs.fail_syncs(true);
+    release_tx.send(()).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let first = first.wait();
+        let rest: Vec<_> = queued.into_iter().map(|p| p.wait()).collect();
+        done_tx.send((first, rest)).unwrap();
+    });
+    let (first, rest) = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("every queued call resolved without a shutdown");
+    assert_eq!(first, Err(CommitError::OutcomeUnknown));
+    assert!(
+        rest.iter().all(|r| *r == Err(CommitError::ReadOnly)),
+        "{rest:?}"
+    );
+    assert!(log.fault().is_some());
+    assert!(
+        !log.watch().stopped(),
+        "the writer resolved them before it stopped"
+    );
+    fs.set_sync_hook(None);
+    assert!(log.shutdown().is_err());
+}
+
+#[test]
 fn a_panic_on_the_writer_thread_fails_pending_calls_and_turns_the_store_read_only() {
     let fs = MemFs::new();
     let log = start(Arc::new(fs.clone()), Path::new("store"), cfg());

@@ -6,15 +6,17 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use common::world::{World, gauge, num};
 use common::{block_on, start};
 use kvik::env::{Env, MemFs, SystemClock};
 use kvik::{
-    Consumer, DeliveryKind, Funnel, LogConfig, Provisional, ProvisionalEvent, ProvisionalOptions,
-    Select, SeriesId, Start, Store, StoreConfig, Timestamp, View, Withdrawal,
+    Consumer, DeliveryKind, Funnel, LogConfig, Provisional, ProvisionalEvent, ProvisionalFact,
+    ProvisionalOptions, Select, SeriesId, Start, Store, StoreConfig, Timestamp, View, Withdrawal,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
@@ -75,6 +77,8 @@ struct Told {
     withdrawn: BTreeMap<u64, Withdrawal>,
     lagged: Vec<(u64, u64)>,
     closed: bool,
+    full: BTreeMap<u64, Vec<ProvisionalFact>>,
+    mark: Option<kvik::Position>,
 }
 
 impl Told {
@@ -93,14 +97,19 @@ impl Told {
                 {
                     return Err(format!("call {} delivered twice", a.seq()));
                 }
+                self.full.insert(a.seq(), a.facts().cloned().collect());
                 if a.durable() {
                     self.durable.insert(a.seq());
                 }
             }
-            ProvisionalEvent::Durable { through, .. } => {
+            ProvisionalEvent::Durable { through, mark } => {
                 if *through <= self.through {
                     return Err(format!("watermark {through} after {}", self.through));
                 }
+                if self.mark.is_some_and(|m| *mark < m) {
+                    return Err(format!("mark {mark:?} after {:?}", self.mark));
+                }
+                self.mark = Some(*mark);
                 self.through = *through;
                 for (&s, _) in self.accepted.range(..=through) {
                     if !self.withdrawn.contains_key(&s) {
@@ -153,13 +162,36 @@ fn all(s: &Store, ids: &[SeriesId]) -> Vec<kvik::Fact> {
 }
 
 fn stored(w: &World, ids: &[SeriesId]) -> BTreeSet<(u32, i64)> {
+    stored_facts(w, ids).into_keys().collect()
+}
+
+fn stored_facts(w: &World, ids: &[SeriesId]) -> BTreeMap<(u32, i64), kvik::Fact> {
     let s = w.open();
     let facts = all(&s, ids)
         .into_iter()
-        .map(|f| (f.series.0, f.t.0))
+        .map(|f| ((f.series.0, f.t.0), f))
         .collect();
     block_on(s.shutdown()).unwrap();
     facts
+}
+
+/// Whether a provisional fact is the fact recorded, but for its position.
+fn same_fact(p: &ProvisionalFact, f: &kvik::Fact) -> bool {
+    p.series == f.series
+        && p.t == f.t
+        && p.value == f.value
+        && p.quality == f.quality
+        && p.supplied_quality == f.supplied_quality
+        && p.flags == f.flags
+        && p.changed_at == f.changed_at
+}
+
+/// A queued call's result if it has one, without waiting.
+fn now_or_never(p: &mut Pin<Box<kvik::Pending>>) -> Option<Result<kvik::Ack, kvik::EmitError>> {
+    match p.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(r) => Some(r),
+        Poll::Pending => None,
+    }
 }
 
 fn consumer(s: &Store, ids: &[SeriesId]) -> Consumer {
@@ -202,7 +234,7 @@ fn a_reading_reaches_the_stream_before_its_sync_and_the_watermark_follows_it() {
 }
 
 #[test]
-fn a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable() {
+fn a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable_and_no_watermark() {
     let w = World::new("fast-late-reader");
     let s = w.open();
     let id = define(&s, "site/a/power");
@@ -210,14 +242,15 @@ fn a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable() {
     block_on(s.emit(&[num(id, 1, 1.0)])).unwrap();
     block_on(s.emit(&[num(id, 2, 2.0)])).unwrap();
     let mut told = Told::default();
-    for e in until(&mut p, |e| matches!(e, ProvisionalEvent::Durable { .. })) {
-        told.take(&e).unwrap();
+    while told.accepted.len() < 2 {
+        told.take(&p.next(WAIT).expect("accepted")).unwrap();
     }
     assert_eq!(
         told.accepted.values().map(|a| a.0).collect::<Vec<_>>(),
         [true, true]
     );
-    assert_eq!(told.through, 2);
+    let more = p.next(Duration::from_millis(50));
+    assert!(more.is_none(), "{more:?}");
     block_on(s.shutdown()).unwrap();
     told.drain_to_close(&mut p).unwrap();
 }
@@ -554,7 +587,8 @@ fn history(ops: &[Op], end: End) -> Result<(), TestCaseError> {
     let mut told = Told::default();
     let mut confirmed = BTreeSet::new();
     let mut t = 0;
-    let mut held = Vec::new();
+    // Each call's first reading time, and its result or the call still pending.
+    let mut calls: Vec<(i64, Call)> = Vec::new();
     for op in ops {
         match op {
             Op::Emit { series, n, wait } => {
@@ -564,11 +598,12 @@ fn history(ops: &[Op], end: End) -> Result<(), TestCaseError> {
                         num(ids[*series], t, t as f64)
                     })
                     .collect();
+                let first = rs[0].t.0;
                 match s.try_emit(&rs) {
                     Ok(pending) if *wait && !*gate.closed.lock().unwrap() => {
-                        block_on(pending).unwrap();
+                        calls.push((first, Call::Done(block_on(pending))));
                     }
-                    Ok(pending) => held.push(pending),
+                    Ok(pending) => calls.push((first, Call::Held(Box::pin(pending)))),
                     Err(e) => return Err(TestCaseError::fail(format!("emit: {e:?}"))),
                 }
             }
@@ -585,18 +620,22 @@ fn history(ops: &[Op], end: End) -> Result<(), TestCaseError> {
             }
         }
     }
+    let results;
     match end {
         End::Shutdown => {
             gate.set(false);
-            drop(held);
+            results = resolve(calls);
             drop(c);
             block_on(s.shutdown()).map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
         }
         End::SyncFails => {
             w.fs.fail_syncs(true);
-            let _ = s.try_emit(&[num(ids[0], t + 1, 0.0)]);
+            let last = num(ids[0], t + 1, 0.0);
+            if let Ok(p) = s.try_emit(std::slice::from_ref(&last)) {
+                calls.push((last.t.0, Call::Held(Box::pin(p))));
+            }
             gate.set(false);
-            drop(held);
+            results = resolve(calls);
             while !told.unsettled().is_empty() || told.accepted.is_empty() {
                 match p.next(WAIT) {
                     Some(e) => told.take(&e).map_err(TestCaseError::fail)?,
@@ -609,7 +648,7 @@ fn history(ops: &[Op], end: End) -> Result<(), TestCaseError> {
         End::Crash | End::PowerLoss | End::PartialPowerLoss(_) => {
             w.fs.crash_after(0);
             gate.set(false);
-            drop(held);
+            results = resolve(calls);
             let power = match end {
                 End::Crash => None,
                 End::PowerLoss => Some(None),
@@ -625,24 +664,81 @@ fn history(ops: &[Op], end: End) -> Result<(), TestCaseError> {
         "silently gone: {:?}",
         told.unsettled()
     );
-    let facts = stored(&w, &ids);
-    for (seq, (_, fs)) in &told.accepted {
+    for (seq, fs) in &told.full {
+        let first = fs.first().map(|f| f.t.0).unwrap_or_default();
+        let result = results.get(&first);
+        if let Some(cause) = told.withdrawn.get(seq) {
+            let given = match result {
+                Some(Err(kvik::EmitError::OutcomeUnknown(_))) => Withdrawal::OutcomeUnknown,
+                Some(Err(kvik::EmitError::ReadOnly(_) | kvik::EmitError::Closed)) => {
+                    Withdrawal::NotStored
+                }
+                other => {
+                    return Err(TestCaseError::fail(format!(
+                        "call {seq} withdrawn {cause:?}, its writer was given {other:?}"
+                    )));
+                }
+            };
+            prop_assert_eq!(*cause, given, "call {}", seq);
+        }
+        if told.durable.contains(seq) {
+            prop_assert!(
+                matches!(result, Some(Ok(_))),
+                "call {} said durable, its writer was given {:?}",
+                seq,
+                result
+            );
+        }
+    }
+    let facts = stored_facts(&w, &ids);
+    for (seq, fs) in &told.full {
         if told.durable.contains(seq) {
             for f in fs {
+                let recorded = facts.get(&(f.series.0, f.t.0));
                 prop_assert!(
-                    facts.contains(f),
-                    "call {seq} said durable, fact {f:?} gone after {end:?}"
+                    recorded.is_some_and(|r| same_fact(f, r)),
+                    "call {} said durable as {:?}, recorded {:?} after {:?}",
+                    seq,
+                    f,
+                    recorded,
+                    end
                 );
             }
         }
     }
     for f in &confirmed {
         prop_assert!(
-            facts.contains(f),
+            facts.contains_key(f),
             "a consumer confirmed {f:?}, gone after {end:?}"
         );
     }
     Ok(())
+}
+
+/// Each call's result by its first reading time, waiting up to [`WAIT`] for those still pending; dropping a pending
+/// call lets the store's writer go once the store is dropped.
+fn resolve(calls: Vec<(i64, Call)>) -> BTreeMap<i64, Result<kvik::Ack, kvik::EmitError>> {
+    let until = Instant::now() + WAIT;
+    calls
+        .into_iter()
+        .filter_map(|(first, call)| match call {
+            Call::Done(r) => Some((first, r)),
+            Call::Held(mut p) => loop {
+                if let Some(r) = now_or_never(&mut p) {
+                    break Some((first, r));
+                }
+                if Instant::now() >= until {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            },
+        })
+        .collect()
+}
+
+enum Call {
+    Done(Result<kvik::Ack, kvik::EmitError>),
+    Held(Pin<Box<kvik::Pending>>),
 }
 
 #[test]
