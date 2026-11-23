@@ -356,3 +356,100 @@ fn a_consumer_starting_at_the_commit_time_of_batches_below_the_seed_starts_after
         assert!(r.seeded, "{order:?}");
     }
 }
+
+#[test]
+fn damage_the_scan_finds_below_a_loss_found_at_the_open_grows_it_under_the_identity_found_first() {
+    let e = |r: Vec<(u32, i64, u8, u8, bool)>, revise| Step::Emit(r, revise);
+    let steps = vec![
+        Step::Seal,
+        e(vec![(2, -1019, 1, 2, false), (3, 2, 3, 2, false)], true),
+        Step::Route(1, 1),
+        Step::Route(0, 4),
+        Step::PowerLoss,
+        Step::Restart,
+        Step::Advance(2),
+        e(vec![(3, 0, 3, 2, false), (3, 1, 2, 1, false)], false),
+        Step::Route(0, 3),
+        Step::Damage(15369219847121119798),
+        Step::Drain(1, 4),
+        e(vec![(3, 1, 5, 0, false), (1, 0, 1, 1, false)], false),
+        Step::Restart,
+        e(vec![(1, 0, 3, 2, false), (2, 1, 5, 1, false)], false),
+        e(vec![(2, 2, 2, 1, false)], false),
+        Step::Directory(3499691690462183775),
+        Step::LoseCursor(0),
+        Step::Seal,
+        e(vec![(3, 0, 5, 3, false)], true),
+        Step::LoseCursor(0),
+        Step::Damage(2772374668308363000),
+    ];
+    let later = [
+        (3, 512, 3, 3, false),
+        (3, 388, 5, 2, false),
+        (2, 2, 4, 2, false),
+        (3, 1, 0, 3, false),
+    ];
+    compare(
+        &steps,
+        End::KillAt(2656987907825394109),
+        ScanOrder::Background,
+        &later,
+        330,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_consumer_starting_below_the_seed_passes_over_a_recorded_loss_as_the_whole_log_does() {
+    let e = |r: Vec<(u32, i64, u8, u8, bool)>, revise| Step::Emit(r, revise);
+    let steps = vec![
+        e(
+            vec![
+                (3, 2, 3, 1, false),
+                (2, 1, 0, 0, false),
+                (2, 0, 3, 1, false),
+                (2, 0, 5, 0, false),
+            ],
+            false,
+        ),
+        Step::Directory(4176864351485358171),
+        e(
+            vec![
+                (3, 2, 5, 1, false),
+                (3, 0, 1, 3, false),
+                (2, 0, 5, 2, false),
+                (3, 1, 5, 2, false),
+            ],
+            true,
+        ),
+        Step::Advance(1194),
+        Step::Damage(5611314754272779672),
+        e(
+            vec![
+                (3, 2, 1, 1, false),
+                (2, 2, 4, 1, false),
+                (2, 1, 2, 1, false),
+            ],
+            false,
+        ),
+        Step::Seal,
+        e(
+            vec![
+                (1, 0, 4, 2, false),
+                (1, 547, 0, 2, false),
+                (3, 564, 5, 3, false),
+            ],
+            false,
+        ),
+        Step::Directory(14052021757065914289),
+        e(vec![(2, 1, 1, 1, false), (2, -1008, 3, 3, false)], false),
+        e(
+            vec![(2, 0, 1, 2, false), (3, 0, 0, 0, true), (1, 1, 3, 2, false)],
+            false,
+        ),
+    ];
+    let later = [(2, 218, 1, 1, false), (1, 1, 2, 2, false)];
+    for _ in 0..4 {
+        compare(&steps, End::Kill, ScanOrder::Background, &later, 2230).unwrap();
+    }
+}

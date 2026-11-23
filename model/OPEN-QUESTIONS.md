@@ -4697,7 +4697,9 @@ long enough or a start reads the whole log. Carrying the scan's progress across 
 whose key's segment holds it is recorded unchecked (Q-750), and a consumer behind the seed that meets it passes
 over the lost facts, counted in `LocalDataUnreadable` and not reported until the scan or a query finds it; the
 scan then completes the report with the commit times around the region, as the start from the whole log gives
-them.
+them. A region the scan finds just below a loss found at the open (the pass above the seed) grows that loss downward
+under the identity it was found under (Q-200), where the start from the whole log, meeting the lower region first,
+reports the lower identity; which identity the next start records is Q-203.
 **Pinned by.** `kvik/src/durable/seed/tests.rs`
 `a_seeded_start_gives_what_the_start_from_the_whole_log_gives` (both orders, over sealed segments; under `Background`
 a loss found after the open is compared by its reports and the series without a fact in the damage),
@@ -4724,6 +4726,10 @@ its last arrival read from the log when a stale-for condition first needs it; co
 time`, are read from the log when asked; a consumer below S reads the log below S as one behind does. The pass reads
 the batch ending at S first, for the commit time a loss just above S reports (Q-1090), and gives way to the whole
 log when that batch is not first, on a void, on a region holding a position at or below S, or on a read error.
+The manifest's recorded lost ranges below S count as regions the start passed over, for the writer's and the
+deliverer's lookups, as the whole read meets them; otherwise a lookup below S that meets one reports the key
+unreadable, and a fact decided or delivered over it is marked unchecked where the whole read's is not
+(`a_consumer_starting_below_the_seed_passes_over_a_recorded_loss_as_the_whole_log_does`).
 Neither a void nor a region at or below S reaches the pass through the seed's own rules: a reset below a
 directory's `through` makes it no seed (`kept_series`), and recovery truncates what a reboot leaves above the mark;
 both give-ways stay as a guard. The two reads below S (a last arrival that may have been outranked, a commit time for

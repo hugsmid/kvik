@@ -718,6 +718,12 @@ pub(super) fn compare(
         if found_after && !untouched(a, &w.damaged) {
             continue;
         }
+        if found_after && a.starts_with("losses ") {
+            // A loss the scan grows downward keeps the identity and region it was found under while open (Q-200,
+            // Q-1110).
+            prop_assert_eq!(without_identity(a), without_identity(b));
+            continue;
+        }
         prop_assert_eq!(a, b);
     }
     let gave = seeded.probe.gave_way;
@@ -730,6 +736,29 @@ pub(super) fn compare(
         below: order == ScanOrder::Background && gave == Some(GiveWay::Below),
         recoveries: seeded.probe.recoveries_naming > 0,
     })
+}
+
+/// `line` without each loss report's identity, segment and region size, which follow the region met first.
+fn without_identity(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let cut = ["identity: Position {", "file_id: ", "bytes: "]
+            .iter()
+            .filter_map(|k| rest.find(k).map(|i| (i, *k)))
+            .min();
+        let Some((i, key)) = cut else { break };
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + key.len()..];
+        let end = if key != "identity: Position {" {
+            tail.find(", ").map_or(tail.len(), |n| n + 2)
+        } else {
+            tail.find("}, ").map_or(tail.len(), |n| n + 3)
+        };
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether a line of [`observe`]'s output is promised alike while a loss below the seed is found after the open: the

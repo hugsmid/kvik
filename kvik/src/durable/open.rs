@@ -430,6 +430,7 @@ fn start_seeded(
             if !r.start_after(seed.reader_after()).unwrap_or(false) {
                 return Err(start::GiveWay::Seed);
             }
+            d.seed_lost(r.lost_ranges());
             let mut first = true;
             loop {
                 let (u, more) = r

@@ -56,6 +56,15 @@ impl Deliverer {
         self.seeded = Some(seed.through);
     }
 
+    /// Takes the recorded lost ranges as damaged regions, as the start from the whole log meets them in its read; a
+    /// seeded start reads none of the log below its seed.
+    pub(crate) fn seed_lost(&mut self, recorded: &[kvik_log::manifest::LostRange]) {
+        for l in recorded {
+            self.damaged
+                .insert(l.file_id, l.offset, l.offset.saturating_add(l.length));
+        }
+    }
+
     /// Takes the batch at the seed, which the writer's pass reads first, for its commit time alone.
     pub(crate) fn seed_commit(&mut self, at_seed: &ReadEvent) {
         let _ = self.finder.apply(std::slice::from_ref(at_seed), self.head);
