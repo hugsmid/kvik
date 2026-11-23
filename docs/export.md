@@ -124,7 +124,9 @@ the read passes it, so every series with facts in a month has its file open at o
 the months it means to refresh.
 
 Publishing: on success and on failure alike the writer `open` returned is dropped, with no signal between. A failure
-stops the export: the files before it are complete, the one it was writing has no footer. So `open` should hand out a
+stops the export: the files of earlier months are complete, and every file then open (one per series with facts in the
+month being read) has no footer. `open` is called in the order of each series' first fact in the month, not of the
+ids given; only the returned list is in id order. So `open` should hand out a
 temporary name or an in-memory buffer, and the caller publishes the paths in the returned list once the call returns
 `Ok`, and discards everything on `Err`; a writer that truncates the final path, or uploads when dropped, can replace
 a good file with a broken one. A per-file completion signal is left to the export call in the store's interface

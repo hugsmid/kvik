@@ -31,8 +31,9 @@ where
 
 /// Several series' [`export_partitioned`] from one read of the range (Q-1110): a series' file for a month is open from
 /// its first fact in the month until the read passes the month, so every series with facts in a month has its file
-/// open at once, each within the options' bounds. Files come in month order, then in the order of `ids`, a repeated id
-/// once; every series is checked before anything is read.
+/// open at once, each within the options' bounds. `open` is called in the order of each series' first fact in the
+/// month, not of `ids`; the returned files come in month order, then in the order of `ids`, a repeated id once. Every
+/// series is checked before anything is read. On failure every file then open has no footer.
 pub fn export_partitioned_of<W, F>(
     reader: &Reader,
     ids: &[SeriesId],

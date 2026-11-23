@@ -458,7 +458,8 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   it, and serves `live`, `series` and `losses` from that, looking a fact up in the log where the state cannot tell
   (Q-1003, Q-1004). `facts` and `at` read the log at the call's cut through the segment indexes (Q-1060); windows,
   `buckets` and calendar results fold the series' current facts in their span from the same reads, one call at one
-  cut, and hold no more than the cap and one bucket's fold per series (roadmap 9.0h, Q-1109); `buckets_of`, `window_of`
+  cut, and hold no more than the cap and one bucket's fold per series and, under `Resolution::Auto`, up to `max_points + 1`
+  facts per series until they pass it, and the results (roadmap 9.0h, Q-1109); `buckets_of`, `window_of`
   and `facts_of` read several series in one pass over the log (Q-1110). The fact index is built only to
   find damage (Q-1060) or for a broken state (Q-1006).
 - `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
