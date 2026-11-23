@@ -143,7 +143,9 @@ impl Ring {
             .entries
             .partition_point(|f| self.facts - f.before() > cap)
             .min(self.entries.len().saturating_sub(1));
-        self.entries.drain(..n).collect()
+        // O(kept) under the lock, where draining the front would be O(evicted).
+        let kept = self.entries.split_off(n);
+        std::mem::replace(&mut self.entries, kept)
     }
 }
 

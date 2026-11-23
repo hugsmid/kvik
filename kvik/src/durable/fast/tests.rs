@@ -755,8 +755,19 @@ fn a_waiting_stream_is_closed_at_once_by_a_shutdown() {
 
 #[test]
 fn dropping_the_last_stream_frees_a_full_ring_outside_its_lock() {
+    frees_outside_the_lock(false);
+}
+
+#[test]
+fn dropping_a_far_behind_stream_beside_a_near_one_frees_most_of_the_ring_outside_its_lock() {
+    frees_outside_the_lock(true);
+}
+
+/// Fills the ring for a far-behind stream, then drops it, with a stream allowed one fact behind left open if `near`.
+fn frees_outside_the_lock(near: bool) {
     const CALLS: usize = 1 << 18;
     let fast = Arc::new(Fast::default());
+    let kept = near.then(|| fast.open(&behind(1), Box::new(Script::default())));
     let s = fast.open(&behind(PROVISIONAL_MAX_BEHIND), Box::new(Script::default()));
     for t in 0..CALLS as i64 {
         accept(&fast, &[(1, t)], 0);
@@ -780,9 +791,10 @@ fn dropping_the_last_stream_frees_a_full_ring_outside_its_lock() {
         (dropped, watcher.join().unwrap())
     });
     assert!(oldest.upgrade().is_none());
-    assert!(lock(&fast.ring).entries.is_empty());
+    assert!(lock(&fast.ring).entries.len() <= usize::from(near));
     assert!(
         longest * 4 < dropped,
         "the ring was held {longest:?} of a {dropped:?} drop"
     );
+    drop(kept);
 }
