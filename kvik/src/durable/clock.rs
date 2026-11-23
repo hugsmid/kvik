@@ -49,10 +49,14 @@ impl Clocks {
     /// The window clock now.
     pub(crate) fn now(&self) -> i64 {
         let mut s = self.lock();
+        // The wall clock is read before the monotonic one: a step of both clocks between the reads then leaves only
+        // the wall reading stale, which the max absorbs. Read the other way round, `now` takes the stepped wall and
+        // the next read adds the step again.
+        let wall = self.env.wall().0;
         let mono = self.env.monotonic().0;
         let advanced = i64::try_from(mono.saturating_sub(s.mono)).unwrap_or(i64::MAX);
         s.mono = s.mono.max(mono);
-        s.now = s.now.saturating_add(advanced).max(self.env.wall().0);
+        s.now = s.now.saturating_add(advanced).max(wall);
         s.now
     }
 
@@ -118,6 +122,49 @@ mod tests {
         fn synchronised(&self) -> bool {
             true
         }
+    }
+
+    /// A clock that steps both readings by `step` right after the next read of either, as a concurrent
+    /// `ManualClock::advance` can.
+    #[derive(Debug)]
+    struct SteppedBetweenReads {
+        state: std::sync::Mutex<(i64, u64, Option<u64>)>,
+    }
+
+    impl SteppedBetweenReads {
+        fn read<T>(&self, f: impl FnOnce(i64, u64) -> T) -> T {
+            let mut s = self.state.lock().unwrap();
+            let out = f(s.0, s.1);
+            if let Some(step) = s.2.take() {
+                s.0 += step as i64;
+                s.1 += step;
+            }
+            out
+        }
+    }
+
+    impl Clock for SteppedBetweenReads {
+        fn wall(&self) -> Timestamp {
+            self.read(|w, _| Timestamp(w))
+        }
+        fn monotonic(&self) -> Monotonic {
+            self.read(|_, m| Monotonic(m))
+        }
+        fn synchronised(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_step_of_both_clocks_between_the_two_reads_is_counted_once() {
+        let env = Arc::new(SteppedBetweenReads {
+            state: std::sync::Mutex::new((1_000, 0, None)),
+        });
+        let c = Clocks::new(env.clone());
+        env.state.lock().unwrap().2 = Some(3_932);
+        c.now();
+        assert_eq!(c.now(), 4_932);
+        assert_eq!(c.now(), 4_932);
     }
 
     #[test]
