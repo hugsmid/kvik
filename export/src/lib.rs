@@ -34,6 +34,7 @@
 mod batch;
 mod error;
 mod layout;
+mod partitioned;
 mod read;
 mod row;
 mod schema;
@@ -53,6 +54,7 @@ pub use layout::{
     MAX_SITE_LEN, Month, check_site, escape_segment, file_name, name_segments, partial_file_name,
     partition_dir, unescape_segment,
 };
+pub use partitioned::{export_partitioned, export_partitioned_of};
 pub use read::{ExportReader, read_rows};
 pub use row::{ExportRow, Flags};
 pub use schema::{
@@ -200,59 +202,11 @@ pub struct PartitionFile {
     pub summary: ExportSummary,
 }
 
-/// Exports one series' facts in `options.range` and `options.view`, one file per UTC month that holds a fact, at
-/// `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet` (`docs/export.md` Partitioned
-/// layout, Q-196). `open` is given each file's relative path in month order; `options.site` is required, and a
-/// series name without three non-empty segments is refused before anything is read (Q-670). Each month is read on
-/// its own, after one pass over the range that finds the months.
-pub fn export_partitioned<W, F>(
-    reader: &Reader,
-    id: SeriesId,
-    options: &ExportOptions,
-    mut open: F,
-) -> Result<Vec<PartitionFile>, ExportError>
-where
-    W: Write + Send,
-    F: FnMut(&str) -> std::io::Result<W>,
-{
-    let options = &with_store(reader, options)?;
-    let site = options.site.as_deref().ok_or(ExportError::InvalidOptions {
-        reason: "a partitioned export needs a site",
-    })?;
-    let name = file_name(options.view)?;
-    let series = reader.series(id)?;
-    SeriesSchema::from_info(&series)?;
-    layout::checked_segments(&series.name)?;
-    let mut months = std::collections::BTreeSet::new();
-    for f in reader.facts(id, options.range, options.view)? {
-        months.insert(Month::of(f?.t));
-    }
-    let mut files = Vec::with_capacity(months.len());
-    for month in months {
-        let m = month.range();
-        let range = TimeRange::new(m.from.max(options.range.from), m.to.min(options.range.to));
-        let dir = partition_dir(site, &series.name, month)?;
-        let path = if range == m {
-            format!("{dir}/{name}")
-        } else {
-            format!("{dir}/{}", partial_file_name(options.view, range)?)
-        };
-        let out = open(&path).map_err(|source| ExportError::Open {
-            path: path.clone(),
-            source,
-        })?;
-        let summary = export_series(reader, id, &options.clone().range(range), out)?;
-        files.push(PartitionFile {
-            path,
-            month,
-            summary,
-        });
-    }
-    Ok(files)
-}
-
 /// The options with the reader's store id (Q-196); one given that differs is refused.
-fn with_store(reader: &Reader, options: &ExportOptions) -> Result<ExportOptions, ExportError> {
+pub(crate) fn with_store(
+    reader: &Reader,
+    options: &ExportOptions,
+) -> Result<ExportOptions, ExportError> {
     let id = reader.store_id();
     if options.store_id.is_some_and(|given| given != id) {
         return Err(ExportError::InvalidOptions {
@@ -295,33 +249,65 @@ where
     W: Write + Send,
     I: IntoIterator<Item = Result<ExportRow, ExportError>>,
 {
-    let mut kv = series.metadata();
-    kv.extend(options.metadata()?);
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(options.row_group_rows))
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
-        .set_column_dictionary_enabled(ColumnPath::from(column::QUALITY), true)
-        .set_column_dictionary_enabled(ColumnPath::from(column::SUPPLIED_QUALITY), true)
-        .set_key_value_metadata(Some(
-            kv.into_iter().map(|(k, v)| KeyValue::new(k, v)).collect(),
-        ))
-        .build();
-    let mut columns = batch::Columns::new(series, options.batch_rows)?;
-    let mut writer = ArrowWriter::try_new(out, columns.schema().clone(), Some(props))?;
-    let mut written = 0u64;
+    let mut w = SeriesWriter::new(series, options, out)?;
     for row in rows {
-        columns.push(&row?)?;
-        written += 1;
-        if columns.len() >= options.batch_rows {
-            writer.write(&columns.finish()?)?;
+        w.push(&row?)?;
+    }
+    w.finish()
+}
+
+/// One Parquet file being written: the open row group and one batch of rows (`ExportOptions` bounds both).
+pub(crate) struct SeriesWriter<W: Write + Send> {
+    columns: batch::Columns,
+    writer: ArrowWriter<W>,
+    batch_rows: usize,
+    written: u64,
+}
+
+impl<W: Write + Send> SeriesWriter<W> {
+    pub(crate) fn new(
+        series: &SeriesSchema,
+        options: &ExportOptions,
+        out: W,
+    ) -> Result<Self, ExportError> {
+        let mut kv = series.metadata();
+        kv.extend(options.metadata()?);
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(options.row_group_rows))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
+            .set_column_dictionary_enabled(ColumnPath::from(column::QUALITY), true)
+            .set_column_dictionary_enabled(ColumnPath::from(column::SUPPLIED_QUALITY), true)
+            .set_key_value_metadata(Some(
+                kv.into_iter().map(|(k, v)| KeyValue::new(k, v)).collect(),
+            ))
+            .build();
+        let columns = batch::Columns::new(series, options.batch_rows)?;
+        let writer = ArrowWriter::try_new(out, columns.schema().clone(), Some(props))?;
+        Ok(SeriesWriter {
+            columns,
+            writer,
+            batch_rows: options.batch_rows,
+            written: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, row: &ExportRow) -> Result<(), ExportError> {
+        self.columns.push(row)?;
+        self.written += 1;
+        if self.columns.len() >= self.batch_rows {
+            self.writer.write(&self.columns.finish()?)?;
         }
+        Ok(())
     }
-    if columns.len() > 0 {
-        writer.write(&columns.finish()?)?;
+
+    pub(crate) fn finish(mut self) -> Result<ExportSummary, ExportError> {
+        if self.columns.len() > 0 {
+            self.writer.write(&self.columns.finish()?)?;
+        }
+        let meta = self.writer.close()?;
+        Ok(ExportSummary {
+            rows: self.written,
+            row_groups: meta.num_row_groups(),
+        })
     }
-    let meta = writer.close()?;
-    Ok(ExportSummary {
-        rows: written,
-        row_groups: meta.num_row_groups(),
-    })
 }

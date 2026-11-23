@@ -4649,12 +4649,15 @@ in id order that would fail alone. The reading before the range is found for eve
 (Q-1065): spans that double, each read once for the series still unfound, then one probe per series. Each series
 folds from a push-driven core that holds one chunk (Q-1109), so a read holds one chunk per series; with
 `Resolution::Auto` it keeps a series' facts until they pass `max_points`, then folds them and the rest, so the range
-is read once. The model backend answers series by series. Provisional: a call over many series holds each series'
+is read once. The model backend answers series by series. `kvik_export::export_partitioned_of` writes several series'
+partitioned files from one `facts_of` read, each series' month file open while the read is in that month, and the
+one-series `export_partitioned` is the same code, reading its range once, at one cut, where it read it twice. Provisional: a call over many series holds each series'
 results until it ends; a caller wanting fewer at once splits the call.
 **Pinned by.** `kvik/src/durable/read/source/tests/windows.rs`
 `windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (every series at once, in
 reverse with one repeated, against each series' own result and its first failure); `kvik/tests/windows.rs`
-`many_series_calls_equal_one_call_per_series_on_both_backends`.
+`many_series_calls_equal_one_call_per_series_on_both_backends`; `export/tests/layout.rs`
+`a_partitioned_export_of_several_series_writes_each_series_files_from_one_read_on_both_backends`.
 
 ## Q-1111 — Passes sized from counts before they are read
 Decided by the lead with roadmap 9.0h, for review.

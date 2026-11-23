@@ -15,8 +15,8 @@ use kvik::{
 };
 use kvik_export::{
     ExportError, ExportOptions, ExportRow, MAX_SITE_LEN, Month, check_site, escape_segment,
-    export_partitioned, file_name, name_segments, partial_file_name, partition_dir,
-    unescape_segment,
+    export_partitioned, export_partitioned_of, file_name, name_segments, partial_file_name,
+    partition_dir, unescape_segment,
 };
 use proptest::prelude::*;
 
@@ -386,21 +386,43 @@ fn partitioned(
     id: SeriesId,
     options: &ExportOptions,
 ) -> Result<Vec<(String, Vec<u8>)>, ExportError> {
+    partitioned_of(r, &[id], options, false)
+}
+
+/// The files of a partitioned export of `ids`, through `export_partitioned_of` when `many`.
+fn partitioned_of(
+    r: &Reader,
+    ids: &[SeriesId],
+    options: &ExportOptions,
+    many: bool,
+) -> Result<Vec<(String, Vec<u8>)>, ExportError> {
     let files: Files = Arc::default();
     let sink = files.clone();
-    let written = export_partitioned(r, id, options, move |path: &str| {
+    let open = move |path: &str| {
         let buf = Arc::new(Mutex::new(Vec::new()));
         sink.lock().unwrap().push((path.to_string(), buf.clone()));
         Ok(Shared(buf))
-    })?;
+    };
+    let written = if many {
+        export_partitioned_of(r, ids, options, open)?
+    } else {
+        export_partitioned(r, ids[0], options, open)?
+    };
     let files = files.lock().unwrap();
+    let mut by_path: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
+    if many {
+        by_path.sort_by_key(|p| written.iter().position(|w| &w.path == p));
+    }
     assert_eq!(
         written.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
-        files.iter().map(|f| f.0.clone()).collect::<Vec<_>>()
+        by_path
     );
-    Ok(files
+    Ok(written
         .iter()
-        .map(|(p, b)| (p.clone(), b.lock().unwrap().clone()))
+        .map(|w| {
+            let b = &files.iter().find(|f| f.0 == w.path).unwrap().1;
+            (w.path.clone(), b.lock().unwrap().clone())
+        })
         .collect())
 }
 
@@ -723,6 +745,79 @@ fn a_name_without_three_non_empty_segments_is_refused_at_definition_and_by_the_p
         assert!(
             err.to_string().contains("three non-empty segments"),
             "{err}"
+        );
+    }
+}
+
+#[test]
+fn a_partitioned_export_of_several_series_writes_each_series_files_from_one_read_on_both_backends()
+{
+    for backend in BACKENDS {
+        let (store, _clock) = store_on(backend, "partitioned-many");
+        let gauge = |name: &str| {
+            SeriesSpec::new(
+                name,
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+        };
+        let a = block_on(store.define_series(gauge("plant/line-1/power"))).unwrap();
+        let b = block_on(store.define_series(gauge("plant/line-2/power"))).unwrap();
+        let readings: Vec<Reading> = [
+            (a, "2026-01-05T12:00:00Z"),
+            (b, "2026-01-07T12:00:00Z"),
+            (a, "2026-02-01T00:00:00Z"),
+            (b, "2026-03-03T00:00:00Z"),
+            (a, "2026-03-04T00:00:00Z"),
+            (b, "2026-03-31T23:00:00Z"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (id, t))| Reading::new(*id, ts(t), Value::F64(i as f64)))
+        .collect();
+        assert_eq!(block_on(store.emit(&readings)).unwrap().recorded(), 6);
+        let r = store.reader();
+        let options = ExportOptions::default()
+            .site("site-1")
+            .range(ts("2026-01-06T00:00:00Z")..ts("2026-12-01T00:00:00Z"));
+        let many = partitioned_of(&r, &[b, a, b], &options, true).unwrap();
+        let mut want = Vec::new();
+        let (fa, fb) = (
+            partitioned(&r, a, &options).unwrap(),
+            partitioned(&r, b, &options).unwrap(),
+        );
+        for month in ["2026-01", "2026-02", "2026-03"] {
+            for f in fb.iter().chain(&fa) {
+                if f.0.contains(&format!("month={month}/")) {
+                    want.push(f.clone());
+                }
+            }
+        }
+        assert_eq!(
+            many.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            want.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            "{backend:?}"
+        );
+        for (got, want) in many.iter().zip(&want) {
+            assert_eq!(
+                bits(&read_back(&got.1)),
+                bits(&read_back(&want.1)),
+                "{backend:?} {}",
+                got.0
+            );
+        }
+        let read = Arc::new(Mutex::new(false));
+        let opened = read.clone();
+        let err = export_partitioned_of(&r, &[a, SeriesId(9_999)], &options, move |_: &str| {
+            *opened.lock().unwrap() = true;
+            Ok(Vec::new())
+        });
+        assert!(err.is_err(), "{backend:?}");
+        assert!(
+            !*read.lock().unwrap(),
+            "{backend:?}: nothing is opened before every series is checked"
         );
     }
 }
