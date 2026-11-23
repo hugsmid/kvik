@@ -131,19 +131,19 @@ impl Default for Ring {
 }
 
 impl Ring {
-    fn keep(&mut self) {
+    /// Moves out the entries no open stream needs. The caller drops them after releasing the ring's lock, which
+    /// `publish` takes: freeing a full ring takes tens of milliseconds (spec §4 Provisional streams bounds the hold).
+    #[must_use = "drop the evicted entries once the ring's lock is released"]
+    fn keep(&mut self) -> VecDeque<Arc<Entry>> {
         let cap = self.wants.values().copied().max().unwrap_or(0) as u64;
-        while self.entries.len() > 1
-            && self
-                .entries
-                .front()
-                .is_some_and(|f| self.facts - f.before() > cap)
-        {
-            self.entries.pop_front();
-        }
         if cap == 0 {
-            self.entries.clear();
+            return std::mem::take(&mut self.entries);
         }
+        let n = self
+            .entries
+            .partition_point(|f| self.facts - f.before() > cap)
+            .min(self.entries.len().saturating_sub(1));
+        self.entries.drain(..n).collect()
     }
 }
 
@@ -271,8 +271,9 @@ impl Fast {
             outcome,
         });
         r.entries.push_back(e.clone());
-        r.keep();
+        let evicted = r.keep();
         drop(r);
+        drop(evicted);
         e
     }
 
@@ -383,7 +384,9 @@ impl Drop for Stream {
             Some(_) => _ = lock(&self.fast.listeners).remove(&self.id),
         }
         self.fast.streams.fetch_sub(1, Ordering::SeqCst);
-        r.keep();
+        let evicted = r.keep();
+        drop(r);
+        drop(evicted);
     }
 }
 

@@ -752,3 +752,37 @@ fn a_waiting_stream_is_closed_at_once_by_a_shutdown() {
         assert!(waited < Duration::from_secs(1), "{waited:?}");
     }
 }
+
+#[test]
+fn dropping_the_last_stream_frees_a_full_ring_outside_its_lock() {
+    const CALLS: usize = 1 << 18;
+    let fast = Arc::new(Fast::default());
+    let s = fast.open(&behind(PROVISIONAL_MAX_BEHIND), Box::new(Script::default()));
+    for t in 0..CALLS as i64 {
+        accept(&fast, &[(1, t)], 0);
+    }
+    let oldest = Arc::downgrade(lock(&fast.ring).entries.front().unwrap());
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (dropped, longest) = std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let mut longest = Duration::ZERO;
+            while !done.load(Ordering::SeqCst) {
+                let t = Instant::now();
+                drop(lock(&fast.ring));
+                longest = longest.max(t.elapsed());
+            }
+            longest
+        });
+        let t = Instant::now();
+        drop(s);
+        let dropped = t.elapsed();
+        done.store(true, Ordering::SeqCst);
+        (dropped, watcher.join().unwrap())
+    });
+    assert!(oldest.upgrade().is_none());
+    assert!(lock(&fast.ring).entries.is_empty());
+    assert!(
+        longest * 4 < dropped,
+        "the ring was held {longest:?} of a {dropped:?} drop"
+    );
+}
