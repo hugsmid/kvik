@@ -713,14 +713,14 @@ pub(super) fn compare(
     let found_after = order == ScanOrder::Background && seeded.seeded && seeded.unrecorded;
     prop_assert_eq!(whole.out.len(), seeded.out.len());
     for (a, b) in whole.out.iter().zip(&seeded.out) {
-        // A loss below the seed found after the open (Q-1110): the reports and every series without a fact in the
+        // A loss below the seed found after the open (Q-1115): the reports and every series without a fact in the
         // damage are alike.
         if found_after && !untouched(a, &w.damaged) {
             continue;
         }
         if found_after && a.starts_with("losses ") {
             // A loss the scan grows downward keeps the identity and region it was found under while open (Q-200,
-            // Q-1110).
+            // Q-1115).
             prop_assert_eq!(without_identity(a), without_identity(b));
             continue;
         }

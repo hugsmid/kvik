@@ -260,7 +260,7 @@ pub(crate) struct Writer {
     start_losses: Vec<LossReport>,
     /// The registry file's `through` as last written, and the lock of every write of the file (Q-1001).
     registry_written: derived::RegistryWritten,
-    /// A seeded start's damage scan of the log below its seed, while it runs (Q-1110).
+    /// A seeded start's damage scan of the log below its seed, while it runs (Q-1115).
     scan: Mutex<Option<scan::Scan>>,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,

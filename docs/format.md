@@ -840,7 +840,7 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   again from the kept log and those recovery entries, with the writer's id floor, so the id of a lost definition stays
   assigned. A seeded start (`spec.md` §3 Order of a start) reads the log only above its series directory's
   `through`: its registry is the file's entries up to that `through` (Q-1001 makes them every one) and the log's
-  above it, and the file is checked against that, file plus tail, by the same rule (Q-33, Q-1111).
+  above it, and the file is checked against that, file plus tail, by the same rule (Q-33, Q-1116).
   The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
   a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
   (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log
@@ -848,7 +848,7 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   recovery entry in a segment that cannot be read, so a start from the whole log checks the file and never trusts it
   over the log, apart from those. A seeded start trusts the file up to its seed's `through`, the part it does not
   read: Q-1001 makes the file hold every entry there, and the start gives way to the whole log when the file's
-  `through` is below the seed's or its generation differs (Q-1111).
+  `through` is below the seed's or its generation differs (Q-1116).
 
 ## A.17 Deep tier: object keys, uploaded forms, claim marker, envelope
 Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below), with two exceptions: claim
@@ -1119,7 +1119,7 @@ series' last arrival (§6 Restart and resume) from fields 96 to 120; bit 7 says 
 counts only from a record of 120 bytes or more with bit 6 set; a shorter record (v1, or a writer before them) gives
 none, whatever its flags say. A writer starts seeded only from a directory every entry of which carries them, and
 continues no fold from one that lacks them, so the first directory it writes after a start from the whole log
-carries them (Q-1111).
+carries them (Q-1116).
 
 Checks: a known value kind and a quality up to 2 when the candidate is present (0 for kind 0), a decimal scale at most 18, a state
 index that fits `u16`, a boolean 0 or 1. Bit 3 means the candidate may not be the live fact (it was corrected to bad,

@@ -1,5 +1,5 @@
-//! Damage below the seed found after the open (Q-1110 (b)), what meets it before the scan does (Q-928), and the seed's
-//! own checks (Q-1111).
+//! Damage below the seed found after the open (Q-1115 (b)), what meets it before the scan does (Q-928), and the seed's
+//! own checks (Q-1116).
 
 use std::sync::Arc;
 

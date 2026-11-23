@@ -143,7 +143,7 @@ pub enum ProvisionalEvent {
         after: Position,
     },
     /// The store was shut down or dropped, its writer has stopped and every call delivered is settled; nothing
-    /// follows (Q-1113).
+    /// follows (Q-1110).
     Closed,
 }
 

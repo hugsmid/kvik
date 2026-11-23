@@ -1,6 +1,6 @@
 # Seeded start: reopen time against store age
 
-Spec §3 Order of a start (seeded start), Q-1110 to Q-1112. A probe builds the home workload W0 (37 series, about 37
+Spec §3 Order of a start (seeded start), Q-1115 to Q-1117. A probe builds the home workload W0 (37 series, about 37
 readings a second, accelerated event time, 60 s of arrivals a call, durable defaults) to 1 or 7 days, or W0x2 (74
 series) to 7 days, then times `Store::open` and the first `latest` read after it; release builds, page cache warm,
 a shared 4-core cloud machine, three opens each. Before is the base of this change, after is its head; each store

@@ -153,7 +153,7 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     // A start passes over the damaged region as lost (spec §3 Recovery rule 2): its facts are out of the log.
     // It passes over the damaged region, which no lost range records: health stays degraded (Q-755).
     let s = open();
-    // A seeded start scans below its seed after the open returns (Q-1110).
+    // A seeded start scans below its seed after the open returns (Q-1115).
     common::scanned(&s);
     assert_eq!(unreadable(&s), Some((0, 0, 0, 1)));
     let ack = block_on(s.emit(&[num(g, 1, 2.0)])).unwrap();

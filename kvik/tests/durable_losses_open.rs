@@ -92,7 +92,7 @@ fn run(name: &str, n: usize, at: usize, place: Place, meets: Meets, small: bool)
     }
     if meets != Meets::Open {
         s = restart(&w, s, small, sealed);
-        // A replay decided before a seeded start's scan reaches the damage meets it unrecorded (Q-1110 (b)).
+        // A replay decided before a seeded start's scan reaches the damage meets it unrecorded (Q-1115 (b)).
         common::scanned(&s);
     }
     let mut outcomes = Vec::new();

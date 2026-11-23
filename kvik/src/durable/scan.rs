@@ -1,4 +1,4 @@
-//! The damage scan of a seeded start (Q-947, Q-1110): the log below the seed read for invalid regions, each loss
+//! The damage scan of a seeded start (Q-947, Q-1115): the log below the seed read for invalid regions, each loss
 //! noted in the process's latch as the start from the whole log notes it. By default it runs after the open returns,
 //! as the derived files' start work does; [`ScanOrder::BeforeOpen`] restores the order in which a damaged store is
 //! found before the open returns.
@@ -22,7 +22,7 @@ use super::loss::{Finder, Latch, Regions};
 use super::start::{PART, log_reader};
 use crate::env::Env;
 
-/// When a seeded start scans the log below its seed for damage (Q-1110).
+/// When a seeded start scans the log below its seed for damage (Q-1115).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanOrder {
     /// After the open returns, on a thread of its own; a loss it finds is reported as one found while open.
@@ -31,7 +31,7 @@ pub(crate) enum ScanOrder {
     BeforeOpen,
 }
 
-/// The order a seeded start uses (Q-1110).
+/// The order a seeded start uses (Q-1115).
 pub(crate) const SCAN_ORDER: ScanOrder = ScanOrder::Background;
 
 /// Orders tests set for the store in a directory, in place of [`SCAN_ORDER`].

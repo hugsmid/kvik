@@ -163,11 +163,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1107 | query design §1 Memory; Q-1069, Q-1103 | The first refresh's bound and the series directory written at the seal (decided by the lead) |
 | Q-1108 | §8 Acknowledging a loss, Self-repair; `api.md` Health; Q-1102 | Acknowledgements, listing and corruption counts across a fold (OWNER) |
 | Q-1109 | §4 Provisional streams, §3 Commit; `api.md` Provisional streams | Delivery before durability: an automation may act on a reading later withdrawn (ruled by the owner) |
-| Q-1110 | §3 Order of a start, Recovery rule 2; Q-947 | A seeded start scans for damage below its seed after the open returns (ruled by the owner) |
-| Q-1111 | §3 Order of a start; `format.md` A.16, A.18; Q-33, Q-1001 | What a seeded start continues from, and when it reads the whole log (decided by the lead) |
-| Q-1112 | `format.md` A.18 Writing; Q-1111 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
-| Q-1113 | §4 Provisional streams; `api.md` Provisional streams; Q-1109 | A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold (decided by the lead) |
-| Q-1114 | §3 Order of a start; Q-1110 | The damage scan below a seed starts again at every open (decided by the lead, provisional) |
+| Q-1110 | §4 Provisional streams; `api.md` Provisional streams; Q-1109 | A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold (decided by the lead) |
+| Q-1114 | §3 Order of a start; Q-1115 | The damage scan below a seed starts again at every open (decided by the lead, provisional) |
+| Q-1115 | §3 Order of a start, Recovery rule 2; Q-947 | A seeded start scans for damage below its seed after the open returns (ruled by the owner) |
+| Q-1116 | §3 Order of a start; `format.md` A.16, A.18; Q-33, Q-1001 | What a seeded start continues from, and when it reads the whole log (decided by the lead) |
+| Q-1117 | `format.md` A.18 Writing; Q-1116 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -4658,8 +4658,55 @@ knows which a reading is for. Built so (`kvik/src/durable/fast.rs`, `kvik/src/pr
 `kvik/src/durable/emit.rs` `a_stream_opened_with_a_call_in_flight_never_names_a_lag_floor_above_a_call_it_missed`,
 `a_stream_opened_while_a_call_is_checked_waits_for_its_offer`.
 
-## Q-1110 — A seeded start scans for damage below its seed after the open returns
-Recorded with the seeded start. **Settled by the owner, 23 November: (b), the background scan as built**;
+## Q-1110 — A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold
+Recorded and decided by the lead with the fast path's fix round (Q-1109). Numbered Q-1115 on the fast path's branch; renumbered where it met the seeded start, which holds Q-1115.
+**Scenario.** (a) The writer thread panics: the log fails every queued call as unknown and the writer stops, but
+the store is neither shut down nor dropped. Every call a stream delivered is withdrawn; should `Closed` follow? A
+`Closed` pushed on the writer's stop alone could precede the publication of a call offered just before the stop,
+which the stream would then never see. (b) A call holds more facts than a stream's `max_behind`: no call in the
+ring lies within the bound, and the stream either lags past the call or takes it whole. (c) A stream receives a call
+already durable (`durable()` true), or skips calls in a `Lagged`, and a later watermark covers only those. (d) A
+stream far behind takes every call past its cursor while holding the ring's lock, which the writer takes to publish
+each call.
+**Options.** (a) `Closed` on a shutdown or drop only, once the writer has stopped; or on the writer's stop alone,
+with a count of calls between their offer and publication. (b) Deliver it whole; or refuse a stream whose
+`max_behind` is below the largest call (calls hold up to `limits.max_call_readings` facts, set per store, so a
+stream could not choose its bound alone). (c) Send a watermark whenever it rises; or only when it covers a call
+delivered provisional. (d) Take at most a fixed number of calls per hold; or copy the ring's head and clone outside
+the lock.
+**Decision.** (a) A shutdown or drop, once the writer has stopped: a shutdown takes the decision lock after the log
+stops, so every call offered before it is in the ring before the streams are told; nothing new is needed for the
+panic case, where every delivered call is still withdrawn and `Closed` waits for the shutdown or drop. (b) Whole:
+the lag ends before it and `Lagged` never names an empty range. (c) Only when it covers a call delivered
+provisional. (d) At most 4,096 calls per hold, and the oldest call within bound found by bisection; the measured
+hold is in `docs/measurements/fast-path.md`. A call wakes only the streams whose selection holds one of its series.
+**Pinned by.** `kvik/src/durable/fast/tests.rs` `a_writer_that_stopped_without_a_shutdown_closes_no_stream`,
+`closed_waits_for_the_writer_to_stop_after_a_shutdown`,
+`a_call_larger_than_max_behind_is_delivered_whole_without_a_lag`,
+`a_lag_ends_at_a_call_larger_than_max_behind_and_delivers_it_whole`, `a_slow_stream_lags_to_within_max_behind_and_others_miss_nothing`,
+`a_stream_takes_at_most_one_batch_per_hold_of_the_ring_and_misses_nothing`,
+`a_call_rings_only_the_streams_that_select_its_series`, `next_reads_past_a_batch_the_selection_filters_out_in_one_call`,
+`a_waiting_stream_is_closed_at_once_by_a_shutdown`; `kvik/tests/provisional.rs`
+`a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable_and_no_watermark`.
+
+## Q-1114 — The damage scan below a seed starts again at every open
+Recorded with the seeded start's fix round (Q-1115 as ruled).
+**Scenario.** A seeded start's background scan reads the log below the seed from its start, and a shutdown stops
+it. A process that runs for less than one scan (seconds at 1 GB: a crash loop, a short-lived tool) never finishes
+it, so damage below the seed stays unfound across any number of such opens; and every open reads the whole log below
+the seed once more in the background, O(store) I/O per open.
+**Options.** (a) As built: the scan starts again at every open; a start from the whole log, after the next fold
+break or an upgrade, finds the damage. (b) Record how far the scan got (status file) and continue from there at the
+next open: one more durable write. (c) Record whether the last scan finished; if not, scan before the next open once
+(`ScanOrder::BeforeOpen` for that open).
+Measured: at 7 days of the home workload the scan ends 12–16 s after the open, longer than a start from the whole
+log takes to read the same store (7–8 s); why it reads more slowly is not yet known.
+**Provisional default.** (a): both other options add a durable record, which a fix round does not. (c) is the
+smaller change if short-lived processes turn out to matter.
+
+## Q-1115 — A seeded start scans for damage below its seed after the open returns
+Recorded with the seeded start, as Q-1110; with Q-1116 and Q-1117 (recorded as Q-1111 and Q-1112) renumbered where
+it met the fast path, which holds Q-1110. **Settled by the owner, 23 November: (b), the background scan as built**;
 `ScanOrder::BeforeOpen` stays as the one-constant way back, and under it the scan runs once, before the open, and no
 scan runs after it.
 **Scenario.** A store a week old opens. Until now the start read the whole log, so a segment damaged since it was
@@ -4706,7 +4753,7 @@ a loss found after the open is compared by its reports and the series without a 
 `a_store_with_a_directory_starts_seeded_and_gives_what_the_whole_log_gives`; `kvik/src/durable/seed/tests/damage.rs`
 (damage below the seed found after the open, and reads, decisions and consumers that meet it first).
 
-## Q-1111 — What a seeded start continues from, and when it reads the whole log
+## Q-1116 — What a seeded start continues from, and when it reads the whole log
 Decided by the lead with the seeded start.
 **Scenario.** A start continues from the newest series directory that is still a function of the kept log (A.18
 Validation, as the writer judges it, `kept_series`) and the registry file, then reads the log after the directory's
@@ -4755,7 +4802,7 @@ day of a replayed build fits one unsealed segment), would otherwise have no seed
 `a_v1_entry_carries_no_start_counts_whatever_its_flags_say`, `log/tests/directory_golden.rs`
 `a_v1_series_directory_reads_as_before_with_no_start_counts`.
 
-## Q-1112 — A power loss can take the seed with the unsynced series directory
+## Q-1117 — A power loss can take the seed with the unsynced series directory
 Decided by the lead with the seeded start, provisional.
 **Scenario.** Derived files are renamed into place and never synced (A.18 Writing). After a power loss the newest
 series directory may be absent or invalid, and the previous one may be behind the start's reset (Q-776), so the
@@ -4770,52 +4817,6 @@ too, the cheap change is to sync the series directory and its directory once per
 **Pinned by.** `kvik/src/durable/seed/tests.rs`
 `a_store_with_a_directory_starts_seeded_and_gives_what_the_whole_log_gives` (a power loss reads the whole log and
 gives the same result).
-
-## Q-1113 — A stream's end after a writer panic, a call larger than `max_behind`, the watermark's rule and the ring's hold
-Recorded and decided by the lead with the fast path's fix round (Q-1109). Numbered Q-1110 on the fast path's branch; renumbered where it met the seeded start, which holds Q-1110.
-**Scenario.** (a) The writer thread panics: the log fails every queued call as unknown and the writer stops, but
-the store is neither shut down nor dropped. Every call a stream delivered is withdrawn; should `Closed` follow? A
-`Closed` pushed on the writer's stop alone could precede the publication of a call offered just before the stop,
-which the stream would then never see. (b) A call holds more facts than a stream's `max_behind`: no call in the
-ring lies within the bound, and the stream either lags past the call or takes it whole. (c) A stream receives a call
-already durable (`durable()` true), or skips calls in a `Lagged`, and a later watermark covers only those. (d) A
-stream far behind takes every call past its cursor while holding the ring's lock, which the writer takes to publish
-each call.
-**Options.** (a) `Closed` on a shutdown or drop only, once the writer has stopped; or on the writer's stop alone,
-with a count of calls between their offer and publication. (b) Deliver it whole; or refuse a stream whose
-`max_behind` is below the largest call (calls hold up to `limits.max_call_readings` facts, set per store, so a
-stream could not choose its bound alone). (c) Send a watermark whenever it rises; or only when it covers a call
-delivered provisional. (d) Take at most a fixed number of calls per hold; or copy the ring's head and clone outside
-the lock.
-**Decision.** (a) A shutdown or drop, once the writer has stopped: a shutdown takes the decision lock after the log
-stops, so every call offered before it is in the ring before the streams are told; nothing new is needed for the
-panic case, where every delivered call is still withdrawn and `Closed` waits for the shutdown or drop. (b) Whole:
-the lag ends before it and `Lagged` never names an empty range. (c) Only when it covers a call delivered
-provisional. (d) At most 4,096 calls per hold, and the oldest call within bound found by bisection; the measured
-hold is in `docs/measurements/fast-path.md`. A call wakes only the streams whose selection holds one of its series.
-**Pinned by.** `kvik/src/durable/fast/tests.rs` `a_writer_that_stopped_without_a_shutdown_closes_no_stream`,
-`closed_waits_for_the_writer_to_stop_after_a_shutdown`,
-`a_call_larger_than_max_behind_is_delivered_whole_without_a_lag`,
-`a_lag_ends_at_a_call_larger_than_max_behind_and_delivers_it_whole`, `a_slow_stream_lags_to_within_max_behind_and_others_miss_nothing`,
-`a_stream_takes_at_most_one_batch_per_hold_of_the_ring_and_misses_nothing`,
-`a_call_rings_only_the_streams_that_select_its_series`, `next_reads_past_a_batch_the_selection_filters_out_in_one_call`,
-`a_waiting_stream_is_closed_at_once_by_a_shutdown`; `kvik/tests/provisional.rs`
-`a_stream_that_reads_after_the_sync_gets_the_calls_flagged_durable_and_no_watermark`.
-
-## Q-1114 — The damage scan below a seed starts again at every open
-Recorded with the seeded start's fix round (Q-1110 as ruled).
-**Scenario.** A seeded start's background scan reads the log below the seed from its start, and a shutdown stops
-it. A process that runs for less than one scan (seconds at 1 GB: a crash loop, a short-lived tool) never finishes
-it, so damage below the seed stays unfound across any number of such opens; and every open reads the whole log below
-the seed once more in the background, O(store) I/O per open.
-**Options.** (a) As built: the scan starts again at every open; a start from the whole log, after the next fold
-break or an upgrade, finds the damage. (b) Record how far the scan got (status file) and continue from there at the
-next open: one more durable write. (c) Record whether the last scan finished; if not, scan before the next open once
-(`ScanOrder::BeforeOpen` for that open).
-Measured: at 7 days of the home workload the scan ends 12–16 s after the open, longer than a start from the whole
-log takes to read the same store (7–8 s); why it reads more slowly is not yet known.
-**Provisional default.** (a): both other options add a durable record, which a fix round does not. (c) is the
-smaller change if short-lived processes turn out to matter.
 
 ## Open at v0.2
 
@@ -5014,11 +5015,12 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1090 | 9.0f | Open, for the lead: a continuing reader reads the batch at its directory's `through` for a loss just above it, so readers agree on the commit time before |
 | Q-1108 | 8.5c | Open, for the owner: records naming a loss folded into a lower identity carry over (as built, recommended) or lapse |
 | Q-1109 | 9.0d | Settled by the owner, 22 November: provisional delivery is acceptable, opt-in per stream and labelled, withdrawn when lost (as built) |
-| Q-1110 | 9.0e | Settled by the owner, 23 November: the damage scan below the seed runs after the open returns (as built); `ScanOrder::BeforeOpen` stays the way back |
-| Q-1111 | 9.0e | Decided by the lead with the seeded start: the start counts in A.18, the rules for giving way to the whole log; for review |
-| Q-1112 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
-| Q-1113 | 9.0d | Decided by the lead with the fast path's fix round: `Closed` after a shutdown or drop; a call larger than `max_behind` delivered whole; a watermark only over a provisional call; a bounded ring hold; for review |
+| Q-1110 | 9.0d | Decided by the lead with the fast path's fix round: `Closed` after a shutdown or drop; a call larger than `max_behind` delivered whole; a watermark only over a provisional call; a bounded ring hold; for review |
+| Q-1113 | 9.0e | Withdrawn: a number given at a merge to the fast path's Q-1110, which keeps its number; not reused |
 | Q-1114 | 9.0e | Open, for the lead: provisional default as built (the scan starts again at every open); carry its progress across opens if short-lived processes matter |
+| Q-1115 | 9.0e | Settled by the owner, 23 November: the damage scan below the seed runs after the open returns (as built); `ScanOrder::BeforeOpen` stays the way back |
+| Q-1116 | 9.0e | Decided by the lead with the seeded start: the start counts in A.18, the rules for giving way to the whole log; for review |
+| Q-1117 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

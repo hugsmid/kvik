@@ -1,4 +1,4 @@
-//! The pass above a seed gives way to the whole log on a void and on a region at or below the seed (Q-1111). Neither
+//! The pass above a seed gives way to the whole log on a void and on a region at or below the seed (Q-1116). Neither
 //! reaches the pass through [`Seed::find`]: a reset below a directory's `through` makes it no seed, and recovery
 //! truncates what a reboot leaves above the mark; so the pass is fed the events directly.
 

@@ -603,9 +603,9 @@ pub enum Withdrawal { OutcomeUnknown, NotStored }                               
   delivered provisional, and `through` may also cover calls missed in a `Lagged`. `Withdrawn` names a range: drop
   the calls delivered in it that no watermark covered; its cause is the outcome the writer was given (`Withdrawal`).
   `Lagged` names the calls missed and `after`, below every fact among them; once durable they can be read there. A
-  call larger than `max_behind` on its own is delivered whole, the lag ending before it (Q-1113).
+  call larger than `max_behind` on its own is delivered whole, the lag ending before it (Q-1110).
 - `Closed` follows a shutdown or the store's drop once the writer has stopped. A writer that stops without either (a
-  panic) withdraws every call delivered, and `Closed` waits for the shutdown or drop (Q-1113).
+  panic) withdraws every call delivered, and `Closed` waits for the shutdown or drop (Q-1110).
 - `seq` is per open of the store: after a restart a stream starts afresh, and anything kept from a provisional
   reading that no watermark covered was withdrawn by the stop (Q-1109).
 - A waiting stream is woken by a call accepted or settled that holds a series it selects, or by a shutdown. It reads
@@ -673,7 +673,7 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */,
 //               start_whole /* the start read the log whole into memory, Q-752 */,
 //               start_seeded /* the start continued from the registry file and the series directory, spec §3 Order of a start */,
-//               start_scanning /* its scan of the log below the seed for damage still runs, Q-1110 */ }
+//               start_scanning /* its scan of the log below the seed for damage still runs, Q-1115 */ }
 // LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
 //            manifest_rebuilds, loss_identities_rebuilt, orphaned_label_entries /* spec §2.1 Labels */ }   ClockStats { jumps, last: Option<ClockJump> }

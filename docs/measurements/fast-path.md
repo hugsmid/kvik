@@ -1,6 +1,6 @@
 # Provisional streams: scaling and reaction with a 1 s gathering window
 
-Spec §4 Provisional streams, Q-1109, Q-1113. `cargo run --release -p kvik --example fast_path -- --dir <scratch dir>`
+Spec §4 Provisional streams, Q-1109, Q-1110. `cargo run --release -p kvik --example fast_path -- --dir <scratch dir>`
 (options in the example's header): a durable store on a local file system with `log.min_sync_interval` and
 `log.sync_interval_floor` at 1 s; 37 series; one thread emits 370 calls a second, each one reading, for 30 s (11,100
 calls, so p99.9 rests on 11 samples per run and p99 on 111); each subscriber is a thread reading a provisional

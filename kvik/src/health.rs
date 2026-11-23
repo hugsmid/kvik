@@ -380,7 +380,7 @@ pub struct IngestStats {
     /// them (`spec.md` §3 Order of a start, seeded start; false with the model backend).
     pub start_seeded: bool,
     /// A seeded start's scan of the log below its seed for damage is still running: a loss there may still be
-    /// reported (Q-1110; false with the model backend).
+    /// reported (Q-1115; false with the model backend).
     pub start_scanning: bool,
 }
 

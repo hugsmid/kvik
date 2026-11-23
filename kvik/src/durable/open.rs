@@ -373,7 +373,7 @@ struct Seeded {
     kept: start::Kept,
     hook: Arc<derived::Hook>,
     deliverer: deliver::Deliverer,
-    /// The regions the scan below the seed met, when it ran before the open (Q-1110 (a)).
+    /// The regions the scan below the seed met, when it ran before the open (Q-1115 (a)).
     scanned: Option<Regions>,
 }
 
