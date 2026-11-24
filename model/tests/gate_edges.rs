@@ -4,10 +4,10 @@ mod gate_common;
 
 use gate_common::*;
 use kvik_model::gate::{
-    ConditionId, GateState, Input, Kind, Latches, Level, MAX_DURATION, ReplayBound, Selector,
-    Window, judge, resume,
+    ConditionId, Entry, GateState, Input, Kind, Latches, Level, MAX_DURATION, ReplayBound,
+    Selector, Window, judge, resume,
 };
-use kvik_model::summary::Aggregate;
+use kvik_model::summary::{Aggregate, Params};
 use kvik_model::types::{DAY, Position, Quality, SECOND, SeriesId, Value};
 
 fn stale_gate() -> kvik_model::gate::Gate {
@@ -107,6 +107,36 @@ fn each(pattern: &str) -> kvik_model::gate::Gate {
     let mut g = levels(&[Level::at(10.0)]);
     g.selector = Selector::Each(pattern.into());
     g
+}
+
+#[test]
+fn a_window_falling_below_min_coverage_breaks_a_pending_hold_which_restarts_when_the_value_is_back()
+{
+    let mut g = levels(&[Level::at(10.0).hold(8 * SECOND, 0)]);
+    g.input = Input::Window(Window {
+        width: 10 * SECOND,
+        aggregate: Aggregate::Sum,
+        min_coverage: 500,
+        cadence: SECOND,
+    });
+    let mut h = H::new().define(0, S, &["s"]);
+    if let Some(Entry::Define { params, .. }) = h.entries.last_mut() {
+        *params = Params::new(kvik_model::types::Kind::Gauge, 2 * SECOND);
+    }
+    h = h.watch(0, C, g);
+    for t in [1, 3, 5, 20, 22, 24, 26, 28, 30, 32, 34, 36] {
+        h = h.num(t, 6.0);
+    }
+    let j = judge(&h.entries, 60 * SECOND).unwrap();
+    let at = |to: Option<GateState>| -> Vec<i64> {
+        j.transitions
+            .iter()
+            .filter(|t| t.to == to)
+            .map(|t| t.now / SECOND)
+            .collect()
+    };
+    assert_eq!(at(Some(GateState::Unknown)), vec![0, 13, 44]);
+    assert_eq!(at(lv(1)), vec![33]);
 }
 
 #[test]
