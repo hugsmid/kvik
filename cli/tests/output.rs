@@ -93,6 +93,7 @@ fn steady(out: &str) -> String {
 fn health_reports_position_losses_segments_leases_and_derived_files() {
     let mut f = Fixture::new();
     f.await_status();
+    f.await_leases(3);
     insta::assert_snapshot!("health_open", steady(&f.run("health").unwrap()));
     f.shut();
     insta::assert_snapshot!("health_shut", steady(&f.run("health").unwrap()));

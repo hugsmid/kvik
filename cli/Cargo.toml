@@ -22,7 +22,8 @@ doc = false
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 kvik = { path = "../kvik" }
 kvik-log = { path = "../log" }
-# The tool lowers its own priority (the query design's section 6).
+# The tool lowers its own priority (the query design's section 6) where rustix has `setpriority`.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
 
 [dev-dependencies]

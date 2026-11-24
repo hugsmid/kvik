@@ -132,6 +132,21 @@ impl Fixture {
         }
     }
 
+    /// Blocks until the running store's own readers hold `n` leases: they open on the store's threads, after its
+    /// status file, and a lease's identity is the next draw of the fixture's entropy.
+    pub fn await_leases(&self, n: usize) {
+        let dir = self.dir.join("leases");
+        let id = self.store_id();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while kvik_log::lease::read_leases(&self.fs, &dir, &id).map_or(0, |v| v.len()) < n {
+            assert!(
+                Instant::now() < deadline,
+                "the store holds fewer than {n} leases"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Opens the store again after [`Fixture::shut`].
     pub fn reopen(&mut self) {
         assert!(self.store.is_none());

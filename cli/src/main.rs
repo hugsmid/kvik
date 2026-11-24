@@ -13,8 +13,7 @@ fn main() -> ExitCode {
         print!("{}", kvik_cli::USAGE);
         return ExitCode::SUCCESS;
     }
-    // A heavy query like any other (the query design's section 3.4): lowered priority. A refusal changes nothing read.
-    let _ = rustix::process::setpriority_process(None, 10);
+    lower_priority();
     let store = std::env::var_os("KVIK_STORE").map(Into::into);
     let mut out = std::io::stdout().lock();
     match kvik_cli::run(&args, store, kvik::env::Env::system(), &mut out) {
@@ -37,3 +36,29 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// A heavy query like any other (the query design's section 3.4) runs at lowered priority; a refusal changes nothing read.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn lower_priority() {
+    let _ = rustix::process::setpriority_process(None, 10);
+}
+
+/// No priority call where rustix has none (Windows).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+fn lower_priority() {}
