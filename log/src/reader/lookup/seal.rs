@@ -25,7 +25,8 @@ impl LogReader {
         if at < HEADER_LEN as u64 || at >= trailer_offset {
             return None;
         }
-        let mut b = vec![0u8; usize::try_from(trailer_offset - at).ok()?];
+        let head = read_header_at(&*f, at, trailer_offset)?;
+        let mut b = vec![0u8; usize::try_from(head.block_len()).ok()?];
         if read_at_full(&*f, &mut b, at).ok()? != b.len() {
             return None;
         }
@@ -35,15 +36,10 @@ impl LogReader {
         }
         let mut records = SegmentIndex::decode(block.body).ok()?.records;
         records.sort_by_key(|r| r.series_id);
-        let next = block.next_offset();
-        let lists = (next + BLOCK_HEADER_LEN as u64 <= b.len() as u64)
-            .then(|| b[next as usize..][..BLOCK_HEADER_LEN].try_into().ok())
-            .flatten()
-            .and_then(crate::block::BlockHeader::decode)
-            .filter(|h| {
-                h.block_type == block_type::SERIES_BATCHES && next + h.block_len() <= b.len() as u64
-            })
-            .map(|h| (at + next, h.block_len()));
+        let next = at + head.block_len();
+        let lists = read_header_at(&*f, next, trailer_offset)
+            .filter(|h| h.block_type == block_type::SERIES_BATCHES)
+            .map(|h| (next, h.block_len()));
         Some(Sealed {
             records,
             lists,
@@ -78,4 +74,20 @@ impl LogReader {
         let trailer = Trailer::decode(block.body).ok()?;
         Some((f, trailer, trailer_offset))
     }
+}
+
+/// The block header at `at`, if a block of that length ends by `limit`.
+fn read_header_at(
+    f: &dyn crate::fs::FsFile,
+    at: u64,
+    limit: u64,
+) -> Option<crate::block::BlockHeader> {
+    let mut h = [0u8; BLOCK_HEADER_LEN];
+    if at.checked_add(BLOCK_HEADER_LEN as u64)? > limit
+        || read_at_full(f, &mut h, at).ok()? != h.len()
+    {
+        return None;
+    }
+    let header = crate::block::BlockHeader::decode(&h)?;
+    (at.checked_add(header.block_len())? <= limit).then_some(header)
 }

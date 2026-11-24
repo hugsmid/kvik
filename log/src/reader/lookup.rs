@@ -583,7 +583,7 @@ impl LogReader {
             listed: Vec::new(),
         };
         if wanted.is_empty() {
-            return Ok((out, Planned::empty(budget)));
+            return Ok((out, self.planned_empty(budget)));
         }
         if within.expect > 0 {
             let record = std::mem::size_of::<FoundFact>() as u64;
@@ -599,7 +599,7 @@ impl LogReader {
                 Some(n) => names.push(n),
                 None => {
                     out.complete.fill(false);
-                    return Ok((out, Planned::empty(budget)));
+                    return Ok((out, self.planned_empty(budget)));
                 }
             }
         }
@@ -608,7 +608,7 @@ impl LogReader {
         self.caches.listed = Some(out.listed.clone());
         if self.caches.keep_listed(&listed) {
             out.complete.fill(false);
-            return Ok((out, Planned::empty(budget)));
+            return Ok((out, self.planned_empty(budget)));
         }
         let mut jobs = Vec::new();
         for name in names {
@@ -691,6 +691,9 @@ impl LogReader {
         }
         let planned = Planned {
             jobs,
+            fs: self.cfg.fs.clone(),
+            log_dir: self.log_dir.clone(),
+            piece: self.caches.piece,
             budget,
             generation: mark.generation,
             last_sequence: mark.last_sequence,

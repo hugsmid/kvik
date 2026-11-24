@@ -60,17 +60,17 @@ enum Damage {
     Refused(BTreeSet<Seen>),
 }
 
-struct World {
-    fs: Arc<MemFs>,
-    log: Log,
-    next: u64,
+pub(super) struct World {
+    pub(super) fs: Arc<MemFs>,
+    pub(super) log: Log,
+    pub(super) next: u64,
     /// The first position of the segment in use, and that segment's file id.
-    segment: (u64, Option<u64>),
-    reader_id: u8,
+    pub(super) segment: (u64, Option<u64>),
+    pub(super) reader_id: u8,
 }
 
 impl World {
-    fn new() -> World {
+    pub(super) fn new() -> World {
         let fs = Arc::new(MemFs::new());
         let new = NewStore {
             store_id: [1; 16],
@@ -99,12 +99,12 @@ impl World {
         }
     }
 
-    fn durable(&self) -> u64 {
+    pub(super) fn durable(&self) -> u64 {
         self.log.stats().durable.sequence
     }
 
     /// Submits `items`; returns whether they started a new segment.
-    fn submit(&mut self, items: Vec<Item>) -> bool {
+    pub(super) fn submit(&mut self, items: Vec<Item>) -> bool {
         let before = self.durable();
         self.log.submit(items).unwrap().wait().unwrap();
         let open = self.log.stats().open_file_id;
@@ -115,7 +115,7 @@ impl World {
         rolled
     }
 
-    fn call(&mut self, facts: u8) {
+    pub(super) fn call(&mut self, facts: u8) {
         let items = (0..facts)
             .map(|_| {
                 self.next += 1;
@@ -133,12 +133,16 @@ impl World {
         self.submit(items);
     }
 
-    fn reader(&mut self) -> LogReader {
+    pub(super) fn reader(&mut self) -> LogReader {
+        self.reader_on(self.fs.clone())
+    }
+
+    pub(super) fn reader_on(&mut self, fs: Arc<dyn crate::fs::Fs>) -> LogReader {
         self.reader_id += 1;
         let clock = Arc::new(SystemClock::default());
         LogReader::open(ReaderConfig::new(
             "s",
-            self.fs.clone(),
+            fs,
             clock,
             Some([2; 16]),
             [self.reader_id; 16],
@@ -146,14 +150,14 @@ impl World {
         .unwrap()
     }
 
-    fn path(&self, name: SegmentName) -> std::path::PathBuf {
+    pub(super) fn path(&self, name: SegmentName) -> std::path::PathBuf {
         Path::new("s")
             .join(crate::store::LOG_DIR)
             .join(name.to_string())
     }
 
     /// The sealed segments, by file id.
-    fn sealed(&self) -> Vec<SegmentName> {
+    pub(super) fn sealed(&self) -> Vec<SegmentName> {
         let dir = Path::new("s").join(crate::store::LOG_DIR);
         let mut names: Vec<_> = self
             .fs
@@ -168,7 +172,7 @@ impl World {
     }
 
     /// The first and last sequence of the segment's batches.
-    fn sequences(&self, name: SegmentName) -> (u64, u64) {
+    pub(super) fn sequences(&self, name: SegmentName) -> (u64, u64) {
         let bytes = self.fs.read(&self.path(name)).unwrap();
         let id = SegmentIdentity {
             store_id: [1; 16],
@@ -186,7 +190,7 @@ impl World {
     }
 
     /// The start and end offsets of the segment's batches that hold a recovery entry.
-    fn entry_batches(&self, name: SegmentName) -> Vec<(usize, usize)> {
+    pub(super) fn entry_batches(&self, name: SegmentName) -> Vec<(usize, usize)> {
         let bytes = self.fs.read(&self.path(name)).unwrap();
         let id = SegmentIdentity {
             store_id: [1; 16],
@@ -212,12 +216,12 @@ impl World {
     }
 
     /// Every fact a fresh refresh takes, voids applied.
-    fn refreshed(&mut self) -> BTreeSet<Seen> {
+    pub(super) fn refreshed(&mut self) -> BTreeSet<Seen> {
         self.try_refreshed().unwrap()
     }
 
     /// [`World::refreshed`]; `None` if a segment is refused.
-    fn try_refreshed(&mut self) -> Option<BTreeSet<Seen>> {
+    pub(super) fn try_refreshed(&mut self) -> Option<BTreeSet<Seen>> {
         let mut out = BTreeSet::new();
         for e in self.reader().refresh().ok()?.events {
             match e {
@@ -446,7 +450,7 @@ fn a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_r
 }
 
 /// A sealed segment's index records and, if it carries them, its series batches (A.8a).
-fn seal_lists(bytes: &[u8]) -> (Vec<crate::body::IndexRecord>, Option<SeriesBatches>) {
+pub(super) fn seal_lists(bytes: &[u8]) -> (Vec<crate::body::IndexRecord>, Option<SeriesBatches>) {
     use crate::block::{block_type, read_block};
     use crate::body::{END_MARKER_LEN, SegmentIndex, Trailer, decode_end_marker};
     let len = bytes.len() as u64;
@@ -464,7 +468,7 @@ fn seal_lists(bytes: &[u8]) -> (Vec<crate::body::IndexRecord>, Option<SeriesBatc
 
 impl World {
     /// Each (series, batch) pair of a segment's batches, its batch count, and whether one holds a recovery entry.
-    fn scanned_pairs(&self, name: SegmentName) -> (Vec<(u32, BatchRef)>, u64, bool) {
+    pub(super) fn scanned_pairs(&self, name: SegmentName) -> (Vec<(u32, BatchRef)>, u64, bool) {
         let bytes = self.fs.read(&self.path(name)).unwrap();
         let id = SegmentIdentity {
             store_id: [1; 16],
@@ -494,7 +498,7 @@ impl World {
     }
 
     /// Every byte of the log's segments.
-    fn log_bytes(&self) -> u64 {
+    pub(super) fn log_bytes(&self) -> u64 {
         let dir = Path::new("s").join(crate::store::LOG_DIR);
         self.fs
             .read_dir(&dir)

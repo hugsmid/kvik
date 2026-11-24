@@ -1,7 +1,11 @@
 //! A lookup's reads of sealed segments through their series batches (`format.md` A.8a, Q-1150): planned under the
 //! reader, read apart from it, so that lookups of several callers read their batches at once.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use super::*;
+use crate::fs::OpenMode;
 
 /// Batches of a listed read closer than this are read together, as a read call costs about as much as copying this
 /// many bytes more.
@@ -10,7 +14,6 @@ const LISTED_GAP: u64 = 4 << 10;
 /// One sealed segment a lookup reads through its series batches: what the read needs, taken from the reader's caches.
 pub(super) struct Listed {
     name: SegmentName,
-    file: Box<dyn crate::fs::FsFile>,
     id: SegmentIdentity,
     /// The series batches block's offset and length, header included.
     lists: (u64, u64),
@@ -27,6 +30,11 @@ pub(super) struct Listed {
 /// The reads a lookup left for [`Planned::run`], with the lookup's budget and position bounds.
 pub struct Planned {
     pub(super) jobs: Vec<Listed>,
+    /// Where [`Planned::run`] opens each job's file, one at a time.
+    pub(super) fs: Arc<dyn crate::fs::Fs>,
+    pub(super) log_dir: PathBuf,
+    /// [`PIECE`] (the caches' value in tests): the most a merged read takes, and the longest lists block read.
+    pub(super) piece: u64,
     pub(super) budget: Budget,
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
@@ -43,9 +51,17 @@ pub struct Ran {
 }
 
 impl Planned {
-    pub(super) fn empty(budget: Budget) -> Self {
+    pub(super) fn empty(
+        budget: Budget,
+        fs: Arc<dyn crate::fs::Fs>,
+        log_dir: PathBuf,
+        piece: u64,
+    ) -> Self {
         Planned {
             jobs: Vec::new(),
+            fs,
+            log_dir,
+            piece,
             budget,
             generation: 0,
             last_sequence: 0,
@@ -102,9 +118,11 @@ impl Planned {
     }
 
     fn read(&self, job: &Listed, facts: &mut Vec<FoundFact>) -> Option<()> {
+        let path = self.log_dir.join(job.name.to_string());
+        let file = self.fs.open(&path, OpenMode::Read).ok()?;
         let (at, len) = job.lists;
         let mut b = vec![0u8; usize::try_from(len).ok()?];
-        if read_at_full(&*job.file, &mut b, at).ok()? != b.len() {
+        if read_at_full(&*file, &mut b, at).ok()? != b.len() {
             return None;
         }
         let block = read_block(&b, 0, b.len() as u64).ok()?;
@@ -118,9 +136,10 @@ impl Planned {
             return None;
         }
         lookup_listed(
-            &*job.file,
+            &*file,
             &job.id,
             &refs,
+            self.piece,
             &self.query(job, &|_, _, _| false),
             facts,
         )
@@ -128,6 +147,15 @@ impl Planned {
 }
 
 impl LogReader {
+    pub(super) fn planned_empty(&self, budget: Budget) -> Planned {
+        Planned::empty(
+            budget,
+            self.cfg.fs.clone(),
+            self.log_dir.clone(),
+            self.caches.piece,
+        )
+    }
+
     /// The read of a sealed segment through its series batches, when its index (cached) says it carries them.
     pub(super) fn listed_job(
         &self,
@@ -143,7 +171,7 @@ impl LogReader {
             return None;
         }
         let sealed = self.caches.index.get(&name.file_id)?.value.as_ref()?;
-        let lists = sealed.lists?;
+        let lists = sealed.lists.filter(|&(_, len)| len <= self.caches.piece)?;
         // Facts stand in for bytes here: a read of most of the segment's facts reads it whole at once.
         let all: u64 = sealed.records.iter().map(|r| u64::from(r.fact_count)).sum();
         let wanted_facts: u64 = sealed
@@ -159,10 +187,6 @@ impl LogReader {
         if wanted_facts.saturating_mul(2) >= all {
             return None;
         }
-        let (n, file) = self.open_segment(name).ok().flatten()?;
-        if !n.sealed {
-            return None;
-        }
         let mut by_series: BTreeMap<u32, Vec<(i64, i64)>> = BTreeMap::new();
         for &i in candidates {
             let w = &wanted[i];
@@ -176,9 +200,8 @@ impl LogReader {
             id: SegmentIdentity {
                 store_id: self.store_id,
                 file_id: name.file_id,
-                generation: n.generation,
+                generation: name.generation,
             },
-            file,
             lists,
             batch_bytes: sealed.batch_bytes,
             index_ids: sealed.records.iter().map(|r| r.series_id).collect(),
@@ -232,12 +255,13 @@ impl LogReader {
 }
 
 /// Reads only the batches `refs` (ascending, apart) of a sealed segment for `query`, those close together in one read
-/// of at most [`PIECE`] bytes unless one batch is longer; `None` when one does not read as the complete batch listed,
+/// of at most `piece` bytes unless one batch is longer; `None` when one does not read as the complete batch listed,
 /// so that the caller reads the segment whole and judges its regions (A.8a).
 fn lookup_listed(
     f: &dyn crate::fs::FsFile,
     id: &SegmentIdentity,
     refs: &[BatchRef],
+    piece: u64,
     query: &Query<'_>,
     facts: &mut Vec<FoundFact>,
 ) -> Option<()> {
@@ -249,7 +273,7 @@ fn lookup_listed(
         let mut j = k + 1;
         while j < refs.len()
             && u64::from(refs[j].offset) <= end + LISTED_GAP
-            && refs[j].end() - start <= PIECE
+            && refs[j].end() - start <= piece
         {
             end = refs[j].end();
             j += 1;
