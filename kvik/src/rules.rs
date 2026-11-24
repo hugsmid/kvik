@@ -159,6 +159,14 @@ pub(crate) fn bucket(
     let numeric = !matches!(spec.kind, Kind::State { .. } | Kind::Text);
     // Min and max are over readings that start in the bucket only; the mean can come from a value carried in.
     let readings = numeric && node.count > 0;
+    let counts = match node.body {
+        km::summary::Body::Counter {
+            resets,
+            regressions,
+            ..
+        } => Some((resets, regressions)),
+        _ => None,
+    };
     Bucket {
         from: ts(lo),
         to: ts(hi),
@@ -180,6 +188,10 @@ pub(crate) fn bucket(
             apportioned: node.apportioned(),
             ..ResultFlags::default()
         },
+        sum: num(km::summary::Aggregate::Sum),
+        increase: num(km::summary::Aggregate::Increase),
+        resets: counts.map(|(r, _)| r),
+        regressions: counts.map(|(_, g)| g),
     }
 }
 

@@ -498,11 +498,15 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   (`format.md` A.18) and the registry, not every fact: it continues the newest valid directory and reads the log above
   it, and serves `live`, `series` and `losses` from that, looking a fact up in the log where the state cannot tell
   (Q-1003, Q-1004). `facts` and `at` read the log at the call's cut through the segment indexes (Q-1060); windows,
-  `buckets` and calendar results build the full fact index at their first use and keep it, until roadmap 9.0h (Q-1000).
+  `buckets` and calendar results fold the series' current facts in their span from the same reads, one call at one
+  cut, and hold no more than the cap and one bucket's fold per series and, under `Resolution::Auto`, up to `max_points + 1`
+  facts per series until they pass it, and the results (roadmap 9.0h, Q-1130); `buckets_of`, `window_of`
+  and `facts_of` read several series in one pass over the log (Q-1131). The fact index is built only to
+  find damage (Q-1060) or for a broken state (Q-1006).
 - `memory` caps what a reader's queries allocate together (default 64 MiB; under 32 MiB is refused with
   `OpenError::Config`), a stream's rows not yet taken by the caller included: a read that needs more works in more
   passes over narrower event-time ranges, down to one key's positions, with equal results at any cap (Q-1063,
-  Q-1067, Q-1068). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
+  Q-1067, Q-1068), sized before they are read from the counts the reader's lookups hold (Q-1132). Outside it: about 1 MiB of a query's own state, the fact index a reader builds once, and then
   keeps, to find damage a read met (Q-1060, Q-1069), and the bytes of the last segment the reader's refresh read, up to
   `log.segment_size`, kept so that the next refresh reads only what is new (Q-1069). Rows a stream holds give way to
   another read that needs the room, and the stream reads that part again: at 32 MiB a held part above about 7 MiB
@@ -522,10 +526,15 @@ let now = reader.live(id)?;                                   // latest valid va
 let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::Avg)?;   // also Window::between(Span, Span)
 // WindowResult { value, coverage, from, to, flags }
 let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;   // chart query: Vec<Bucket>
-// Bucket { from, to, count: u64, min: Option<Value>, max: Option<Value>, mean: Option<f64>, coverage, flags }
+// Bucket { from, to, count: u64, min: Option<Value>, max: Option<Value>, mean: Option<f64>, coverage, flags,
+//          sum: Option<f64>, increase: Option<f64>, resets: Option<u64>, regressions: Option<u64> }
 let day = reader.calendar(id, date, Aggregate::Integral)?;   // site time zone
 let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named IANA zone for the whole span
 let (start, end) = reader.interval(id, t)?;                 // the interval of an interval series' reading at t
+// Several series in one read of the log, each result as the one-series call gives it (Q-1131):
+let charts = reader.buckets_of(&ids, range, Resolution::Auto { max_points: 2_000 })?;   // Vec<ChartData>, in ids' order
+let tiles = reader.window_of(&ids, Window::rolling(Duration::from_secs(600)), Aggregate::Avg)?;   // Vec<WindowResult>
+let rows = reader.facts_of(&ids, range, View::Current)?;   // Facts: event-time order, then series, then position
 
 pub fn facts(&self, id: SeriesId, range: TimeRange, view: View) -> Result<Facts, QueryError>;   // accepted at gate 3.3
 pub struct Facts;   /* impl Iterator<Item = Result<FactRow, QueryError>> */   // streams pass by pass at one cut, bounded memory
@@ -901,7 +910,8 @@ the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
 `export_series(&reader, id, &ExportOptions, writer)` for one file, `export_partitioned(&reader, id, &ExportOptions,
 open)` for one file per UTC month under `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/`, the
-series name's three segments (Q-670); both write `reader.store_id()` into every file. Its schema is export version
+series name's three segments (Q-670), and `export_partitioned_of(&reader, &ids, &ExportOptions, open)` for several
+series' files from one read (Q-1131); all write `reader.store_id()` into every file. Its schema is export version
 1 ([`export.md`](export.md), Q-190 to Q-197).
 
 ## Environment seams (accepted at gate 3.3)

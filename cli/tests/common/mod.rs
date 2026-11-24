@@ -14,6 +14,7 @@ use kvik::{
     Kind, Quality, Reading, SeriesId, SeriesSpec, StateValues, Store, StoreConfig, Timestamp,
     Value, ValueType,
 };
+use kvik_log::directory::{self, Family};
 
 pub const T0: i64 = 1_767_225_600_000_000_000;
 pub const S: i64 = 1_000_000_000;
@@ -118,6 +119,31 @@ impl Fixture {
     pub fn shut(&mut self) {
         if let Some(s) = self.store.take() {
             block_on(s.shutdown()).unwrap();
+        }
+    }
+
+    /// Waits until the writer has written a status file. It does so on its own thread, polling the log's monotonic
+    /// clock, which the manual clock does not drive; this asserts nothing about timing.
+    pub fn await_status(&self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while directory::generations(&self.fs, &self.dir, Family::Status).is_empty() {
+            assert!(Instant::now() < deadline, "no status file");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Blocks until the running store's own readers hold `n` leases: they open on the store's threads, after its
+    /// status file, and a lease's identity is the next draw of the fixture's entropy.
+    pub fn await_leases(&self, n: usize) {
+        let dir = self.dir.join("leases");
+        let id = self.store_id();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while kvik_log::lease::read_leases(&self.fs, &dir, &id).map_or(0, |v| v.len()) < n {
+            assert!(
+                Instant::now() < deadline,
+                "the store holds fewer than {n} leases"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 

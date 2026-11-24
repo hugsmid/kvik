@@ -49,6 +49,9 @@ pub struct Within {
     pub above: Option<Position>,
     /// The position facts are kept at or below.
     pub upto: Option<Position>,
+    /// The facts expected ([`LogReader::estimate`]): room for them is taken from the budget at once, so that the
+    /// facts' vector need not grow by doubling.
+    pub expect: u64,
 }
 
 impl Default for Within {
@@ -57,6 +60,7 @@ impl Default for Within {
             budget: u64::MAX,
             above: None,
             upto: None,
+            expect: 0,
         }
     }
 }
@@ -166,6 +170,9 @@ struct SegmentMap {
     /// the batches again voids at each what it took above its `after` from the batches before it, as a scan does
     /// (Q-831).
     recoveries: Vec<(usize, Position)>,
+    /// Per series, by id, its facts in `batches` and their least and greatest `t`: an A.8 index of what is mapped,
+    /// for [`LogReader::estimate`].
+    tally: Vec<IndexRecord>,
 }
 
 impl SegmentMap {
@@ -173,6 +180,7 @@ impl SegmentMap {
         64 + self.batches.len() * std::mem::size_of::<Span>()
             + self.regions.len() * 16
             + self.recoveries.len() * std::mem::size_of::<(usize, Position)>()
+            + self.tally.len() * std::mem::size_of::<IndexRecord>()
     }
 }
 
@@ -204,6 +212,8 @@ pub(super) struct Caches {
     /// Segments a lookup took a fact from: one gone with no record naming its removal makes every later lookup of
     /// this reader incomplete (Q-951, Q-1066).
     stood: std::collections::BTreeSet<u64>,
+    /// The segments the last lookup listed.
+    listed: Option<Vec<u64>>,
     tick: u64,
     bytes: usize,
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
@@ -220,6 +230,7 @@ impl Default for Caches {
             index: HashMap::new(),
             maps: HashMap::new(),
             stood: std::collections::BTreeSet::new(),
+            listed: None,
             tick: 0,
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
@@ -431,7 +442,7 @@ fn header(f: &dyn crate::fs::FsFile, id: &SegmentIdentity) -> Option<HeaderState
 
 /// What one segment's read is for: the wanted ranges by series, the mark, and the regions taken as lost.
 pub(super) struct Query<'a> {
-    pub(super) by_series: BTreeMap<u32, Vec<(i64, i64)>>,
+    pub(super) by_series: BySeries,
     pub(super) ranges: Vec<(i64, i64)>,
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
@@ -455,14 +466,21 @@ impl Query<'_> {
             && self.upto.is_none_or(|u| pos(s.first) <= u)
     }
 
-    /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget; `None` if a body does
-    /// not decode.
-    fn take(&self, b: &crate::batch::Batch<'_>, facts: &mut Vec<FoundFact>) -> Option<Taken> {
+    /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget, counting every fact
+    /// in `tally` if given; `None` if a body does not decode.
+    fn take(
+        &self,
+        b: &crate::batch::Batch<'_>,
+        facts: &mut Vec<FoundFact>,
+        tally: Option<&mut Vec<IndexRecord>>,
+    ) -> Option<Taken> {
         let g = b.commit.generation;
+        let tally = tally.map(std::cell::RefCell::new);
         let wants = |series: u32, t: i64| {
-            self.by_series
-                .get(&series)
-                .is_some_and(|rs| rs.iter().any(|(a, z)| (*a..=*z).contains(&t)))
+            if let Some(c) = &tally {
+                note(&mut c.borrow_mut(), series, t);
+            }
+            self.by_series.wants(series, t)
         };
         let mut keep = |sequence: u64, received_at: i64, row: FactRow| {
             let position = Position {
@@ -525,6 +543,13 @@ impl LogReader {
         if wanted.is_empty() {
             return Ok(out);
         }
+        if within.expect > 0 {
+            let record = std::mem::size_of::<FoundFact>() as u64;
+            let n = within.expect.min(within.budget / record);
+            if budget.charge(n * record) {
+                out.facts.reserve_exact(usize::try_from(n).unwrap_or(0));
+            }
+        }
         let mut names = self.segments()?;
         names.retain(|n| n.file_id > 0 && n.file_id <= mark.file_id);
         if mark.file_id > 0 && names.last().is_none_or(|n| n.file_id != mark.file_id) {
@@ -538,6 +563,7 @@ impl LogReader {
         }
         let listed: HashSet<u64> = names.iter().map(|n| n.file_id).collect();
         out.listed = names.iter().map(|n| n.file_id).collect();
+        self.caches.listed = Some(out.listed.clone());
         if self.caches.keep_listed(&listed) {
             out.complete.fill(false);
             return Ok(out);
@@ -580,7 +606,7 @@ impl LogReader {
                     .push((w.from, w.to));
             }
             let query = Query {
-                by_series,
+                by_series: BySeries::new(by_series),
                 ranges: candidates
                     .iter()
                     .map(|&i| (wanted[i].from, wanted[i].to))
@@ -663,7 +689,7 @@ impl LogReader {
                 continue;
             }
             let at = facts.len();
-            if read_batch_at(&*f, &id, s, |b| query.take(b, facts)).is_none() {
+            if read_batch_at(&*f, &id, s, |b| query.take(b, facts, None)).is_none() {
                 facts.truncate(at);
                 stale = true;
             }
@@ -742,4 +768,8 @@ impl LogReader {
 }
 
 mod append;
+mod estimate;
+mod wanted;
 use append::{scan_new, void_above};
+use estimate::note;
+pub(in crate::reader) use wanted::BySeries;

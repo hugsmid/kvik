@@ -170,6 +170,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1117 | `format.md` A.18 Writing; Q-1116 | A power loss can take the seed with the unsynced series directory (decided by the lead) |
 | Q-1118 | query design §3.6; `api.md` Live reads; Q-1013, Q-1015 | Selective fan-out of live sessions: what a session passed over no longer counts (decided by the lead, provisional) |
 | Q-1119 | §4 Delivery; `api.md` Consuming; Q-706 | Consumer deliveries taken off the emit's path, and wakes per consumer (decided by the lead, provisional) |
+| Q-1130 | §6 Chart buckets; `api.md` Reader; Q-1000, Q-1060 | Windows, chart buckets and calendar results from the sources (decided by the lead) |
+| Q-1131 | §6 Chart buckets; `api.md` Reading; Q-1062, Q-1130 | Several series' windows, buckets and facts from one read (decided by the lead) |
+| Q-1132 | query design §2.2; Q-1063, Q-1068 | Passes sized from counts before they are read (decided by the lead) |
+| Q-1133 | `api.md` Reader processes; Q-1131, Q-1132 | A reader call on more than one thread (OWNER) |
 | Q-1140 | §6 Gates; `api.md` Gates (proposal) | Gates beside today's condition funnels, and what the model leaves to later steps (decided by the lead, provisional) |
 | Q-1141 | §6 Gates | When a gate's input has no value (decided by the lead, provisional) |
 | Q-1142 | §6 Gates; `api.md` Gates (proposal) | A transition's identity names the instance's series, not an instance number (decided by the lead, provisional) |
@@ -3375,7 +3379,7 @@ reads only latest values never holds one. Cost: a reader that mixes windows with
 before 9.0c, beside the latest values, until 9.0f.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs` `a_readers_memory_does_not_grow_with_the_facts`;
 `kvik/tests/latest_memory.rs` `a_readers_heap_does_not_grow_with_the_facts_it_folds` (the heap allocated and not
-freed while a reader catches up over 280,000 facts, against a reader that builds the index);
+freed while a reader catches up over 280,000 facts; one that also answers windows holds no more since 9.0h);
 `kvik/src/durable/reader/tests.rs` `a_first_read_in_parts_builds_the_index_one_read_whole_does`;
 `log/tests/reader_start.rs` `a_refresh_upto_returns_nothing_above_it_and_resumes_there`.
 
@@ -4109,10 +4113,10 @@ Q-1006's cost), and reads once more: a region that read reports lost is passed o
 and live session of the process as before (Q-938); damage it does not report is `NotAvailable`. A segment gone from
 under the sources' reads follows Q-951 as Q-1066 applies it. Finding the damage builds the fact index, and the reader
 keeps it, outside the memory cap of Q-1063 (`api.md` says so). `facts` and `at` no longer
-build the fact index; windows, `buckets` and calendar results still do until roadmap 9.0h folds them from the stream,
+build the fact index; windows, `buckets` and calendar results did until 9.0h folded them from the stream (Q-1130),
 and a broken state's latest values still answer from it (Q-1006). The merge drops a position two sources hold, for the
 recent window when it becomes a source. No new lease: the lookups' log reader already holds one, so a reader keeps up
-to three leases until 9.0h removes the fact index's. The lookups' mutex is held for one pass's lookup, not across a
+to three leases while it holds the fact index. The lookups' mutex is held for one pass's lookup, not across a
 stream, so passes of concurrent calls on one reader run one at a time.
 **Pinned by.** `kvik/src/durable/read/source/tests.rs`
 `facts_and_at_equal_the_fact_index_and_the_model_at_every_cap` (generated histories of late facts, revisions of a
@@ -4913,6 +4917,99 @@ registered too.
 consumer
 properties against the model backend (`kvik/tests/consumer_properties.rs`), whose manual clock moves between steps.
 
+## Q-1130 — Windows, chart buckets and calendar results from the sources
+Decided by the lead with roadmap 9.0h, for review.
+**Scenario.** Windows, `buckets` and calendar results built the reader's fact index at their first use and kept it
+(about 150 bytes a fact, Q-1000), so a reader's memory and its first such call's time grew with the store's age:
+47 MiB held over 320,000 facts, 268 MiB over 2.2 million (`docs/measurements/9.0h-bucket-reads.md`).
+**Decided.** Each call takes one view and reads the series' current facts with `t` from the reach of its span to its
+end through the sources of Q-1060, in passes under the reader's cap and admission (Q-1063, Q-1067, Q-1068); the
+reading before the span comes from `at`'s backward search (Q-1065). A cut that a reset or its age ends is read once
+more under a new cut, and a second end is `CutExpired`, as for `at` (Q-1061). A window's core is folded 256 readings
+at a time and merged (`kvik_tree::merge`, associative and exact: spec §5.3, invariant 6), so a window or bucket holds
+one chunk whatever it covers; an interval series' readings are credited as they are taken and kept only while their
+interval reaches past the bucket. Buckets fold left to right from one stream of the range, `Resolution::Auto`'s
+first `max_points` + 1 facts included (Q-1131). A tiny cap refuses as `facts` does. The fact
+index is now built only to find damage (Q-1060) and for a broken state (Q-1006). `Bucket` gains `sum`, `increase`,
+`resets` and `regressions` from the bucket's node on both backends (the query design's Q-744), additive since
+`Bucket` is `#[non_exhaustive]`. Cost left: a fresh reader's first read fills the lookups' cache (Q-1069), reading
+every sealed segment's index (`format.md` A.8) and scanning unsealed ones, so its time grows with the number of
+segments, and its memory is bounded by the cache's share; a span of event times per segment would let a lookup pass
+over segments outside the range (with compaction, 6.2).
+**Pinned by.** `kvik/src/durable/read/source/tests/windows.rs`
+`windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (revisions, forecasts and their
+issue times, late readings, gaps, restarts, power losses and damaged batches, a change to summer time; against a fresh
+reader's fact index, the evaluation before 9.0h, and the model); `kvik/src/durable/windows/tests.rs`
+`a_streamed_fold_equals_the_one_shot_fold_and_the_model`; `kvik/tests/windows.rs`
+`buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum`; `kvik/tests/window_memory.rs`
+`bucket_window_and_calendar_reads_stay_flat_with_the_stores_age`.
+
+## Q-1131 — Several series' windows, buckets and facts from one read
+Decided by the lead with roadmap 9.0h, for review.
+**Scenario.** A dashboard reads every series over the same range. One call per series reads the log once per series,
+and when every batch holds every series, so a query over 37 series decoded each batch 37 times: 23 s for a
+day's charts of a one-day store, 45 s for a week's (`docs/measurements/9.0h-bucket-reads.md`). `Resolution::Auto` read
+the range twice, once for its first `max_points` + 1 facts and once to fold.
+**Decided.** `Reader::buckets_of`, `window_of` and `facts_of` take several series (in any order, repeats allowed) and
+read them in one stream at one cut, in event-time order then series (Q-1062); each result equals the one-series call's,
+and the one-series calls are the same code with one series. Checks run series by series in id order, each as its own
+call orders them (the series, then the range, resolution, aggregate or window), so the call fails as the first series
+in id order that would fail alone. The reading before the range is found for every series in one backward search
+(Q-1065): spans that double, each read once for the series still unfound, then one probe per series. Each series
+folds from a push-driven core that holds one chunk (Q-1130), so a read holds one chunk per series; with
+`Resolution::Auto` it keeps a series' facts until they pass `max_points`, then folds them and the rest, so the range
+is read once. The model backend answers series by series. `kvik_export::export_partitioned_of` writes several series'
+partitioned files from one `facts_of` read, each series' month file open while the read is in that month, and the
+one-series `export_partitioned` is the same code, reading its range once, at one cut, where it read it twice. Provisional: a call over many series holds each series'
+results until it ends; a caller wanting fewer at once splits the call.
+**Pinned by.** `kvik/src/durable/read/source/tests/windows.rs`
+`windows_buckets_and_calendar_results_equal_the_fact_index_and_the_model_at_every_cap` (every series at once, in
+reverse with one repeated, against each series' own result and its first failure); `kvik/tests/windows.rs`
+`many_series_calls_equal_one_call_per_series_and_the_model`; `export/tests/layout.rs`
+`a_partitioned_export_of_several_series_writes_each_series_files_from_one_read_on_both_backends`.
+
+## Q-1132 — Passes sized from counts before they are read
+Decided by the lead with roadmap 9.0h, for review.
+**Scenario.** A pass that would pass its grant was read until its rows filled it, then halved and read again (Q-1063),
+so on a week-old store of 37 series at a reading a second, a week of one series read the log 4.3 times, and an
+unsealed segment, with no index, was read again at each narrowed pass. Rows were sorted in place, about 100 bytes moved at each
+step, and each row a lookup decoded was looked up in an ordered map of the wanted series.
+**Decided.** The lookups' log reader keeps, for each segment it maps, a tally of what it mapped: per series the facts,
+their least and greatest `t` (the fields of an A.8 record), in its cache's share. `LogReader::estimate` sums, over the
+segments its last lookup listed, the sealed segments' indexes and the tallies, taking each record's facts as spread
+evenly over its span; `None` before a lookup has listed them or when a listed segment has neither. A part not narrowed
+to one key's positions whose estimate takes more than half the rows an admission would grant is halved before it is
+read; a pass takes room for its estimate and an eighth at once (`Within::expect`), so its vector does not grow by
+doubling. An estimate is a guide: a pass that still passes its grant halves and reads again as before (Q-1068), and
+results are unchanged. Texts' bytes are not estimated, so a text series meets the fallback more. Windows and buckets
+take each pass's rows as it is read (`each_row`), with the grant held while they fold, rather than through a stream's
+shelf, whose rows wait on a caller (Q-1067). A pass's rows are sorted by their keys `(t, series, position)` with each
+row then moved once, when the room left in its grant holds 36 bytes a row; else in place. A lookup finds a row's wanted
+ranges in a table by series id when the greatest id is at most 4,096. Every batch a pass reads is still verified
+(Q-1063): checking each once per reader would let damage after a first read go unseen, and once passes stop reading
+again CRC32C is about 3% of a read; a hardware CRC32C, a new dependency, would take most of that (not built). Not built
+either: a span of event times per segment for a fresh reader's first read (Q-1130). Provisional: half a grant as the
+target and an eighth as the margin, which keep a wrong estimate of up to a third from meeting the fallback.
+**Pinned by.** `log/src/reader/tests/parts_and_lookup.rs`
+`an_estimate_counts_what_a_lookup_finds_from_seal_indexes_and_the_tallies_of_unsealed_segments`,
+`room_for_the_expected_facts_is_taken_at_once_so_a_budget_doubling_overflows_holds_them`;
+`kvik/src/durable/read/source/tests.rs` `a_read_again_is_sized_from_counts_so_no_pass_passes_its_grant`;
+`kvik/src/durable/read/merge.rs` `a_sort_by_keys_equals_a_sort_in_place_and_holds_to_the_room_given`; the facts' and
+the windows' differentials at every cap (Q-1060, Q-1130, Q-1131).
+
+## Q-1133 — A reader call on more than one thread
+Recorded by the lead with roadmap 9.0h; for the owner. Built as option (a) until ruled.
+**Scenario.** A long chart read of many series spends about three fifths of its time reading and decoding passes and
+two fifths folding them (37 series over a week: 3.8 s and 2.5 s, `docs/measurements/9.0h-bucket-reads.md`). Folding
+one pass while the next is read would take the read close to the reading alone, within the cap: the accountant
+admits two passes at the default cap. Every reader call so far runs on the caller's thread.
+**Options.** (a) Calls stay on the caller's thread. (b) A call whose estimate passes some millions of facts folds on a
+scoped thread of its own while the caller's thread reads the next pass; the call still blocks until it ends, and a
+reader's lookups still run one at a time. (c) As (b), on a pool the reader owns, sized by its configuration.
+**Recommended.** (a) until stored levels (7.1) are built, since they shorten exactly these reads; then (b) if long
+many-series reads still matter, as it keeps the call's contract and adds no configuration.
+**Pinned by.** Nothing yet.
+
 ## Q-1140 — Gates beside today's condition funnels, and what the model leaves to later steps
 Decided by the lead with the gates model (conditions step 1), provisional.
 **Scenario.** Gates (spec §6 Gates) are specified and judged by the model's `gate` module, but no backend delivers
@@ -5200,7 +5297,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-961 | 8.3d | The marker errors, switches and reports at `Store::restore`, and pacing the retries; recorded when the owner's ruling on Q-614 was applied |
 | Q-1001 | 9.0c | Decided by the lead: the registry file written before a series directory that covers an entry it lacks; for review |
 | Q-1002 | 6.3b | OWNER. No series directory in a run over a loss no lost range records, so that readers keep reporting it; (a) as built |
-| Q-1000 | 9.0h | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; since 9.0f only windows, `buckets` and calendar results build it (Q-1060) |
+| Q-1000 | 9.0h | Decided by the lead with 9.0c: the fact index built only for calls that read facts, at the main reader's cut; since 9.0h only finding damage and a broken state build it (Q-1060, Q-1130) |
 | Q-1003 | 9.0c | Decided by the lead: which series directory and registry file a reader continues; for review |
 | Q-1004 | 9.0c | Decided by the lead: what the reader finds by lookup at the cut, and a named fact not found reported unavailable; for review |
 | Q-1005 | 9.0h | Decided by the lead with 9.0c: `Snapshot` answers latest values, series and losses; facts and windows join it once 9.0h folds windows from the sources (Q-1060) |
@@ -5221,7 +5318,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1054 | 9.2 | Decided by the lead: the mark read through a held handle; the rest is this machine's wake-up cost; the desktop-class figure waits for 9.2 |
 | Q-1055 | 9.0j | Decided by the lead: a known miss; the hub feed for the writer's reader lands with 9.0j (Q-1007) |
 | Q-1056 | 9.0f | Decided by the lead: `kvik series` counts from `fact_count` now; `tail --since`/`--once` follow 9.0f |
-| Q-1060 | 9.0h | Decided by the lead with 9.0f: `facts` and `at` from the log tail through the 11.0 lookup at the cut; the fact index left to windows; for review |
+| Q-1060 | 9.0h | Decided by the lead with 9.0f: `facts` and `at` from the log tail through the 11.0 lookup at the cut; windows too since 9.0h (Q-1130); for review |
 | Q-1061 | 9.0g | Decided by the lead with 9.0f: an iteration ends with `CutExpired` when its cut ends, its reset stamp or generation changes; for review |
 | Q-1062 | 9.0g | Decided by the lead with 9.0f: several series in one pass in event-time order, then series; public with the `Query` read; for review |
 | Q-1063 | 9.0g | Decided by the lead with 9.0f: the accountant's shares, grants held by passes and their rows until taken (Q-1067), the flat block reserve; the envelope's admission builds on it |
@@ -5242,6 +5339,10 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1117 | 9.0e | Decided by the lead, provisional: derived files stay unsynced, so a power loss may cost a whole read; sync the series directory if that matters |
 | Q-1118 | 9.0d | Decided by the lead, provisional: sessions passed over rounds they select nothing of; those rounds no longer count to their backlog; a waiting session is polled; losses found elsewhere within a second; a read reaches anything from its `open` until answered; the lead accepted fewer `Lagged`, the 1 s loss reach and an error gone by a session's turn not being returned |
 | Q-1119 | 5.2 | Decided by the lead, provisional: an emit leaves its batch to the `kvik-deliver` thread, taken as of its acknowledgement; wakes per consumer; Q-706's counts may lag with consumers too; the lead accepted that the backends differ on when a consumer is woken after `emit` (`api.md` Consuming) |
+| Q-1130 | 6.2 | Decided by the lead with 9.0h: windows, buckets and calendar results from the sources, chunked fold, `Bucket` sum, increase, resets and regressions; the first read's segment index reads wait on per-segment spans; for review |
+| Q-1131 | 6.2 | Decided by the lead with 9.0h: several series' windows, buckets and facts from one read; results held per series until the call ends; for review |
+| Q-1132 | 6.2 | Decided by the lead with 9.0h: passes sized from the lookups' counts, rows sorted by keys; half a grant as the target; for review |
+| Q-1133 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |
 | Q-1142 | conditions step 3 | Decided by the lead, provisional: ids name the series; for review with the public API |

@@ -5,7 +5,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Nightly deep property run: new random cases every day.
+    # Nightly deep property run: new random cases every day. A failure there does not block a pull request; it is
+    # fixed on its own, its case pinned as a named test.
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
@@ -216,6 +217,11 @@ jobs:
     #     both backends: 625 histories took 343 s locally in release mode at
     #     low priority, so about 9 minutes at 10,000 and at 40,000, plus the
     #     build.
+    #   - The near-limit and one-window properties of the scan bound
+    #     (log-scan-bound) run a 64th of the cases, at least 12 and 16, at
+    #     most 160: about 0.17 s and 0.11 s a case locally in release mode,
+    #     so about 30 s each at 10,000 and at 40,000. The file's other
+    #     properties take about 3.6 s per 1,000 cases each.
     #   - The durable-backend differential of kvik (kvik-differential, and
     #     kvik-differential-small with small windows) runs a quarter of the
     #     cases, each a history on both backends with restarts; not yet
@@ -237,6 +243,19 @@ jobs:
           key: deep
       - name: Check that the shards cover every test of the file once
         run: bash .github/deep-shards.sh check ${{ matrix.shard }}
-      - run: bash .github/deep-shards.sh run ${{ matrix.shard }}
+      # Pull requests and pushes draw the same cases on every run, a seed fixed per shard from its name, so a run
+      # finds only what the change brings. The nightly and manual runs draw fresh cases; their seed is printed so a
+      # failure reproduces with `PROPTEST_RNG_SEED`.
+      - name: Run the shard
+        run: |
+          if [[ $EVENT == schedule || $EVENT == workflow_dispatch ]]; then
+            seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          else
+            seed=$((16#$(printf '%s' "$SHARD" | sha256sum | cut -c1-15)))
+          fi
+          echo "PROPTEST_RNG_SEED=$seed PROPTEST_CASES=$PROPTEST_CASES"
+          PROPTEST_RNG_SEED=$seed bash .github/deep-shards.sh run "$SHARD"
         env:
+          EVENT: ${{ github.event_name }}
+          SHARD: ${{ matrix.shard }}
           PROPTEST_CASES: ${{ inputs.cases || (github.event_name == 'schedule' && '40000' || '10000') }}

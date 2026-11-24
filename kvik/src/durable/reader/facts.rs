@@ -14,16 +14,20 @@ use crate::series::SeriesKey;
 use crate::time::{TimeRange, Timestamp};
 use crate::types::{Fact, SeriesId};
 
-/// What a read of `ids` in `view` selects at `v`'s cut. As of a time meets damage as a pass does: the scanning read
+/// What a read of `ids` in `view` selects at `v`'s cut; the ids are checked once each, in ascending order. As of a time meets damage as a pass does: the scanning read
 /// finds it first, and the search runs once more (Q-1064).
-fn plan(r: &DurableReader, v: &View, ids: &[SeriesId], view: ReadView) -> Result<Plan, QueryError> {
+pub(crate) fn plan(
+    r: &DurableReader,
+    v: &View,
+    ids: &[SeriesId],
+    view: ReadView,
+) -> Result<Plan, QueryError> {
+    let (ids, _) = crate::durable::distinct(ids);
     let mut series = Vec::with_capacity(ids.len());
-    for id in ids {
+    for id in &ids {
         let info = latest::series(v, &SeriesKey::Id(*id))?;
         series.push((id.0, info.spec.versioned.is_some()));
     }
-    series.sort_unstable();
-    series.dedup();
     let cut = v.cut().durable;
     let bound = match view {
         ReadView::History | ReadView::Current => cut,

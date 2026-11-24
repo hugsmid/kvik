@@ -1,14 +1,14 @@
-//! Live state, windows, chart buckets and calendar results of a durable store (roadmap 5.4), computed from the facts
-//! of the kept log that a reader holds (spec §2.3, §5, §6).
+//! Live state, windows, chart buckets and calendar results of a durable store (roadmap 5.4, spec §2.3, §5, §6).
 //!
-//! Each call reads the current facts it needs from the reader's [`Index`] and evaluates them with [`crate::fold`];
-//! no summary is stored yet. When the summary tree arrives (roadmap 7.x), its stored nodes take the place of the
-//! parts they cover in a window's core, and these calls keep their shape.
+//! Windows, buckets and calendar results fold a series' current facts in the range, streamed from the sources
+//! ([`stream`], roadmap 9.0h); a broken state's live state reads the reader's [`Index`] (Q-1006). No summary is
+//! stored yet: when the summary tree arrives (roadmap 7.x), its stored nodes take the place of the parts they cover
+//! in a window's core, and these calls keep their shape.
 
 use std::ops::Bound;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use km::summary::{CounterRules, Node, Params};
+use km::summary::{CounterRules, Params};
 use kvik_log::entries::{
     Definition, IntervalLength as LogInterval, Kind as LogKind, Timing as LogTiming, Versioning,
 };
@@ -16,15 +16,16 @@ use kvik_log::facts::{Quality as LogQuality, Value as LogValue};
 use kvik_model as km;
 
 use super::index::{Index, Stored, fact_out};
+use super::read::view::View;
 use super::reader::DurableReader;
-use super::registry::Series;
+use super::registry::{Registry, Series};
 use crate::backend::{Error, convert};
 use crate::error::QueryError;
-use crate::fold::{self, Reading};
+use crate::fold::Reading;
 use crate::read::{Aggregate, ChartData, Live, LiveValue, Resolution, Window, WindowResult};
 use crate::rules;
 use crate::time::TimeRange;
-use crate::types::{Fact, SeriesId};
+use crate::types::SeriesId;
 
 /// The time-zone rules calendar results are taken with: those the reference model embeds, so that both backends
 /// take the same local days. A reader computes calendar results with its own release (spec §5.7).
@@ -161,49 +162,6 @@ impl<'a> Of<'a> {
         self.index
             .current_between(self.id(), versioned, from, to, rev)
     }
-
-    fn reading(&self, s: &Stored) -> Option<Reading> {
-        reading_of(self.series, s)
-    }
-
-    /// The summarised readings with `t` in `[from, to)`.
-    fn readings(&self, from: i64, to: i64) -> Vec<Reading> {
-        if from >= to {
-            return Vec::new();
-        }
-        self.current(Bound::Included(from), Bound::Excluded(to), false)
-            .filter_map(|s| self.reading(s))
-            .collect()
-    }
-
-    /// The last summarised reading before `t`: the current fact of the greatest such `t` that is not bad quality.
-    /// The backward scan reads through a run of bad-quality current facts before `t`, so its cost is that run's
-    /// length; nothing bounds it until the summary tree carries each node's last reading (roadmap 7.1).
-    fn prior(&self, t: i64) -> Option<Reading> {
-        if self.params.interval.is_some() {
-            return None;
-        }
-        self.current(Bound::Unbounded, Bound::Excluded(t), true)
-            .find_map(|s| self.reading(s))
-    }
-
-    /// A window `[start, end)` evaluated at `now`.
-    fn window(&self, start: i64, end: i64, now: i64) -> Node {
-        let readings = self.readings(fold::reach(&self.params, start), end);
-        self.model(fold::window(
-            &self.params,
-            self.prior(start).as_ref(),
-            &readings,
-            start,
-            end,
-            now,
-        ))
-    }
-
-    /// A node as the result rules take it.
-    fn model(&self, n: kvik_tree::Node) -> Node {
-        fold::model_node(n, &self.series.def.state_names)
-    }
 }
 
 /// The live-state fact of a series (spec §2.3) in an index at `now`: the current fact with the greatest `t ≤ now`
@@ -214,8 +172,7 @@ pub(crate) fn live_fact(index: &Index, id: SeriesId, now: i64) -> Result<Option<
     if p.timing == km::registry::Timing::Forecast {
         return Ok(None);
     }
-    // As for `prior`, the scan reads through bad-quality facts, and here also through readings of an observed
-    // interval series not yet ready (at most d of event time).
+    // The scan reads through bad-quality facts and readings of an observed interval series not yet ready.
     Ok(of
         .current(Bound::Unbounded, Bound::Included(now), true)
         .find(|s| may_be_live(of.series, p, s, now)))
@@ -243,93 +200,68 @@ pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> 
     r.with_latest_again(|v| super::read::latest::live(r, v, id, now))
 }
 
-/// A window result (spec §6), a calendar result among them (spec §5.7: a window over its span, in the site zone or
-/// a named one).
-pub(crate) fn window(
+/// The span of `window` at `now` under `registry`'s site zones (spec §5.7: a calendar window in the site zone or a
+/// named one).
+fn span_in(
     r: &DurableReader,
+    registry: &Registry,
+    window: &Window,
+    now: i64,
+) -> Result<(i64, i64), Error> {
+    if let Some(span) = rules::plain_span(window, now)? {
+        return Ok(span);
+    }
+    let Window::Calendar { window, zone } = window else {
+        unreachable!("a window without a plain span is a calendar window")
+    };
+    let zoning = match zone {
+        Some(z) => km::calendar::Zoning::Named(z.as_str().to_string()),
+        None => km::calendar::Zoning::Site {
+            initial: r.created_zone().to_string(),
+            entries: registry.site_zones().clone(),
+        },
+    };
+    let (from, to, _) =
+        km::calendar::window_span(&zoning, tzdb(), rules::calendar_window(window)?, now)
+            .map_err(|e| convert::error(km::engine::Error::Tree(e)))?;
+    Ok((from, to))
+}
+
+fn series_in(v: &View, id: SeriesId) -> Result<&Series, QueryError> {
+    v.latest()
+        .registry()
+        .get(id.0)
+        .ok_or_else(|| Error::UnknownSeries(id.to_string()).query())
+}
+
+/// A window result (spec §6), a calendar result among them, folded from the series' facts in its span.
+pub(crate) fn window(
+    r: &Arc<DurableReader>,
     id: SeriesId,
     window: &Window,
     agg: &Aggregate,
 ) -> Result<WindowResult, QueryError> {
-    let now = r.now();
-    r.with(|i, _| {
-        let of = Of::new(i, id)?;
-        let a = rules::aggregate_for(&of.series.spec, of.params.kind, agg)?;
-        let spec = Some(&of.series.spec);
-        let (from, to) = match rules::plain_span(window, now)? {
-            Some(span) => span,
-            None => {
-                let Window::Calendar { window, zone } = window else {
-                    unreachable!("a window without a plain span is a calendar window")
-                };
-                let zoning = match zone {
-                    Some(z) => km::calendar::Zoning::Named(z.as_str().to_string()),
-                    None => km::calendar::Zoning::Site {
-                        initial: r.created_zone().to_string(),
-                        entries: i.registry().site_zones().clone(),
-                    },
-                };
-                let (from, to, _) = km::calendar::window_span(
-                    &zoning,
-                    tzdb(),
-                    rules::calendar_window(window)?,
-                    now,
-                )
-                .map_err(|e| convert::error(km::engine::Error::Tree(e)))?;
-                (from, to)
-            }
-        };
-        let node = of.window(from, to, now);
-        Ok(rules::window_result(
-            spec,
-            &node,
-            &a,
-            (from, to),
-            false,
-            false,
-        ))
-    })
+    Ok(many::window_of(r, &[id], window, agg)?.remove(0))
 }
 
 /// A chart query: the raw current facts of the range when there are few enough, else buckets aligned to UTC, each
-/// the window evaluation over its span (`docs/api.md` Reading).
+/// the window evaluation over its span (`docs/api.md` Reading), folded from one stream of the range.
 pub(crate) fn buckets(
-    r: &DurableReader,
+    r: &Arc<DurableReader>,
     id: SeriesId,
     range: TimeRange,
     resolution: Resolution,
 ) -> Result<ChartData, QueryError> {
-    let now = r.now();
-    r.with(|i, _| {
-        let of = Of::new(i, id)?;
-        let (a, b) = rules::chart_range(range)?;
-        let step = match resolution {
-            Resolution::Auto { max_points } => {
-                let max = max_points.max(1);
-                let range = || of.current(Bound::Included(a), Bound::Excluded(b), false);
-                // Counted before any is converted: a long range gives buckets.
-                if range().take(max.saturating_add(1)).count() <= max {
-                    return Ok(ChartData::Facts(
-                        range().map(fact_out).collect::<Vec<Fact>>(),
-                    ));
-                }
-                rules::auto_step(a, b, max_points)
-            }
-            Resolution::Step(d) => rules::fixed_step(d, a, b)?,
-        };
-        let p = &of.params;
-        let readings = of.readings(fold::reach(p, a), b);
-        let prior = of.prior(a);
-        let buckets = rules::bucket_spans(a, b, step)
-            .map(|(lo, hi)| {
-                let before = fold::before(&readings, lo).or(prior.as_ref());
-                let node = of.model(fold::window(p, before, &readings, lo, hi, now));
-                rules::bucket(&of.series.spec, &node, lo, hi, false)
-            })
-            .collect();
-        Ok(ChartData::Buckets {
-            step: convert::dur(i128::from(step)),
-            buckets,
-        })
-    })
+    Ok(many::buckets_of(r, &[id], range, resolution)?.remove(0))
 }
+
+pub(crate) use many::{buckets_of, distinct, window_of};
+
+#[cfg(test)]
+pub(crate) mod indexed;
+mod many;
+mod stream;
+#[cfg(test)]
+pub(crate) use stream::ChunkOverride;
+#[cfg(test)]
+mod tests;

@@ -92,6 +92,8 @@ fn steady(out: &str) -> String {
 #[test]
 fn health_reports_position_losses_segments_leases_and_derived_files() {
     let mut f = Fixture::new();
+    f.await_status();
+    f.await_leases(3);
     insta::assert_snapshot!("health_open", steady(&f.run("health").unwrap()));
     f.shut();
     insta::assert_snapshot!("health_shut", steady(&f.run("health").unwrap()));
@@ -126,6 +128,7 @@ fn without_bytes(out: &str) -> String {
 fn a_loss_found_then_recorded_degrades_health_and_fails_static_answers_after_writing_them() {
     let mut f = Fixture::new();
     f.damage(1_204.25);
+    f.await_status();
     insta::assert_snapshot!("health_found_loss", steady(&f.run("health").unwrap()));
     for cmd in ["latest", "series"] {
         let (out, done) = f.run_both(cmd, f.env.clone());

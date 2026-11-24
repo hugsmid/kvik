@@ -150,6 +150,19 @@ impl Accountant {
         self.sizes.block + self.sizes.min_rows
     }
 
+    /// The bytes of facts a pass admitted now would be granted ([`Grant::rows`]); a guide for sizing passes.
+    pub(crate) fn rows_hint(&self) -> u64 {
+        let least = self.least();
+        let s = self.lock();
+        let free = self.for_passes().saturating_sub(s.running + s.shelved);
+        let bytes = if free < 2 * least {
+            free.max(least)
+        } else {
+            (free / 2).max(least)
+        };
+        bytes - self.sizes.block
+    }
+
     /// Admits a pass: takes all that is free when that is under two least grants, else half of it. While less than
     /// the least grant is free it waits for running passes, which wait on nothing, when their grants would make
     /// room, and otherwise empties shelves, one admission at a time, so no admission waits on a caller's iteration

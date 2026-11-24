@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::lookup::{Budget, Query};
+use super::lookup::{Budget, BySeries, Query};
 use super::{LogReader, ReaderError};
 use crate::scan::ScanLimit;
 use crate::writer::Position;
@@ -80,7 +80,7 @@ impl LogReader {
                 ScanLimit::End
             };
             let query = Query {
-                by_series: BTreeMap::new(),
+                by_series: BySeries::new(BTreeMap::new()),
                 ranges: Vec::new(),
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,

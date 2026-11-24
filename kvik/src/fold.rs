@@ -3,10 +3,10 @@
 //! results equal the model's; the window rules (credit limit, readiness, reach) are the model's. A window is a core
 //! up to its credit limit, folded from the readings inside (stored nodes take the place of the readings they cover
 //! from roadmap 7.1b), then the edge stretches; an interval series is credited pro rata instead. Readings are
-//! current, not bad quality, in strictly increasing `t`.
+//! current, not bad quality, in strictly increasing `t`. A durable reader folds the same window from a stream
+//! (`durable::windows::stream`), which its tests compare with `window`.
 
 use kvik_model as km;
-use kvik_model::registry::Timing;
 use kvik_model::summary::Params;
 use kvik_model::types::Nanos;
 use kvik_tree as kt;
@@ -45,6 +45,7 @@ pub(crate) fn reach(p: &Params, start: Nanos) -> Nanos {
 /// A window `[start, end)` evaluated at `now` from raw readings: `prior` is the last reading before `start`, and
 /// `readings` hold at least those with `t` in `[start, end)` (others are ignored). An interval series takes
 /// [`interval_window`] instead.
+#[cfg(test)]
 pub(crate) fn window(
     p: &Params,
     prior: Option<&Reading>,
@@ -71,6 +72,7 @@ pub(crate) fn window(
 /// A window `[start, end)` over an interval series, evaluated at `now`: every ready reading's amount pro rata to
 /// the part of its interval inside the window (spec §6 Aggregates); a reading of an observed series is ready once
 /// `t + d ≤ now`. `readings` hold at least those with `t` in `[reach(start), end)`.
+#[cfg(test)]
 pub(crate) fn interval_window(
     p: &Params,
     readings: &[Reading],
@@ -80,7 +82,7 @@ pub(crate) fn interval_window(
 ) -> kt::Node {
     let np = node_params(p);
     let end = end.max(start);
-    let observed = p.timing == Timing::Observed;
+    let observed = p.timing == km::registry::Timing::Observed;
     let ready = within(readings, reach(p, start), end)
         .iter()
         .filter(|(t, _)| !observed || p.ready_at(*t) <= now);
@@ -90,6 +92,7 @@ pub(crate) fn interval_window(
 }
 
 /// The readings with `t` in `[from, to)`, from readings in `t` order.
+#[cfg(test)]
 pub(crate) fn within(readings: &[Reading], from: Nanos, to: Nanos) -> &[Reading] {
     let a = readings.partition_point(|(t, _)| *t < from);
     let b = readings.partition_point(|(t, _)| *t < to).max(a);
@@ -97,6 +100,7 @@ pub(crate) fn within(readings: &[Reading], from: Nanos, to: Nanos) -> &[Reading]
 }
 
 /// The last reading before `t`, from readings in `t` order.
+#[cfg(test)]
 pub(crate) fn before(readings: &[Reading], t: Nanos) -> Option<&Reading> {
     readings[..readings.partition_point(|(r, _)| *r < t)].last()
 }
@@ -185,6 +189,7 @@ pub(crate) fn model_node(n: kt::Node, names: &[String]) -> km::summary::Node {
 #[cfg(test)]
 mod tests {
     use kvik_model::oracle;
+    use kvik_model::registry::Timing;
     use kvik_model::types::{Kind, SECOND};
     use proptest::prelude::*;
 

@@ -222,6 +222,50 @@ fn several_series_read_in_one_pass_come_in_event_time_order_then_series() {
 }
 
 #[test]
+fn a_read_again_is_sized_from_counts_so_no_pass_passes_its_grant() {
+    let log = LogConfig {
+        seal_interval: Duration::from_millis(20),
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("sized", log);
+    let now = rig.clock.wall().0;
+    for round in 0..30i64 {
+        let readings: Vec<Reading> = (0..100i64)
+            .flat_map(|k| {
+                let t = Timestamp(now - (3_000 - round * 100 - k) * 1_000_000_000);
+                [
+                    Reading::new(rig.ids[0], t, Value::F64(k as f64)),
+                    Reading::new(rig.ids[1], t, Value::F64(round as f64)),
+                ]
+            })
+            .collect();
+        rig.emit_readings(&readings, Intent::Normal);
+    }
+    let reader = reader_with(&rig.env, &rig.dir, tiny(300));
+    let ids = [rig.ids[0], rig.ids[1]];
+    let first = collect(crate::read::Facts::stream(
+        facts_of(reader.clone(), &ids, all(), View::Current).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(first.len(), 6_000);
+    assert!(reader.overflows() > 0, "a fresh reader has no counts");
+    let (overflows, lookups) = (reader.overflows(), reader.lookups());
+    let again = collect(crate::read::Facts::stream(
+        facts_of(reader.clone(), &ids, all(), View::Current).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(again, first);
+    assert_eq!(reader.overflows(), overflows);
+    // Halving leaves each pass between a quarter and a half of the 300 facts a grant holds.
+    assert!(
+        reader.lookups() - lookups <= 6_000 / 75,
+        "{} lookups",
+        reader.lookups() - lookups
+    );
+    rig.shut();
+}
+
+#[test]
 fn a_maximal_batch_reads_in_several_passes_at_the_least_cap_with_the_fact_indexs_result() {
     let log = LogConfig {
         max_batch_bytes: 8 << 20,
@@ -682,6 +726,7 @@ fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_late
 }
 
 mod shelves;
+mod windows;
 
 /// The shrunk history of the property (Q-1104): with timed seals the clean stop before the damage can leave the
 /// store's own series directory through the damaged batch, and a fresh reader continues it before the start meets

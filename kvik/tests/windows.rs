@@ -3,16 +3,16 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{at, block_on, start};
-use kvik::env::{Env, ManualClock, MemFs};
+use kvik::env::{Clock, Env, ManualClock, MemFs, Monotonic};
 use kvik::{
     Aggregate, Backend, CalendarPeriod, CalendarWindow, ChangedAtKind, ChartData, CounterRules,
-    Intent, IntervalLength, Kind, Live, LocalDate, LogConfig, Position, Quality, Reader,
-    ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues, Store, StoreConfig,
-    Timestamp, Timing, Value, ValueType, Window, ZoneName,
+    Intent, IntervalLength, Kind, Live, LocalDate, LogConfig, Position, Quality, QueryError,
+    Reader, ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues, Store,
+    StoreConfig, Timestamp, Timing, Value, ValueType, Window, ZoneName,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -462,6 +462,95 @@ fn durable_results_equal_the_model_s() {
         .unwrap();
 }
 
+/// A manual clock that, once armed with `(n, d)`, steps both readings by `d` right after the `n`th read of either
+/// from then on: a step landing between two reads, as a `ManualClock::advance` on another thread can.
+#[derive(Debug)]
+struct StepAfterRead {
+    clock: ManualClock,
+    armed: Mutex<Option<(u32, Duration)>>,
+}
+
+impl StepAfterRead {
+    fn then_step<T>(&self, read: T) -> T {
+        let mut armed = self.armed.lock().unwrap();
+        if let Some((n, d)) = armed.as_mut() {
+            *n -= 1;
+            if *n == 0 {
+                self.clock.advance(*d);
+                *armed = None;
+            }
+        }
+        read
+    }
+}
+
+impl Clock for StepAfterRead {
+    fn wall(&self) -> Timestamp {
+        self.then_step(self.clock.wall())
+    }
+    fn monotonic(&self) -> Monotonic {
+        self.then_step(Clock::monotonic(&self.clock))
+    }
+    fn synchronised(&self) -> bool {
+        true
+    }
+}
+
+/// The 3,932 s gap of a deep run's counterexample: the window clock (spec §6 `now`) counted a step of both clocks
+/// twice when the step fell between its reads of the monotonic and the wall clock.
+#[test]
+fn a_clock_step_between_any_two_clock_reads_moves_now_once_as_on_the_model() {
+    let case = Case::of(3);
+    let step = Duration::from_secs(3_932);
+    for n in 1..=24 {
+        let stepped = Arc::new(StepAfterRead {
+            clock: ManualClock::new(case.base),
+            armed: Mutex::new(None),
+        });
+        let mut env = Env::test(ManualClock::new(case.base));
+        env.clock = stepped.clone();
+        env.fs = Arc::new(MemFs::new());
+        env.background_timers = false;
+        let durable = block_on(Store::open(
+            StoreConfig::new(format!("windows/stepped-{n}"), case.zone)
+                .create_if_missing(true)
+                .env(env),
+        ))
+        .unwrap();
+        let m_clock = ManualClock::new(case.base);
+        let model = block_on(Store::open(
+            StoreConfig::new(format!("kvik-test/windows/stepped-{}", next()), case.zone)
+                .create_if_missing(true)
+                .backend(Backend::Model)
+                .env(Env::test(m_clock.clone())),
+        ))
+        .unwrap();
+        let d = block_on(durable.define_series(number(gauge()).name("w/g/stepped"))).unwrap();
+        let m = block_on(model.define_series(number(gauge()).name("w/g/stepped"))).unwrap();
+        // A step during a read may outlive its cut; the read is then asked again.
+        let span = |s: &Store, id| loop {
+            match s
+                .reader()
+                .window(id, Window::rolling(Duration::from_secs(60)), Aggregate::Avg)
+            {
+                Err(QueryError::CutExpired) => continue,
+                w => break w.map(|w| (w.from, w.to)).unwrap(),
+            }
+        };
+        span(&durable, d);
+        *stepped.armed.lock().unwrap() = Some((n, step));
+        m_clock.advance(step);
+        for _ in 0..3 {
+            span(&durable, d);
+        }
+        assert!(stepped.armed.lock().unwrap().is_none(), "read {n}: no step");
+        assert_eq!(span(&durable, d), span(&model, m), "step after read {n}");
+        assert_eq!(span(&durable, d).1, case.at(3_932), "step after read {n}");
+        block_on(durable.shutdown()).unwrap();
+        block_on(model.shutdown()).unwrap();
+    }
+}
+
 #[test]
 fn a_reader_process_answers_after_shutdown_and_power_loss() {
     let clock = ManualClock::new(start());
@@ -584,4 +673,179 @@ fn a_commit_nobody_awaits_refreshes_live_staleness() {
         std::thread::sleep(Duration::from_millis(5));
     }
     block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn buckets_carry_a_counters_increase_resets_and_regressions_and_a_gauges_sum() {
+    for backend in [Backend::Model, Backend::Durable] {
+        let clock = ManualClock::new(at(600));
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        let s = block_on(Store::open(
+            StoreConfig::new(format!("windows/fields-{}", next()), "Europe/London")
+                .create_if_missing(true)
+                .backend(backend)
+                .env(env),
+        ))
+        .unwrap();
+        let c = block_on(s.define_series(number(counter()).name("w/c/energy"))).unwrap();
+        let g = block_on(s.define_series(number(gauge()).name("w/g/power"))).unwrap();
+        // 100 → 150 → 5 is a reset (below a tenth), 5 → 4 a regression, 4 → 10 a rise: 50 + 5 + 6.
+        let mut readings: Vec<Reading> = [100.0, 150.0, 5.0, 4.0, 10.0]
+            .iter()
+            .enumerate()
+            .map(|(k, v)| Reading::new(c, at(k as i64), Value::F64(*v)))
+            .collect();
+        readings.extend((1..=3).map(|k| Reading::new(g, at(k), Value::F64(k as f64))));
+        block_on(s.emit(&readings)).unwrap();
+        let r = s.reader();
+        let only = |id| match r
+            .buckets(id, at(0)..at(60), Resolution::Step(Duration::from_secs(60)))
+            .unwrap()
+        {
+            ChartData::Buckets { buckets, .. } => buckets.into_iter().next().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let b = only(c);
+        assert_eq!(
+            (b.increase, b.resets, b.regressions, b.sum),
+            (Some(61.0), Some(1), Some(1), None),
+            "{backend:?}"
+        );
+        let b = only(g);
+        assert_eq!(
+            (b.sum, b.increase, b.resets, b.regressions),
+            (Some(6.0), None, None, None),
+            "{backend:?}"
+        );
+        block_on(s.shutdown()).unwrap();
+    }
+}
+
+#[test]
+fn many_series_calls_equal_one_call_per_series_and_the_model() {
+    let mut shown: Vec<Vec<String>> = Vec::new();
+    for backend in [Backend::Model, Backend::Durable] {
+        let mut out = Vec::new();
+        let clock = ManualClock::new(at(600));
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        let s = block_on(Store::open(
+            StoreConfig::new(format!("windows/many-{}", next()), "Europe/London")
+                .create_if_missing(true)
+                .backend(backend)
+                .env(env),
+        ))
+        .unwrap();
+        let c = block_on(s.define_series(number(counter()).name("w/c/energy"))).unwrap();
+        let g = block_on(s.define_series(number(gauge()).name("w/g/power"))).unwrap();
+        let i = block_on(s.define_series(number(interval(4, 0)).name("w/i/use"))).unwrap();
+        // Its reading before the ranges lies further back than the first span searched for it; a counter's step from
+        // it is credited whatever the staleness limit.
+        let o = block_on(s.define_series(number(counter()).name("w/c/old"))).unwrap();
+        let mut readings: Vec<Reading> = (0..40)
+            .map(|k| Reading::new(c, at(k * 3), Value::F64((k * k % 50) as f64)))
+            .collect();
+        readings.extend((0..30).map(|k| Reading::new(g, at(k * 5 + 1), Value::F64(k as f64))));
+        readings.extend((0..20).map(|k| Reading::new(i, at(k * 4), Value::F64(1.0 + k as f64))));
+        readings.push(Reading::new(o, at(-9_000), Value::F64(100.0)));
+        readings.extend(
+            (0..10).map(|k| Reading::new(o, at(k * 10 + 10), Value::F64(110.0 + k as f64))),
+        );
+        let ack = block_on(s.emit(&readings)).unwrap();
+        assert_eq!(ack.refused().count(), 0, "{backend:?}");
+        clock.advance(Duration::from_secs(30));
+        let r = s.reader();
+        let ids = [g, c, i, o, g];
+        // The second range starts inside an interval, whose reading before the range reaches into it.
+        for range in [at(-20)..at(130), at(2)..at(130)] {
+            for res in [
+                Resolution::Auto { max_points: 3 },
+                Resolution::Auto { max_points: 35 },
+                Resolution::Auto { max_points: 2_000 },
+                Resolution::Step(Duration::from_secs(7)),
+            ] {
+                let each: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!("{:?}", r.buckets(*id, range.clone(), res).unwrap()))
+                    .collect();
+                let many: Vec<String> = r
+                    .buckets_of(&ids, range.clone(), res)
+                    .unwrap()
+                    .iter()
+                    .map(|c| format!("{c:?}"))
+                    .collect();
+                assert_eq!(many, each, "{backend:?} {res:?}");
+                out.extend(many.into_iter().filter(|c| c.starts_with("Buckets")));
+            }
+        }
+        let w = Window::rolling(Duration::from_secs(100));
+        for a in [Aggregate::Last, Aggregate::Max, Aggregate::Count] {
+            let each: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{:?}", r.window(*id, w.clone(), a.clone()).unwrap()))
+                .collect();
+            let many: Vec<String> = r
+                .window_of(&ids, w.clone(), a.clone())
+                .unwrap()
+                .iter()
+                .map(|x| format!("{x:?}"))
+                .collect();
+            assert_eq!(many, each, "{backend:?} {a:?}");
+            out.extend(many);
+        }
+        // Refused on an interval series alone, so refused for the call.
+        assert!(r.window_of(&[g, i], w.clone(), Aggregate::Avg).is_err());
+        let range = at(-20)..at(130);
+        let mut each: Vec<_> = [c, g, i]
+            .iter()
+            .flat_map(|id| r.facts(*id, range.clone(), kvik::View::Current).unwrap())
+            .map(Result::unwrap)
+            .collect();
+        each.sort_by_key(|f| (f.t, f.series, f.position));
+        let many: Vec<_> = r
+            .facts_of(&[i, c, g, c], range.clone(), kvik::View::Current)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(many, each, "{backend:?}");
+        assert!(
+            r.buckets_of(
+                &[g, SeriesId(9_999)],
+                range.clone(),
+                Resolution::Auto { max_points: 3 }
+            )
+            .is_err()
+        );
+        // Of several failing ids the call fails as the least id fails alone, whatever order they come in. Two
+        // unknown ids fail alike; an unknown id after a series that fails on its own does not decide the error.
+        let (low, high) = (SeriesId(9_998), SeriesId(9_999));
+        let res = Resolution::Auto { max_points: 3 };
+        let view = kvik::View::Current;
+        let unknown = format!("{:?}", QueryError::UnknownSeries);
+        for ids in [[high, low], [low, high]] {
+            let got = r.buckets_of(&ids, range.clone(), res).unwrap_err();
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
+            let got = r.window_of(&ids, w.clone(), Aggregate::Last).unwrap_err();
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
+            let got = r.facts_of(&ids, range.clone(), view).err().unwrap();
+            assert_eq!(format!("{got:?}"), unknown, "{backend:?} {ids:?}");
+        }
+        let inverted = at(130)..at(-20);
+        let alone = format!("{:?}", r.buckets(g, inverted.clone(), res).unwrap_err());
+        assert_ne!(alone, unknown, "{backend:?}");
+        let alone_window = format!("{:?}", r.window(i, w.clone(), Aggregate::Avg).unwrap_err());
+        assert_ne!(alone_window, unknown, "{backend:?}");
+        for ids in [[high, g], [g, high]] {
+            let got = r.buckets_of(&ids, inverted.clone(), res).unwrap_err();
+            assert_eq!(format!("{got:?}"), alone, "{backend:?} {ids:?}");
+        }
+        for ids in [[high, i], [i, high]] {
+            let got = r.window_of(&ids, w.clone(), Aggregate::Avg).unwrap_err();
+            assert_eq!(format!("{got:?}"), alone_window, "{backend:?} {ids:?}");
+        }
+        block_on(s.shutdown()).unwrap();
+        shown.push(out);
+    }
+    assert_eq!(shown[0], shown[1], "the durable backend against the model");
 }

@@ -10,6 +10,7 @@ use kvik_log::crc::{PrefixCrc, crc32c, crc32c_shift};
 use kvik_log::scan::{ScanLimit, ScanReport, legacy, scan_with_stats};
 use kvik_log::segment::SegmentImage;
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 use support::*;
 
 proptest! {
@@ -282,17 +283,30 @@ fn near_limit_with(over: [i64; 2], one: bool, damage: &[Damage]) -> Vec<u8> {
     f
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(12))]
+/// A runner for a property whose cases each scan megabytes: a 64th of the configured cases, from `least` to 160, so
+/// that the deep runs fit their time limit (`.github/workflows/ci.yml`, the `deep` job). `PROPTEST_CASES` overrides a
+/// `proptest!` block's own case count, so these properties build their runner themselves.
+fn heavy(least: u32) -> TestRunner {
+    TestRunner::new(ProptestConfig {
+        cases: (ProptestConfig::default().cases / 64).clamp(least, 160),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })
+}
 
-    #[test]
-    fn the_bounded_scan_agrees_with_the_reference_scan_across_the_batch_and_pruning_limits(
-        over in [prop::sample::select(vec![-16i64, -8, 0, 8]), prop::sample::select(vec![-16i64, -8, 0, 8])],
-        damage in prop::collection::vec(damage(), 0..3),
-        mark in any::<prop::sample::Index>(),
-    ) {
-        agree(&near_limit(over, &damage), mark)?;
-    }
+#[test]
+fn the_bounded_scan_agrees_with_the_reference_scan_across_the_batch_and_pruning_limits() {
+    let over = prop::sample::select(vec![-16i64, -8, 0, 8]);
+    heavy(12)
+        .run(
+            &(
+                [over.clone(), over],
+                prop::collection::vec(damage(), 0..3),
+                any::<prop::sample::Index>(),
+            ),
+            |(over, damage, mark)| agree(&near_limit(over, &damage), mark),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -489,31 +503,37 @@ enum Site {
     Page,
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(16))]
-
-    #[test]
-    fn the_bounded_scan_agrees_with_the_reference_scan_under_disjoint_damage_in_one_window(
-        two in any::<bool>(),
-        site in prop_oneof![any::<u8>().prop_map(Site::Flip), Just(Site::Sector), Just(Site::Page)],
-        at in prop::collection::vec(any::<prop::sample::Index>(), 1..=64),
-        mark in any::<prop::sample::Index>(),
-    ) {
-        let (clean, end) = engine_shaped(two);
-        let mut f = clean.clone();
-        // One site in each of `at.len()` equal slices of the data, so the sites are disjoint by construction.
-        let from = kvik_log::header::HEADER_LEN + 4_096;
-        let slice = (end - from) / at.len();
-        for (k, i) in at.iter().enumerate() {
-            let p = from + k * slice + i.index(slice - 4_096);
-            match site {
-                Site::Flip(bit) => f[p] ^= 1 << (bit % 8),
-                Site::Sector => f[p & !511..(p & !511) + 512].fill(0),
-                Site::Page => f[p & !4_095..(p & !4_095) + 4_096].fill(0),
+#[test]
+fn the_bounded_scan_agrees_with_the_reference_scan_under_disjoint_damage_in_one_window() {
+    let site = prop_oneof![
+        any::<u8>().prop_map(Site::Flip),
+        Just(Site::Sector),
+        Just(Site::Page)
+    ];
+    let inputs = (
+        any::<bool>(),
+        site,
+        prop::collection::vec(any::<prop::sample::Index>(), 1..=64),
+        any::<prop::sample::Index>(),
+    );
+    heavy(16)
+        .run(&inputs, |(two, site, at, mark)| {
+            let (clean, end) = engine_shaped(two);
+            let mut f = clean.clone();
+            // One site in each of `at.len()` equal slices of the data, so the sites are disjoint by construction.
+            let from = kvik_log::header::HEADER_LEN + 4_096;
+            let slice = (end - from) / at.len();
+            for (k, i) in at.iter().enumerate() {
+                let p = from + k * slice + i.index(slice - 4_096);
+                match site {
+                    Site::Flip(bit) => f[p] ^= 1 << (bit % 8),
+                    Site::Sector => f[p & !511..(p & !511) + 512].fill(0),
+                    Site::Page => f[p & !4_095..(p & !4_095) + 4_096].fill(0),
+                }
             }
-        }
-        agree(&f, mark)?;
-    }
+            agree(&f, mark)
+        })
+        .unwrap();
 }
 
 #[test]
