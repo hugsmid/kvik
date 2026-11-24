@@ -142,6 +142,9 @@ pub(crate) struct DurableReader {
     /// Lookups that would have passed their budget.
     #[cfg(test)]
     overflows: AtomicU64,
+    /// Sealed segments lookups read through their series batches.
+    #[cfg(test)]
+    listed: AtomicU64,
     /// Lookups still to end with `CutExpired`, as a reset between the cut and the read ends them.
     #[cfg(test)]
     pub(crate) expire_lookups: AtomicU64,
@@ -310,6 +313,8 @@ impl DurableReader {
             lookups_made: AtomicU64::new(0),
             #[cfg(test)]
             overflows: AtomicU64::new(0),
+            #[cfg(test)]
+            listed: AtomicU64::new(0),
             #[cfg(test)]
             expire_lookups: AtomicU64::new(0),
             #[cfg(test)]
@@ -629,6 +634,12 @@ impl DurableReader {
     #[cfg(test)]
     pub(crate) fn overflows(&self) -> u64 {
         self.overflows.load(Ordering::Relaxed)
+    }
+
+    /// Sealed segments lookups read through their series batches (`format.md` A.8a).
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> u64 {
+        self.listed.load(Ordering::Relaxed)
     }
 
     /// What the reader holds: the latest values' series, full facts and entries, whether it holds a fact index, and

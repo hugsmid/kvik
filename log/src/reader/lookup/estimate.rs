@@ -49,7 +49,7 @@ impl LogReader {
         let mut n = 0.0;
         for id in listed {
             let records = match (self.caches.index.get(id), self.caches.maps.get(id)) {
-                (Some(Cached { value: Some(r), .. }), _) => r,
+                (Some(Cached { value: Some(s), .. }), _) => &s.records,
                 (_, Some(m)) if m.value.resume.is_some() => &m.value.tally,
                 _ => return None,
             };
@@ -69,6 +69,7 @@ impl LogReader {
             .index
             .values()
             .filter_map(|c| c.value.as_ref())
+            .map(|s| &s.records)
             .filter_map(|records| records.iter().find(|r| r.series_id == series_id))
             .map(|r| r.max_t)
             .max()

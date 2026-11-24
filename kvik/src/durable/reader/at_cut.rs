@@ -32,11 +32,17 @@ impl DurableReader {
         wanted: &[Wanted],
         within: Within,
     ) -> Result<(Option<Vec<FoundFact>>, Vec<u64>), QueryError> {
-        let mut l = self.read_at_cut(
+        // Segments read through their series batches are read without the lookups' lock (Q-1150).
+        let (mut l, planned) = self.read_at_cut(
             v,
-            |r, lost| r.lookup_within(wanted, lost, within),
-            |l| (l.stamp, l.durable),
+            |r, lost| r.lookup_planned(wanted, lost, within),
+            |(l, _)| (l.stamp, l.durable),
         )?;
+        let ran = planned.run(&mut l);
+        self.with_lookups(v, |r, lost| {
+            r.finish_planned(&mut l, &planned, ran, lost);
+            Ok(())
+        })?;
         #[cfg(test)]
         if let Some(hook) = self
             .after_lookup
@@ -47,6 +53,8 @@ impl DurableReader {
         {
             hook();
         }
+        #[cfg(test)]
+        self.listed.fetch_add(l.segments_listed, Ordering::Relaxed);
         let listed = std::mem::take(&mut l.listed);
         if l.overflowed {
             #[cfg(test)]
@@ -96,11 +104,12 @@ impl DurableReader {
         complete(l, v)
     }
 
-    fn read_at_cut<T>(
+    /// `read` on the lookups' log reader, opened at the first, with the regions taken as lost at `v`: those the
+    /// manifest records and those the process found.
+    fn with_lookups<T>(
         &self,
         v: &View,
         read: impl FnOnce(&mut LogReader, &dyn Fn(u64, u64, u64) -> bool) -> Result<T, ReaderError>,
-        mark: impl FnOnce(&T) -> (LogStamp, LogPos),
     ) -> Result<T, QueryError> {
         let mut g = self.lookups.lock().unwrap_or_else(PoisonError::into_inner);
         if g.is_none() {
@@ -110,8 +119,6 @@ impl DurableReader {
             );
         }
         let reader = g.as_mut().expect("opened above");
-        #[cfg(test)]
-        self.lookups_made.fetch_add(1, Ordering::Relaxed);
         let recorded = v.lost_ranges();
         let skip = |file_id: u64, start: u64, end: u64| {
             recorded.iter().any(|l| {
@@ -120,7 +127,18 @@ impl DurableReader {
                     && end <= l.offset.saturating_add(l.length)
             }) || self.latch.covers(file_id, start, end)
         };
-        let l = read(reader, &skip).map_err(|e| query_error(&self.dir, e))?;
+        read(reader, &skip).map_err(|e| query_error(&self.dir, e))
+    }
+
+    fn read_at_cut<T>(
+        &self,
+        v: &View,
+        read: impl FnOnce(&mut LogReader, &dyn Fn(u64, u64, u64) -> bool) -> Result<T, ReaderError>,
+        mark: impl FnOnce(&T) -> (LogStamp, LogPos),
+    ) -> Result<T, QueryError> {
+        #[cfg(test)]
+        self.lookups_made.fetch_add(1, Ordering::Relaxed);
+        let l = self.with_lookups(v, read)?;
         let cut = v.cut();
         let (stamp, durable) = mark(&l);
         #[cfg(test)]

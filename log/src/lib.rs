@@ -83,6 +83,7 @@ pub mod registry;
 mod rle;
 pub mod scan;
 pub mod segment;
+pub mod series_batches;
 pub mod setaside;
 pub mod store;
 #[doc(hidden)]

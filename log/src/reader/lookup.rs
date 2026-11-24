@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::files::read_at_full;
 use super::{LogReader, ReaderError};
-use crate::batch::{BatchRead, Refusal, SegmentIdentity, read_batch_in};
+use crate::batch::{BatchRead, Refusal, SegmentIdentity, read_batch_in, read_batch_in_unjudged};
 use crate::block::{BLOCK_HEADER_LEN, block_type, read_block};
 use crate::body::{
     END_MARKER_LEN, IndexRecord, SegmentIndex, TRAILER_LEN, Trailer, decode_end_marker,
@@ -26,6 +26,7 @@ use crate::facts::FactRow;
 use crate::header::HEADER_LEN;
 use crate::name::SegmentName;
 use crate::scan::{Found, HeaderState, InvalidRegion, Resume, ScanLimit, Scanner, read_header};
+use crate::series_batches::{BatchRef, SeriesBatches};
 use crate::writer::Position;
 
 /// One series' facts wanted with event time from `from` to `to`, both inclusive.
@@ -89,6 +90,8 @@ pub struct Lookup {
     pub stamp: crate::mark::ResetStamp,
     /// Segments read for the lookup.
     pub segments_read: u64,
+    /// Of those, the sealed segments read through their series batches (`format.md` A.8a).
+    pub segments_listed: u64,
     /// Whether the lease was renewed when due ([`LogReader::keep_alive`]).
     pub lease_kept: bool,
     /// The facts found would have passed the byte budget ([`LogReader::lookup_within`]): `facts` is partial.
@@ -155,9 +158,6 @@ pub const LOOKUP_CACHE_BYTES: usize = 8 << 20;
 /// The bytes of a segment a lookup holds at a time, unless one batch is longer.
 pub const PIECE: u64 = 4 << 20;
 
-/// A sealed segment's index as the lookup uses it: `None` when the segment has none that reads.
-type SealIndex = Option<Vec<IndexRecord>>;
-
 /// What lookups have read of one segment: each complete batch's place, positions and range of event times, the
 /// invalid regions met, and where a scan of what was appended since resumes. One record per batch.
 #[derive(Clone, Debug, Default)]
@@ -195,6 +195,7 @@ struct Span {
     min_t: i64,
     max_t: i64,
     commit_time: i64,
+    series: crate::content::Sole,
 }
 
 #[derive(Debug)]
@@ -219,6 +220,9 @@ pub(super) struct Caches {
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
     cap: usize,
     piece: u64,
+    /// Sealed segments are read whole, their series batches unused, as before A.8a.
+    #[cfg(test)]
+    lists_off: bool,
     /// The most bytes held at any time, and the largest entry.
     #[cfg(test)]
     peak: (usize, usize),
@@ -235,6 +239,8 @@ impl Default for Caches {
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
             piece: PIECE,
+            #[cfg(test)]
+            lists_off: false,
             #[cfg(test)]
             peak: (0, 0),
         }
@@ -268,7 +274,7 @@ impl Caches {
         let bytes = 64
             + value
                 .as_ref()
-                .map_or(0, |r| r.len() * std::mem::size_of::<IndexRecord>());
+                .map_or(0, |s| s.records.len() * std::mem::size_of::<IndexRecord>());
         self.bytes += bytes;
         if let Some(old) = self.index.insert(
             file_id,
@@ -371,6 +377,18 @@ impl Caches {
     }
 
     #[cfg(test)]
+    pub(in crate::reader) fn forget_maps(&mut self) {
+        for (_, c) in self.maps.drain() {
+            self.bytes -= c.bytes;
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::reader) fn lists_off(&mut self) {
+        self.lists_off = true;
+    }
+
+    #[cfg(test)]
     pub(super) fn limit(&mut self, cap: usize, piece: u64) {
         self.cap = cap;
         self.piece = piece;
@@ -415,7 +433,7 @@ fn read_batch_at<R>(
     if read_at_full(f, &mut buf, s.offset).ok()? != buf.len() {
         return None;
     }
-    match read_batch_in(
+    match read_batch_in_unjudged(
         &buf,
         s.offset,
         id,
@@ -423,7 +441,6 @@ fn read_batch_at<R>(
         s.end,
         s.first,
         Refusal::AtOnce,
-        false,
     ) {
         BatchRead::Complete(b, _) if b.end() == s.end && b.commit.first_sequence == s.first => {
             take(&b)
@@ -464,6 +481,15 @@ impl Query<'_> {
             .any(|(a, z)| *a <= s.max_t && s.min_t <= *z)
             && self.above.is_none_or(|a| pos(s.last) > a)
             && self.upto.is_none_or(|u| pos(s.first) <= u)
+    }
+
+    /// Whether a batch of facts of `series` may hold a wanted fact.
+    fn may_hold_series(&self, series: crate::content::Sole) -> bool {
+        match series {
+            crate::content::Sole::None => false,
+            crate::content::Sole::One(id) => self.by_series.has(id),
+            crate::content::Sole::Several => true,
+        }
     }
 
     /// Keeps the wanted facts of a complete batch whose bodies were checked, within the budget, counting every fact
@@ -523,6 +549,21 @@ impl LogReader {
         lost: &dyn Fn(u64, u64, u64) -> bool,
         within: Within,
     ) -> Result<Lookup, ReaderError> {
+        let (mut out, planned) = self.lookup_planned(wanted, lost, within)?;
+        let ran = planned.run(&mut out);
+        self.finish_planned(&mut out, &planned, ran, lost);
+        Ok(out)
+    }
+
+    /// [`LogReader::lookup_within`] but for the sealed segments it reads through their series batches (A.8a), which
+    /// are left to [`Planned::run`], which needs no access to the reader and may run without the lookups' lock;
+    /// [`LogReader::finish_planned`] then ends the lookup.
+    pub fn lookup_planned(
+        &mut self,
+        wanted: &[Wanted],
+        lost: &dyn Fn(u64, u64, u64) -> bool,
+        within: Within,
+    ) -> Result<(Lookup, Planned), ReaderError> {
         let budget = Budget::new(within.budget);
         let mark = self.read_mark()?;
         // The lease's renewal is apart from the read: a failure to write it makes no range incomplete.
@@ -537,11 +578,12 @@ impl LogReader {
             },
             stamp: mark.stamp,
             segments_read: 0,
+            segments_listed: 0,
             overflowed: false,
             listed: Vec::new(),
         };
         if wanted.is_empty() {
-            return Ok(out);
+            return Ok((out, Planned::empty(budget)));
         }
         if within.expect > 0 {
             let record = std::mem::size_of::<FoundFact>() as u64;
@@ -557,7 +599,7 @@ impl LogReader {
                 Some(n) => names.push(n),
                 None => {
                     out.complete.fill(false);
-                    return Ok(out);
+                    return Ok((out, Planned::empty(budget)));
                 }
             }
         }
@@ -566,8 +608,9 @@ impl LogReader {
         self.caches.listed = Some(out.listed.clone());
         if self.caches.keep_listed(&listed) {
             out.complete.fill(false);
-            return Ok(out);
+            return Ok((out, Planned::empty(budget)));
         }
+        let mut jobs = Vec::new();
         for name in names {
             if name.sealed && !self.caches.index.contains_key(&name.file_id) {
                 let index = self.read_seal_index(name);
@@ -580,7 +623,7 @@ impl LogReader {
                     (0..wanted.len())
                         .filter(|&i| {
                             let w = &wanted[i];
-                            c.value.as_ref().is_none_or(|recs| {
+                            c.value.as_ref().map(|s| &s.records).is_none_or(|recs| {
                                 recs.binary_search_by_key(&w.series_id, |r| r.series_id)
                                     .is_ok_and(|k| recs[k].min_t <= w.to && w.from <= recs[k].max_t)
                             })
@@ -619,7 +662,16 @@ impl LogReader {
                 upto: within.upto,
             };
             let before = out.facts.len();
+            if matches!(limit, ScanLimit::End)
+                && let Some(job) = self.listed_job(name, &candidates, wanted)
+            {
+                jobs.push(job);
+                out.segments_read += 1;
+                self.caches.trim();
+                continue;
+            }
             let read = self.lookup_segment(name, limit, &query, &mut out.facts);
+
             out.segments_read += 1;
             if out.facts.len() > before {
                 self.caches.stood.insert(name.file_id);
@@ -637,7 +689,15 @@ impl LogReader {
             // After each segment, so that a lookup over many segments holds at most the bound too.
             self.caches.trim();
         }
-        Ok(out)
+        let planned = Planned {
+            jobs,
+            budget,
+            generation: mark.generation,
+            last_sequence: mark.last_sequence,
+            above: within.above,
+            upto: within.upto,
+        };
+        Ok((out, planned))
     }
 
     /// Reads one segment for `query`; returns whether every batch that may hold a wanted fact was read and only lost
@@ -685,7 +745,7 @@ impl LogReader {
                 void_above(facts, first, *after);
                 continue;
             }
-            if !query.may_hold(s) {
+            if !query.may_hold(s) || !query.may_hold_series(s.series) {
                 continue;
             }
             let at = facts.len();
@@ -717,59 +777,15 @@ impl LogReader {
         self.caches.put_map(file_id, map);
         whole
     }
-
-    /// A sealed segment's index, read from its seal blocks.
-    fn read_seal_index(&self, name: SegmentName) -> SealIndex {
-        let (f, trailer, trailer_offset) = self.read_trailer(name)?;
-        let at = trailer.index_offset;
-        if at < HEADER_LEN as u64 || at >= trailer_offset {
-            return None;
-        }
-        let mut b = vec![0u8; usize::try_from(trailer_offset - at).ok()?];
-        if read_at_full(&*f, &mut b, at).ok()? != b.len() {
-            return None;
-        }
-        let block = read_block(&b, 0, b.len() as u64).ok()?;
-        if block.header.block_type != block_type::SEGMENT_INDEX {
-            return None;
-        }
-        let mut records = SegmentIndex::decode(block.body).ok()?.records;
-        records.sort_by_key(|r| r.series_id);
-        Some(records)
-    }
-
-    /// A sealed segment's trailer with the open file and the trailer's offset; `None` if it does not read.
-    pub(super) fn read_trailer(
-        &self,
-        name: SegmentName,
-    ) -> Option<(Box<dyn crate::fs::FsFile>, Trailer, u64)> {
-        let (n, f) = self.open_segment(name).ok().flatten()?;
-        if !n.sealed {
-            return None;
-        }
-        let len = f.len().ok()?;
-        let tail = (BLOCK_HEADER_LEN + TRAILER_LEN + END_MARKER_LEN) as u64;
-        let start = len.checked_sub(tail)?;
-        let mut b = vec![0u8; tail as usize];
-        if read_at_full(&*f, &mut b, start).ok()? != b.len() {
-            return None;
-        }
-        let trailer_offset = decode_end_marker(&b[b.len() - END_MARKER_LEN..])?;
-        if trailer_offset != start {
-            return None;
-        }
-        let block = read_block(&b, 0, (BLOCK_HEADER_LEN + TRAILER_LEN) as u64).ok()?;
-        if block.header.block_type != block_type::TRAILER {
-            return None;
-        }
-        let trailer = Trailer::decode(block.body).ok()?;
-        Some((f, trailer, trailer_offset))
-    }
 }
 
 mod append;
 mod estimate;
+mod listed;
+mod seal;
 mod wanted;
 use append::{scan_new, void_above};
 use estimate::note;
+pub use listed::{Planned, Ran};
+use seal::SealIndex;
 pub(in crate::reader) use wanted::BySeries;

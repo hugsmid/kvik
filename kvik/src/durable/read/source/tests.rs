@@ -725,6 +725,7 @@ fn at_ends_not_available_when_a_segment_an_earlier_span_listed_is_gone_at_a_late
     rig.shut();
 }
 
+mod listed;
 mod shelves;
 mod windows;
 

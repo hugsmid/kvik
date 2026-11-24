@@ -220,6 +220,7 @@ fn take_found(
         min_t,
         max_t,
         commit_time: b.commit.commit_time,
+        series: taken.series,
     });
     if let Some(r) = taken.recovery_after {
         let after = Position {

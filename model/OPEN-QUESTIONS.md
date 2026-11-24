@@ -174,6 +174,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1131 | §6 Chart buckets; `api.md` Reading; Q-1062, Q-1130 | Several series' windows, buckets and facts from one read (decided by the lead) |
 | Q-1132 | query design §2.2; Q-1063, Q-1068 | Passes sized from counts before they are read (decided by the lead) |
 | Q-1133 | `api.md` Reader processes; Q-1131, Q-1132 | A reader call on more than one thread (OWNER) |
+| Q-1150 | `format.md` A.8a; Q-1063, Q-1130, Q-1131 | One series' facts from its own batches: series batches at seal (decided by the lead) |
+| Q-1151 | `api.md` Reader; Q-1133, Q-1150 | Several callers' many-series reads at once (for review) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5000,6 +5002,58 @@ reader's lookups still run one at a time. (c) As (b), on a pool the reader owns,
 many-series reads still matter, as it keeps the call's contract and adds no configuration.
 **Pinned by.** Nothing yet.
 
+## Q-1150 — One series' facts from its own batches: series batches at seal
+Decided by the lead, for review.
+**Scenario.** Without the fact index (Q-1130) a one-series chart read read and checked every batch in its range
+whatever series it held. At the home load most batches hold one reading, so a dashboard charting 37 series one call at
+a time read a day's log 37 times and more: 55.8 s for a day and 89.5 s for a week, against 2.5 s and 2.9 s for one
+`buckets_of` (`docs/measurements/series-reads.md`). A segment's index (A.8) names the series it holds, but every
+segment of a day holds every series.
+**Decided.** (a) Format: a sealed segment written by the writer that wrote its batches may carry a series batches block
+after its index (A.8a): for each series the complete batches holding one of its facts, by offset and length, 8 bytes a
+reference. Written when the (series, batch) pairs are at most half the batches times the series, no batch holds a
+recovery entry (a read must meet it), and there are at most 262,144 pairs; a segment sealed by a start carries none.
+New code reads stores without the block as before; a reader without A.8a skips the block (skippable) and reads the
+segment index as before. (b) Reads: a lookup reads a sealed segment's wanted series through the block when the index's
+counts put those series under half the segment's facts and their batches under half its batch bytes; each listed batch
+is read and verified as a complete batch at its place (Q-1063); a batch that does not read as listed, or a block that
+does not check or does not list exactly the index's series, sends the segment to the whole read, which judges its
+regions. A batch holding none of the series read is not read, so damage confined to it leaves that read complete, as a
+segment whose index lists none of them is not read (A.8). (c) The lookup plans these reads under the lookups' lock and
+reads them without it (`Planned::run`), then ends under the lock (`finish_planned`): calls from several threads read
+their batches at once; passes and folds stay apart for Q-1133. (d) Batches of unsealed segments a lookup has mapped
+carry their sole series, and a lookup skips those of other series. (e) A lookup's batch read leaves the bodies' checks
+to its walk of the rows, which makes every check of A.5 and A.6 (`read_batch_in_unjudged`), so each row is checked
+once. Results: 37 one-series calls over a day 3.9 s at the 1-day store and 4.2 s at the 7-day one, 1.4 to 1.8 times one
+`buckets_of`; three such dashboards at once 1.6 to 2.2 times one. Provisional: the two halves, the 4 KiB gap under which listed
+batches are read together, 262,144 pairs, and 8-byte references, which add about 5% to a home store's sealed bytes and
+make about three fifths of a one-series read's bytes (delta-coded references would take about a third of that).
+`format_minor` stays 0: additions are judged per element (A.3).
+**Pinned by.** `log/src/series_batches.rs` (round trip and checks); `log/src/writer/seg_index.rs`
+`the_lists_name_each_batch_once_for_every_series_it_holds_while_a_series_is_in_at_most_half`,
+`an_index_rebuilt_without_offsets_carries_no_lists`, `a_segment_past_the_most_references_carries_no_lists`;
+`log/src/reader/tests/lookup_properties.rs`
+`a_sealed_segment_lists_each_series_batches_as_a_scan_finds_them_while_a_series_is_in_at_most_half`,
+`a_listed_lookup_finds_what_a_whole_read_finds_and_is_left_incomplete_only_by_damage_to_its_own_batches`,
+`a_one_series_lookup_checks_only_its_own_batches_and_the_lists`,
+`damage_in_a_listed_batch_leaves_its_series_incomplete_and_spares_the_others`; `log/tests/golden.rs`
+(`sealed-listed.kvl`);
+`kvik/src/durable/read/source/tests/listed.rs`
+`a_one_series_read_of_sealed_segments_reads_them_through_their_series_batches`; the windows' differential against the
+fact index, the model and `buckets_of` (Q-1130, Q-1131), whose sealed segments now carry the block.
+
+## Q-1151 — Several callers' many-series reads at once
+Recorded by the lead with Q-1150, for review.
+**Scenario.** Three dashboards charting 37 series each with one `buckets_of` at once take about three times one (6.6 s
+against 2.1 s at a day of the home load): a many-series pass reads most of each segment, so it reads it whole under the lookups'
+lock, and the three calls' passes take turns. One-series calls read their batches without the lock (Q-1150 (c)).
+**Options.** (a) As built. (b) Concurrent calls over the same range and cut share one pass: a call joins a pass already
+reading and folds its series from the same rows. (c) Whole reads of sealed segments also leave the lock, with a second
+map cache or none.
+**Recommended.** (b) once a dashboard's calls arrive together in practice, as it cuts bytes as well as waits; (a) until
+then. Provisional default: (a).
+**Pinned by.** Nothing yet.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5209,6 +5263,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1131 | 6.2 | Decided by the lead with 9.0h: several series' windows, buckets and facts from one read; results held per series until the call ends; for review |
 | Q-1132 | 6.2 | Decided by the lead with 9.0h: passes sized from the lookups' counts, rows sorted by keys; half a grant as the target; for review |
 | Q-1133 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
+| Q-1150 | 6.2 | Decided by the lead: series batches at seal (A.8a), one-series lookups from their own batches, read without the lookups' lock; the halves, gap, pair limit and reference size provisional; for review |
+| Q-1151 | 6.2 | For review: concurrent many-series reads; (a) as built until callers' reads arrive together |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

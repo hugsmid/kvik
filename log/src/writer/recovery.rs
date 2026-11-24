@@ -1756,6 +1756,7 @@ pub(super) fn start(
                 end,
                 summary,
                 records: seg.index.into_records(),
+                lists: None,
                 has_entries: seg.has_entries,
                 prepared: Default::default(),
             });
@@ -1817,7 +1818,8 @@ fn open_segment<'a>(
     now: Duration,
 ) -> OpenSegment {
     let mut summary: Option<SealSummary> = None;
-    let mut index = super::seg_index::SegIndex::default();
+    // The batches' offsets are not known here, so a segment rebuilt by recovery carries no lists (A.8a).
+    let mut index = super::seg_index::SegIndex::without_lists();
     let mut has_entries = false;
     for (c, t, first) in batches {
         let last = c.last_sequence();

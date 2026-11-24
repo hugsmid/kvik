@@ -126,7 +126,10 @@ impl Ends {
         let plausible = slice(reads.bytes, p, 8).is_some_and(|w| {
             let len = u64::from(u32::from_le_bytes([w[4], w[5], w[6], w[7]]));
             match w[0] {
-                0 | block_type::SEGMENT_INDEX | block_type::TRAILER => false,
+                0
+                | block_type::SEGMENT_INDEX
+                | block_type::SERIES_BATCHES
+                | block_type::TRAILER => false,
                 block_type::COMMIT => len == COMMIT_LEN as u64,
                 _ => BLOCK_HEADER_LEN as u64 + len.next_multiple_of(8) <= MAX_BATCH_DATA,
             }
@@ -142,7 +145,10 @@ impl Ends {
             {
                 named(reads.bytes, p).map_or(NONE, |s| entry(NAMES, -(((p - s) / 8) as i64)))
             }
-            block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => NONE,
+            block_type::COMMIT
+            | block_type::SEGMENT_INDEX
+            | block_type::SERIES_BATCHES
+            | block_type::TRAILER => NONE,
             _ if h.block_len() > MAX_BATCH_DATA => NONE,
             _ => {
                 let q = p + h.block_len();

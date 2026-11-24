@@ -46,6 +46,7 @@ impl LogReader {
             },
             stamp: mark.stamp,
             segments_read: 0,
+            segments_listed: 0,
             overflowed: false,
             listed: Vec::new(),
         };

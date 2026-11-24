@@ -143,6 +143,32 @@ pub(crate) fn read_batch_in<'a>(
     )
 }
 
+/// [`read_batch_in`] leaving the data bodies' checks of A.5 and A.6 to the caller, which must make them, as a lookup
+/// does in [`crate::content::BatchContent::take_wanted`], so that each row is checked once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_batch_in_unjudged<'a>(
+    bytes: &'a [u8],
+    base: u64,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    refusal: Refusal,
+) -> BatchRead<'a> {
+    read_batch_framed(
+        &mut Reads::new(bytes),
+        base,
+        id,
+        o,
+        limit,
+        min_first,
+        refusal,
+        false,
+        true,
+        None,
+    )
+}
+
 /// [`read_batch`] of a batch whose data blocks a boundary read of this scan has already judged, each body passing
 /// the checks of its type: the bodies are not checked again, so a kept body is checked once (Q-651); with `keep`,
 /// each is decoded for its content outside the counted checks (Q-990).
@@ -317,7 +343,7 @@ fn read_blocks<'a>(
                 Err(_) => return incomplete(BatchFault::Content),
             },
             // Seal blocks never belong to a batch.
-            block_type::SEGMENT_INDEX | block_type::TRAILER => {
+            block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
                 return incomplete(BatchFault::Disagreement);
             }
             _ if b.header.skippable() => None,
@@ -451,7 +477,9 @@ pub(crate) fn framing(
                     && c.batch_crc32c == crc.finish())
                 .then_some(data);
             }
-            block_type::SEGMENT_INDEX | block_type::TRAILER => return None,
+            block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
+                return None;
+            }
             t => {
                 if pos - o + h.block_len() > MAX_BATCH_DATA {
                     return None;

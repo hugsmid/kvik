@@ -50,16 +50,18 @@ pub fn encode_seal(
 ) -> Result<Vec<u8>, EncodeError> {
     let mut crc = crate::crc::Crc32c::new();
     crc.update(before);
-    encode_seal_streamed(crc, before.len() as u64, summary, index)
+    encode_seal_streamed(crc, before.len() as u64, summary, index, None)
 }
 
 /// [`encode_seal`] from a running checksum `crc` of the `index_offset` bytes before the seal blocks, so that the
-/// sealer reads the segment in pieces and holds none of it whole (Q-115 (l)).
+/// sealer reads the segment in pieces and holds none of it whole (Q-115 (l)); with `lists`, the series batches block
+/// follows the index (A.8a), unless its body would pass the largest block.
 pub(crate) fn encode_seal_streamed(
     mut crc: crate::crc::Crc32c,
     index_offset: u64,
     summary: &SealSummary,
     index: &SegmentIndex,
+    lists: Option<&crate::series_batches::SeriesBatches>,
 ) -> Result<Vec<u8>, EncodeError> {
     if index_offset < HEADER_LEN as u64 || !index_offset.is_multiple_of(8) {
         return Err(EncodeError::Misaligned(index_offset));
@@ -71,6 +73,17 @@ pub(crate) fn encode_seal_streamed(
         &index.encode(),
         &mut seal,
     )?;
+    if let Some(body) = lists
+        .map(crate::series_batches::SeriesBatches::encode)
+        .filter(|b| b.len() <= crate::block::MAX_BODY_LEN as usize)
+    {
+        encode_block(
+            block_type::SERIES_BATCHES,
+            crate::block::FLAG_SKIPPABLE,
+            &body,
+            &mut seal,
+        )?;
+    }
     let trailer_offset = index_offset + seal.len() as u64;
     crc.update(&seal);
     let trailer = Trailer {
@@ -183,6 +196,15 @@ impl SegmentImage {
     /// id), the trailer block and the end marker, growing the image if needed. Returns the end of the end marker,
     /// the length step 2 sets. An empty segment is never sealed.
     pub fn write_seal_blocks(&mut self, records: Vec<IndexRecord>) -> Result<u64, EncodeError> {
+        self.write_seal_blocks_listed(records, None)
+    }
+
+    /// [`SegmentImage::write_seal_blocks`] with the series batches block after the index (A.8a) when `lists` is given.
+    pub fn write_seal_blocks_listed(
+        &mut self,
+        records: Vec<IndexRecord>,
+        lists: Option<&crate::series_batches::SeriesBatches>,
+    ) -> Result<u64, EncodeError> {
         let Some(s) = self.summary.filter(|_| !self.sealed) else {
             return Err(EncodeError::State("sealing needs at least one batch, once"));
         };
@@ -195,7 +217,9 @@ impl SegmentImage {
             records,
         };
         let at = self.write_offset as usize;
-        let seal = encode_seal(&self.bytes[..at], &s, &index)?;
+        let mut crc = crate::crc::Crc32c::new();
+        crc.update(&self.bytes[..at]);
+        let seal = encode_seal_streamed(crc, at as u64, &s, &index, lists)?;
         let end = at + seal.len();
         if self.bytes.len() < end {
             self.bytes.resize(end, 0);
