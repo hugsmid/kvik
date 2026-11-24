@@ -5021,7 +5021,10 @@ does not check or does not list exactly the index's series, sends the segment to
 regions. A batch holding none of the series read is not read, so damage confined to it leaves that read complete, as a
 segment whose index lists none of them is not read (A.8). (c) The lookup plans these reads under the lookups' lock and
 reads them without it (`Planned::run`), then ends under the lock (`finish_planned`): calls from several threads read
-their batches at once; passes and folds stay apart for Q-1133. (d) Batches of unsealed segments a lookup has mapped
+their batches at once; each planned read opens its segment when it runs, so a lookup holds one segment file open at a
+time, and reads no lists block longer than a piece (4 MiB), reading that segment whole. A segment taken from reaches
+`stood` (Q-951) at `finish_planned`, so a lookup in between does not yet count it; the next does. Passes and folds
+stay apart for Q-1133. (d) Batches of unsealed segments a lookup has mapped
 carry their sole series, and a lookup skips those of other series. (e) A lookup's batch read leaves the bodies' checks
 to its walk of the rows, which makes every check of A.5 and A.6 (`read_batch_in_unjudged`), so each row is checked
 once. Results: 37 one-series calls over a day 3.9 s at the 1-day store and 4.2 s at the 7-day one, 1.4 to 1.8 times one

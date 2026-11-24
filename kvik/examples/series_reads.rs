@@ -228,7 +228,7 @@ fn config(dir: &Path, clock: Option<&ManualClock>) -> StoreConfig {
 }
 
 /// The writer seals by its monotonic clock, which is real time: a W0 build gives each five minutes of event time
-/// [`BLOCK_REAL`] of real time and seals after [`SEAL_REAL`], so that a segment holds about five minutes, as at home.
+/// [`BLOCK_REAL`] of real time and seals after [`SEAL_REAL`], so that a segment holds about five minutes, as in the household load (W0).
 const SEAL_REAL: Duration = Duration::from_millis(560);
 const BLOCK_REAL: Duration = Duration::from_millis(600);
 
@@ -280,7 +280,7 @@ fn build(dir: &Path, span: i64, shape: Shape) -> i64 {
         .expect("clock")
         .as_secs() as i64;
     let start = end - span;
-    // W0 arrives in real time, so that segments are sealed every five minutes of it, as at home.
+    // W0 arrives in real time, so that segments are sealed every five minutes of it, as in the household load (W0).
     let clock = (shape == Shape::W0).then(|| ManualClock::new(Timestamp(start * 1_000_000_000)));
     let store = block_on(Store::open(config(&dir.join("store"), clock.as_ref()))).expect("open");
     let ids: Vec<SeriesId> = (0..SERIES)

@@ -239,6 +239,16 @@ mod tests {
     }
 
     #[test]
+    fn a_series_record_of_no_references_is_refused() {
+        let mut b = SeriesBatches::from_pairs(vec![(1, r(64, 64)), (2, r(128, 64))]).encode();
+        b[SERIES_BATCHES_HEADER_LEN + 4..SERIES_BATCHES_HEADER_LEN + 8]
+            .copy_from_slice(&0u32.to_le_bytes());
+        b[SERIES_BATCHES_HEADER_LEN + 12..SERIES_BATCHES_HEADER_LEN + 16]
+            .copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(SeriesBatches::decode(&b, 4096), None);
+    }
+
+    #[test]
     fn longer_records_and_references_have_their_tail_ignored() {
         let mut b = Vec::new();
         b.extend_from_slice(&1u32.to_le_bytes());

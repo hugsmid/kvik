@@ -14,8 +14,8 @@ cargo run --release -p kvik --example series_reads -- --dir <scratch dir> --days
   store is shut down, then a fresh reader (default 64 MiB cap) charts the last 24 hours at
   `Resolution::Auto { max_points: 1_500 }`.
 - Shape `w0` is the home load (bench W0): each series on its own phase with ±100 ms jitter, 0.5% late by 1 to 5 s,
-  0.1% missing, the arrivals of each 10 ms in one call, so most batches hold one reading, as the home run's syncs
-  follow the arrival rate. Segments are sealed about every five minutes of event time, as at home: 288 a day.
+  0.1% missing, the arrivals of each 10 ms in one call, so most batches hold one reading, as the household load's syncs
+  follow the arrival rate. Segments are sealed about every five minutes of event time, as in the household load (W0): 288 a day.
   Shape `slice` is 60-second slices of every series in one call, so that every batch holds every series (the 9.0h
   harness).
 - Queries: one series alone; every series one call at a time; every series in one `buckets_of` call; three dashboards

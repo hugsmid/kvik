@@ -70,6 +70,11 @@ impl Planned {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::reader) fn behind(&mut self, last_sequence: u64) {
+        self.last_sequence = last_sequence;
+    }
+
     fn query<'a>(&'a self, job: &Listed, lost: &'a dyn Fn(u64, u64, u64) -> bool) -> Query<'a> {
         Query {
             by_series: BySeries::new(job.by_series.clone()),

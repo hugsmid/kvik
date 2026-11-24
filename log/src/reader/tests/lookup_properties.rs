@@ -67,6 +67,8 @@ pub(super) struct World {
     /// The first position of the segment in use, and that segment's file id.
     pub(super) segment: (u64, Option<u64>),
     pub(super) reader_id: u8,
+    /// The facts of calls go to this many series in turn.
+    pub(super) series: u64,
 }
 
 impl World {
@@ -96,6 +98,7 @@ impl World {
             next: 0,
             segment: (1, None),
             reader_id: 0,
+            series: 4,
         }
     }
 
@@ -121,7 +124,7 @@ impl World {
                 self.next += 1;
                 let k = self.next;
                 Item::Fact(FactRow {
-                    series_id: (k % 4) as u32,
+                    series_id: (k % self.series) as u32,
                     t: (k % 50) as i64,
                     quality: Quality::Good,
                     flags: FactFlags::default(),
@@ -511,7 +514,7 @@ impl World {
 }
 
 /// Facts of `l` in the ranges of `wanted` whose flag in `keep` is set.
-fn kept(l: &Lookup, wanted: &[Wanted], keep: &[bool]) -> BTreeSet<Seen> {
+fn kept(l: &Lookup, wanted: &[Wanted], keep: &[bool]) -> Vec<Seen> {
     l.facts
         .iter()
         .map(seen)
@@ -598,7 +601,7 @@ proptest! {
         if poked.is_none() {
             let refreshed = w.refreshed();
             let all = vec![true; wanted.len()];
-            let want: BTreeSet<Seen> = refreshed
+            let want: Vec<Seen> = refreshed
                 .into_iter()
                 .filter(|f| wanted.iter().any(|r| r.series_id == f.1 && r.from <= f.2 && f.2 <= r.to))
                 .collect();
