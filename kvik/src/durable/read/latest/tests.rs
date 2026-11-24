@@ -561,7 +561,12 @@ pub(super) fn restamp_directory(env: &Env, dir: &Path, bytes: &[u8], lost: u32) 
 
 /// Runs a history and checks at its end.
 pub(super) fn run(history: &[Step]) -> Result<(u64, u64, u64), TestCaseError> {
-    let mut rig = Rig::new("history");
+    // Each store open zero-fills a segment: the smallest allowed one makes a case about seven times cheaper.
+    let log = LogConfig {
+        segment_size: 16 << 20,
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("history", log);
     for s in history {
         rig.step(s)?;
     }
