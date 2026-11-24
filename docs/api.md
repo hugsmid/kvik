@@ -429,7 +429,7 @@ let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity)
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),
         Level::above(85.0).clear(80.0),
     ]).stale_after(Duration::from_secs(600))).await?;    // GateId; equal spec under the name: same id, nothing written
-consumer.watch("pump-faults", Gate::set(Input::value(code), [Value::Num(0.0)]).each("plant/*/code")).await?;
+consumer.watch("pump-faults", Gate::set(Input::value_each(), [Value::Num(0.0)]).each("plant/*/code")).await?;
 consumer.unwatch("bathroom-humidity").await?;
 while let Some(d) = consumer.next().await {
     match d.kind {
@@ -439,23 +439,23 @@ while let Some(d) = consumer.next().await {
     }
     consumer.confirm(d.id).await?;
 }
-pub struct TransitionId { pub at: Position, pub due: Option<Timestamp>, pub gate: GateId, pub series: SeriesId }
+pub struct TransitionId { pub at: Position, pub due: Option<Timestamp>, pub condition: GateId, pub series: SeriesId }
 pub enum GateState { Unknown, Stale, Level(u8), Match(bool), Value(Value) }
 pub struct Transition { pub id: TransitionId, pub name: String, pub series: SeriesId,
     pub from: Option<GateState>, pub to: Option<GateState>,      // None: the instance starts / leaves
     pub cause: Cause /* Fact { position, t } | Timer { due, kind: Hold | Stale | Mature | Window } | Entry { position } */,
     pub value: Option<Value>, pub event_time: Option<Timestamp>, pub now: Timestamp, pub flags: DeliveryFlags }
-pub struct GateInstanceState { pub gate: GateId, pub series: SeriesId, pub state: GateState, pub set_by: TransitionId }
+pub struct GateInstanceState { pub condition: GateId, pub series: SeriesId, pub state: GateState, pub set_by: TransitionId }
 ```
 | Item | Rule |
 |---|---|
-| Kinds | `Gate::levels(input, levels)` (1 to 16 boundaries, rising; each `above(at)`, `.clear(c)` with `c ≤ at`, `.hold_up(d)`, `.hold_down(d)`), `Gate::set(input, values)` (1 to 64, `.hold_on(d)`, `.hold_off(d)`), `Gate::change(input).deadband(x)`; on any, `.stale_after(d)` and `.each(pattern)` (a name pattern, at most 256 instances, Q-1143). |
-| Inputs | `Input::value(series)`; `Input::window(series, width, aggregate)` with `.min_coverage(thousandths)` (default 500) and `.cadence(d)` (default 1 s). A series by id or by name; a name resolves when the routing entry commits. |
+| Kinds | `Gate::levels(input, levels)` (1 to 16 boundaries, rising; each `above(at)`, `.clear(c)` with `c ≤ at`, `.hold_up(d)`, `.hold_down(d)`), `Gate::set(input, values)` (1 to 64, none `Absent`, `.hold_on(d)`, `.hold_off(d)`), `Gate::change(input).deadband(x)`; on any, `.stale_after(d)` and `.each(pattern)` (a name pattern, at most 256 instances, Q-1143); every duration at most ten years (`Duration`). |
+| Inputs | `Input::value(series)` or, under `.each`, the series-free `Input::value_each()`; `Input::window(series, width, aggregate)` (series-free `window_each(width, aggregate)` under `.each`; naming a series and `.each` together is refused, `GateError::Selector`) with `.min_coverage(thousandths)` (default 500) and `.cadence(d)` (default 1 s). A series by id or by name; a name resolves when the routing entry commits. |
 | Naming | A name is unique within its consumer (1–64 bytes, the series-name segment grammar). `watch` with an equal spec returns the id in force and writes nothing, so applications watch at every start, as `route` (Q-91 (c)); a different spec under a name in force is refused (`ConsumerError::Gate`). `watch` and `unwatch` are routing entries and take effect at their positions. |
-| Delivery | Transitions at a position follow that position's fact deliveries; timer transitions in `TransitionId` order. Each instance starts with a transition from `None` (state now at attach) and an `Each` instance that leaves ends with one to `None`. |
-| Resume | Per instance the latch is the last confirmed `TransitionId`. On resume: transitions after the latch, `replayed`, under their first ids, then a resync carrying `gates`. Beyond `conditions.replay_max` (default 24 h or 1,000,000 facts) nothing is replayed, counted as `transitions_not_replayed`. |
-| Limits and errors | 4,096 gates per consumer, 65,536 per store. New errors: `ConsumerError::Gate(GateError)` with `GateError` { `Levels`, `Set`, `Deadband`, `Duration`, `Coverage`, `Pattern(RouteError)`, `NameInUse`, `TooMany` }. |
-| Raw series | A consumer watching raw series receives at attach and after a restart each watched series' latest value with its event time; deliveries carry event time. |
+| Delivery | Transitions at a position follow that position's fact deliveries; timer transitions in `TransitionId` order. Each instance starts with a transition from `None` (state now at the watch or join) and an `Each` instance that leaves ends with one to `None`. |
+| Resume | Per instance the latch is the last confirmed `TransitionId`. On resume: transitions after the latch, `replayed`, under their first ids, then a resync carrying `gates`. Beyond `conditions.replay_max` (default 24 h or 1,000,000 facts, measured from the cursor) nothing is replayed, counted as `transitions_not_replayed`. |
+| Limits and errors | 4,096 gates per consumer, 65,536 per store. New errors: `ConsumerError::Gate(GateError)` with `GateError` { `Levels`, `Set`, `Deadband`, `Duration`, `Coverage`, `Selector`, `Pattern(RouteError)`, `NameInUse`, `TooMany` }. |
+| Raw series | A consumer watching raw series receives at attach and after a restart each watched series' latest value with its event time; deliveries carry event time (built with the public API, conditions step 3, Q-1140). |
 
 ## Reader processes (accepted at gate 3.3)
 ```rust

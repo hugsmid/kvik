@@ -312,7 +312,7 @@ fn a_future_fact_refreshes_staleness_only_once_it_takes_effect() {
 }
 
 #[test]
-fn a_bad_quality_fact_refreshes_staleness_but_not_the_value() {
+fn a_bad_quality_fact_neither_moves_the_value_nor_refreshes_staleness() {
     let mut g = levels(&[Level::at(10.0)]);
     g.stale_after = Some(10 * SECOND);
     let h = H::new().watch(0, C, g).num(1, 11.0).fact_on(
@@ -323,7 +323,7 @@ fn a_bad_quality_fact_refreshes_staleness_but_not_the_value() {
         Quality::Bad,
     );
     let j = run(&h);
-    assert_eq!(instants(&j.transitions), vec![0, 1, 18]);
+    assert_eq!(instants(&j.transitions), vec![0, 1, 11]);
     assert_eq!(j.transitions.last().unwrap().to, Some(GateState::Stale));
 }
 

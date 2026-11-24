@@ -134,6 +134,8 @@ pub const MAX_LEVELS: usize = 16;
 pub const MAX_MEMBERS: usize = 64;
 /// Most instances of one [`Selector::Each`] gate at a time.
 pub const MAX_INSTANCES: usize = 256;
+/// Longest hold, staleness limit, window width or cadence: ten years of 365 days.
+pub const MAX_DURATION: Nanos = 10 * 365 * crate::types::DAY;
 
 /// A gate the model refuses.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -148,8 +150,8 @@ pub enum GateError {
     /// A dead-band negative or not finite.
     #[error("dead-band must be finite and not negative")]
     Deadband,
-    /// A duration not positive where one is needed, or negative.
-    #[error("durations must be positive (holds: not negative)")]
+    /// A duration not positive where one is needed, negative, or beyond [`MAX_DURATION`].
+    #[error("durations must be positive (holds: not negative) and at most ten years")]
     Duration,
     /// `min_coverage` above 1,000.
     #[error("min_coverage is in thousandths, at most 1000")]
@@ -173,11 +175,15 @@ impl Gate {
         {
             return Err(GateError::Pattern);
         }
-        if self.stale_after.is_some_and(|s| s <= 0) {
+        if self
+            .stale_after
+            .is_some_and(|s| !(1..=MAX_DURATION).contains(&s))
+        {
             return Err(GateError::Duration);
         }
         if let Input::Window(w) = &self.input {
-            if w.width <= 0 || w.cadence <= 0 {
+            let span = 1..=MAX_DURATION;
+            if !span.contains(&w.width) || !span.contains(&w.cadence) {
                 return Err(GateError::Duration);
             }
             if w.min_coverage > 1_000 {
@@ -194,7 +200,10 @@ impl Gate {
                 if ls.is_empty() || ls.len() > MAX_LEVELS || !finite || !each || !rising {
                     return Err(GateError::Levels);
                 }
-                if ls.iter().any(|l| l.hold_up < 0 || l.hold_down < 0) {
+                if ls
+                    .iter()
+                    .any(|l| !hold_ok(l.hold_up) || !hold_ok(l.hold_down))
+                {
                     return Err(GateError::Duration);
                 }
             }
@@ -209,7 +218,7 @@ impl Gate {
                 {
                     return Err(GateError::Set);
                 }
-                if *hold_on < 0 || *hold_off < 0 {
+                if !hold_ok(*hold_on) || !hold_ok(*hold_off) {
                     return Err(GateError::Duration);
                 }
             }
@@ -221,6 +230,10 @@ impl Gate {
         }
         Ok(())
     }
+}
+
+fn hold_ok(d: Nanos) -> bool {
+    (0..=MAX_DURATION).contains(&d)
 }
 
 /// A gate's state.
@@ -283,7 +296,7 @@ pub enum Cause {
         /// Which deadline.
         kind: TimerKind,
     },
-    /// A watch or a definition entry: an instance joining or leaving, or a fact of another series.
+    /// A watch or a definition entry: an instance joining or leaving.
     Entry {
         /// Its position.
         position: Position,

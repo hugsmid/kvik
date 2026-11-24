@@ -48,12 +48,8 @@ pub fn resume(
     bound: ReplayBound,
 ) -> Result<Resume, GateError> {
     let j = judge(history, until)?;
-    let start = latches
-        .values()
-        .map(|l| l.at)
-        .chain(std::iter::once(cursor))
-        .min()
-        .expect("cursor");
+    // Confirmation is cumulative, so latches only filter and never lengthen the replay (spec §6 Gates).
+    let start = cursor;
     let facts = history
         .iter()
         .filter(|e| matches!(e, Entry::Fact { .. }) && e.position() > start)

@@ -224,7 +224,9 @@ fn last_arrival(h: &[Entry], series: SeriesId, x: Nanos, upto: Position) -> Opti
                 continue;
             }
             best.insert(fact.t, fact.rank());
-            arrivals.push((*commit_time).max(fact.t));
+            if fact.quality != Quality::Bad && !matches!(fact.value, Value::Absent) {
+                arrivals.push((*commit_time).max(fact.t));
+            }
         }
     }
     arrivals.into_iter().filter(|a| *a <= x).max()

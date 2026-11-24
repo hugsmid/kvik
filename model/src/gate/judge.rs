@@ -81,8 +81,13 @@ impl SeriesData {
             .range(..=now)
             .rev()
             .map(|(_, f)| f)
-            .find(|f| f.quality != Quality::Bad && !matches!(f.value, Value::Absent))
+            .find(|f| usable(f))
     }
+}
+
+/// A fact that is neither bad quality nor without a value.
+fn usable(f: &Fact) -> bool {
+    f.quality != Quality::Bad && !matches!(f.value, Value::Absent)
 }
 
 struct Instance {
@@ -120,8 +125,11 @@ impl Judge {
                     .is_some_and(|c| c.rank() > fact.rank());
                 if !outranked {
                     sd.current.insert(fact.t, fact.clone());
-                    // A future fact counts for staleness once it takes effect (spec §4 Future facts).
-                    sd.arrivals.push(now.max(fact.t));
+                    // A bad or valueless fact refreshes nothing (spec §2.5, §5.4); a future one counts
+                    // once it takes effect (spec §4 Future facts).
+                    if usable(fact) {
+                        sd.arrivals.push(now.max(fact.t));
+                    }
                 }
                 let cause = Cause::Fact {
                     position: at,
@@ -322,10 +330,10 @@ impl Judge {
             return false;
         }
         let sd = self.data(s);
-        let stale = w
-            .gate
-            .stale_after
-            .is_some_and(|lim| sd.last_arrival(now).is_some_and(|a| now - a >= lim));
+        let stale = w.gate.stale_after.is_some_and(|lim| {
+            sd.last_arrival(now)
+                .is_some_and(|a| now.saturating_sub(a) >= lim)
+        });
         let (value, event_time) = input_value(&w.gate, sd, now);
         let gate = w.gate.clone();
         let i = self
@@ -425,7 +433,7 @@ fn cross(on: &mut bool, pending: &mut Option<Nanos>, toward: bool, hold: Nanos, 
         return;
     }
     let since = *pending.get_or_insert(now);
-    if now - since >= hold {
+    if now.saturating_sub(since) >= hold {
         *on = !*on;
         *pending = None;
     }
@@ -445,7 +453,8 @@ fn input_value(gate: &Gate, sd: &SeriesData, now: Nanos) -> (Option<Value>, Opti
                 .filter(|f| f.summarised())
                 .map(|f| (f.t, f.value.clone()))
                 .collect();
-            let node = crate::oracle::window(&sd.params, &readings, now - w.width, now, now);
+            let node =
+                crate::oracle::window(&sd.params, &readings, now.saturating_sub(w.width), now, now);
             // Coverage below `min_coverage` gives no value (Q-1141).
             if node.coverage * 1_000 < i128::from(w.min_coverage) * i128::from(w.width) {
                 return (None, None);
@@ -460,7 +469,8 @@ fn input_value(gate: &Gate, sd: &SeriesData, now: Nanos) -> (Option<Value>, Opti
 }
 
 /// The instance's next deadline after its last evaluation: a hold, staleness, a future fact taking
-/// effect or a window tick, and which (the first in that order when several fall together).
+/// effect or a window tick, and which (the first in that order when several fall together). A deadline
+/// beyond the clock's range never falls due.
 fn next_due(gate: &Gate, i: &Instance, sd: &SeriesData) -> Option<(Nanos, TimerKind)> {
     let after = i.last_eval;
     let mut cands: Vec<(Nanos, TimerKind)> = Vec::new();
@@ -468,23 +478,19 @@ fn next_due(gate: &Gate, i: &Instance, sd: &SeriesData) -> Option<(Nanos, TimerK
         && i.reported != GateState::Stale
         && let Some(a) = sd.last_arrival(after)
     {
-        cands.push((a + lim, TimerKind::Stale));
+        cands.extend(a.checked_add(lim).map(|d| (d, TimerKind::Stale)));
     }
-    cands.extend(
-        i.pending
-            .iter()
-            .enumerate()
-            .filter_map(|(k, p)| p.map(|p| (p + hold(&gate.kind, k, i.on[k]), TimerKind::Hold))),
-    );
+    cands.extend(i.pending.iter().enumerate().filter_map(|(k, p)| {
+        let due = p.and_then(|p| p.checked_add(hold(&gate.kind, k, i.on[k])))?;
+        Some((due, TimerKind::Hold))
+    }));
     // A future fact not outranked is an arrival at its `t`, so this also schedules its taking effect.
     if let Some(a) = sd.arrivals.iter().copied().filter(|a| *a > after).min() {
         cands.push((a, TimerKind::Mature));
     }
     if let Input::Window(w) = &gate.input {
-        cands.push((
-            (after.div_euclid(w.cadence) + 1) * w.cadence,
-            TimerKind::Window,
-        ));
+        let next = (after.div_euclid(w.cadence) + 1).checked_mul(w.cadence);
+        cands.extend(next.map(|d| (d, TimerKind::Window)));
     }
     cands
         .into_iter()
