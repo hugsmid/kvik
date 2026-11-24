@@ -51,13 +51,16 @@ impl Writer {
         }
     }
 
-    /// Runs the timers that are due, before a call is decided, as the model backend runs them; the batches and the
-    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread. With no consumer there is nothing
-    /// to evaluate (Q-706).
+    /// Takes the acknowledged batches, then runs the timers that are due, before a call is decided, as the model
+    /// backend runs them (Q-1119); the cursor files are left to the `kvik-deliver` thread. With no consumer there is
+    /// nothing to evaluate (Q-706).
     pub(crate) fn run_timers(&self) {
         if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
             h.ticked();
-            h.run(|d, c| d.tick(c));
+            h.run(|d, c| {
+                d.pump(c);
+                d.tick(c)
+            });
         }
     }
 

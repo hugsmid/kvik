@@ -414,11 +414,14 @@ impl Hub {
         }
     }
 
-    /// Sets a subscriber's backlog limit. Its reach stays until its next [`Hub::advance`]: a read just opened is
-    /// answered at the cut of the session's next batch, so a round passed over before then owes it nothing.
-    pub(crate) fn set_cap(&self, sub: u64, cap: (u64, u64)) {
+    /// A read was opened: sets a subscriber's backlog limit and has it reach anything until its next
+    /// [`Hub::advance`], so that no round ending before the batch that opens the read, or between that batch's cut and
+    /// its advance, is passed over by the reach it had before (Q-1118 (a)).
+    pub(crate) fn open(&self, sub: u64, cap: (u64, u64)) {
         if let Some(x) = self.lock().subs.get_mut(&sub) {
             x.cap = cap;
+            x.reach = Reach::All;
+            x.fresh = Reach::All;
         }
     }
 
@@ -676,6 +679,26 @@ mod tests {
         // An entry, a void or a gap reaches everyone.
         round(&hub, vec![Piece::Void(LogPos::default())]);
         assert_eq!(rung(), [1, 3, 2]);
+    }
+
+    #[test]
+    fn a_round_ending_between_an_open_and_the_batch_that_answers_it_is_not_passed_over() {
+        let hub = Hub::default();
+        let cap = (100, 1 << 20);
+        let (sub, bell) = hub.subscribe(cap, Duration::ZERO);
+        hub.start(sub, 0, cap);
+        hub.advance(sub, 0, (Reach::Series([1].into()), Reach::All));
+        hub.open(sub, cap);
+        let seq = round(&hub, vec![fact(2, 1)]);
+        hub.advance(sub, 0, (Reach::Series([1, 2].into()), Reach::All));
+        let t = hub.take(sub, seq, Duration::ZERO);
+        assert_eq!(bell.rung(), 1);
+        assert!(!t.lagged);
+        assert_eq!(
+            t.rounds.len(),
+            1,
+            "the fact of the series just opened was passed over"
+        );
     }
 
     #[test]

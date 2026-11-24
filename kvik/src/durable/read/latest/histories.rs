@@ -34,8 +34,21 @@ fn latest_values_equal_the_models_at_every_check() {
         ..ProptestConfig::default()
     });
     let counts: [AtomicU64; 4] = Default::default();
+    // A quarter of the histories end with a latest fact revised to bad and read: the search for a live value that
+    // the reach below asserts is otherwise met by only a few histories in a hundred.
+    let aimed = prop::sample::select(vec![0usize, 1, 3, 4]).prop_map(|s| {
+        [
+            Step::Emit(vec![(s, -30, 0, 0, 0), (s, -4, 1, 0, 0)], false),
+            Step::Emit(vec![(s, -4, 0, 3, 0)], true),
+            Step::Check,
+        ]
+    });
+    let histories = (steps(), prop::option::weighted(0.25, aimed)).prop_map(|(mut h, aimed)| {
+        h.extend(aimed.into_iter().flatten());
+        h
+    });
     runner
-        .run(&steps(), |history| {
+        .run(&histories, |history| {
             for (c, n) in counts.iter().zip(run(&history)?) {
                 c.fetch_add(n, Ordering::Relaxed);
             }

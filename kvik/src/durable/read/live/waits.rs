@@ -256,3 +256,79 @@ fn a_refresh_rings_a_session_with_a_latest_of_the_series_and_not_a_tail_alone() 
     assert_eq!(rung(&mut tail), t0);
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn the_rest_of_a_round_a_row_limit_cut_is_taken_once_the_interval_passes_with_no_new_ring() {
+    use crate::time::Timestamp;
+    use crate::types::{Reading, Value};
+    let w = World::new("cut-rest");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = s.reader();
+    let mut session = r.session();
+    let t = session
+        .open(super::tests::tail_all(), LiveOptions::default().max_rows(2))
+        .unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    apply(&mut held, &session.next(Duration::ZERO).unwrap().unwrap());
+    let now = w.clock.wall().0;
+    let rs: Vec<Reading> = (0..6)
+        .map(|k| {
+            let at = Timestamp(now - (k + 1) * super::tests::S);
+            Reading::new(id, at, Value::F64(k as f64))
+        })
+        .collect();
+    block_on(s.emit(&rs)).unwrap();
+    w.clock.advance(TICK);
+    apply(
+        &mut held,
+        &session.next(Duration::from_secs(3)).unwrap().unwrap(),
+    );
+    assert_eq!(held[&t].tail.len(), 2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            w.clock.advance(TICK);
+        });
+        let started = Instant::now();
+        let b = session.next(Duration::from_secs(5)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the rest of the round waited for a ring: {:?}",
+            started.elapsed()
+        );
+        apply(&mut held, &b.unwrap());
+    });
+    assert_eq!(held[&t].tail.len(), 4);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_fan_out_thread_that_panics_rings_every_session_and_leaves_them_rung_by_every_round() {
+    use crate::durable::read::fanout::Guard;
+    use std::sync::atomic::Ordering;
+    let w = World::new("fanout-panics");
+    let s = w.open();
+    let r = s.reader();
+    let d = r.durable().unwrap().unwrap();
+    let mut session = r.session();
+    session
+        .open(super::tests::tail_all(), LiveOptions::default())
+        .unwrap();
+    session.next(Duration::ZERO).unwrap().unwrap();
+    let before = session.durable_mut().and_then(|x| x.rung()).unwrap();
+    let weak = std::sync::Arc::downgrade(&d);
+    let died = std::thread::spawn(move || {
+        let _guard = Guard {
+            reader: weak,
+            progress: None,
+        };
+        panic!("a round failed");
+    })
+    .join();
+    assert!(died.is_err());
+    assert!(d.fanout_failed.load(Ordering::SeqCst));
+    assert!(session.durable_mut().and_then(|x| x.rung()).unwrap() > before);
+    drop(session);
+    block_on(s.shutdown()).unwrap();
+}

@@ -387,7 +387,9 @@ enum Live { Value(Fact), None, Unknown }
   it, whatever `start`. The model backend supports only `Start::Now`.
 - A waiting `next` is woken only for its own consumer: a delivery queued for it, a catch-up, a transition, a resync,
   an entry in a batch, or its own confirmation freeing room; another consumer's deliveries and confirmations never
-  wake it (Q-1119).
+  wake it (Q-1119). The backends differ on when a consumer is woken after an `emit`: the durable backend wakes it
+  shortly after, from the delivery thread; the model backend wakes it inside `emit`. Either way a `poll` always
+  sees a delivery whose `emit` returned.
 - `confirm` is cheap and batched; the cursor is written at most once a second, at once when the confirmation changes
   a latch (it returns once the file is synced, Q-132), on shutdown and when a resync carrying `forget_above` is
   confirmed.

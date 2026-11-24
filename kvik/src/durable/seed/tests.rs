@@ -57,6 +57,35 @@ fn cases() -> u32 {
         .map_or(32, |n: u32| (n / 4).clamp(8, 2_000))
 }
 
+/// A history aimed at damage below a seed, which random histories meet in about one in a hundred: sealed rounds of
+/// readings for routed consumers, one consumer's cursor file lost, an older batch damaged, and an end that writes
+/// the series directory at the newest batch before a kill.
+fn aimed() -> impl Strategy<Value = Vec<Step>> {
+    let reading = (1..=SERIES, 0i64..3, 0u8..6, 0u8..4, Just(false));
+    let round = prop::collection::vec(prop::collection::vec(reading.clone(), 1..4), 2..4);
+    (
+        (0u8..6, 0u8..6),
+        prop::collection::vec(round, 2..4),
+        (0usize..2, prop::collection::vec(reading, 1..3), 0usize..4),
+    )
+        .prop_map(|((r0, r1), rounds, (lost, last, damaged))| {
+            let mut steps = vec![Step::Route(0, r0), Step::Route(1, r1)];
+            for round in rounds {
+                for rs in round {
+                    steps.push(Step::Emit(rs, false));
+                    steps.push(Step::Advance(1));
+                }
+                steps.push(Step::Seal);
+            }
+            steps.extend([
+                Step::LoseCursor(lost),
+                Step::Emit(last, false),
+                Step::Damage(damaged),
+            ]);
+            steps
+        })
+}
+
 #[test]
 fn a_seeded_start_gives_what_the_start_from_the_whole_log_gives() {
     let mut runner = TestRunner::new(ProptestConfig {
@@ -66,12 +95,17 @@ fn a_seeded_start_gives_what_the_start_from_the_whole_log_gives() {
     });
     let tally = RefCell::new(Tally::default());
     let histories = (
-        prop::collection::vec(step(), 1..30),
-        end(),
+        prop_oneof![
+            3 => (prop::collection::vec(step(), 1..30), end()),
+            1 => aimed().prop_map(|steps| (steps, End::KillAt(usize::MAX))),
+        ],
         any::<bool>(),
         readings(),
         0i64..3_000,
-    );
+    )
+        .prop_map(|((steps, end), before, later, start_back)| {
+            (steps, end, before, later, start_back)
+        });
     let run = runner.run(&histories, |(steps, end, before, later, start_back)| {
         let order = if before {
             ScanOrder::BeforeOpen

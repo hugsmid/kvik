@@ -121,8 +121,6 @@ pub(crate) struct Ctx<'a> {
     pub(crate) now: i64,
     pub(crate) wall: i64,
     pub(crate) mono: i64,
-    /// Acknowledgements noted since the last call ([`Hub::acked`]).
-    pub(crate) acked: Vec<(LogPos, Stamp)>,
 }
 
 /// The clocks at an instant: the store's `now`, the wall clock and the monotonic clock.
@@ -470,7 +468,6 @@ impl Deliverer {
             now: clocks.now(),
             wall: 0,
             mono: 0,
-            acked: Vec::new(),
         }
     }
 
@@ -631,9 +628,7 @@ impl Deliverer {
 
     /// Notes that something consumer `name` may be waiting for changed.
     pub(super) fn changed(&mut self, name: &str) {
-        if !self.notify.contains(name) {
-            self.notify.insert(name.to_owned());
-        }
+        self.notify.insert(name.to_owned());
     }
 
     /// The handle was dropped.

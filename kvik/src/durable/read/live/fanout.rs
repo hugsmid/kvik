@@ -1,7 +1,8 @@
 //! Selective fan-out (Q-1118) against the path it replaced and the model backend: random sessions with random
 //! selections, each polled only when its bell rang, a `Latest` fell due or its last call gave a batch, receive exactly
 //! what a session rung by every round receives polled every time, and at the end what the model's session holds; a
-//! session not owed a look has no batch to give.
+//! session not owed a look has no batch to give. A round may end inside a session's turn, between its view and its
+//! advance.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,6 +42,9 @@ enum Step {
     /// Another read opened in subscriber `k`: (subscriber, kind, selection).
     Open(u8, u8, u8),
     Poll,
+    /// A poll in which subscriber `k`'s fan-out session's turn has readings emitted and a round ended between its
+    /// view and its advance.
+    Race(u8, Vec<(u8, i64, u8)>),
 }
 
 /// A subscriber: (reads: 0 `Latest`, 1 `Tail`, 2 both; selection; a `Tail` with small limits).
@@ -54,11 +58,13 @@ fn histories() -> impl Strategy<Value = (Vec<Spec>, Vec<Step>)> {
         any::<u8>(),
     );
     let step = prop_oneof![
-        8 => prop::collection::vec(reading, 1..6).prop_map(Step::Emit),
+        8 => prop::collection::vec(reading.clone(), 1..6).prop_map(Step::Emit),
         1 => Just(Step::Define),
         2 => prop_oneof![Just(0u64), 1u64..20, Just(400)].prop_map(Step::Advance),
         1 => (any::<u8>(), 0u8..2, any::<u8>()).prop_map(|(k, q, s)| Step::Open(k, q, s)),
         6 => Just(Step::Poll),
+        2 => (any::<u8>(), prop::collection::vec(reading.clone(), 1..4))
+            .prop_map(|(k, rs)| Step::Race(k, rs)),
     ];
     (
         prop::collection::vec(spec, 1..7),
@@ -123,8 +129,15 @@ impl Sub {
         self.owed = true;
     }
 
-    /// One call of each session's `next`. Returns whether any gave a batch.
-    fn poll(&mut self) -> Result<bool, TestCaseError> {
+    /// One call of each session's `next`, the fan-out session's last with `fan_last`. Returns whether any gave a
+    /// batch.
+    fn poll(&mut self, fan_last: bool) -> Result<bool, TestCaseError> {
+        let others = fan_last.then(|| {
+            (
+                self.every.next(std::time::Duration::ZERO).unwrap(),
+                self.model.next(std::time::Duration::ZERO).unwrap(),
+            )
+        });
         let owed = {
             let s = self.fan.durable_mut();
             let rung = s.as_ref().and_then(|s| s.rung());
@@ -139,15 +152,14 @@ impl Sub {
             fan
         );
         self.owed = fan.is_some();
-        for (k, b) in [
-            Some(fan),
-            Some(self.every.next(std::time::Duration::ZERO).unwrap()),
-            Some(self.model.next(std::time::Duration::ZERO).unwrap()),
-        ]
-        .into_iter()
-        .flatten()
-        .enumerate()
-        {
+        let (every, model) = match others {
+            Some(o) => o,
+            None => (
+                self.every.next(std::time::Duration::ZERO).unwrap(),
+                self.model.next(std::time::Duration::ZERO).unwrap(),
+            ),
+        };
+        for (k, b) in [fan, every, model].into_iter().enumerate() {
             if let Some(b) = b {
                 apply(&mut self.held[k], &b);
                 any = true;
@@ -187,8 +199,6 @@ impl Rig {
         .unwrap();
         let own = store.reader();
         let reader = own.durable().unwrap().unwrap();
-        // The test runs the fan-out thread's passes itself, after each step, so that every ring is in place when
-        // the sessions are looked at.
         reader.fanout.store(true, Ordering::SeqCst);
         let mut rig = Rig {
             reader,
@@ -234,20 +244,41 @@ impl Rig {
         self.ids.push(d);
     }
 
+    fn readings(&self, rs: &[(u8, i64, u8)]) -> Vec<Reading> {
+        let now = self.w.clock.wall().0;
+        rs.iter()
+            .map(|&(i, secs, v)| {
+                let id = self.ids[usize::from(i) % self.ids.len()];
+                Reading::new(id, Timestamp(now + secs * S), Value::F64(f64::from(v % 9)))
+            })
+            .collect()
+    }
+
     fn step(&mut self, s: &Step) -> Result<(), TestCaseError> {
         match s {
             Step::Emit(rs) => {
-                let now = self.w.clock.wall().0;
-                let readings: Vec<Reading> = rs
-                    .iter()
-                    .map(|&(i, secs, v)| {
-                        let id = self.ids[usize::from(i) % self.ids.len()];
-                        Reading::new(id, Timestamp(now + secs * S), Value::F64(f64::from(v % 9)))
-                    })
-                    .collect();
+                let readings = self.readings(rs);
                 let d = block_on(self.store.emit(&readings));
                 let m = block_on(self.model.emit(&readings));
                 prop_assert_eq!(d.is_ok(), m.is_ok(), "{:?} {:?}", d, m);
+            }
+            Step::Race(k, rs) => {
+                let readings = self.readings(rs);
+                let (store, model, reader) =
+                    (self.store.clone(), self.model.clone(), self.reader.clone());
+                let n = self.subs.len();
+                let fan = self.subs[usize::from(*k) % n].fan.durable_mut();
+                fan.expect("a durable session").before_advance.0 = Some(Box::new(move || {
+                    let d = block_on(store.emit(&readings));
+                    let m = block_on(model.emit(&readings));
+                    assert_eq!(d.is_ok(), m.is_ok(), "{d:?} {m:?}");
+                    fanout::pass(&reader);
+                }));
+                self.poll_racing(Some(usize::from(*k) % n))?;
+                // A turn that computed no batch leaves the hook unfired; nothing was emitted then.
+                if let Some(fan) = self.subs[usize::from(*k) % n].fan.durable_mut() {
+                    fan.before_advance.0 = None;
+                }
             }
             Step::Define => self.define(),
             Step::Advance(secs) => self.w.clock.advance(std::time::Duration::from_secs(*secs)),
@@ -265,11 +296,16 @@ impl Rig {
     /// A tick of the clock, the fan-out thread's pass, then one call of every session; the fan-out session holds what
     /// the session rung by every round holds.
     fn poll(&mut self) -> Result<bool, TestCaseError> {
+        self.poll_racing(None)
+    }
+
+    /// As [`Rig::poll`], subscriber `racing`'s fan-out session called after its other two.
+    fn poll_racing(&mut self, racing: Option<usize>) -> Result<bool, TestCaseError> {
         self.w.clock.advance(TICK);
         fanout::pass(&self.reader);
         let mut any = false;
-        for s in &mut self.subs {
-            any |= s.poll()?;
+        for (k, s) in self.subs.iter_mut().enumerate() {
+            any |= s.poll(racing == Some(k))?;
             if s.small {
                 passed_over(&s.held[0], &s.held[1])?;
             } else {
@@ -375,6 +411,21 @@ fn a_small_tail_selecting_nothing_passes_over_other_series_rows_where_the_old_pa
         vec![
             Step::Emit(vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)]),
             Step::Emit(vec![(0, -1, 0), (0, 0, 13), (0, 1, 0)]),
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it() {
+    let r = run((
+        vec![(1, 3, false)],
+        vec![
+            Step::Emit(vec![(1, 0, 1)]),
+            Step::Poll,
+            Step::Poll,
+            Step::Open(0, 1, 3),
+            Step::Race(0, vec![(1, 0, 5)]),
         ],
     ));
     assert!(r.is_ok(), "{r:?}");

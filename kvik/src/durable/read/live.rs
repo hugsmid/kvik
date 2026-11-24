@@ -85,6 +85,9 @@ pub(crate) struct Session {
     bell: Option<Arc<Bell>>,
     /// The bell's count before the last turn that gave a batch or found nothing: nothing rung up to it is pending.
     settled: Option<u64>,
+    /// The last batch stopped inside its rounds (Q-1014): what is left was rung already, so the rest is taken once
+    /// the interval passes with no ring.
+    rest: bool,
     /// The last round taken whole, and how many pieces of the next were taken.
     at: (u64, usize),
     started: bool,
@@ -109,6 +112,25 @@ pub(crate) struct Session {
     /// Rung by every round, as before Q-1118 ([`super::hub::Hub::every`]).
     #[cfg(test)]
     pub(crate) every: bool,
+    /// Run once by the next turn that computed a batch, between its view and its advance.
+    #[cfg(test)]
+    pub(crate) before_advance: Hook,
+}
+
+/// A test's action inside a turn ([`Session::before_advance`]).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Hook(pub(crate) Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Hook(armed)"
+        } else {
+            "Hook"
+        })
+    }
 }
 
 impl Drop for Session {
@@ -283,6 +305,7 @@ impl Session {
             sub: None,
             bell: None,
             settled: None,
+            rest: false,
             at: (0, 0),
             started: false,
             reads: BTreeMap::new(),
@@ -299,6 +322,8 @@ impl Session {
             turns: 0,
             #[cfg(test)]
             every: false,
+            #[cfg(test)]
+            before_advance: Hook::default(),
         }
     }
 
@@ -322,7 +347,7 @@ impl Session {
         };
         self.reads.insert(id, read);
         if let Some(s) = self.sub {
-            self.reader.hub().set_cap(s, self.cap());
+            self.reader.hub().open(s, self.cap());
         }
     }
 
@@ -394,7 +419,7 @@ impl Session {
             let turn = self.try_batch()?;
             let left = until.saturating_duration_since(Instant::now());
             if !matches!(turn, Turn::Sleep(_)) {
-                self.settled = rung;
+                self.settled = rung.filter(|_| !self.rest);
             }
             let rest = match turn {
                 Turn::Batch(b) => return Ok(Some(b)),
@@ -522,6 +547,7 @@ impl Session {
             Ok(n) => reach(n.reads.as_ref().unwrap_or(&self.reads), &v),
             Err(_) => (Reach::All, Reach::All),
         };
+        let round = v.round();
         let live = r.end(v);
         let next = out?;
         live?;
@@ -529,10 +555,15 @@ impl Session {
             self.reads = reads;
         }
         self.at = next.at;
+        self.rest = next.at != (round, 0);
         self.recorded = next.recorded;
         self.named = next.named;
         self.refreshes = next.refreshes;
         self.judged = mono;
+        #[cfg(test)]
+        if let Some(f) = self.before_advance.0.take() {
+            f();
+        }
         if next.idle {
             self.leave();
         } else {
@@ -688,6 +719,8 @@ mod differential;
 mod fanout;
 #[cfg(test)]
 mod lags;
+#[cfg(test)]
+mod races;
 #[cfg(test)]
 mod stops;
 #[cfg(test)]

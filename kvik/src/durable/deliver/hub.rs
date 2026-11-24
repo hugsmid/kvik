@@ -108,6 +108,8 @@ impl Hub {
         let now = self.clocks.now();
         let mono = i64::try_from(self.env.clock.monotonic().0).unwrap_or(i64::MAX);
         let acked = std::mem::take(&mut *lock(&self.acked));
+        // Kept by the deliverer whatever `f` does: a call that takes no batch must not drop an instant (Q-1119).
+        d.note_acked(acked);
         let ctx = Ctx {
             watch: watch.as_ref(),
             env: &self.env,
@@ -116,7 +118,6 @@ impl Hub {
             now,
             wall,
             mono,
-            acked,
         };
         f(&mut d, &ctx)
     }
