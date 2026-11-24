@@ -27,6 +27,14 @@ impl BySeries {
         }
     }
 
+    /// Whether `series` has a wanted range.
+    pub(super) fn has(&self, series: u32) -> bool {
+        match self {
+            BySeries::Table(table, _) => table.get(series as usize).is_some_and(|&k| k != u16::MAX),
+            BySeries::Map(map) => map.contains_key(&series),
+        }
+    }
+
     pub(super) fn wants(&self, series: u32, t: i64) -> bool {
         let ranges = match self {
             BySeries::Table(table, lists) => match table.get(series as usize) {

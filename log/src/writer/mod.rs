@@ -1307,13 +1307,15 @@ impl LogWriter {
         if let Some(old) = self.open.replace(next)
             && let Some(summary) = old.summary
         {
+            let (records, lists) = old.index.into_parts();
             self.seals.push(SealJob {
                 end: old.write_offset,
                 file: old.file,
                 id: old.id,
                 log_dir: self.log_dir.clone(),
                 summary,
-                records: old.index.into_records(),
+                records,
+                lists,
                 has_entries: old.has_entries,
                 prepared: Default::default(),
             });
@@ -1457,6 +1459,8 @@ impl LogWriter {
         });
         seg.has_entries |= builder.block_types().any(|t| t == block_type::ENTRIES);
         let (file_id, offset) = (seg.id.file_id, seg.write_offset);
+        let mut recovery = false;
+        seg.index.begin_batch(offset - bytes.len() as u64);
         for item in &content.items {
             match item.view() {
                 ItemRef::Fact(r) => {
@@ -1469,9 +1473,11 @@ impl LogWriter {
                         intervals.insert(d.id, i.clone());
                     }
                 }
+                ItemRef::Entry(Entry::Recovery(_)) => recovery = true,
                 ItemRef::Entry(_) => {}
             }
         }
+        seg.index.end_batch(bytes.len() as u64, recovery);
         if let Some(n) = next {
             self.roll_to(n);
         }

@@ -18,6 +18,7 @@ use kvik_log::mark::{MarkSlot, encode_mark_file, read_mark};
 use kvik_log::registry::{self, RegistryFile};
 use kvik_log::scan::{HeaderState, LossCause, ScanLimit, SealState, Tail, scan};
 use kvik_log::segment::SegmentImage;
+use kvik_log::series_batches::{BatchRef, SeriesBatches};
 use kvik_log::{Element, FormatError};
 use support::*;
 
@@ -42,6 +43,33 @@ fn sealed_image() -> (SegmentImage, u64) {
     }];
     let end = s.write_seal_blocks(records).unwrap();
     (s, end)
+}
+
+fn sealed_listed() -> Vec<u8> {
+    let (mut s, _) = in_use();
+    let refs: Vec<(u32, BatchRef)> = scan(s.bytes(), &ID, ScanLimit::End)
+        .unwrap()
+        .batches
+        .iter()
+        .skip(1)
+        .map(|b| {
+            let r = BatchRef {
+                offset: b.offset as u32,
+                length: (b.end() - b.offset) as u32,
+            };
+            (1, r)
+        })
+        .collect();
+    let records = vec![IndexRecord {
+        series_id: 1,
+        fact_count: 4,
+        min_t: T0,
+        max_t: T0 + 30 * SECOND,
+    }];
+    let lists = SeriesBatches::from_pairs(refs);
+    let end = s.write_seal_blocks_listed(records, Some(&lists)).unwrap();
+    s.set_len(end);
+    s.into_bytes()
 }
 
 fn ends_of(bytes: &[u8]) -> Vec<u64> {
@@ -98,6 +126,9 @@ fn generate() -> Vec<(&'static str, Vec<u8>)> {
     let mut torn = sealed_image().0;
     torn.zero_fill_from(end - 40).unwrap();
     files.push(("seal-torn.open", torn.into_bytes()));
+
+    // Sealed with series batches (A.8a): the definition's batch holds no fact, so series 1 is in two of three.
+    files.push(("sealed-listed.kvl", sealed_listed()));
 
     // A block of unknown, skippable type inside a batch, and one of unknown, critical type.
     let r = T0 + SECOND;
@@ -327,6 +358,27 @@ fn golden_files_decode_to_what_they_show() {
     );
     assert_eq!((seal.trailer.entry_count, seal.trailer.batch_count), (5, 3));
     assert_eq!(r.batches.len(), 3);
+
+    let b = read("sealed-listed.kvl");
+    let r = scan(&b, &ID, ScanLimit::End).unwrap();
+    let seal = r.seal.as_ref().unwrap();
+    assert_eq!(seal.state, SealState::Sealed);
+    assert!(seal.file_crc_matches(&b));
+    let index_len = seal.index.clone().flatten().unwrap().encode().len();
+    let lists_at = seal.start as usize + 16 + index_len.next_multiple_of(8);
+    assert_eq!(b[lists_at], block_type::SERIES_BATCHES);
+    let body_len = u32::from_le_bytes(b[lists_at + 4..lists_at + 8].try_into().unwrap()) as usize;
+    let lists = SeriesBatches::decode(&b[lists_at + 16..][..body_len], seal.start).unwrap();
+    let batches: Vec<u64> = r.batches.iter().skip(1).map(|x| x.offset).collect();
+    assert_eq!(
+        lists
+            .of(1)
+            .unwrap()
+            .iter()
+            .map(|x| u64::from(x.offset))
+            .collect::<Vec<_>>(),
+        batches
+    );
 
     let b = read("seal-length-pending.open");
     let r = scan(&b, &ID, ScanLimit::End).unwrap();

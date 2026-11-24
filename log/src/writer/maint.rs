@@ -193,6 +193,8 @@ pub struct SealJob {
     pub(crate) end: u64,
     pub(crate) summary: SealSummary,
     pub(crate) records: Vec<IndexRecord>,
+    /// The series batches block's lists, when the segment carries one (A.8a).
+    pub(crate) lists: Option<crate::series_batches::SeriesBatches>,
     pub(crate) has_entries: bool,
     /// Kept across a blocked seal's retries, so the segment is read and hashed once per seal (Q-220 (c)).
     pub(crate) prepared: OnceLock<Prepared>,
@@ -320,14 +322,15 @@ fn prepare(job: &SealJob, path: &Path, halt: &Halt) -> Result<Prepared, SealErro
         },
         records: job.records.clone(),
     };
-    let seal = encode_seal_streamed(crc, job.end, &job.summary, &index).map_err(|e| {
-        SealError::Fault(Fault {
-            op: FaultOp::Seal,
-            path: path.to_path_buf(),
-            kind: io::ErrorKind::InvalidData,
-            message: e.to_string(),
-        })
-    })?;
+    let seal = encode_seal_streamed(crc, job.end, &job.summary, &index, job.lists.as_ref())
+        .map_err(|e| {
+            SealError::Fault(Fault {
+                op: FaultOp::Seal,
+                path: path.to_path_buf(),
+                kind: io::ErrorKind::InvalidData,
+                message: e.to_string(),
+            })
+        })?;
     sha.update(&seal);
     Ok(Prepared {
         seal,
@@ -585,6 +588,7 @@ mod tests {
             end,
             summary,
             records: Vec::new(),
+            lists: None,
             has_entries: false,
             prepared: Default::default(),
         };

@@ -175,6 +175,7 @@ commit block. A batch never spans files. Unsealed segments are created ahead of 
 | `0x02` | entries | no | definitions, parameters, aliases, retirements, scale raises, site-zone and tzdata entries, routing changes, recovery entries |
 | `0x0F` | commit | no | ends a batch |
 | `0x10` | segment index | yes | written at seal: which series the segment holds |
+| `0x11` | series batches | yes | written at seal, after the segment index, when series are in few batches: each series' batches (A.8a) |
 | `0x7F` | trailer | no | written at seal: marks the file as sealed |
 
 **Sequence assignment.** Entries take consecutive sequences in the order they appear: block by block, and row
@@ -214,7 +215,7 @@ of the segment it resumes in again, in place, before its first sync (`spec.md` ย
 
 **Sealing** (off the writer thread) of segment S starts only after the next segment is in use and synced, so a
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
-segment index block, the trailer block and the 16-byte end marker; (2) set the file length to the end of the end
+segment index block, the series batches block where A.8a writes one, the trailer block and the 16-byte end marker; (2) set the file length to the end of the end
 marker (the file may grow or shrink); (3) `sync_all`; (4) rename `.open` to `.kvl`; (5) sync the directory. The mark
 does not move at sealing: it keeps naming S until the first commit in the next segment, whose batch is acknowledged
 only once the mark naming it is synced (`spec.md` ยง3 Commit, Q-630). An empty segment is never
@@ -433,6 +434,26 @@ of its series is listed **and** `has_entries` is clear; otherwise they read at l
 `min_t` is the least `t`. `max_t` is the greatest *reach* of a reading and does not depend on tzdata: `t` for kinds
 other than interval, `t + d` for a fixed interval, `t + 50 h` for `day`, `t + 33 days` for `month`.
 
+### A.8a Series batches body (written at seal; Q-1150)
+Written by the writer that wrote the segment's batches, immediately after the segment index block and before the
+trailer, only when the (series, batch) pairs are at most half of the batches times the series the index lists (a
+series is on average in at most half the batches), no batch holds a recovery entry, there are
+at most 262,144 pairs and the body is at most 16 MiB; a segment sealed by a start (whose batch offsets it does not
+keep) carries none. Body: `series_count: u32`, `record_size: u16` (8 in v1), `ref_size: u16` (8 in v1), `ref_count:
+u32`, reserved `u32`; then `series_count` records sorted strictly ascending by id, `series_id: u32`, `count: u32`
+(at least 1); then `ref_count` references, `offset: u32` (the batch's first block header, a multiple of 8 and at least
+64), `length: u32` (the batch's bytes, commit block included, a multiple of 8), the references of each series in
+record order and within a series in strictly ascending offset, none overlapping the next or reaching past the index
+block. The counts sum to `ref_count` and the arrays fill the body exactly; longer records and references have their
+tail ignored. A series' references are exactly the complete batches of the segment that hold at least one of its
+facts.
+
+A reader may use the block only when it lists exactly the series of the segment index; it then reads a few series'
+facts from their batches alone, each read and verified as a complete batch at its listed place (A.7). A reader that
+finds the block invalid or absent, or a listed batch that does not read as listed, reads the segment as before. A
+batch holding none of the series read is not read, so damage confined to it leaves that read complete, as a segment
+whose index lists none of them is not read (A.8).
+
 ### A.9 Trailer body (64 bytes) and end marker
 | Offset | Size | Field |
 |---:|---:|---|
@@ -534,7 +555,7 @@ while it exists; a new file is created only when none exists.
 - Round trip of every block type, with property tests over row counts, encodings and field combinations.
 - Golden files for v1, including: an unsealed segment with a torn final batch; segments with a recovery entry, with
   a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail; corruption
-  inside a segment with a kept batch after it; each seal state of A.4; a mark with one torn slot; a stale mark below
+  inside a segment with a kept batch after it; each seal state of A.4; a sealed segment with series batches (A.8a); a mark with one torn slot; a stale mark below
   acknowledged batches after a power loss; flagged batches beyond a same-boot mark, then an unflagged one (A.7); a block with an unknown ignorable and an unknown critical element; the
   store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file; a log
   directory root and group, a series directory and a status file (A.18).

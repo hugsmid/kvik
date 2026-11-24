@@ -302,7 +302,10 @@ impl Chains {
                             }),
                     );
                 }
-                block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => {
+                block_type::COMMIT
+                | block_type::SEGMENT_INDEX
+                | block_type::SERIES_BATCHES
+                | block_type::TRAILER => {
                     break Some(None);
                 }
                 _ if h.block_len() > MAX_BATCH_DATA => break Some(None),

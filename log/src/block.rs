@@ -21,12 +21,17 @@ pub mod block_type {
     pub const COMMIT: u8 = 0x0F;
     /// Written at seal: which series the segment holds (`format.md` A.8). Skippable.
     pub const SEGMENT_INDEX: u8 = 0x10;
+    /// Written at seal after the segment index: each series' batches (`format.md` A.8a). Skippable.
+    pub const SERIES_BATCHES: u8 = 0x11;
     /// Written at seal: marks the file as sealed (`format.md` A.9).
     pub const TRAILER: u8 = 0x7F;
 
     /// Whether a log segment reader of this version knows `t`.
     pub fn is_known(t: u8) -> bool {
-        matches!(t, FACTS | ENTRIES | COMMIT | SEGMENT_INDEX | TRAILER)
+        matches!(
+            t,
+            FACTS | ENTRIES | COMMIT | SEGMENT_INDEX | SERIES_BATCHES | TRAILER
+        )
     }
 }
 

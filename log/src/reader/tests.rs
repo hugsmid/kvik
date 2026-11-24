@@ -139,6 +139,7 @@ fn the_kept_bytes_are_those_of_the_followed_segment_and_a_whole_file_read_is_fre
     assert_eq!((r.scratch.file_id, r.scratch.bytes.capacity()), (None, 0));
 }
 
+mod listed_reads;
 mod lookup_properties;
 mod parts_and_lookup;
 mod position_at;

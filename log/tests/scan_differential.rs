@@ -38,7 +38,7 @@ impl R {
     }
 }
 
-const TYPES: [u8; 9] = [
+const TYPES: [u8; 10] = [
     block_type::FACTS,
     block_type::ENTRIES,
     0x50,
@@ -46,6 +46,7 @@ const TYPES: [u8; 9] = [
     0x30,
     block_type::COMMIT,
     block_type::SEGMENT_INDEX,
+    block_type::SERIES_BATCHES,
     block_type::TRAILER,
     0,
 ];

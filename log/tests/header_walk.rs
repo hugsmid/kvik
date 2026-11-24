@@ -252,6 +252,7 @@ fn plausible_body() -> [u8; 8] {
             0,
             block_type::COMMIT,
             block_type::SEGMENT_INDEX,
+            block_type::SERIES_BATCHES,
             block_type::TRAILER,
         ];
         if !seal_or_commit.contains(&t) && u64::from(len) < W - 64 {
@@ -481,7 +482,9 @@ fn plausible_steps(f: &[u8]) -> u64 {
     for p in (HEADER_LEN..f.len().saturating_sub(15)).step_by(8) {
         let len = u64::from(u32::from_le_bytes(f[p + 4..p + 8].try_into().unwrap()));
         n += u64::from(match f[p] {
-            0 | block_type::SEGMENT_INDEX | block_type::TRAILER => false,
+            0 | block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
+                false
+            }
             block_type::COMMIT => len == COMMIT_LEN as u64,
             _ => 16 + len.next_multiple_of(8) <= W,
         });

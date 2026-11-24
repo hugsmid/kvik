@@ -597,12 +597,13 @@ enum Head {
     Zero,
 }
 
-const DATA_TYPES: [u8; 6] = [
+const DATA_TYPES: [u8; 7] = [
     kvik_log::block::block_type::FACTS,
     kvik_log::block::block_type::ENTRIES,
     0x50,
     0x30,
     kvik_log::block::block_type::SEGMENT_INDEX,
+    kvik_log::block::block_type::SERIES_BATCHES,
     kvik_log::block::block_type::TRAILER,
 ];
 
@@ -630,7 +631,9 @@ fn named_by_its_chain(f: &[u8], o: usize, limit: usize) -> bool {
             return false;
         };
         match h.block_type {
-            0 | block_type::SEGMENT_INDEX | block_type::TRAILER => return false,
+            0 | block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
+                return false;
+            }
             block_type::COMMIT => {
                 return h.body_len == 48
                     && p + 64 <= limit
@@ -652,7 +655,9 @@ fn chain_end(f: &[u8], mut p: usize) -> Option<usize> {
         match h.block_type {
             0 => return None,
             block_type::COMMIT => return (h.body_len == 48).then_some(p),
-            block_type::SEGMENT_INDEX | block_type::TRAILER => return None,
+            block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
+                return None;
+            }
             _ if h.block_len() > kvik_log::batch::MAX_BATCH_DATA => return None,
             _ => p += h.block_len() as usize,
         }

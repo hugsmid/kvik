@@ -105,7 +105,7 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
             Err(BodyError::Unsupported(element)) => stop(Stop::Refuse(element)),
             Err(_) => stop(Stop::Fault(BatchFault::Content)),
         },
-        block_type::SEGMENT_INDEX | block_type::TRAILER => {
+        block_type::SEGMENT_INDEX | block_type::SERIES_BATCHES | block_type::TRAILER => {
             stop(Stop::Fault(BatchFault::Disagreement))
         }
         _ if b.header.skippable() => Judged::Pass(b.next_offset()),

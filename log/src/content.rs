@@ -18,6 +18,27 @@ pub(crate) struct Taken {
     pub(crate) max_t: i64,
     /// The `after` of the recovery entry it holds, alone (A.6).
     pub(crate) recovery_after: Option<u64>,
+    /// Which series its facts are of.
+    pub(crate) series: Sole,
+}
+
+/// Which series a batch's facts are of: none, one, or several.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Sole {
+    #[default]
+    None,
+    One(u32),
+    Several,
+}
+
+impl Sole {
+    fn add(&mut self, series: u32) {
+        *self = match *self {
+            Sole::None => Sole::One(series),
+            Sole::One(s) if s == series => Sole::One(s),
+            _ => Sole::Several,
+        };
+    }
 }
 
 /// One entry of a batch: a fact or another entry. Each takes one sequence.
@@ -245,6 +266,14 @@ impl BatchContent {
             min_t: i64::MAX,
             max_t: i64::MIN,
             recovery_after: None,
+            series: Sole::None,
+        };
+        let sole = std::cell::Cell::new(Sole::None);
+        let wants = &|series: u32, t: i64| {
+            let mut s = sole.get();
+            s.add(series);
+            sole.set(s);
+            wants(series, t)
         };
         let mut items = 0u64;
         for d in &batch.blocks {
@@ -277,6 +306,7 @@ impl BatchContent {
         if items > 1 && out.recovery_after.is_some() {
             return Err(ContentError::RecoveryNotAlone.into());
         }
+        out.series = sole.get();
         Ok(out)
     }
 

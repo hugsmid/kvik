@@ -10,7 +10,7 @@ reader            epoch                             1
 reader            reset_stamp                       0/0000000000000000
 log               sealed_segments                   1
 log               open_segments                     2
-log               bytes                             134223584
+log               bytes                             134223664
 tier              cold                              not configured
 leases            count                             1
 lease             09000000000000000a00000000000000  epoch 1 renewals 1 created 2026-01-01T00:00:00Z

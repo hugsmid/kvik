@@ -20,6 +20,7 @@ format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-log --test golden`.
 | `corrupt-middle.open` | `in-use.open` with one bit of the second batch's facts body flipped; the third batch is kept |
 | `gap.open` | Two batches with a gap in sequences (1, then 10–11) |
 | `sealed.kvl` | `in-use.open` sealed: segment index, trailer and end marker; the file ends at the end marker |
+| `sealed-listed.kvl` | `in-use.open` sealed with a series batches block (A.8a) after the index: series 1 in the second and third batches |
 | `seal-length-pending.open` | Seal step 1 done, step 2 (setting the length) not: zeros follow the end marker |
 | `seal-torn.open` | Seal blocks torn before the end marker: not sealed |
 | `unknown-skippable.open` | A batch holding a block of unknown type `0x50` with `skippable` set: skipped and counted |
