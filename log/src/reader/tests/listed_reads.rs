@@ -259,6 +259,7 @@ fn a_lookup_of_two_series_sharing_batches_finds_each_fact_once_in_log_order() {
     while w.sealed().len() < 3 {
         w.call(2);
     }
+    (0..24).for_each(|_| w.call(2));
     let wanted = [series(1)[0], series(2)[0]];
     let (got, whole) = both(&mut w, &wanted);
     assert!(got.segments_listed >= 2);
