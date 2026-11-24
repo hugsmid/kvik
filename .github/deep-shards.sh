@@ -86,7 +86,7 @@ kvik-ingest     kvik  lib         durable::ingest::
 kvik-fold       kvik  lib         durable::derived::tests::
 kvik-pmap       kvik  lib         durable::read::pmap::
 kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
-kvik-latest     kvik  lib         durable::read::latest::tests::
+kvik-latest     kvik  lib         durable::read::latest::
 kvik-live       kvik  lib         durable::read::live::differential::
 kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
