@@ -37,6 +37,9 @@ model           model model
 labels          model labels
 names           model names
 provisional     model provisional
+gates           model gates
+gate-properties model gate_properties
+gate-edges      model gate_edges
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
