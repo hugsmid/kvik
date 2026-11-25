@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fixture, S, T0, block_on};
+use common::{Fixture, S, SEGMENT, T0, block_on};
 use kvik::{Kind, Reading, SeriesSpec, Timestamp, Value, ValueType};
 use kvik_log::directory::status::{StatusFile, counter, health, reason};
 use kvik_log::directory::{self, Family, Frame};
@@ -94,6 +94,7 @@ fn health_reports_position_losses_segments_leases_and_derived_files() {
     let mut f = Fixture::new();
     f.await_status();
     f.await_leases(3);
+    f.await_segments();
     insta::assert_snapshot!("health_open", steady(&f.run("health").unwrap()));
     f.shut();
     insta::assert_snapshot!("health_shut", steady(&f.run("health").unwrap()));
@@ -129,6 +130,7 @@ fn a_loss_found_then_recorded_degrades_health_and_fails_static_answers_after_wri
     let mut f = Fixture::new();
     f.damage(1_204.25);
     f.await_status();
+    f.await_segments();
     insta::assert_snapshot!("health_found_loss", steady(&f.run("health").unwrap()));
     for cmd in ["latest", "series"] {
         let (out, done) = f.run_both(cmd, f.env.clone());
@@ -140,8 +142,32 @@ fn a_loss_found_then_recorded_degrades_health_and_fails_static_answers_after_wri
     f.store.as_ref().unwrap().reader().snapshot().unwrap();
     f.shut();
     f.reopen();
+    f.await_segments();
     f.shut();
     insta::assert_snapshot!("health_recorded_loss", steady(&f.run("health").unwrap()));
+}
+
+/// The `log bytes` figure of a `health` answer.
+fn log_bytes(out: &str) -> u64 {
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("log") && l.contains(" bytes "))
+        .unwrap();
+    line.split_whitespace().last().unwrap().parse().unwrap()
+}
+
+#[test]
+fn health_log_bytes_count_whole_segments_once_the_segment_created_ahead_is_filled() {
+    let f = Fixture::with_fill_pace(Duration::from_millis(10));
+    f.await_status();
+    let during = log_bytes(&f.run("health").unwrap());
+    f.await_segments();
+    let after = log_bytes(&f.run("health").unwrap());
+    assert!(during < after, "{during} {after}");
+    assert!(
+        (2 * SEGMENT..2 * SEGMENT + 65_536).contains(&after),
+        "{after}"
+    );
 }
 
 #[test]
