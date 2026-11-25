@@ -159,7 +159,7 @@ fn facts_and_at_equal_the_fact_index_and_the_model_at_every_cap() {
         ..ProptestConfig::default()
     });
     let log = LogConfig {
-        seal_interval: Duration::from_millis(20),
+        seal_interval: Duration::from_millis(250),
         ..LogConfig::default()
     };
     runner
@@ -729,54 +729,96 @@ mod listed;
 mod shelves;
 mod windows;
 
-/// The shrunk history of the property (Q-1104): with timed seals the clean stop before the damage can leave the
-/// store's own series directory through the damaged batch, and a fresh reader continues it before the start meets
-/// the damage (Q-1002); the check before the start then skips. Seals run on real time: a pause past the seal interval
-/// before the clean stop lets the seal run however fast the host is, and the history repeats until one attempt reaches
-/// the skip; every attempt passes.
-#[test]
-fn a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start() {
+/// The longest a seal and the series directory it triggers are waited for.
+const SEAL_WAIT: Duration = Duration::from_secs(5);
+
+/// The newest series directory generation in the store.
+fn newest_directory(rig: &Rig) -> Option<u64> {
+    kvik_log::directory::generations(&*rig.env.fs, &rig.dir, kvik_log::directory::Family::Series)
+        .first()
+        .map(|(id, _)| *id)
+}
+
+/// Waits until a series directory newer than `before` exists, or [`SEAL_WAIT`] passes.
+fn await_directory_after(rig: &Rig, before: Option<u64>) {
+    let end = std::time::Instant::now() + SEAL_WAIT;
+    while newest_directory(rig) <= before && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Whether some attempt of the shrunk history of the property (Q-1104) ends with a check before a start that
+/// skips for the store's directory over the damage, with every sync of the store taking `sync_delay`.
+///
+/// With timed seals the clean stop before the damage can leave the store's own series directory through the damaged
+/// batch, and a fresh reader continues it before the start meets the damage (Q-1002); the check before the start
+/// then skips. Seals run on real time: the interval is long against the host's open and first emit (a short one
+/// seals before the newest batch exists, and the directory then misses it), the segments are the smallest allowed
+/// (a default segment's zero-fill alone outlasts a short interval on a slow host), and the history waits for the
+/// directory the seal writes. It repeats until one attempt reaches the skip; every attempt passes.
+fn reaches_directory_over_damage(
+    newest: &[(usize, i64, u8, u8, u64)],
+    sync_delay: Duration,
+) -> bool {
     let log = LogConfig {
-        seal_interval: Duration::from_millis(20),
+        segment_size: 16 << 20,
+        seal_interval: Duration::from_millis(250),
         ..LogConfig::default()
     };
-    // In the second history the newest batch holds one reading, so the directory's `through` can equal the damaged
-    // position.
-    for newest in [
-        vec![
-            (0, -214, 222, 241, 0),
-            (6, -96, 158, 143, 0),
-            (0, 4, 225, 98, 0),
-            (6, 105, 93, 198, 0),
-        ],
-        vec![(0, -214, 222, 241, 0)],
-    ] {
-        let history = [
-            Step::Emit(
-                vec![
-                    (0, -168, 121, 203, 0),
-                    (3, -85, 36, 155, 1),
-                    (3, 30, 5, 244, 0),
-                ],
-                false,
-            ),
-            Step::Emit(vec![(0, -274, 96, 162, 2)], false),
-            Step::PowerLoss,
-            Step::Emit(newest.clone(), true),
-            Step::Damage(64454, true),
-            Step::Check,
-        ];
-        let reached = (0..64).any(|_| {
-            let mut rig = Rig::with_log("sources-over-damage", log.clone());
-            for s in &history {
-                if matches!(s, Step::Damage(..)) {
-                    std::thread::sleep(2 * log.seal_interval);
-                }
-                rig.step(s).unwrap();
+    let history = [
+        Step::Emit(
+            vec![
+                (0, -168, 121, 203, 0),
+                (3, -85, 36, 155, 1),
+                (3, 30, 5, 244, 0),
+            ],
+            false,
+        ),
+        Step::Emit(vec![(0, -274, 96, 162, 2)], false),
+        Step::PowerLoss,
+        Step::Emit(newest.to_vec(), true),
+        Step::Damage(64454, true),
+        Step::Check,
+    ];
+    (0..64).any(|_| {
+        let mut rig = Rig::with_log("sources-over-damage", log.clone());
+        if !sync_delay.is_zero() {
+            rig.fs.set_sync_hook(Some(Arc::new(move |_: &Path| {
+                std::thread::sleep(sync_delay)
+            })));
+        }
+        let mut before = None;
+        for s in &history {
+            match s {
+                Step::Emit(_, true) => before = newest_directory(&rig),
+                Step::Damage(..) => await_directory_after(&rig, before),
+                _ => {}
             }
-            rig.shut();
-            rig.over_damage > 0
-        });
-        assert!(reached, "the store's directory over the damage, {newest:?}");
+            rig.step(s).unwrap();
+        }
+        rig.shut();
+        rig.over_damage > 0
+    })
+}
+
+/// In the second history the newest batch holds one reading, so the directory's `through` can equal the damaged
+/// position. A host whose syncs are slow must reach the skip as a fast one does.
+#[test]
+fn a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start() {
+    for sync_delay in [Duration::ZERO, Duration::from_millis(30)] {
+        for newest in [
+            vec![
+                (0, -214, 222, 241, 0),
+                (6, -96, 158, 143, 0),
+                (0, 4, 225, 98, 0),
+                (6, 105, 93, 198, 0),
+            ],
+            vec![(0, -214, 222, 241, 0)],
+        ] {
+            assert!(
+                reaches_directory_over_damage(&newest, sync_delay),
+                "the store's directory over the damage, {newest:?}, syncs taking {sync_delay:?}"
+            );
+        }
     }
 }

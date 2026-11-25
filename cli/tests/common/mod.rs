@@ -18,6 +18,8 @@ use kvik_log::directory::{self, Family};
 
 pub const T0: i64 = 1_767_225_600_000_000_000;
 pub const S: i64 = 1_000_000_000;
+/// The default log segment size.
+pub const SEGMENT: u64 = 64 << 20;
 
 struct ThreadWaker(Thread);
 
@@ -59,10 +61,23 @@ impl Fixture {
 
     /// [`Fixture::new`] whose log seals by time after `seal` of the log's own clock, when given.
     pub fn with_seal_interval(seal: Option<Duration>) -> Fixture {
+        Fixture::build(seal, None)
+    }
+
+    /// [`Fixture::new`] on a file system where each write to a segment under creation takes `pace`, as on a slow
+    /// host: the segment's length grows in view for a while.
+    pub fn with_fill_pace(pace: Duration) -> Fixture {
+        Fixture::build(None, Some(pace))
+    }
+
+    fn build(seal: Option<Duration>, pace: Option<Duration>) -> Fixture {
         let clock = ManualClock::new(Timestamp(T0));
         let mut env = Env::test(clock.clone());
         let fs = MemFs::new();
-        env.fs = Arc::new(fs.clone());
+        env.fs = match pace {
+            Some(p) => Arc::new(Recording::paced(Arc::new(fs.clone()), p)),
+            None => Arc::new(fs.clone()),
+        };
         env.background_timers = false;
         let dir = PathBuf::from("store");
         let mut config = StoreConfig::new(&dir, "Etc/UTC")
@@ -128,6 +143,26 @@ impl Fixture {
         let deadline = Instant::now() + Duration::from_secs(60);
         while directory::generations(&self.fs, &self.dir, Family::Status).is_empty() {
             assert!(Instant::now() < deadline, "no status file");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Blocks until every log segment the writer creates ahead is whole. A segment is visible under its own name
+    /// while it is zero-filled, so its length is the segment's only afterwards; the fill takes longer on some hosts.
+    pub fn await_segments(&self) {
+        let log = self.dir.join("log");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let open: Vec<u64> = kvik::env::Fs::read_dir(&self.fs, &log)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.name.ends_with(".open"))
+                .map(|e| e.len)
+                .collect();
+            if open.len() >= 2 && open.iter().all(|l| *l == SEGMENT) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "segment lengths {open:?}");
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -218,6 +253,7 @@ impl Fixture {
 #[derive(Debug, Clone)]
 pub struct Recording {
     inner: Arc<dyn Fs>,
+    pace: Option<Duration>,
     pub log: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
 }
 
@@ -225,6 +261,7 @@ pub struct Recording {
 struct RecordingFile {
     inner: Box<dyn FsFile>,
     path: PathBuf,
+    pace: Option<Duration>,
     log: Arc<Mutex<Vec<(&'static str, PathBuf)>>>,
 }
 
@@ -232,7 +269,16 @@ impl Recording {
     pub fn new(inner: Arc<dyn Fs>) -> Self {
         Recording {
             inner,
+            pace: None,
             log: Arc::default(),
+        }
+    }
+
+    /// [`Recording::new`] where each write to a file being created (`.open`) takes `pace`.
+    pub fn paced(inner: Arc<dyn Fs>, pace: Duration) -> Self {
+        Recording {
+            pace: Some(pace),
+            ..Recording::new(inner)
         }
     }
 
@@ -250,6 +296,7 @@ impl Fs for Recording {
         Ok(Box::new(RecordingFile {
             inner,
             path: path.to_path_buf(),
+            pace: self.pace,
             log: self.log.clone(),
         }))
     }
@@ -289,6 +336,12 @@ impl FsFile for RecordingFile {
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.note("write_at");
+        if let Some(p) = self
+            .pace
+            .filter(|_| self.path.extension().is_some_and(|e| e == "open"))
+        {
+            thread::sleep(p);
+        }
         self.inner.write_at(buf, offset)
     }
     fn sync_data(&self) -> io::Result<()> {
