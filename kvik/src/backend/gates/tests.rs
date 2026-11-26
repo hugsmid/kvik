@@ -1,5 +1,5 @@
 //! The model backend against `judge` directly: what a consumer receives through the interface is what
-//! [`km::gate::judge`] computes from the model's log (cond2 design section 9, step 3).
+//! [`km::gate::judge`] computes from the model's log (Q-1140, Q-1583).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -274,6 +274,28 @@ fn a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition(
         .map(|d| d.position)
         .unwrap();
     assert_eq!(got[1].0.at, other);
+}
+
+#[test]
+fn a_timer_after_a_funnel_change_takes_that_entry_as_its_at() {
+    let mut rig = Rig::new("pinned-other");
+    rig.apply(&Op::Watch(0));
+    rig.apply(&Op::Emit {
+        series: 0,
+        dt: 1,
+        v: 60.0,
+    });
+    rig.clock.advance(Duration::from_secs(5));
+    block_on(rig.consumer.route(Funnel::facts(Select::None))).unwrap();
+    let route_at = rig.store.stats().log.durable;
+    rig.apply(&Op::Tick { dt: 40 });
+    let got = rig.delivered();
+    assert_eq!(got, rig.judged());
+    let timer = got
+        .iter()
+        .find(|t| matches!(t.3, TransitionCause::Timer { .. }))
+        .unwrap();
+    assert_eq!(timer.0.at, route_at);
 }
 
 #[test]

@@ -20,7 +20,7 @@ use crate::gate::{
 use crate::series::SeriesKey;
 use crate::types::{SeriesId, Value};
 
-/// Whether durable gates are judged; turned on with the live engine (cond2 design section 9, step 4).
+/// Whether durable gates are judged; turned on with the live engine (Q-1583).
 pub(crate) const LIVE: bool = false;
 
 /// The gate as its watch entry carries it, its series resolved now (`docs/api.md` Gates, Inputs).

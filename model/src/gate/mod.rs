@@ -366,7 +366,7 @@ pub enum Entry {
         id: ConditionId,
     },
     /// Any other log entry: it moves the frontier only, so a timer's `at` is the last position of the whole log
-    /// before its instant (cond2 design section 3.2).
+    /// before its instant (Q-1582).
     Other {
         /// Position.
         position: Position,

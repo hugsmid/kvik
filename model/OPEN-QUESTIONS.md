@@ -5267,7 +5267,7 @@ equals the per-instance latch filter); `tests/gates.rs`
 
 ## Q-1580 — The routing fields of a watch and an unwatch
 Decided by the lead, provisional (settle with conditions step 4).
-**Scenario.** Routing changes 4 and 5 need field ids after 66 (cond2 design section 3.4). Ids are per entry type,
+**Scenario.** Routing changes 4 and 5 need field ids after 66. Ids are per entry type,
 but `format.md` A.6 names field 70 as the label item of type 10, and one id meaning two things across types invites
 mistakes. A set gate's members need a value form in the entry codec, which had none.
 **Decision.** 67 gate id, 68 name, 69 selector, 71 input, 72 kind, 73 level, 74 member, 75 holds, 76 dead-band,
@@ -5291,13 +5291,13 @@ gate) has no effect.
 
 ## Q-1582 — Every entry moves a gate's frontier
 Decided by the lead, provisional (settle with conditions step 4).
-**Scenario.** A timer transition's `at` is the last position of the whole log before its instant (cond2 design
-section 3.2), but `kvik_model::gate::Entry` could carry only facts, definitions and the consumer's own gates, so the
+**Scenario.** A timer transition's `at` is the last position of the whole log before its instant, but `kvik_model::gate::Entry` could carry only facts, definitions and the consumer's own gates, so the
 model backend could not hand `judge` a funnel change, another consumer's watch or a site-zone entry.
 **Decision.** `gate::Entry::Other { position, commit_time }` carries any other entry; it changes no state.
 `Model::gate_history` maps the whole log so.
 **Pinned by.** `kvik/src/backend/gates/tests.rs`
-`a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition`.
+`a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition`,
+`a_timer_after_a_funnel_change_takes_that_entry_as_its_at`.
 
 ## Q-1583 — The model backend's gates for now
 Decided by the lead, provisional (settle with conditions step 5).
