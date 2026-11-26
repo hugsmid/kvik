@@ -77,9 +77,9 @@ pub fn exact_ns(ns: i128) -> Exact {
     Exact::from_integer(num_bigint::BigInt::from(ns))
 }
 
-/// Floor of `t` to a multiple of `step` (works for negative times).
+/// Floor of `t` to a multiple of `step` (works for negative times); saturates at `Nanos::MIN`.
 pub fn floor_to(t: Nanos, step: Nanos) -> Nanos {
-    t.div_euclid(step) * step
+    t.div_euclid(step).saturating_mul(step)
 }
 
 /// Series identifier, assigned once by the registry and never reused.

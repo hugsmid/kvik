@@ -1,4 +1,4 @@
-//! Probes of the full review of reads, query and export: calls a dashboard can make with an open-ended range.
+//! Reads whose range touches the first or last instant, as an open-ended dashboard call does, on both backends.
 //! Each test passes when the call returns (a result or an error) and fails when it panics.
 
 mod common;
@@ -121,9 +121,12 @@ fn a_window_over_every_instant_returns() {
     none(panics("window-all", |s, g, i| {
         let r = s.reader();
         (
-            r.window(g, Window::absolute(MIN..MAX), Aggregate::Avg).map(|_| ()),
-            r.window(i, Window::absolute(MIN..MAX), Aggregate::Sum).map(|_| ()),
-            r.window_of(&[g, i], Window::absolute(MIN..at(0)), Aggregate::Sum).map(|_| ()),
+            r.window(g, Window::absolute(MIN..MAX), Aggregate::Avg)
+                .map(|_| ()),
+            r.window(i, Window::absolute(MIN..MAX), Aggregate::Sum)
+                .map(|_| ()),
+            r.window_of(&[g, i], Window::absolute(MIN..at(0)), Aggregate::Sum)
+                .map(|_| ()),
         )
     }));
 }
@@ -142,7 +145,9 @@ fn at_and_interval_at_the_extremes_return() {
 
 #[test]
 fn interval_at_the_first_instant_returns() {
-    none(panics("interval-min", |s, _, i| s.reader().interval(i, MIN)));
+    none(panics("interval-min", |s, _, i| {
+        s.reader().interval(i, MIN)
+    }));
 }
 
 #[test]

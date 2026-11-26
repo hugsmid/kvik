@@ -37,6 +37,12 @@ pub enum ExportError {
         /// The fact's series.
         found: SeriesId,
     },
+    /// A partitioned export read a fact of an earlier month after a later one.
+    #[error("fact at {position}: month before the one being written")]
+    MonthRegressed {
+        /// The fact's position.
+        position: Position,
+    },
     /// A fact's value does not match the series' value type.
     #[error("fact at {position}: value does not match the series' value type")]
     WrongValue {

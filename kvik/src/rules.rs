@@ -106,32 +106,32 @@ pub(crate) fn chart_range(range: TimeRange) -> Result<(i64, i64)> {
 /// The bucket width `Resolution::Auto` picks for more than `max_points` raw facts: 1 minute, 15 minutes or a
 /// multiple of 15 minutes, whichever first gives at most `max_points` buckets aligned to UTC.
 pub(crate) fn auto_step(a: i64, b: i64, max_points: usize) -> i64 {
-    const MINUTE: i64 = 60_000_000_000;
-    const QUARTER: i64 = 15 * MINUTE;
-    let max = i64::try_from(max_points.max(1)).unwrap_or(i64::MAX);
-    let span = b - a;
+    const MINUTE: i128 = 60_000_000_000;
+    const QUARTER: i128 = 15 * MINUTE;
+    let max = i128::try_from(max_points.max(1)).unwrap_or(i128::MAX);
+    let (a, b) = (i128::from(a), i128::from(b));
     // Buckets are aligned to UTC, so they are counted from the aligned floor of the start, not from the start.
-    let buckets = |step: i64| {
-        let first = a.div_euclid(step) * step;
-        (b - first + step - 1) / step
-    };
-    if buckets(MINUTE) <= max {
+    let buckets = |step: i128| (b - a.div_euclid(step) * step + step - 1) / step;
+    // A step beyond `i64::MAX` is not representable; the widest step then covers the range in at most three buckets.
+    let widest = i128::from(i64::MAX);
+    let step = if buckets(MINUTE) <= max {
         MINUTE
     } else if buckets(QUARTER) <= max {
         QUARTER
     } else {
-        let mut k = ((span + QUARTER - 1) / QUARTER + max - 1) / max;
-        while buckets(QUARTER * k) > max {
+        let mut k = ((b - a + QUARTER - 1) / QUARTER + max - 1) / max;
+        while QUARTER * k < widest && buckets(QUARTER * k) > max {
             k += 1;
         }
-        QUARTER * k
-    }
+        (QUARTER * k).min(widest)
+    };
+    step as i64
 }
 
 /// The bucket width of `Resolution::Step`, refused when not positive or above 1,000,000 buckets.
 pub(crate) fn fixed_step(d: std::time::Duration, a: i64, b: i64) -> Result<i64> {
     let step = dur_nanos(d)?;
-    if step <= 0 || (b - a) / step > 1_000_000 {
+    if step <= 0 || (i128::from(b) - i128::from(a)) / i128::from(step) > 1_000_000 {
         return Err(Error::InvalidQuery(
             "a step must be positive and give at most 1,000,000 buckets".into(),
         ));
@@ -141,10 +141,11 @@ pub(crate) fn fixed_step(d: std::time::Duration, a: i64, b: i64) -> Result<i64> 
 
 /// The buckets of `[a, b)` at width `step`, aligned to UTC and clipped to the range.
 pub(crate) fn bucket_spans(a: i64, b: i64, step: i64) -> impl Iterator<Item = (i64, i64)> {
+    let (a, b, step) = (i128::from(a), i128::from(b), i128::from(step));
     let first = a.div_euclid(step) * step;
     std::iter::successors(Some(first), move |t| Some(t + step))
         .take_while(move |t| *t < b)
-        .map(move |t| (t.max(a), (t + step).min(b)))
+        .map(move |t| ((t.max(a)) as i64, ((t + step).min(b)) as i64))
 }
 
 /// A chart bucket from the window evaluation over its span.
@@ -209,4 +210,38 @@ pub(crate) fn model_period(p: CalendarPeriod) -> Result<km::calendar::Period> {
             km::calendar::Period::Month(km::calendar::Month { year, month })
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn range() -> impl Strategy<Value = (i64, i64)> {
+        (i64::MIN..i64::MAX, any::<u64>()).prop_map(|(a, r)| {
+            let room = i128::from(i64::MAX) - i128::from(a);
+            let b = i128::from(a) + 1 + i128::from(r) % room;
+            (a, i64::try_from(b).unwrap_or(i64::MAX))
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn auto_buckets_tile_any_range_within_the_point_limit((a, b) in range(), max in 1usize..64) {
+            let step = auto_step(a, b, max);
+            let spans: Vec<_> = bucket_spans(a, b, step).collect();
+            prop_assert_eq!(spans.first().map(|s| s.0), Some(a));
+            prop_assert_eq!(spans.last().map(|s| s.1), Some(b));
+            prop_assert!(spans.windows(2).all(|w| w[0].1 == w[1].0));
+            prop_assert!(spans.iter().all(|s| s.0 < s.1));
+            prop_assert!(spans.len() <= max.max(3));
+        }
+    }
+
+    #[test]
+    fn a_range_ending_at_the_last_instant_ends() {
+        let spans: Vec<_> = bucket_spans(0, i64::MAX, 60_000_000_000).take(2).collect();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(bucket_spans(i64::MAX - 5, i64::MAX, i64::MAX).count(), 1);
+    }
 }
