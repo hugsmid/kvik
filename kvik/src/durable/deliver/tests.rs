@@ -338,7 +338,7 @@ mod bounded {
         };
         let s = block_on(Store::open(config())).unwrap();
         block_on(s.define_series(gauge("a/b/one"))).unwrap();
-        let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+        let c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
         block_on(c.route(Funnel::facts(Select::All))).unwrap();
         for k in 0..20 {
             let r = Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64));
