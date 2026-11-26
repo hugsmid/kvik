@@ -406,7 +406,10 @@ impl Session {
             None => Duration::MAX,
             Some(d) => {
                 let ns = u64::try_from(d.saturating_sub(self.reader.now())).unwrap_or(0);
-                Duration::from_nanos(ns).min(FULL_REFRESH_EVERY)
+                // A state that cannot tell is due at `now + 1` on every turn; a batch cannot come sooner than the interval.
+                Duration::from_nanos(ns)
+                    .max(self.opts.min_batch_interval)
+                    .min(FULL_REFRESH_EVERY)
             }
         }
     }
