@@ -5190,6 +5190,44 @@ arithmetic, so a late commit clock plus the maximum never panics: a deadline bey
 **Pinned by.** `tests/gate_edges.rs` `durations_beyond_the_maximum_are_refused_and_the_maximum_is_accepted`,
 `the_longest_durations_late_on_the_commit_clock_judge_without_overflow`.
 
+## Q-1460 — How a nodes block stores a node version
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.9), provisional.
+**Scenario.** The design gave each entry one `as_of: uv64` relative to the block's `base_pos`. A version is a position
+(Q-1422), and positions of current facts can belong to an older generation, whose sequences restart at 1, so one
+unsigned difference cannot hold every version a run may carry.
+**Options.** (a) Two fields: the generation difference from `base_pos`, then the sequence, as a difference when the
+generation is the same and whole otherwise; (b) a full 12-byte position per entry; (c) one field, refusing a run
+that spans generations.
+**Decision (provisional).** (a), with `base_pos` the least version of the whole run so both differences are
+non-negative, the same in each of the run's blocks so a block's split does not depend on the versions it holds. It
+costs one byte more than the design's field in the usual case; (c) would make an ordinary restore fail a checkpoint.
+**Pinned by.** `tests/refusals.rs` vectors `AsOf` and `BasePosition`; `tests/files/mod.rs` `day_part` (an older
+generation's version).
+
+## Q-1461 — Tree files accept only canonical bytes
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.8, T.11), provisional.
+**Scenario.** `format.md`'s common rules have readers ignore reserved bytes and padding and accept non-canonical
+blocks, so a later minor version may use them. A tree part or root that passes the listed checks but is not what the
+writer would write (other padding, another block split, a stale directory) could then be read with nothing to say
+which bytes are meant.
+**Options.** (a) Accept only canonical bytes, as the derived files of A.18 already refuse unknown skippable blocks;
+(b) the common rules, with a separate canonical check for the scrub.
+**Decision (provisional).** (a): a tree file is derived, so a refusal costs a rebuild and never data, and a reader
+that accepts only what encodes to itself has one meaning for every accepted file, which the fuzz target checks.
+A newer writer's additions take version refusals (Q-1462), not reserved bytes.
+**Pinned by.** `tests/refusals.rs` vectors `Reserved`, `Padding`, `Split`, `Directory`, `DirectoryRoot`, `Summary`;
+`tests/fuzz_inputs.rs`.
+
+## Q-1462 — A record size above v1 in a tree file
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12), provisional.
+**Scenario.** A.18 lets a reader ignore the tail of a record longer than it knows. With canonical reading (Q-1461) a
+file whose records carry such a tail would not encode to itself.
+**Options.** (a) A version refusal; (b) keep the tail bytes through a decode and encode.
+**Decision (provisional).** (a): the reader leaves the file to the newer writer that wrote it and takes facts; a
+size below v1 is damage.
+**Pinned by.** `tests/refusals.rs` vectors `RecordSize`, `RecordSizeSmall`;
+`root_refusals_shared_with_parts`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

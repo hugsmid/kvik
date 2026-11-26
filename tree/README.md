@@ -9,6 +9,9 @@ associative merge, the window edge credit, and the canonical byte layout of a st
   from it equal the reference model's whatever the bracketing.
 - `encode` writes the one byte sequence of a node and refuses window evaluations; `decode` applies the checks of
   T.6, never panics and never allocates from an unchecked length.
+- `part::Part` and `root::Root` encode and decode tree parts and the tree root (roadmap 7.1b, T.8 to T.12) over byte
+  buffers; a decode accepts only canonical bytes and names each refusal (`Refusal`). The stored levels are one table,
+  `LEVELS`; files carry the table they were written under.
 
 ```rust
 use kvik_tree::{Kind, Params, Value, decode, encode, fold, merge};
@@ -28,4 +31,6 @@ assert_eq!(decode(&encode(&whole).unwrap()).unwrap(), whole);
 Tests: merge laws and agreement with the model (`tests/properties.rs`), layout checks (`tests/layout.rs`, one vector
 per T.6 check in `tests/checks.rs`), node rules (`tests/nodes.rs`), golden
 nodes (`tests/golden/`), the fuzz entry over random and mutated inputs (`tests/fuzz_inputs.rs`), and a cargo-fuzz
-target in [`fuzz/`](fuzz/README.md). Fold time and node sizes: `cargo run --release -p kvik-tree --example fold_cost`.
+target in [`fuzz/`](fuzz/README.md); for parts and roots, round trips (`tests/parts.rs`), one vector per refusal
+(`tests/refusals.rs`) and golden files (`tests/golden_files.rs`). Fold time, node and entry sizes and the cost of a
+decode and merge: `cargo run --release -p kvik-tree --example fold_cost` (`docs/measurements/tree-parts.md`).

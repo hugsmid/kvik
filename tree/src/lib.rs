@@ -27,12 +27,18 @@
 mod bytes;
 mod exact;
 mod fold;
+mod frame;
 pub mod fuzz;
+mod level;
 mod node;
+pub mod part;
+pub mod root;
 mod window;
 
 pub use bytes::{DecodeError, NotStorable, decode, encode, form};
 pub use exact::{Exact, exact, exact_ns};
 pub use fold::{fold, merge, merge_all};
+pub use frame::{EncodeError, FileError, Refusal};
+pub use level::{LEVELS, Level, MINUTE};
 pub use node::{Body, CounterRules, Kind, Node, Params, StateKey, Value};
 pub use window::{credit_intervals, with_stretches};
