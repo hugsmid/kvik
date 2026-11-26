@@ -76,8 +76,13 @@ fn a_tail_with_no_rows_allowed_is_refused() {
     let w = World::new("zero-rows");
     let s = w.open();
     let r = s.reader();
-    let got = r.session().open(super::tests::tail_all(), LiveOptions::default().max_rows(0));
-    assert!(matches!(got, Err(crate::QueryError::Invalid { .. })), "{got:?}");
+    let got = r
+        .session()
+        .open(super::tests::tail_all(), LiveOptions::default().max_rows(0));
+    assert!(
+        matches!(got, Err(crate::QueryError::Invalid { .. })),
+        "{got:?}"
+    );
     block_on(s.shutdown()).unwrap();
 }
 

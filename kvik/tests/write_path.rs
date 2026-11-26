@@ -18,9 +18,11 @@ use kvik_log::name::SegmentName;
 struct Counts {
     lease_writes: u64,
     segment_syncs: u64,
+    /// Reads made on the `kvik-deliver` thread.
+    deliver_reads: u64,
 }
 
-/// The in-memory file system counting lease writes and log segment syncs.
+/// The in-memory file system counting lease writes, log segment syncs and the `kvik-deliver` thread's reads.
 #[derive(Debug)]
 struct CountFs {
     inner: MemFs,
@@ -37,6 +39,9 @@ struct CountFile {
 
 impl FsFile for CountFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        if std::thread::current().name() == Some("kvik-deliver") {
+            self.counts.lock().unwrap().deliver_reads += 1;
+        }
         self.inner.read_at(buf, offset)
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
@@ -166,6 +171,24 @@ fn the_delivery_reader_refreshes_at_most_once_per_batch_sync() {
         s2 - s1
     );
     drop(consumer);
+    block_on(store.shutdown()).unwrap();
+}
+
+fn deliver_reads(c: &Mutex<Counts>) -> u64 {
+    c.lock().unwrap().deliver_reads
+}
+
+#[test]
+fn with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit() {
+    let (store, _clock, counts, ids) = counted("no-consumer-reads", 1);
+    let r0 = deliver_reads(&counts);
+    for i in 0..50 {
+        block_on(store.emit(&[num(ids[0], i, 1.0)])).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let reads = deliver_reads(&counts) - r0;
+    // One refresh's reads at most: the burst is shorter than the interval between reads with no consumer (Q-1490).
+    assert!(reads <= 16, "{reads} reads for 50 emits");
     block_on(store.shutdown()).unwrap();
 }
 

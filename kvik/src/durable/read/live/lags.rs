@@ -153,7 +153,8 @@ fn a_round_failing_after_taking_events_lags_the_tail_it_took_them_for() {
     let sealed = |text: &[u8]| {
         for _ in 0..500 {
             if w.segments().iter().any(|(p, b)| {
-                p.extension().is_some_and(|e| e == "kvl") && b.windows(text.len()).any(|x| x == text)
+                p.extension().is_some_and(|e| e == "kvl")
+                    && b.windows(text.len()).any(|x| x == text)
             }) {
                 return;
             }
