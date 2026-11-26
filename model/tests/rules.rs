@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
+use kvik_model::engine::Start;
 use kvik_model::engine::{Alert, Corruption};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
@@ -1282,9 +1283,16 @@ fn s3_missing_cursor_file_is_named_by_the_recovery_entry() {
             .iter()
             .any(|l| l.kind == LossKind::PossibleLoss && l.cursors_missing == vec![C])
     );
+    assert!(m.cursor_lost(C), "waits to be started again (Q-131)");
+    m.start_consumer(C, Start::Time(0)).unwrap();
     m.drain().unwrap();
+    let last = m.observed[&C].last().unwrap().session;
     assert!(
-        m.observed[&C].iter().filter(|o| o.session == 2).count() == 1,
+        m.observed[&C]
+            .iter()
+            .filter(|o| o.session == last && o.replayed)
+            .count()
+            == 1,
         "replayed from no cursor"
     );
 }
