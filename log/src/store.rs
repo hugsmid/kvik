@@ -279,8 +279,12 @@ impl StoreDir {
             });
         }
         // No descriptor: only what creation makes may be present, with its directories empty.
-        let unfinished = matches!(Self::judge(&*fs, dir)?, Judged::Unfinished(_));
-        let Some(new) = new.filter(|_| unfinished) else {
+        match Self::judge(&*fs, dir)? {
+            Judged::HasStore => return Self::open(fs, dir, new),
+            Judged::Unfinished(_) => {}
+            Judged::Other => return Err(StoreError::NotAStore),
+        }
+        let Some(new) = new else {
             return Err(StoreError::NotAStore);
         };
         Self::create(fs, dir, new)
