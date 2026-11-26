@@ -5198,7 +5198,10 @@ durable backend (`deliver/take.rs`: `dormant` is cleared at the first take and t
 confirmation) resumes it from P with a plain `Resume`, so facts above P reach a consumer that was never told to
 forget above P; `recovery_generator_coverage` at 1,024 cases finds the model doing the same. Recommended default:
 until the `NoCursor` resync is confirmed the consumer stays lost, and every take sends it again (model `reconnect`
-and the durable `take`, together, so the differential still agrees). Settle by: roadmap 5.3 step 2.
+and the durable `take`, together, so the differential still agrees). **Settled by the lead, 26 November, to the
+recommended default; built with roadmap 5.3 step 1:** every take before the confirmation sends the `NoCursor` resync
+again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`;
+`kvik/tests/consumers.rs`).
 
 ## Open at v0.2
 
@@ -5759,6 +5762,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1202 | `CursorBehindLog` and the catch-up that needs an entry on no local tier, on the durable backend | §4 Resync, Overflow, `api.md` Consuming (owner's ruling, 26 November): model only until the local log is trimmed; built with the first trimming path. The model sets each cause where it issues the `resync`, and the model backend maps it one to one. Scenario: a cursor older than the oldest local log segment (`rules.rs` `s4_resync_for_a_cursor_behind_the_log_waits_for_its_confirmation`) |
 | Q-1401 | A saved point whose stamp matches and whose position is above the last position | §4 New consumer, §7 Readers (decided by the lead, 26 November, to the provisional default): the check answers `Kept`; a start at it begins at the last position, as every start is lowered to it. Scenario: a point built by hand with a zero stamp against a store that never reset (`starts.rs` `each_start_kind_begins_after_its_position_with_no_resync`; `kvik/tests/api.rs` `a_new_consumer_starts_after_the_position_before_its_start_with_no_resync`, both backends) |
 | Q-1403 | "First fact at or after T" for `start: time` | §4 New consumer (decided by the lead, 26 November, to the provisional default): by the receive time of the batch, as the durable backend's commit index; the model takes the last entry received before T. Scenario: facts received a second apart; a start at the second's receive time begins after the first (`starts.rs`; `kvik/tests/api.rs`, both backends) |
+| Q-1450 | A lost consumer taken again before it confirms its `NoCursor` resync | §4 Resync, invariant 25 (settled by the lead, 26 November, to the recommended default): every take before the confirmation sends the `NoCursor` resync again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`; `kvik/tests/consumers.rs`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

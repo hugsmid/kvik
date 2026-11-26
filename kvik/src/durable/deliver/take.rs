@@ -92,6 +92,7 @@ impl Deliverer {
     /// - one whose cursor file was missing or unreadable at the start is first sent a resync of cause `NoCursor`
     ///   whose `forget_above` is the position before its start, carrying each funnel's state (its latches are lost),
     ///   then continues from there;
+    /// - one taken again before it confirmed that resync is sent it again, with the same `forget_above` (Q-1450);
     /// - one taken again in this run resumes from its confirmed cursor, and one with a cursor file as set up at the
     ///   start, whatever `start`.
     pub(crate) fn take(
@@ -111,11 +112,12 @@ impl Deliverer {
             }
         };
         let head = self.head;
-        let lost = !new && self.consumers[name].dormant;
-        let point = if new || lost {
-            Some(self.start_point(start, ctx)?)
-        } else {
-            None
+        let retaken = self.consumers.get(name).and_then(|rt| rt.no_cursor);
+        let lost = !new && (self.consumers[name].dormant || retaken.is_some());
+        let point = match retaken {
+            Some(p) => Some(p),
+            None if new || lost => Some(self.start_point(start, ctx)?),
+            None => None,
         };
         let rt = self.consumers.entry(name.to_string()).or_default();
         if rt.attached {
@@ -144,6 +146,7 @@ impl Deliverer {
         rt.cursor = point;
         rt.behind = (point < head).then(|| next(point));
         if lost {
+            rt.no_cursor = Some(point);
             rt.latches.clear();
             self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
             return Ok(Ok(()));

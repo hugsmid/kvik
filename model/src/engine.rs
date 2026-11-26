@@ -4242,6 +4242,14 @@ impl Model {
             .consumer_index(id)
             .and_then(|i| self.vol.as_ref().and_then(|v| v.consumers[i].started));
         self.vol()?;
+        // Until its `NoCursor` resync is confirmed the consumer stays lost and is sent it again (Q-1450).
+        if let Some(p) = started.filter(|_| !self.disk.cursors.contains_key(&id)) {
+            let i = self
+                .consumer_index(id)
+                .expect("started is set only on a known consumer");
+            self.send_no_cursor(i, p);
+            return Ok(());
+        }
         let cursor = self
             .disk
             .cursors

@@ -109,6 +109,9 @@ impl Deliverer {
             if o.reset {
                 rt.reset = Some(o.position);
             }
+            if o.forced && rt.no_cursor == Some(o.position) {
+                rt.no_cursor = None;
+            }
             forced |= o.forced;
             rt.cursor = rt.cursor.max(o.position);
         }

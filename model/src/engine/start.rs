@@ -54,11 +54,10 @@ impl Model {
     pub fn start_consumer(&mut self, id: ConsumerId, start: Start) -> Result<Position, Error> {
         let p = self.start_position(start)?;
         let i = self.consumer_index(id).ok_or(Error::UnknownConsumer(id))?;
-        let points = self.reset_points();
         let s = self.sessions.entry(id).or_insert(0);
         *s += 1;
         let session = *s;
-        let v = self.vol.as_mut().expect("up");
+        let v = self.vol.as_ref().expect("up");
         // A declaration that selects something, or a registration, names the consumer as a routing change does.
         let declared = match &v.consumers[i].decl.selection {
             Selection::All => true,
@@ -71,25 +70,9 @@ impl Model {
                     *consumer == id
                 }
             });
-        let behind =
-            v.entries.range(p.next()..).next().is_some() || points.iter().any(|r| r.id > p);
-        let c = &mut v.consumers[i];
-        let lost = matches!(c.mode, Mode::Dormant) && named;
-        c.queue.clear();
-        c.unconfirmed.clear();
-        c.runners.clear();
-        c.emitted.clear();
-        c.resume = None;
-        c.awaiting = None;
-        c.pending = None;
-        c.session = session;
-        c.last_received = p;
-        c.started = lost.then_some(p);
-        c.mode = if behind {
-            Mode::CatchUp { next: p.next() }
-        } else {
-            Mode::Live
-        };
+        let lost = matches!(v.consumers[i].mode, Mode::Dormant) && named;
+        self.restart_at(i, p, session);
+        self.vol.as_mut().expect("up").consumers[i].started = lost.then_some(p);
         // Never ahead of the synced mark (invariant 26).
         self.disk.cover(p);
         let written = p.min(self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last));
@@ -106,5 +89,40 @@ impl Model {
             self.sync_runners(i);
         }
         Ok(p)
+    }
+
+    /// A lost consumer taken again before confirming its `NoCursor` resync: dropped back to the position before its
+    /// start and sent the resync again, delivering nothing above it until confirmed (Q-1450).
+    pub(super) fn send_no_cursor(&mut self, i: usize, p: Position) {
+        let id = self.vol.as_ref().expect("up").consumers[i].decl.id;
+        let s = self.sessions.entry(id).or_insert(0);
+        *s += 1;
+        let session = *s;
+        self.restart_at(i, p, session);
+        self.vol.as_mut().expect("up").consumers[i].awaiting = Some(p);
+        self.issue_resync(i, p, None, Some(p), ResyncCause::NoCursor);
+    }
+
+    /// Drops what the consumer was handed and sets it after `p`: catch-up if anything follows, else live.
+    fn restart_at(&mut self, i: usize, p: Position, session: u32) {
+        let points = self.reset_points();
+        let v = self.vol.as_mut().expect("up");
+        let behind =
+            v.entries.range(p.next()..).next().is_some() || points.iter().any(|r| r.id > p);
+        let c = &mut v.consumers[i];
+        c.queue.clear();
+        c.unconfirmed.clear();
+        c.runners.clear();
+        c.emitted.clear();
+        c.resume = None;
+        c.awaiting = None;
+        c.pending = None;
+        c.session = session;
+        c.last_received = p;
+        c.mode = if behind {
+            Mode::CatchUp { next: p.next() }
+        } else {
+            Mode::Live
+        };
     }
 }

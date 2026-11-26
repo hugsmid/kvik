@@ -216,6 +216,9 @@ struct Rt {
     /// Known (routes or an unreadable cursor file) but without a cursor, and not taken in this run: it starts with a
     /// resync when it is (`spec.md` §4 Resync, a consumer with no cursor file).
     dormant: bool,
+    /// Taken lost in this run, its `NoCursor` resync not yet confirmed: the position before its start, sent again
+    /// at every take (Q-1450).
+    no_cursor: Option<LogPos>,
     queue: VecDeque<Pend>,
     parts: VecDeque<(Delivery, Out)>,
     unconfirmed: Vec<Out>,
