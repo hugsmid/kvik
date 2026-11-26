@@ -6,7 +6,11 @@ mod gate_common;
 
 use gate_common::*;
 use kvik_model::gate::{Entry, Gate, GateState, Kind, Level, Selector, Transition, judge};
-use kvik_model::types::{DAY, Fact, Nanos, Position, Quality, SECOND, SeriesId, Value};
+use kvik_model::gate::{Input, Window};
+use kvik_model::summary::{Aggregate, Params};
+use kvik_model::types::{
+    DAY, Fact, Kind as SeriesKind, Nanos, Position, Quality, SECOND, SeriesId, Value,
+};
 use proptest::prelude::*;
 
 const OTHER: SeriesId = SeriesId(2);
@@ -191,6 +195,48 @@ fn a_future_fact_replaced_before_the_look_back_takes_effect_as_its_replacement()
     let j = run(&h);
     assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
     assert_eq!(instants(&j.transitions), vec![15, 34]);
+}
+
+#[test]
+fn a_gate_without_holds_starts_from_the_last_fact_committed_at_its_watchs_instant() {
+    let h = H::new()
+        .num(0, 3.0)
+        .num(0, 2.0)
+        .watch(0, C, levels(&[Level::at(2.0)]));
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(0))]);
+}
+
+#[test]
+fn a_window_in_the_seed_aggregates_by_the_series_definition() {
+    let mut g = levels(&[Level::at(10.0).hold(5 * SECOND, 0)]);
+    g.input = Input::Window(Window {
+        width: 20 * SECOND,
+        aggregate: Aggregate::Increase,
+        min_coverage: 0,
+        cadence: SECOND,
+    });
+    let mut h = H::new().define(0, S, &["meter"]);
+    if let Some(Entry::Define { params, .. }) = h.entries.last_mut() {
+        *params = Params::new(SeriesKind::Counter, None);
+    }
+    let h = fact_at(fact_at(fact_at(h, 80, 80, 0.0), 85, 85, 20.0), 90, 90, 40.0).watch(100, C, g);
+    assert_eq!(moves(&run(&h).transitions)[0], (None, lv(1)));
+}
+
+#[test]
+fn a_crossing_between_one_and_two_longest_holds_back_is_kept_by_hysteresis() {
+    let h = fact_at(
+        fact_at(fact_at(H::new(), 1, 1, 0.0), 91, 91, 11.0),
+        93,
+        93,
+        7.0,
+    )
+    .watch(
+        100,
+        C,
+        levels(&[Level::at(10.0).clear(5.0).hold(SECOND, 5 * SECOND)]),
+    );
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(1))]);
 }
 
 #[test]
@@ -442,12 +488,14 @@ fn live(h: &[Entry], upto: Position, x: Nanos) -> Option<Fact> {
 /// entries and how many precede the later facts.
 fn early_watch(c: &Case, h: &[Entry], watch: Position, start: Nanos) -> (Vec<Entry>, usize) {
     let from = start - (2 * longest_hold(&c.gate)).min(DAY);
+    // With no hold the seed reads nothing: every fact before the watch is the state at the start.
+    let cut = if from == start { start + 1 } else { from };
     let mut earlier: std::collections::BTreeMap<Nanos, Fact> = Default::default();
-    for (_, f) in s_facts(h).filter(|(ct, f)| f.position < watch && *ct < from) {
+    for (_, f) in s_facts(h).filter(|(ct, f)| f.position < watch && *ct < cut) {
         earlier.insert(f.t, f.clone());
     }
     let inside: Vec<(Nanos, Fact)> = s_facts(h)
-        .filter(|(ct, f)| f.position < watch && *ct >= from)
+        .filter(|(ct, f)| f.position < watch && *ct >= cut)
         .map(|(ct, f)| (ct, f.clone()))
         .collect();
     let mut seq = 0u64;
