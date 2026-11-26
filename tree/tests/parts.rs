@@ -156,3 +156,30 @@ proptest! {
         decode_root(&bytes);
     }
 }
+
+#[test]
+fn a_nodes_block_takes_an_entry_that_fills_it_to_exactly_the_target() {
+    let n = 13_103u64;
+    let mut p = empty_part();
+    p.period_len = n * MINUTE as u64;
+    p.runs = vec![Run {
+        series: 1,
+        level: 1,
+        entries: (0..n)
+            .map(|i| Entry {
+                start: T0 + i as i64 * MINUTE,
+                stale: true,
+                as_of: pos(3, if (1..5).contains(&i) { 200 } else { 0 }),
+                node: None,
+            })
+            .collect(),
+    }];
+    let bytes = round_trip(&p);
+    let bodies: Vec<_> = split(&bytes)
+        .1
+        .into_iter()
+        .filter(|(t, _)| *t == 0x60)
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0].1.len(), TARGET_BODY);
+}

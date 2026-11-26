@@ -375,6 +375,21 @@ fn root_refusals_shared_with_parts() {
 }
 
 #[test]
+fn base_position_of_the_last_run_is_checked() {
+    let bytes = with_nodes(vec![nodes_body(
+        1,
+        2,
+        T0,
+        pos(3, 5),
+        &[(0, 0, 0, 1, gauge(T0, 3))],
+    )]);
+    assert_eq!(
+        Part::decode(&bytes).map(|_| ()).map_err(|e| e.refusal),
+        Err(Refusal::BasePosition)
+    );
+}
+
+#[test]
 fn version_refusals_are_the_ones_a_newer_writer_can_cause() {
     let v: Vec<_> = Refusal::ALL.iter().filter(|r| r.is_version()).collect();
     assert_eq!(
