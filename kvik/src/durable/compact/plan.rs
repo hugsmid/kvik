@@ -81,19 +81,18 @@ pub(crate) fn candidates(
         .collect())
 }
 
+/// Each listed segment's generation and `file_id`, with its first and last sequence where its description gives them.
+type Listed = BTreeMap<(u32, u64), Option<(u64, u64)>>;
+
 /// The segments the manifest lists, each with the sequence range its `0x22` description gives.
-fn listed(
-    fs: &dyn Fs,
-    dir: &Path,
-    store_id: &[u8; 16],
-) -> io::Result<BTreeMap<(u32, u64), Option<(u64, u64)>>> {
+fn listed(fs: &dyn Fs, dir: &Path, store_id: &[u8; 16]) -> io::Result<Listed> {
     let f = match fs.open(&dir.join(MANIFEST), OpenMode::Read) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e),
     };
     let bytes = super::run::read_whole(&*f)?;
-    let mut out: BTreeMap<(u32, u64), Option<(u64, u64)>> = read_manifest(&bytes, store_id)
+    let mut out: Listed = read_manifest(&bytes, store_id)
         .map(|read| listed_segments(&bytes, &read))
         .unwrap_or_default()
         .into_iter()
