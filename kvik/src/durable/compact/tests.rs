@@ -700,6 +700,13 @@ proptest! {
 }
 
 #[test]
+fn a_day_ending_exactly_fourteen_days_before_the_last_commit_keeps_its_day() {
+    let none = BTreeSet::new();
+    assert_eq!(super::period(5, 15 * DAY, &none), Some((0, DAY)));
+    assert_eq!(super::period(5, 15 * DAY + 1, &none), Some((0, 7 * DAY)));
+}
+
+#[test]
 fn the_period_of_a_time_at_the_edges_of_i64_is_the_models() {
     let none = BTreeSet::new();
     for t in [
