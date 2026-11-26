@@ -380,10 +380,25 @@ pub(super) fn tmp_path(dir: &Path, id: &Identity) -> PathBuf {
         .join(format!("{:08x}-{:016x}.kvc.tmp", id.generation, id.file_id))
 }
 
+/// Writes one file per period and class under its `.tmp` name; on any error every file it created is removed (§3.5).
 pub(super) fn write(
     input: &RunInput<'_>,
     taken: &Inputs,
     parts: BTreeMap<(i64, i64), Part>,
+) -> Result<Vec<Written>, RunError> {
+    let mut created = Vec::new();
+    write_files(input, taken, parts, &mut created).inspect_err(|_| {
+        for p in &created {
+            let _ = input.fs.remove_file(p);
+        }
+    })
+}
+
+fn write_files(
+    input: &RunInput<'_>,
+    taken: &Inputs,
+    parts: BTreeMap<(i64, i64), Part>,
+    created: &mut Vec<PathBuf>,
 ) -> Result<Vec<Written>, RunError> {
     let mut files: Vec<(i64, i64, Class, Vec<SeriesRows>, Entries)> = Vec::new();
     for ((start, len), part) in parts {
@@ -489,6 +504,7 @@ pub(super) fn write(
             _ => {}
         }
         let f = input.fs.open(&path, OpenMode::CreateNew)?;
+        created.push(path.clone());
         f.write_at(&bytes, 0)?;
         f.sync_all()?;
         out.push(Written {
