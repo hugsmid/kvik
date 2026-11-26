@@ -6,6 +6,59 @@ use std::sync::Arc;
 use super::*;
 
 impl Session {
+    /// The walk over rounds of facts alone, where each opened `Tail` takes, below its row limit, the facts of the
+    /// series it selects: those come shared from the hub, one decode per set of series a round's sessions take, and
+    /// the round's series are what the batch touched. `None` where the whole walk is needed.
+    pub(super) fn walk_shared(
+        &self,
+        rounds: &[Arc<super::super::hub::Round>],
+        reads: &BTreeMap<LiveId, Read>,
+        lagged: bool,
+    ) -> Option<Walk> {
+        #[cfg(test)]
+        if self.every {
+            return None;
+        }
+        let partial = |r: &super::super::hub::Round| r.seq == self.at.0 + 1 && self.at.1 > 0;
+        if lagged || rounds.iter().any(|r| !r.facts_only || partial(r)) {
+            return None;
+        }
+        let hub = self.reader.hub();
+        let mut w = Walk::default();
+        for (k, x) in reads {
+            let Read::Tail(t) = x else { continue };
+            if !t.opened {
+                continue;
+            }
+            let mut taken = 0usize;
+            let mut chunks = Vec::new();
+            for r in rounds {
+                let mine: BTreeSet<u32> = r
+                    .series
+                    .iter()
+                    .copied()
+                    .filter(|id| selects(&t.sel, &t.names, *id))
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let f = hub.facts_of(r, &mine);
+                taken = taken.saturating_add(f.len());
+                if taken > t.opts.max_rows {
+                    return None;
+                }
+                chunks.push(f);
+            }
+            if !chunks.is_empty() {
+                w.shared.insert(*k, chunks);
+            }
+        }
+        for r in rounds {
+            w.touched.extend(&r.series);
+        }
+        Some(w)
+    }
+
     /// Walks the pieces of the rounds after the session's cursor: the facts each opened `Tail` takes, up to the
     /// first row limit met, and what the `Latest`s must judge again. Every gap taken is named, past the stop too, so
     /// no batch carries a fact the reader knows lost nor leaves a loss below its cut unnamed (Q-1011); a fact a
@@ -153,10 +206,17 @@ pub(super) fn tail(
             });
         }
         t.names = at.registry().into_owned();
-    } else if let Some(facts) = w.facts.get(&id).filter(|f| !f.is_empty()) {
-        out.push(LiveEvent::Appended(Appended::Facts(
-            facts.iter().map(fact_out).collect(),
-        )));
+    } else {
+        let facts: Vec<Fact> = match w.shared.get(&id) {
+            Some(chunks) => chunks.iter().flat_map(|c| c.iter().cloned()).collect(),
+            None => w
+                .facts
+                .get(&id)
+                .map_or_else(Vec::new, |f| f.iter().map(fact_out).collect()),
+        };
+        if !facts.is_empty() {
+            out.push(LiveEvent::Appended(Appended::Facts(facts)));
+        }
     }
     t.from = at.cut;
 }

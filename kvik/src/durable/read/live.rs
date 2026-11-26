@@ -34,7 +34,7 @@ use crate::read::{
 };
 use crate::series::SeriesKey;
 use crate::time::Timestamp;
-use crate::types::SeriesId;
+use crate::types::{Fact, SeriesId};
 
 #[derive(Clone, Debug)]
 struct LatestRead {
@@ -109,7 +109,7 @@ pub(crate) struct Session {
     /// Calls of `try_batch`, for the tests of waiting.
     #[cfg(test)]
     pub(crate) turns: u64,
-    /// Rung by every round, as before Q-1118 ([`super::hub::Hub::every`]).
+    /// Rung by every round, as before Q-1118 ([`super::hub::Hub::every`]), and walks every piece itself.
     #[cfg(test)]
     pub(crate) every: bool,
     /// Run once by the next turn that computed a batch, between its view and its advance.
@@ -286,6 +286,8 @@ struct Walk {
     gaps: Vec<(LogPos, LogPos)>,
     /// Per `Tail`, its facts in position order.
     facts: BTreeMap<LiveId, Vec<Stored>>,
+    /// Per `Tail`, its facts in position order as the hub shares them, in place of `facts`.
+    shared: BTreeMap<LiveId, Vec<Arc<[Fact]>>>,
     /// Where the batch stopped inside a round: (round, pieces taken, cut).
     stop: Option<(u64, usize, LogPos)>,
     /// The gaps named that stand after the stop.
@@ -651,7 +653,10 @@ impl Session {
                 }
                 Read::Latest(_) => false,
             });
-        let mut walk = self.walk(v, &taken.rounds, &mut reads, lagged);
+        let mut walk = match self.walk_shared(&taken.rounds, &reads, lagged) {
+            Some(w) => w,
+            None => self.walk(v, &taken.rounds, &mut reads, lagged),
+        };
         for (a, b) in &recorded {
             if !self.recorded.contains(&(*a, *b)) && !walk.gaps.contains(&(*a, *b)) {
                 walk.gaps.push((*a, *b));
@@ -721,6 +726,8 @@ mod fanout;
 mod lags;
 #[cfg(test)]
 mod races;
+#[cfg(test)]
+mod sharing;
 #[cfg(test)]
 mod stops;
 #[cfg(test)]
