@@ -219,6 +219,8 @@ pub(super) struct Caches {
     stood: std::collections::BTreeSet<u64>,
     /// The segments the last lookup listed.
     listed: Option<Vec<u64>>,
+    /// The mark's reset stamp and generation the maps were taken under.
+    under: Option<(crate::mark::ResetStamp, u32)>,
     tick: u64,
     bytes: usize,
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
@@ -239,6 +241,7 @@ impl Default for Caches {
             maps: HashMap::new(),
             stood: std::collections::BTreeSet::new(),
             listed: None,
+            under: None,
             tick: 0,
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
@@ -271,6 +274,18 @@ impl Caches {
         });
         self.bytes -= freed;
         !self.stood.iter().all(|id| listed.contains(id))
+    }
+
+    /// Drops the segment maps when the mark's reset stamp or generation differs from the last lookup's: a map taken
+    /// under a mark whose update was later lost may pass over batches that are now different (Q-250, Q-1320).
+    pub(super) fn keep_maps_under(&mut self, stamp: crate::mark::ResetStamp, generation: u32) {
+        let now = Some((stamp, generation));
+        if self.under != now {
+            let freed: usize = self.maps.values().map(|c| c.bytes).sum();
+            self.maps.clear();
+            self.bytes -= freed;
+            self.under = now;
+        }
     }
 
     #[cfg(test)]
@@ -577,6 +592,7 @@ impl LogReader {
     ) -> Result<(Lookup, Planned), ReaderError> {
         let budget = Budget::new(within.budget);
         let mark = self.read_mark()?;
+        self.caches.keep_maps_under(mark.stamp, mark.generation);
         // The lease's renewal is apart from the read: a failure to write it makes no range incomplete.
         let lease_kept = self.keep_alive().is_ok();
         let mut out = Lookup {
