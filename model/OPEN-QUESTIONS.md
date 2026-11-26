@@ -5822,6 +5822,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1201 | Records held for a consumer not taken in this run | `api.md` Memory (ruled by the owner, 2026-11-26: none held) |
 | Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
 | Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
+| Q-1145 | A gate's state when it starts | §6 Gates, Transitions (ruled by the owner, 2026-11-26: (b), seeded from history) |
+| Q-1390 | The seed at a gate's start | §6 Gates, Transitions (ruled by the owner, 2026-11-26: the provisional default) |
+| Q-1391 | Durable resume state for gates | §6 Gates, Resume; `api.md` Gates (ruled by the owner, 2026-11-26: the provisional default) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
