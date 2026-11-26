@@ -110,6 +110,9 @@ impl Deliverer {
                 rt.reset = Some(o.position);
             }
             forced |= o.forced;
+            if o.forced {
+                rt.forget = None;
+            }
             rt.cursor = rt.cursor.max(o.position);
         }
         rt.dirty = true;

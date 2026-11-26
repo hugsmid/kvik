@@ -93,7 +93,7 @@ impl Deliverer {
     ///   whose `forget_above` is the position before its start, carrying each funnel's state (its latches are lost),
     ///   then continues from there;
     /// - one taken again in this run resumes from its confirmed cursor, and one with a cursor file as set up at the
-    ///   start, whatever `start`.
+    ///   start, whatever `start`; one whose `NoCursor` resync is not yet confirmed is sent it again.
     pub(crate) fn take(
         &mut self,
         name: &str,
@@ -118,6 +118,7 @@ impl Deliverer {
             None
         };
         let rt = self.consumers.entry(name.to_string()).or_default();
+        let again = rt.attached.then_some(rt.forget).flatten();
         if rt.attached {
             // The consumer process restarted (Q-95 (b)): what it was handed is dropped and it resumes from its
             // confirmed cursor, with its latches, as after downtime.
@@ -136,15 +137,16 @@ impl Deliverer {
         }
         rt.handle = true;
         rt.attached = true;
-        let Some(point) = point else {
+        let Some(point) = point.or(again) else {
             return Ok(Ok(()));
         };
         rt.dormant = false;
         rt.resume = None;
         rt.cursor = point;
         rt.behind = (point < head).then(|| next(point));
-        if lost {
+        if lost || again.is_some() {
             rt.latches.clear();
+            rt.forget = Some(point);
             self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
             return Ok(Ok(()));
         }
