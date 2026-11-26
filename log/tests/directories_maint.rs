@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use kvik_log::content::Item;
@@ -16,17 +17,79 @@ use kvik_log::writer::{DirectoryOptions, Log, LogWriter, SystemClock, WriterConf
 
 const T0: i64 = 1_767_225_600_000_000_000;
 
+#[derive(Debug, Default)]
+struct PaceState {
+    armed: bool,
+    permits: u64,
+    waiting: bool,
+    reads: u64,
+}
+
+/// Holds every read of a sealed segment until the test grants it a permit, so a build is at a known point.
+#[derive(Debug, Default)]
+struct Pace {
+    state: Mutex<PaceState>,
+    cv: Condvar,
+}
+
+impl Pace {
+    fn arm(&self) {
+        self.state.lock().unwrap().armed = true;
+    }
+
+    fn disarm(&self) {
+        self.state.lock().unwrap().armed = false;
+        self.cv.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut s = self.state.lock().unwrap();
+        while s.armed && s.permits == 0 {
+            s.waiting = true;
+            self.cv.notify_all();
+            s = self.cv.wait(s).unwrap();
+        }
+        s.waiting = false;
+        if s.armed {
+            s.permits -= 1;
+        }
+        s.reads += 1;
+    }
+
+    fn wait_held(&self) {
+        let mut s = self.state.lock().unwrap();
+        while !s.waiting {
+            s = self.cv.wait(s).unwrap();
+        }
+    }
+
+    fn reads(&self) -> u64 {
+        self.state.lock().unwrap().reads
+    }
+
+    /// Lets one read through, then waits until the next is held or `done`.
+    fn step(&self, done: &AtomicBool) {
+        let mut s = self.state.lock().unwrap();
+        s.permits += 1;
+        s.waiting = false;
+        self.cv.notify_all();
+        while !s.waiting && !done.load(Ordering::SeqCst) {
+            s = self.cv.wait_timeout(s, Duration::from_millis(1)).unwrap().0;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SlowFs {
     inner: MemFs,
-    slow: AtomicBool,
+    pace: Pace,
 }
 
 impl Fs for SlowFs {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>> {
         let sealed = path.extension().is_some_and(|e| e == "kvl");
-        if sealed && matches!(mode, OpenMode::Read) && self.slow.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(20));
+        if sealed && matches!(mode, OpenMode::Read) {
+            self.pace.pass();
         }
         self.inner.open(path, mode)
     }
@@ -80,10 +143,10 @@ fn start(fs: Arc<SlowFs>, dir: &Path, dirs: bool) -> Log {
         tzdata: "2026a".into(),
         software: "kvik test".into(),
     };
-    fs.slow.store(false, Ordering::SeqCst);
+    fs.pace.disarm();
     let store = StoreDir::open(fs.clone(), dir, Some(&new)).unwrap();
     let w = LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO, T0).unwrap();
-    fs.slow.store(true, Ordering::SeqCst);
+    fs.pace.arm();
     Log::start_with(
         w,
         Arc::new(SystemClock::default()),
@@ -92,16 +155,12 @@ fn start(fs: Arc<SlowFs>, dir: &Path, dirs: bool) -> Log {
     .unwrap()
 }
 
-/// Submits calls one by one for `calls` calls and returns the longest wait for an acknowledgement.
-fn ingest(log: &Log, calls: i64, base: i64) -> Duration {
-    let mut worst = Duration::ZERO;
+/// Submits `calls` calls one by one, each acknowledged before the next.
+fn ingest(log: &Log, calls: i64, base: i64) {
     for i in 0..calls {
-        let at = Instant::now();
         let items: Vec<Item> = (0..40).map(|k| fact(base + i * 40 + k)).collect();
         log.submit(items).unwrap().wait().unwrap();
-        worst = worst.max(at.elapsed());
     }
-    worst
 }
 
 fn sealed(fs: &MemFs) -> usize {
@@ -113,32 +172,59 @@ fn sealed(fs: &MemFs) -> usize {
 
 #[test]
 fn ingest_does_not_wait_while_the_directories_are_first_built() {
-    let mut worst = Vec::new();
-    for dirs in [false, true] {
-        let fs = Arc::new(SlowFs {
-            inner: MemFs::new(),
-            slow: AtomicBool::new(false),
+    let fs = Arc::new(SlowFs {
+        inner: MemFs::new(),
+        pace: Pace::default(),
+    });
+    let dir = PathBuf::from("store");
+    // A log written before the derived files existed (or whose `derived/` was lost, or a restored store).
+    let log = start(fs.clone(), &dir, false);
+    ingest(&log, 1_500, 0);
+    log.shutdown().unwrap();
+    let n = sealed(&fs.inner) as u64;
+    assert!(n > 50, "{n} sealed segments");
+    let log = start(fs.clone(), &dir, true);
+    fs.pace.wait_held();
+    let held_at = fs.pace.reads();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            ingest(&log, 5, 10_000_000);
+            tx.send(()).unwrap();
         });
-        let dir = PathBuf::from("store");
-        // A log written before the derived files existed (or whose `derived/` was lost, or a restored store).
-        let log = start(fs.clone(), &dir, false);
-        ingest(&log, 1_500, 0);
-        log.shutdown().unwrap();
-        let n = sealed(&fs.inner);
-        let log = start(fs.clone(), &dir, dirs);
-        let w = ingest(&log, 200, 10_000_000);
-        assert!(n > 50, "{n} sealed segments");
-        let at = Instant::now();
-        log.shutdown().unwrap();
-        // A shutdown never waits for the start's work.
-        assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
-        worst.push(w);
+        // Within one segment, so no rollover needs the held maintenance thread. Generous: only a failure waits.
+        if rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            fs.pace.disarm();
+            panic!("ingest waited for the directories' first build");
+        }
+    });
+    assert_eq!(
+        fs.pace.reads(),
+        held_at,
+        "the build was not held while ingest ran"
+    );
+    // A shutdown never waits for the start's work: it ends within the step under way.
+    let watch = log.watch();
+    let done = Arc::new(AtomicBool::new(false));
+    let stopper = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let r = log.shutdown();
+            done.store(true, Ordering::SeqCst);
+            r
+        })
+    };
+    while !watch.stopped() {
+        std::thread::yield_now();
     }
+    while !done.load(Ordering::SeqCst) {
+        fs.pace.step(&done);
+    }
+    stopper.join().unwrap().unwrap();
+    let built = fs.pace.reads() - held_at;
     assert!(
-        worst[1] < worst[0] * 20 + Duration::from_millis(500),
-        "ingest waited {:?} with the directories, {:?} without",
-        worst[1],
-        worst[0]
+        built < n / 2,
+        "{built} reads of {n} sealed segments before the shutdown ended"
     );
 }
 
@@ -165,7 +251,7 @@ impl kvik_log::writer::SealHook for Dropper {
 fn a_log_dropped_on_its_own_maintenance_thread_does_not_wait_for_itself() {
     let fs = Arc::new(SlowFs {
         inner: MemFs::new(),
-        slow: AtomicBool::new(false),
+        pace: Pace::default(),
     });
     let new = NewStore {
         store_id: [9; 16],
@@ -216,7 +302,7 @@ impl kvik_log::writer::SealHook for Panics {
 fn a_hook_that_panics_leaves_the_store_writable() {
     let fs = Arc::new(SlowFs {
         inner: MemFs::new(),
-        slow: AtomicBool::new(false),
+        pace: Pace::default(),
     });
     let new = NewStore {
         store_id: [9; 16],
@@ -242,7 +328,7 @@ fn a_hook_that_panics_leaves_the_store_writable() {
 fn a_seal_is_listed_soon_although_the_timed_mark_sync_is_an_hour_away() {
     let fs = Arc::new(SlowFs {
         inner: MemFs::new(),
-        slow: AtomicBool::new(false),
+        pace: Pace::default(),
     });
     let new = NewStore {
         store_id: [9; 16],
