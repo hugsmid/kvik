@@ -405,3 +405,169 @@ fn version_refusals_are_the_ones_a_newer_writer_can_cause() {
         ]
     );
 }
+
+fn part_refusal(bytes: &[u8]) -> Result<(), Refusal> {
+    Part::decode(bytes).map(|_| ()).map_err(|e| e.refusal)
+}
+
+fn root_refusal(bytes: &[u8]) -> Result<(), Refusal> {
+    Root::decode(bytes).map(|_| ()).map_err(|e| e.refusal)
+}
+
+fn counter(start: i64, width: i64) -> Vec<u8> {
+    encode(&node(Kind::Counter, start, width, 3, 1)).unwrap()
+}
+
+#[test]
+fn nodes_of_one_series_at_two_levels_of_different_forms_are_refused() {
+    let bytes = with_nodes(vec![
+        nodes_body(1, 2, T0, pos(3, 5), &[(0, 0, 0, 0, gauge(T0, 3))]),
+        nodes_body(1, 3, T0, pos(3, 5), &[(0, 0, 0, 0, counter(T0, width(3)))]),
+    ]);
+    assert_eq!(part_refusal(&bytes), Err(Refusal::NodeKind));
+    let run = |level: u8, kind| kvik_tree::part::Run {
+        series: 1,
+        level,
+        entries: vec![kvik_tree::part::Entry {
+            start: T0,
+            stale: false,
+            as_of: pos(3, 5),
+            node: Some(node(kind, T0, width(level), 3, 1)),
+        }],
+    };
+    let part = Part {
+        runs: vec![run(2, Kind::Gauge), run(3, Kind::Counter)],
+        ..empty_part()
+    };
+    assert!(part.encode().is_err());
+}
+
+#[test]
+fn nodes_of_two_series_of_different_forms_are_accepted() {
+    let run = |series, kind| kvik_tree::part::Run {
+        series,
+        level: 2,
+        entries: vec![kvik_tree::part::Entry {
+            start: T0,
+            stale: false,
+            as_of: pos(3, 5),
+            node: Some(node(kind, T0, width(2), 3, 1)),
+        }],
+    };
+    let part = Part {
+        runs: vec![run(1, Kind::Gauge), run(2, Kind::Counter)],
+        ..empty_part()
+    };
+    let bytes = part.encode().unwrap();
+    assert_eq!(Part::decode(&bytes).unwrap(), part);
+}
+
+#[test]
+fn nodes_of_one_run_in_two_blocks_of_different_forms_are_refused() {
+    let q = width(2);
+    let bytes = with_nodes(vec![
+        nodes_body(1, 2, T0, pos(3, 5), &[(0, 0, 0, 0, gauge(T0, 3))]),
+        nodes_body(1, 2, T0 + q, pos(3, 5), &[(0, 0, 0, 0, counter(T0 + q, q))]),
+    ]);
+    assert_eq!(part_refusal(&bytes), Err(Refusal::NodeKind));
+}
+
+fn record_size_of(block: u8, size: u16) -> Vec<u8> {
+    edit_block(|t, _| t == block, |b| put(b, 4, &size.to_le_bytes()))
+}
+
+#[test]
+fn a_directory_or_directory_root_record_size_above_v1_is_a_version_refusal() {
+    use block_type::{DIRECTORY, DIRECTORY_ROOT};
+    for (block, larger, smaller) in [(DIRECTORY, 56, 40), (DIRECTORY_ROOT, 40, 24)] {
+        let got = Part::decode(&record_size_of(block, larger)).unwrap_err();
+        assert_eq!(got.refusal, Refusal::RecordSize, "block {block:#x}");
+        assert!(got.refusal.is_version());
+        assert_eq!(
+            part_refusal(&record_size_of(block, smaller)),
+            Err(Refusal::RecordSizeSmall),
+            "block {block:#x}"
+        );
+    }
+}
+
+/// The sample root with its parts replaced; each `(file_id, seq, day, days, least series, greatest series)`.
+fn root_with_parts(parts: &[(u64, u64, i64, i64, u64, u64)]) -> kvik_tree::root::Root {
+    let mut r = sample_root();
+    let template = r.parts[0];
+    r.parts = parts
+        .iter()
+        .map(
+            |&(file_id, seq, day, days, lo, hi)| kvik_tree::root::PartRef {
+                file_id,
+                seq,
+                period_start: T0 + day * DAY,
+                period_len: (days * DAY) as u64,
+                least_start: T0 + day * DAY,
+                greatest_end: T0 + (day + days) * DAY,
+                least_series: lo,
+                greatest_series: hi,
+                ..template
+            },
+        )
+        .collect();
+    r.retired.clear();
+    r
+}
+
+#[test]
+fn parts_of_one_seq_are_accepted_when_periods_or_series_ranges_are_disjoint() {
+    for parts in [
+        vec![(3, 9, 0, 1, 7, 20), (5, 9, 0, 1, 21, 40)],
+        vec![(3, 9, 0, 1, 7, 40), (5, 9, 1, 1, 7, 40)],
+        vec![
+            (3, 9, 0, 7, 0, 10),
+            (4, 9, 0, 7, 20, 30),
+            (5, 9, 2, 1, 11, 19),
+        ],
+    ] {
+        let root = root_with_parts(&parts);
+        let bytes = root.encode().unwrap_or_else(|e| panic!("{parts:?}: {e}"));
+        assert_eq!(Root::decode(&bytes).unwrap(), root);
+    }
+}
+
+/// The bytes of [`root_with_parts`], encoded with distinct `seq`s and then given the ones asked for.
+fn root_bytes_with_parts(parts: &[(u64, u64, i64, i64, u64, u64)]) -> Vec<u8> {
+    let distinct: Vec<_> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, &(f, _, d, n, lo, hi))| (f, 100 + i as u64, d, n, lo, hi))
+        .collect();
+    let mut b = root_with_parts(&distinct).encode().unwrap();
+    for (i, p) in parts.iter().enumerate() {
+        put(&mut b, PARTS + 80 * i + 8, &p.1.to_le_bytes());
+    }
+    reframe(&mut b);
+    b
+}
+
+#[test]
+fn parts_of_one_seq_overlapping_in_period_and_series_are_refused() {
+    for parts in [
+        vec![(3, 9, 0, 1, 7, 20), (5, 9, 0, 1, 20, 40)],
+        vec![(3, 9, 0, 7, 7, 40), (5, 9, 6, 1, 0, 7)],
+        vec![
+            (3, 9, 0, 7, 0, 10),
+            (4, 9, 0, 7, 20, 30),
+            (5, 9, 2, 1, 10, 19),
+        ],
+        vec![
+            (3, 9, 2, 1, 11, 19),
+            (4, 9, 0, 7, 20, 30),
+            (5, 9, 0, 7, 0, 11),
+        ],
+    ] {
+        assert!(root_with_parts(&parts).encode().is_err(), "{parts:?}");
+        assert_eq!(
+            root_refusal(&root_bytes_with_parts(&parts)),
+            Err(Refusal::PartOrder),
+            "{parts:?}"
+        );
+    }
+}
