@@ -207,3 +207,6 @@ decimal scale above 18, or, in a partitioned export, a series name without three
 (`UnsupportedSeries`). A site label outside its alphabet, a partitioned export without one, or
 a store id other than the reader's is `InvalidOptions`; a file the partitioned export cannot open is `Open`, with its
 path.
+
+`read_rows` refuses with `NotAnExport` a file whose `kvik.export_version` is missing or not `1`, and a file with a
+null in a column that is never null (Q-1322).

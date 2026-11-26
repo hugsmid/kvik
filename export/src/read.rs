@@ -14,7 +14,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::file::reader::ChunkReader;
 
 use crate::batch::QUALITY_NAMES;
-use crate::schema::column;
+use crate::schema::{EXPORT_VERSION, column};
 use crate::{ExportError, ExportRow, Flags};
 
 /// The rows of an export file, streamed one record batch at a time.
@@ -40,7 +40,7 @@ pub fn read_rows<R: ChunkReader + 'static>(input: R) -> Result<ExportReader, Exp
     let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(input, options)?;
     let file = builder.metadata().file_metadata();
-    let metadata = file
+    let metadata: Vec<(String, String)> = file
         .key_value_metadata()
         .map(|kv| {
             kv.iter()
@@ -48,6 +48,14 @@ pub fn read_rows<R: ChunkReader + 'static>(input: R) -> Result<ExportReader, Exp
                 .collect()
         })
         .unwrap_or_default();
+    let version = metadata
+        .iter()
+        .find(|(k, _)| k == "kvik.export_version")
+        .map(|(_, v)| v.as_str());
+    // `docs/export.md` Compatibility: a new version is a breaking change, so its columns cannot be trusted (Q-1322).
+    if version != Some(EXPORT_VERSION) {
+        return Err(bad(format!("export version {version:?}")));
+    }
     let row_groups = builder.metadata().num_row_groups();
     Ok(ExportReader {
         batches: builder.build()?,
@@ -87,6 +95,9 @@ impl Iterator for ExportReader {
             }
             match self.batches.next()? {
                 Ok(b) => {
+                    if let Some(name) = null_in_never_null(&b) {
+                        return Some(Err(bad(format!("a null in column {name}"))));
+                    }
                     self.batch = Some(b);
                     self.next = 0;
                 }
@@ -94,6 +105,25 @@ impl Iterator for ExportReader {
             }
         }
     }
+}
+
+/// The first column `docs/export.md` Columns declares never null that holds a null (Q-1322).
+fn null_in_never_null(b: &RecordBatch) -> Option<&'static str> {
+    [
+        column::SERIES_ID,
+        column::SERIES_NAME,
+        column::T,
+        column::GENERATION,
+        column::SEQUENCE,
+        column::RECEIVED_AT,
+        column::QUALITY,
+        column::SUPPLIED_QUALITY,
+        column::CHANGED_AT,
+        column::INTERVAL_END,
+    ]
+    .into_iter()
+    .chain(column::FLAGS)
+    .find(|name| b.column_by_name(name).is_some_and(|c| c.null_count() > 0))
 }
 
 fn bad(reason: impl Into<String>) -> ExportError {
