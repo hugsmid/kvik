@@ -313,23 +313,7 @@ fn two_corrupt_merges_retire_every_input_down_the_chain() {
 fn opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable() {
     let (h, i) = lost_record_history();
     let (bytes, _) = image_with_corrupt(&h, &[i]);
-    let store = || {
-        let fs = MemFs::new();
-        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
-        let new = NewStore {
-            store_id: STORE_ID,
-            created_at: T0,
-            site_zone: "Etc/UTC".into(),
-            tzdata: "2026a".into(),
-            software: "kvik test".into(),
-        };
-        drop(StoreDir::open(afs.clone(), &dir(), Some(&new)).unwrap());
-        let f = fs.open(&manifest_path(), OpenMode::ReadWrite).unwrap();
-        f.set_len(0).unwrap();
-        f.write_at(&bytes, 0).unwrap();
-        f.sync_all().unwrap();
-        (fs, afs)
-    };
+    let store = || store_holding(&bytes);
     let rebuild = |fs: &MemFs| {
         rebuild_manifest(
             fs,
@@ -362,6 +346,55 @@ fn opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable() {
         };
         let appended = app.append(Body::Empty, NOW).unwrap();
         drop((app, store));
+        fs.power_loss_partial(seed);
+        fs.restart();
+        let img = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
+        assert!(!img.is_corrupt(), "seed {seed}");
+        assert_eq!(img.last_epoch(), appended, "seed {seed}");
+    }
+}
+
+fn store_holding(bytes: &[u8]) -> (MemFs, Arc<dyn Fs>) {
+    let fs = MemFs::new();
+    let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+    let new = NewStore {
+        store_id: STORE_ID,
+        created_at: T0,
+        site_zone: "Etc/UTC".into(),
+        tzdata: "2026a".into(),
+        software: "kvik test".into(),
+    };
+    drop(StoreDir::open(afs.clone(), &dir(), Some(&new)).unwrap());
+    let f = fs.open(&manifest_path(), OpenMode::ReadWrite).unwrap();
+    f.set_len(0).unwrap();
+    f.write_at(bytes, 0).unwrap();
+    f.sync_all().unwrap();
+    (fs, afs)
+}
+
+/// `spec.md` §7 step 4: once `rebuild_manifest` returns, the rename is durable, so a power loss keeps the rebuilt
+/// manifest and what is appended to it, with no other directory sync in between.
+#[test]
+fn a_completed_rebuild_survives_a_power_loss_with_what_was_appended_to_it() {
+    let (h, i) = lost_record_history();
+    let (bytes, _) = image_with_corrupt(&h, &[i]);
+    for seed in 0..32 {
+        let (fs, _afs) = store_holding(&bytes);
+        rebuild_manifest(
+            &fs,
+            &dir(),
+            STORE_ID,
+            state(&h),
+            &FakeVerifier::default(),
+            Finality::Final,
+            NOW,
+        )
+        .unwrap();
+        let Opened::Ready(mut app) = Appender::open(&fs, &dir(), STORE_ID, 0).unwrap() else {
+            panic!("the rebuilt manifest reads")
+        };
+        let appended = app.append(Body::Empty, NOW).unwrap();
+        drop(app);
         fs.power_loss_partial(seed);
         fs.restart();
         let img = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
