@@ -202,3 +202,18 @@ fn only_a_holder_of_the_oldest_round_counts_down_and_a_start_above_it_stops_hold
     hub.advance(subs[1], seq, (Reach::All, Reach::All));
     assert_eq!(hub.held().2, 0);
 }
+
+#[test]
+fn a_failed_round_told_only_of_a_gap_is_kept_not_whole_with_the_gap() {
+    let hub = Hub::default();
+    hub.subscribe((100, 1 << 20), Duration::ZERO);
+    let mut c = hub.collector().unwrap();
+    let p = LogPos {
+        generation: 0,
+        sequence: 3,
+    };
+    c.gap(p, p);
+    let c = c.failed().expect("a round holding a gap is kept");
+    assert!(!c.whole);
+    assert!(matches!(c.pieces[..], [Piece::Gap(a, b)] if a == p && b == p));
+}
