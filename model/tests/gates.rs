@@ -311,6 +311,41 @@ fn a_future_fact_refreshes_staleness_only_once_it_takes_effect() {
     assert_eq!(instants(&j.transitions), vec![0, 1, 11, 30, 40]);
 }
 
+/// Q-1200: a future fact outranked before its `t` by a fact that is not an arrival is not an arrival at `t`.
+#[test]
+fn a_future_fact_outranked_before_its_t_does_not_take_a_silent_series_out_of_stale() {
+    let mut g = levels(&[Level::at(10.0)]);
+    g.stale_after = Some(10 * SECOND);
+    let mut future = fact(
+        S,
+        Position::ORIGIN,
+        2 * SECOND,
+        30 * SECOND,
+        Value::Num(0.0),
+        Quality::Good,
+    );
+    future.changed_at = Some(1);
+    let mut retract = future.clone();
+    retract.changed_at = Some(2);
+    retract.value = Value::Absent;
+    retract.quality = Quality::Bad;
+    let h = H::new()
+        .watch(0, C, g)
+        .num(1, 0.0)
+        .push_fact(2 * SECOND, future)
+        .push_fact(3 * SECOND, retract);
+    let j = run(&h);
+    assert!(!j.transitions.iter().any(|t| matches!(
+        t.cause,
+        Cause::Timer {
+            kind: TimerKind::Mature,
+            ..
+        }
+    )));
+    assert_eq!(instants(&j.transitions), vec![0, 1, 11]);
+    assert_eq!(j.transitions.last().unwrap().to, Some(GateState::Stale));
+}
+
 #[test]
 fn a_bad_quality_fact_neither_moves_the_value_nor_refreshes_staleness() {
     let mut g = levels(&[Level::at(10.0)]);

@@ -604,6 +604,44 @@ fn a_latch_change_within_a_second_of_the_last_cursor_write_survives_a_crash() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Spec §4 Resync: a `NoCursor` resync the consumer never confirmed is sent again, with the same `forget_above` and
+/// nothing before it, when the consumer is taken again in the same run.
+#[test]
+fn an_unconfirmed_no_cursor_resync_is_sent_again_on_a_second_take() {
+    let w = World::new("retake-no-cursor");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = block_on(s.consumer("log", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    for i in 0..4 {
+        block_on(s.emit(&[num(g, i, 1.0)])).unwrap();
+        w.clock.advance(Duration::from_secs(1));
+    }
+    drain(&mut c);
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let path = w.path_with(Path::new("cursors").join("log.cur")).unwrap();
+    w.fs.poke(&path, 0, &[0; 16]);
+
+    let s = w.open();
+    let mut c = block_on(s.consumer("log", Start::Now, Select::None)).unwrap();
+    let ds = ready(&mut c);
+    let first = resync(&ds[0]).unwrap();
+    assert_eq!(first.cause, ResyncCause::NoCursor);
+    let forget = first.forget_above;
+    assert!(forget.is_some());
+    drop(c);
+    block_on(s.emit(&[num(g, 10, 2.0)])).unwrap();
+    let mut c = block_on(s.consumer("log", Start::Now, Select::None)).unwrap();
+    let ds = ready(&mut c);
+    let again = resync(&ds[0]).expect("the resync comes first");
+    assert_eq!(
+        (again.cause, again.forget_above),
+        (ResyncCause::NoCursor, forget)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Q-130: the registry file holds a routing change when the routing call returns, so a consumer whose routing
 /// entries are no longer in the log is still known at a start; with its cursor file lost it is named in the
 /// recovery entry and sent the `NoCursor` resync.
