@@ -26,7 +26,7 @@ a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 >   to an S3-compatible sink, tested against a local fake; the Parquet export; the compacted-file catalogue; and the
 >   summary-node fold and layout.
 > - **Next:** the open delivery items (roadmap 5), then compaction and the summary tree (6 and 7), tiers and restore
->   (8), and query (9). Several wait on the owner's rulings, named in the table below.
+>   (8), and query (9). Several wait on open questions, named in the table below.
 >
 > - The [specification](docs/spec.md) is tagged **v0.2**.
 > - A slow, exact [reference model](model/) of its semantics exists, with property tests and edge-case tests; a few
@@ -46,7 +46,7 @@ a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, on macOS and the Linux NVMe target) |
-> | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for the owner's ruling on Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
+> | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for an answer to Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for answers to Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
 > | 6. Compacted segments | 3 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export at schema version 1, with the partitioned layout) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
 > | 8. Tiers and backup | 1 of 5 done (8.2, the backup sink interface) |

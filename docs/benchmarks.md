@@ -1,9 +1,9 @@
 # Comparative benchmarks: plan
 
 > [!IMPORTANT]
-> **This is a plan. Nothing here has been run, and there are no results.** The engine does not exist yet
-> ([roadmap](roadmap.md)). Tool versions, settings and hardware are fixed when the benchmarks run, and recorded
-> with the results. Roadmap item 10.2.
+> **This is a plan. Nothing here has been run, and there are no results.** The engine is still in development: the
+> durable log works, but compaction, the summary tree, tiers, restore and query are not finished ([roadmap](roadmap.md)). Tool versions,
+> settings and hardware are fixed when the benchmarks run, and recorded with the results. Roadmap item 10.2.
 
 ## Purpose
 Someone choosing a store for device data should be able to see, on workloads like their own, where kvik is the
