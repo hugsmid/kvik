@@ -84,6 +84,7 @@ impl LogReader {
                 ranges: Vec::new(),
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,
+                mark_file: mark.file_id,
                 lost,
                 budget: &none,
                 above: None,

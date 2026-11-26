@@ -697,6 +697,31 @@ fn a_later_lookup_allocates_only_the_batches_it_reads_and_those_appended() {
 }
 
 #[test]
+fn a_lookup_again_of_a_segment_before_the_marks_scans_nothing_while_the_mark_stays() {
+    let (fs, log) = store(30);
+    // A key of the first segment, read through its scan rather than its lists.
+    let wanted = [Wanted {
+        series_id: 7,
+        from: 0,
+        to: 0,
+    }];
+    let mut r = reader(&fs, 51);
+    r.caches.lists_off();
+    let first = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    assert_eq!(
+        (first.complete.as_slice(), first.facts.len()),
+        (&[true][..], 1)
+    );
+    lookup::BUFFER_BYTES.with(|c| c.set(0));
+    let again = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    assert_eq!((again.facts, again.complete), (first.facts, first.complete));
+    // The batch holding the key only, not the 16 KiB segment to its end.
+    let allocated = lookup::BUFFER_BYTES.with(|c| c.get());
+    assert!(allocated < 4 << 10, "{allocated} bytes");
+    log.shutdown().unwrap();
+}
+
+#[test]
 fn a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact() {
     let (fs, log) = store(10);
     let before = log.stats().durable.sequence;

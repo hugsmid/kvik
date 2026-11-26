@@ -91,6 +91,7 @@ impl LogReader {
                 ranges: at.iter().map(|&i| (wanted[i].t, wanted[i].t)).collect(),
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,
+                mark_file: mark.file_id,
                 lost,
                 budget: &unbounded,
                 above: None,

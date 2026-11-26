@@ -38,6 +38,7 @@ pub struct Planned {
     pub(super) budget: Budget,
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
+    pub(super) mark_file: u64,
     pub(super) above: Option<Position>,
     pub(super) upto: Option<Position>,
 }
@@ -65,6 +66,7 @@ impl Planned {
             budget,
             generation: 0,
             last_sequence: 0,
+            mark_file: 0,
             above: None,
             upto: None,
         }
@@ -81,6 +83,7 @@ impl Planned {
             ranges: job.ranges.clone(),
             generation: self.generation,
             last_sequence: self.last_sequence,
+            mark_file: self.mark_file,
             lost,
             budget: &self.budget,
             above: self.above,

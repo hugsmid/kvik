@@ -4,8 +4,9 @@
 use super::*;
 
 /// Scans what follows the map's resume point up to the limit, a part at a time, adding batches and regions to the
-/// map and the wanted facts to `facts`; `None` if the segment could not be read. A part ends at [`PIECE`] bytes past
-/// where it starts; a region running to a part's end that may be a batch cut by it is read again in a longer part.
+/// map and the wanted facts to `facts`; whether it reached the limit, or `None` if the segment could not be read. A
+/// part ends at [`PIECE`] bytes past where it starts; a region running to a part's end that may be a batch cut by it
+/// is read again in a longer part.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_new(
     f: &dyn crate::fs::FsFile,
@@ -17,7 +18,7 @@ pub(super) fn scan_new(
     map: &mut SegmentMap,
     first: usize,
     facts: &mut Vec<FoundFact>,
-) -> Option<()> {
+) -> Option<bool> {
     let mut from = map.resume.unwrap_or(Resume {
         offset: HEADER_LEN as u64,
         last_sequence: None,
@@ -35,19 +36,19 @@ pub(super) fn scan_new(
             .min(len);
         let last = to >= len;
         if !last && from.offset >= to {
-            return Some(());
+            return Some(false);
         }
         let lim = if last { limit } else { ScanLimit::Mark(to) };
         if let ScanLimit::Mark(m) = lim
             && from.offset <= m
         {
             match take_complete(f, id, header, from, m, query, map, first, facts)? {
-                Taken::Stopped => return Some(()),
+                Taken::Stopped => return Some(false),
                 Taken::To(p) if p.offset == m => {
                     from = p;
                     if last {
                         map.resume = Some(from);
-                        return Some(());
+                        return Some(true);
                     }
                     piece = part_bytes;
                     continue;
@@ -91,7 +92,7 @@ pub(super) fn scan_new(
                 Found::Region(r) => held = Some((r, after)),
                 Found::Batch(b) => {
                     if take_found(&b, before, after, query, map, first, facts) {
-                        return Some(());
+                        return Some(false);
                     }
                 }
             }
@@ -108,7 +109,7 @@ pub(super) fn scan_new(
         }
         if last && !cut {
             map.resume = Some(end);
-            return Some(());
+            return Some(true);
         }
         from = map.resume.unwrap_or(from);
         piece = part_bytes;

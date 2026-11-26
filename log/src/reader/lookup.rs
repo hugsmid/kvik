@@ -173,6 +173,10 @@ struct SegmentMap {
     /// Per series, by id, its facts in `batches` and their least and greatest `t`: an A.8 index of what is mapped,
     /// for [`LogReader::estimate`].
     tally: Vec<IndexRecord>,
+    /// The file length, mark generation and mark segment at which a scan to the end of this segment, one before the
+    /// mark's, reached the end. The writer does not write such a segment while the mark stays in the same generation
+    /// and segment, so a lookup that finds all three unchanged has nothing new to scan.
+    ended: Option<(u64, u32, u64)>,
 }
 
 impl SegmentMap {
@@ -463,6 +467,8 @@ pub(super) struct Query<'a> {
     pub(super) ranges: Vec<(i64, i64)>,
     pub(super) generation: u32,
     pub(super) last_sequence: u64,
+    /// The file id of the mark's segment.
+    pub(super) mark_file: u64,
     pub(super) lost: &'a dyn Fn(u64, u64, u64) -> bool,
     pub(super) budget: &'a Budget,
     /// Facts are kept above this position and at or below `upto` only.
@@ -656,6 +662,7 @@ impl LogReader {
                     .collect(),
                 generation: mark.generation,
                 last_sequence: mark.last_sequence,
+                mark_file: mark.file_id,
                 lost,
                 budget: &budget,
                 above: within.above,
@@ -696,6 +703,7 @@ impl LogReader {
             piece: self.caches.piece,
             budget,
             generation: mark.generation,
+            mark_file: mark.file_id,
             last_sequence: mark.last_sequence,
             above: within.above,
             upto: within.upto,
@@ -761,17 +769,27 @@ impl LogReader {
             facts.truncate(first);
             map = SegmentMap::default();
         }
-        let read = scan_new(
-            &*f,
-            &id,
-            len,
-            limit,
-            self.caches.piece,
-            query,
-            &mut map,
-            first,
-            facts,
-        );
+        let key = (len, query.generation, query.mark_file);
+        let settled = matches!(limit, ScanLimit::End) && file_id < query.mark_file;
+        let read = if settled && map.ended == Some(key) {
+            Some(true)
+        } else {
+            map.ended = None;
+            scan_new(
+                &*f,
+                &id,
+                len,
+                limit,
+                self.caches.piece,
+                query,
+                &mut map,
+                first,
+                facts,
+            )
+        };
+        if settled && read == Some(true) {
+            map.ended = Some(key);
+        }
         let whole = read.is_some()
             && map
                 .regions
