@@ -236,6 +236,7 @@ impl Appender {
         store_id: [u8; 16],
         lease_epoch: u64,
     ) -> Result<Opened, OpenError> {
+        fs.sync_dir(dir)?;
         remove_leftover(fs, dir)?;
         let path = dir.join(MANIFEST);
         let bytes = read_file(fs, &path)?;
