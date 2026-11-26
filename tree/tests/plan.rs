@@ -366,3 +366,67 @@ fn a_merge_takes_the_inputs_highest_seq_and_through_and_fresh_file_ids() {
     let levels: Vec<u8> = out[0].runs.iter().map(|r| r.level).collect();
     assert_eq!(levels, vec![2, 3, 4]);
 }
+
+#[test]
+fn a_rollup_merge_publishes_its_rollup_levels_as_covered_over_the_period() {
+    let parts = [quarter_part(1, 4, 0), quarter_part(2, 6, 1)];
+    let r = listed(&parts);
+    let plan = Plan {
+        inputs: vec![1, 2],
+        periods: vec![(T0, DAY as u64)],
+        rollups: true,
+        minute_from: i64::MIN,
+    };
+    let out = merge(&r, &parts, &plan, &part_header(0), |_| {
+        Some(Params::new(Kind::Gauge, None))
+    })
+    .unwrap();
+    let refs: Vec<PartRef> = out
+        .iter()
+        .map(|p| kvik_tree::set::part_ref(p, &p.encode().unwrap()))
+        .collect();
+    let next = kvik_tree::set::next_root(&r, &plan, &refs, T0 + 2 * DAY);
+    assert_eq!(
+        next.covered,
+        vec![
+            all(2, T0, T0 + DAY),
+            all(3, T0, T0 + DAY),
+            all(4, T0, T0 + DAY)
+        ]
+    );
+    assert_eq!(next.parts, refs);
+    assert_eq!(next.retired.len(), 2);
+    assert_eq!((next.seq, next.next_file_id), (51, 501));
+}
+
+#[test]
+fn a_merge_drops_minute_entries_ending_at_the_cut_and_keeps_later_ones() {
+    let minute = |start: i64| Entry {
+        start,
+        stale: false,
+        as_of: pos(3, 1),
+        node: Some(node(Kind::Gauge, start, MINUTE, 1, 1)),
+    };
+    let mut p = quarter_part(1, 1, 0);
+    p.runs.push(Run {
+        series: 1,
+        level: 1,
+        entries: vec![minute(T0), minute(T0 + MINUTE)],
+    });
+    p.runs.sort_by_key(|r| (r.series, r.level));
+    let parts = [p];
+    let plan = Plan {
+        inputs: vec![1],
+        periods: vec![(T0, DAY as u64)],
+        rollups: false,
+        minute_from: T0 + MINUTE,
+    };
+    let out = merge(&listed(&parts), &parts, &plan, &part_header(0), |_| None).unwrap();
+    let kept: Vec<i64> = out[0]
+        .runs
+        .iter()
+        .filter(|r| r.level == 1)
+        .flat_map(|r| r.entries.iter().map(|e| e.start))
+        .collect();
+    assert_eq!(kept, vec![T0 + MINUTE]);
+}
