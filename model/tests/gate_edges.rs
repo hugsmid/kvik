@@ -4,8 +4,8 @@ mod gate_common;
 
 use gate_common::*;
 use kvik_model::gate::{
-    ConditionId, Entry, GateState, Input, Kind, Latches, Level, MAX_DURATION, ReplayBound,
-    Selector, Window, judge, resume,
+    ConditionId, Entry, Frontier, GatePoint, GateState, Input, Kind, Level, MAX_DURATION,
+    ReplayBound, Selector, Window, judge, resume,
 };
 use kvik_model::summary::{Aggregate, Params};
 use kvik_model::types::{DAY, Position, Quality, SECOND, SeriesId, Value};
@@ -164,7 +164,7 @@ fn a_series_refused_by_a_full_each_joins_with_a_start_transition_when_room_frees
     assert_eq!(first.id.at, join_at);
 }
 
-fn quiet_and_busy() -> (H, Position, Latches) {
+fn quiet_and_busy() -> (H, Frontier, GatePoint) {
     let (quiet, busy) = (ConditionId(1), ConditionId(2));
     let mut h = H::new()
         .watch(0, quiet, levels(&[Level::at(1_000.0)]))
@@ -176,34 +176,48 @@ fn quiet_and_busy() -> (H, Position, Latches) {
     }
     let all = judge(&h.entries, 3 * DAY).unwrap().transitions;
     let cut = Position::new(0, 23);
-    let mut latches = Latches::new();
-    for t in all.iter().filter(|t| t.id.at <= cut) {
-        latches.insert((t.id.condition, t.id.series), t.id);
-    }
-    (h, cut, latches)
+    let now = h
+        .entries
+        .iter()
+        .find(|e| e.position() == cut)
+        .unwrap()
+        .commit_time();
+    (
+        h,
+        Frontier { at: cut, now },
+        GatePoint::Transition(all[0].id),
+    )
 }
 
 #[test]
-fn the_replay_bound_runs_from_the_cursor_not_from_a_quiet_instances_old_latch() {
-    let (h, cut, latches) = quiet_and_busy();
-    let r = resume(&h.entries, 3 * DAY, cut, &latches, ReplayBound::default()).unwrap();
+fn the_replay_bound_runs_from_the_checkpoint_not_from_an_old_gate_cursor() {
+    let (h, start, cursor) = quiet_and_busy();
+    let r = resume(
+        &h.entries,
+        3 * DAY,
+        start,
+        Some(cursor),
+        ReplayBound::default(),
+    )
+    .unwrap();
     assert!(!r.not_replayed);
     assert!(!r.replayed.is_empty());
+    assert!(r.replayed.iter().all(|t| !start.covers(&t.id)));
 }
 
 #[test]
-fn the_replay_bound_still_refuses_a_cursor_older_than_the_span() {
-    let (h, cut, latches) = quiet_and_busy();
+fn the_replay_bound_still_refuses_a_checkpoint_older_than_the_span() {
+    let (h, start, cursor) = quiet_and_busy();
     let bound = ReplayBound {
         span: 10 * 60 * SECOND,
         facts: 1_000_000,
     };
-    let r = resume(&h.entries, 3 * DAY, cut, &latches, bound).unwrap();
+    let r = resume(&h.entries, 3 * DAY, start, Some(cursor), bound).unwrap();
     assert!(r.not_replayed && r.replayed.is_empty());
 }
 
 #[test]
-fn the_facts_bound_admits_exactly_that_many_facts_after_the_cursor() {
+fn the_facts_bound_admits_exactly_that_many_facts_after_the_checkpoint() {
     let h = H::new()
         .watch(0, C, levels(&[Level::at(10.0).hold(5 * SECOND, 0)]))
         .num(1, 11.0)
@@ -211,14 +225,18 @@ fn the_facts_bound_admits_exactly_that_many_facts_after_the_cursor() {
         .num(20, 0.0)
         .num(30, 11.0);
     let start = judge(&h.entries, 100 * SECOND).unwrap().transitions[0].id;
-    let latches: Latches = [((C, S), start)].into();
+    let cursor = Some(GatePoint::Transition(start));
+    let origin = Frontier {
+        at: Position::ORIGIN,
+        now: 0,
+    };
     let at = |facts| ReplayBound {
         span: 1_000 * SECOND,
         facts,
     };
-    let ok = resume(&h.entries, 100 * SECOND, Position::ORIGIN, &latches, at(4)).unwrap();
+    let ok = resume(&h.entries, 100 * SECOND, origin, cursor, at(4)).unwrap();
     assert!(!ok.not_replayed);
-    let over = resume(&h.entries, 100 * SECOND, Position::ORIGIN, &latches, at(3)).unwrap();
+    let over = resume(&h.entries, 100 * SECOND, origin, cursor, at(3)).unwrap();
     assert!(over.not_replayed);
 }
 

@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use gate_common::*;
 use kvik_model::gate::{
-    ConditionId, Entry, Gate, GateState, Input, Judgement, Kind, Latches, Level, ReplayBound,
-    Selector, Transition, TransitionId, Window, judge, pattern_matches, resume,
+    ConditionId, Entry, Frontier, Gate, GatePoint, GateState, Input, Judgement, Kind, Level,
+    ReplayBound, Selector, Transition, TransitionId, Window, judge, pattern_matches, resume,
 };
 use kvik_model::summary::Aggregate;
 use kvik_model::types::{Nanos, Position, Quality, SECOND, SeriesId, Value};
@@ -369,6 +369,7 @@ proptest! {
     #[test]
     fn a_restart_resumes_every_transition_once_after_dedup_by_id(
         c in arb_case(), cut in 0..40usize, delivered in 0..60usize, confirmed in 0..60usize,
+        pick in 0..64usize,
     ) {
         let (h, all) = judged(&c);
         let k = (c.gates.len() + cut).min(h.len());
@@ -377,23 +378,64 @@ proptest! {
         let before = judge(prefix, horizon).expect("judge").transitions;
         let d = delivered.min(before.len());
         let n = confirmed.min(d);
-        let mut latches = Latches::new();
-        for t in &before[..n] {
-            latches.insert((t.id.condition, t.id.series), t.id);
-        }
-        let cursor = before[..n].iter().filter(|t| t.id.due.is_none()).map(|t| t.id.at).max()
-            .unwrap_or(Position::ORIGIN);
-        let unbounded = ReplayBound { span: Nanos::MAX, facts: u64::MAX };
-        let r = resume(&h, until(&h), cursor, &latches, unbounded).expect("resume");
-        prop_assert!(!r.not_replayed);
         let confirmed_ids: Vec<TransitionId> = before[..n].iter().map(|t| t.id).collect();
+        let cursor = before[..n].last().map(|t| GatePoint::Transition(t.id));
+        let start = checkpoint(&h, &all.transitions, &confirmed_ids, pick);
+        let unbounded = ReplayBound { span: Nanos::MAX, facts: u64::MAX };
+        let r = resume(&h, until(&h), start, cursor, unbounded).expect("resume");
+        prop_assert!(!r.not_replayed);
         prop_assert!(r.replayed.iter().all(|t| !confirmed_ids.contains(&t.id)));
+        prop_assert_eq!(&r.replayed, &by_latches(&all.transitions, &before[..n]));
         let mut seen: Vec<TransitionId> = before[..d].iter().chain(&r.replayed).map(|t| t.id).collect();
         seen.sort();
         seen.dedup();
         prop_assert_eq!(seen, all.transitions.iter().map(|t| t.id).collect::<Vec<_>>());
         prop_assert_eq!(r.states, all.states);
     }
+}
+
+/// A checkpoint frontier that covers only confirmed transitions (design G5), drawn by `pick`.
+fn checkpoint(
+    h: &[Entry],
+    all: &[Transition],
+    confirmed: &[TransitionId],
+    pick: usize,
+) -> Frontier {
+    let mut cands = vec![Frontier {
+        at: Position::ORIGIN,
+        now: 0,
+    }];
+    cands.extend(h.iter().map(|e| Frontier {
+        at: e.position(),
+        now: e.commit_time(),
+    }));
+    cands.extend(
+        confirmed
+            .iter()
+            .filter_map(|id| id.due.map(|now| Frontier { at: id.at, now })),
+    );
+    cands.retain(|f| {
+        all.iter()
+            .all(|t| !f.covers(&t.id) || confirmed.contains(&t.id))
+    });
+    cands[pick % cands.len()]
+}
+
+/// The replay under per-instance latches (Q-1391): each instance's transitions after the last of its
+/// own that was confirmed, all of them for an instance with none confirmed.
+fn by_latches(all: &[Transition], confirmed: &[Transition]) -> Vec<Transition> {
+    let mut latches: BTreeMap<(ConditionId, SeriesId), TransitionId> = BTreeMap::new();
+    for t in confirmed {
+        latches.insert((t.id.condition, t.id.series), t.id);
+    }
+    all.iter()
+        .filter(|t| {
+            latches
+                .get(&(t.id.condition, t.id.series))
+                .is_none_or(|l| t.id > *l)
+        })
+        .cloned()
+        .collect()
 }
 
 #[test]

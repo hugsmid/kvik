@@ -4,7 +4,7 @@
 //! state at every instant. [`judge`] computes, from a history of log entries in position order, every
 //! transition of every gate with an identity that depends only on the log ([`TransitionId`]), so a
 //! replay after a restart finds the same transitions under the same ids. [`resume`] is the replay a
-//! consumer receives from its latches.
+//! consumer receives from its gate cursor and checkpoint.
 
 mod judge;
 mod pattern;
@@ -12,7 +12,7 @@ mod resume;
 
 pub use judge::{Judgement, judge};
 pub use pattern::{matches as pattern_matches, valid as pattern_valid};
-pub use resume::{Latches, ReplayBound, Resume, resume};
+pub use resume::{Frontier, GatePoint, ReplayBound, Resume, resume};
 
 use crate::summary::{Aggregate, Params};
 use crate::types::{Fact, Nanos, Position, SeriesId, Value};

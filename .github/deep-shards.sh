@@ -40,6 +40,7 @@ provisional     model provisional
 gates           model gates
 gate-properties model gate_properties
 gate-edges      model gate_edges
+gate-seed       model gate_seed
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
