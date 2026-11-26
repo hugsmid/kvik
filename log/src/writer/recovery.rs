@@ -935,7 +935,8 @@ pub(super) fn start(
     };
     let in_use_idx: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
 
-    // The first start of a new store, or a first start that stopped before its mark was readable.
+    // The first start of a new store, or a first start that stopped before its mark was readable. A registry,
+    // cursor or derived file naming a position of the generation means it is not (Q-1310).
     // Bytes in an unused segment are reported by the recovery entry of rule 3 first (Q-320).
     let unused_written = unused
         .iter()
@@ -960,11 +961,45 @@ pub(super) fn start(
             &generation,
         )
     };
+    // The other sources of F (`sources`): the registry file, cursor files. The consumers named by routing changes
+    // tell a missing cursor file from one that never existed.
+    let mut consumers = BTreeSet::new();
+    let routing = registry
+        .iter()
+        .flat_map(|f| f.entries.iter().map(|(_, _, e)| e))
+        .chain(segs.iter().flat_map(|s| {
+            s.batches.iter().flat_map(|b| {
+                b.content.items.iter().filter_map(|i| match i {
+                    Item::Entry(e) => Some(&**e),
+                    Item::Fact(_) => None,
+                })
+            })
+        }));
+    for e in routing {
+        if let Entry::Routing(r) = e {
+            consumers.insert(r.consumer.clone());
+        }
+    }
+    consumers.extend(sealed_scan.consumers.iter().cloned());
+    let sourced = super::sources::read_all(&super::sources::SourceContext {
+        fs: &*fs,
+        store_dir: store.dir(),
+        store_id,
+        generation: g,
+        consumers: &consumers,
+    })
+    .map_err(StoreError::Unsupported)?;
+
     let first_mark = match &mark {
         MarkRead::Readable { slot, .. } => generation.is_first_mark(slot),
         _ => true,
     };
-    if empty_log && !unused_written && first_mark && manifest.highest_sequence(g) == 0 {
+    if empty_log
+        && !unused_written
+        && first_mark
+        && manifest.highest_sequence(g) == 0
+        && sourced.highest < generation.first
+    {
         for &i in &to_delete {
             if let Err(e) = fs.remove_file(&segs[i].path) {
                 return Ok(read_only(
@@ -1029,34 +1064,6 @@ pub(super) fn start(
         });
     }
 
-    // The other sources of F (`sources`): the registry file, cursor files. The consumers named by routing changes
-    // tell a missing cursor file from one that never existed.
-    let mut consumers = BTreeSet::new();
-    let routing = registry
-        .iter()
-        .flat_map(|f| f.entries.iter().map(|(_, _, e)| e))
-        .chain(segs.iter().flat_map(|s| {
-            s.batches.iter().flat_map(|b| {
-                b.content.items.iter().filter_map(|i| match i {
-                    Item::Entry(e) => Some(&**e),
-                    Item::Fact(_) => None,
-                })
-            })
-        }));
-    for e in routing {
-        if let Entry::Routing(r) = e {
-            consumers.insert(r.consumer.clone());
-        }
-    }
-    consumers.extend(sealed_scan.consumers.iter().cloned());
-    let sourced = super::sources::read_all(&super::sources::SourceContext {
-        fs: &*fs,
-        store_dir: store.dir(),
-        store_id,
-        generation: g,
-        consumers: &consumers,
-    })
-    .map_err(StoreError::Unsupported)?;
     // F is at or above the generation's first position.
     let mut p = plan(
         &segs,
