@@ -249,13 +249,17 @@ fn model_start(start: Start) -> km::engine::Start {
     match start {
         Start::Now => km::engine::Start::Now,
         Start::Time(t) => km::engine::Start::Time(nanos(t)),
-        Start::Position(p) => km::engine::Start::Point(km::recovery::SavedPoint {
-            position: mpos(p.position),
-            stamp: km::recovery::ResetStamp {
-                sequence: p.stamp.sequence,
-                nonce: p.stamp.nonce,
-            },
-        }),
+        Start::Position(p) => km::engine::Start::Point(msaved(p)),
+    }
+}
+
+fn msaved(p: crate::types::SavedPoint) -> km::recovery::SavedPoint {
+    km::recovery::SavedPoint {
+        position: mpos(p.position),
+        stamp: km::recovery::ResetStamp {
+            sequence: p.stamp.sequence,
+            nonce: p.stamp.nonce,
+        },
     }
 }
 
@@ -1875,8 +1879,27 @@ impl Slot {
             durable: self.head(),
             epoch: self.model.disk.latest_epoch(),
             generation: self.model.disk.generation,
-            stamp: crate::types::ResetStamp::default(),
+            stamp: {
+                let s = self.model.stamp();
+                crate::types::ResetStamp {
+                    sequence: s.sequence,
+                    nonce: s.nonce,
+                }
+            },
             lease_renewed_at: ts(self.model.now),
+        })
+    }
+
+    /// `Reader::check` (`docs/api.md` Reader processes): the model's `check_point`.
+    pub(crate) fn check_point(
+        &mut self,
+        point: crate::types::SavedPoint,
+    ) -> Result<crate::types::PointCheck> {
+        self.readable()?;
+        Ok(match self.model.check_point(msaved(point)) {
+            km::recovery::PointCheck::Kept => crate::types::PointCheck::Kept,
+            km::recovery::PointCheck::VoidAbove(x) => crate::types::PointCheck::VoidAbove(pos(x)),
+            km::recovery::PointCheck::Unknown => crate::types::PointCheck::Unknown,
         })
     }
 

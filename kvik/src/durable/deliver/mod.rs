@@ -41,7 +41,6 @@ use std::time::Duration;
 use kvik_log::content::Item;
 use kvik_log::cursor::{self, Latch};
 use kvik_log::entries::Entry;
-use kvik_log::manifest::LossCause;
 use kvik_log::reader::{
     LogReader, ReadBatch, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError, Update,
 };
@@ -527,10 +526,10 @@ impl Deliverer {
                 generation: l.last.0,
                 sequence: l.last.1,
             };
-            let described = l.cause == LossCause::TruncatedTail
-                && d.resets
-                    .get(&next(last))
-                    .is_some_and(|after| *after == before(first));
+            let described = d
+                .resets
+                .get(&next(last))
+                .is_some_and(|after| super::saved::describes(next(last), *after, &l));
             if !described {
                 let fa = before(first);
                 let e = d.resets.entry(last).or_insert(fa);

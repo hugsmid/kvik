@@ -34,7 +34,7 @@ use crate::error::{OpenError, QueryError};
 use crate::health::LossReport;
 use crate::read::ReaderState;
 use crate::time::Timestamp;
-use crate::types::ResetStamp;
+use crate::types::{PointCheck, ResetStamp, SavedPoint};
 
 pub(crate) use errors::{copy, open_error, query_error};
 
@@ -657,6 +657,20 @@ impl DurableReader {
     /// Re-reads the mark, the manifest and new entries, and renews the lease when due.
     pub(crate) fn refresh(&self) -> Result<ReaderState, QueryError> {
         self.with_latest(|v| Ok(state_of(v)))
+    }
+
+    /// `Reader::check` under the cut of an ordinary refresh (`spec.md` §7 Readers, Reset stamp and saved points).
+    pub(crate) fn check_point(&self, point: SavedPoint) -> Result<PointCheck, QueryError> {
+        self.with_latest(|v| {
+            let st = state_of(v);
+            Ok(super::saved::check(
+                point,
+                st.generation,
+                st.stamp,
+                v.latest().entries(),
+                v.lost_ranges(),
+            ))
+        })
     }
 
     /// How many cuts the log reader holds: the current view's and those of views not yet released.

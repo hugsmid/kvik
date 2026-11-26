@@ -465,7 +465,7 @@ pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id re
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
 pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
 pub struct SavedPoint { pub position: Position, pub stamp: ResetStamp }
-pub fn check(&self, point: SavedPoint) -> Result<PointCheck, QueryError>;   // roadmap 5.3
+pub fn check(&self, point: SavedPoint) -> Result<PointCheck, QueryError>;   // refreshes first; reads no byte at the point
 pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 ```
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
@@ -579,7 +579,10 @@ pub struct Snapshot;   // live(id), series(key), fact_count(id), losses(), state
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
 - A reader that reads a recovery entry drops what it took above the entry's `after` (spec §7 Readers). A position
   kept for later use is kept with `ReaderState.stamp` as a `SavedPoint`; `reader.check(point)` judges it against the
-  resets since (spec §7 Readers): kept, void above a position, or unknown (start again). Built with roadmap 5.3.
+  resets since (spec §7 Readers): kept, void above a position, or unknown (start again). `Start::Position` takes
+  the same answer: kept starts at the point, void above X at X, both lowered to the last position (Q-1401);
+  unknown is `ConsumerError::UnknownPoint`. A point judged after a restore is unknown until restore records carry
+  their stamps (Q-1400).
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
 ### Live reads (roadmap 9.0d)
@@ -614,7 +617,7 @@ pub fn select(&self, s: &Selection) -> Result<Vec<SeriesId>, QueryError>;      /
   staleness passing) is updated at its due time with no new fact.
 - `Tail` delivers the facts of the selected series in position order as they become durable, chosen by what was
   known at each fact's position (Q-895), from the cut of its `Opened`; it has no static read and opens at that cut
-  only (from a time with roadmap 9.0f, from a saved point with 5.3). At most `max_rows` facts per batch: the batch's
+  only (from a time or a saved point with roadmap 9.0f, Q-1406). At most `max_rows` facts per batch: the batch's
   cut stops there for every live read of the session (Q-1014). A consumer more than `max_backlog_*` behind the mark
   gets `Lagged { from, to }` and continues at the mark; the facts between may be read statically (Q-1013).
 - Nothing is silently wrong (Q-1011): a reset is `Reset { above }` (drop what is held above it) and a fresh `Opened`
