@@ -192,6 +192,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1413 | §7, §8 Restore step 1; Q-796 | A non-fact entry set aside beyond a restored end (provisional) |
 | Q-1414 | §7, §9 row 10 | Where a run's outputs wait before publishing (provisional) |
 | Q-1530 | `format-compacted.md` B.1 Canonical writing; Q-811 | A chunk the streaming writer holds whole (provisional) |
+| Q-1531 | compaction design §4; `api.md` Threads; Q-721 | The governor's details and the background task's hook (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5257,6 +5258,12 @@ Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
 **Decision (provisional).** `FileWriter::push` streams a chunk block by block once a row with a greater `t` has arrived, no set-aside chunk shares its first `t` and no chunk is held; otherwise it holds the chunk's rows whole and writes the held chunks in B.1 order once the next chunk's first `t` is greater. Set-aside facts, which only a restore makes, come whole with the series. Held rows count against the maintenance cap (`FileWriter::held_rows`). Reason: the format is unchanged, the bytes equal the whole-series writer's, and the held case needs more than 4,096 revisions of one key or a restore.
 **Pinned by.** `chunk/src/file/stream.rs` tests (`a_streamed_revision_series_writes_the_bytes_of_the_whole_one`, `a_chunk_boundary_inside_one_key_orders_chunks_by_least_position`).
 
+## Q-1531 — The governor's details and the background task's hook
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §4 of the compaction design gives the governor's two limits and its idle preference but not: when a returned sync counts, what a sync or a rename costs, how an idle task is asked again, or how a task reaches `kvik-maint` before 6.3e wires compaction in.
+**Decision (provisional).** `kvik_log::writer::share::Governor`: after a step that worked `w` the next waits `w × (1 − share) / share`, rounded up to the nanosecond; the byte bucket refills at `io_rate` (the floor rate under the writer's pressure flag, which is ingest waiting) and holds one 128 KiB piece. A device call goes at the first of: no commit sync in flight; a commit sync returned since the governor last looked (each return counts once, and one seen while the step waited for CPU or bytes is spent); or the floor's deadline, a piece's time at the floor rate from when the call was first asked for. A sync or a rename costs no bytes and takes a piece's deadline. The writer marks each commit sync and wakes `kvik-maint` when a waiting task asked to hear of a return. A task with nothing due is asked again after a seal or after a second. Creation ahead, seals and descriptions always go before a step. `Log::start_with_task` takes the task (hidden from the documentation until 6.3e wires compaction in); `Log::maint_waits` reports how long creations and seals waited for `kvik-maint`, for the gate of Q-801.
+**Pinned by.** `log/src/writer/share/tests.rs`; `log/tests/threads.rs` `a_background_task_runs_between_creations_and_seals_and_every_call_still_lands`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5419,6 +5426,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1413 | 6.2c | A set-aside non-fact entry stalls a run; provisional |
 | Q-1414 | 6.3e | Unpublished outputs wait under `.tmp` names in `data/`; provisional |
 | Q-1530 | 6.2c | The streaming writer holds a chunk only while its place is undecided; provisional |
+| Q-1531 | 6.3e | Governor details and the hook for a background task; provisional |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 | Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give, which 9.0c adds a case of (a registry file that could not be written, Q-1001); for review |
