@@ -54,6 +54,9 @@ pub(crate) enum VerifyError {
     /// A row is out of place (step 3).
     #[error("misplaced: {0}")]
     Placement(&'static str),
+    /// Its description names other inputs, run or run size than the run's (§3.5 rebuild rule).
+    #[error("description disagrees with the run: {0}")]
+    Description(&'static str),
 }
 
 /// Reads every output back and checks it; returns the outputs with their hashes.
@@ -97,6 +100,15 @@ pub(super) fn verify(
             SeriesInfo { name, reach }
         })?;
         let d = file.description();
+        if d.inputs != taken.names {
+            return Err(VerifyError::Description("inputs"));
+        }
+        if d.run_id != input.first_file_id {
+            return Err(VerifyError::Description("run id"));
+        }
+        if d.run_count as usize != written.len() {
+            return Err(VerifyError::Description("run count"));
+        }
         let within = |t: i64| {
             (i128::from(d.period_start)..i128::from(d.period_start) + i128::from(d.period_len))
                 .contains(&i128::from(t))
@@ -108,9 +120,7 @@ pub(super) fn verify(
                 if !within(f.t) {
                     return Err(VerifyError::Placement("a row outside its file's period"));
                 }
-                if e.set_aside() != input.set_aside.holds(p)
-                    || (e.set_aside() && d.class != Class::Revision)
-                {
+                if e.set_aside() != input.set_aside.holds(p) {
                     return Err(VerifyError::Placement("a set-aside row in the wrong chunk"));
                 }
                 if !e.set_aside() {
