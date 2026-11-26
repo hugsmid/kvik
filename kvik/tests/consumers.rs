@@ -423,6 +423,61 @@ fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Q-1450: a lost consumer taken again before it confirms its `NoCursor` resync is sent it again, with the same
+/// `forget_above`, and nothing above that until it is confirmed.
+#[test]
+fn a_lost_consumer_taken_again_before_confirming_gets_no_cursor_again() {
+    let w = World::new("lost-retake");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = new_consumer(&s, "alarm", Select::None);
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    let ps = four_facts(&w, &s, g, 20.0);
+    drain(&mut c);
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let path = w.path_with(Path::new("cursors").join("alarm.cur")).unwrap();
+    w.fs.poke(&path, 0, &[0; 16]);
+    let s = w.open();
+    let lost = |c: &mut Consumer| {
+        let ds = ready(c);
+        let r = resync(&ds[0]).unwrap();
+        assert_eq!(
+            (r.cause, r.forget_above),
+            (ResyncCause::NoCursor, Some(ps[0]))
+        );
+        assert_eq!(
+            ds.len(),
+            1,
+            "nothing above forget_above before it is confirmed"
+        );
+        ds[0].id
+    };
+    let mut c =
+        block_on(s.consumer("alarm", Start::Position(stamp0(ps[0])), Select::None)).unwrap();
+    lost(&mut c);
+    drop(c);
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    let d = lost(&mut c);
+    block_on(c.confirm(d)).unwrap();
+    let facts = drain(&mut c)
+        .iter()
+        .filter(|d| matches!(&d.kind, DeliveryKind::Fact(_)))
+        .count();
+    assert_eq!(
+        facts, 3,
+        "the facts above forget_above follow the confirmation"
+    );
+    drop(c);
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    assert!(
+        ready(&mut c)
+            .iter()
+            .all(|d| resync(d).is_none_or(|r| r.cause != ResyncCause::NoCursor))
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Q-91 (c), row 16: routing the same funnel at every start adds no funnel and keeps its latch; a condition that
 /// became true while the consumer was down is delivered once, as a transition, and not again after the next start.
 #[test]

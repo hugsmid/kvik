@@ -253,7 +253,7 @@ fn a_routed_consumer_started_again_is_sent_no_resync() {
 }
 
 #[test]
-fn a_lost_consumer_taken_again_before_confirming_resumes_from_its_start() {
+fn a_lost_consumer_taken_again_before_confirming_is_sent_no_cursor_again() {
     let (mut m, s) = model(Selection::All);
     facts(&mut m, s, 0, 1.0);
     m.drain().unwrap();
@@ -265,11 +265,14 @@ fn a_lost_consumer_taken_again_before_confirming_resumes_from_its_start() {
         take(&mut m)[0].resync().unwrap().cause,
         ResyncCause::NoCursor
     );
+    facts(&mut m, s, 10, 1.0);
     m.reconnect(C).unwrap();
     let got = take(&mut m);
-    assert!(
-        got.iter().all(|d| d.fact().is_none()),
-        "no replay from the origin"
+    let r = got[0].resync().expect("the resync is sent again");
+    assert_eq!(r.cause, ResyncCause::NoCursor);
+    assert_eq!(
+        got.len(),
+        1,
+        "nothing above forget_above before the confirmation"
     );
-    assert_eq!(got[0].resync().unwrap().cause, ResyncCause::Resume);
 }
