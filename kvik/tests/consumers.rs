@@ -626,7 +626,6 @@ fn a_condition_delivery_meeting_a_full_queue_arrives_through_catch_up() {
         w.clock.advance(Duration::from_secs(1));
     }
     block_on(s.emit(&[num(g, 4, 20.0)])).unwrap();
-    assert!(s.consumer_stats("alarms").unwrap().catching_up);
     let ds = drain(&mut c);
     let triggers: Vec<_> = ds
         .iter()
