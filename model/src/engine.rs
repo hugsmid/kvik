@@ -20,6 +20,7 @@ mod faults;
 mod provisional;
 mod recovery;
 mod repair;
+mod start;
 use crate::provisional::{Outcome as CallOutcome, Provisional, Withdrawal};
 use crate::registry::{
     ChangedAtKind, Durability, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef,
@@ -36,6 +37,7 @@ pub use cuts::Cut;
 pub use repair::{
     Alert, Corruption, CorruptionReport, QuarantineCause, RepairConfig, ResendRequest,
 };
+pub use start::Start;
 
 /// Engine configuration. Defaults follow the spec where it gives one.
 #[derive(Clone, Debug)]
@@ -765,6 +767,9 @@ pub enum Error {
     /// A routing change names a consumer that is not declared.
     #[error("unknown consumer {0:?}")]
     UnknownConsumer(ConsumerId),
+    /// A saved point a start names is unknown (§7 Readers): start now or at a time.
+    #[error("the saved point is unknown")]
+    UnknownPoint,
     /// A routing change is refused.
     #[error("route refused: {0}")]
     BadRoute(&'static str),
@@ -1059,6 +1064,23 @@ pub struct Resync {
     /// de-duplication memory, and nothing further is delivered to it until
     /// it has confirmed this `resync` (§4 At-least-once, Resync).
     pub forget_above: Option<Position>,
+    /// Why it was sent, set where it is issued (`api.md` `ResyncCause`).
+    pub cause: ResyncCause,
+}
+
+/// Why a `resync` was sent (§4 Resync).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResyncCause {
+    /// It ends a resume after a restart or reconnect.
+    Resume,
+    /// A reset point: positions above `forget_above` may name other facts.
+    ResetPoint,
+    /// It follows `generation_changed` (§8 Restore step 2).
+    GenerationChanged,
+    /// The cursor is older than the oldest local log segment.
+    CursorBehindLog,
+    /// The consumer's cursor file was lost (Q-131).
+    NoCursor,
 }
 
 /// What a delivery carries.
@@ -1304,6 +1326,8 @@ pub struct Disk {
     /// Set by fault injection: consumers whose cursor file is missing or
     /// unreadable, until a recovery entry names them (§3 Recovery rule 3).
     pub lost_cursors: BTreeSet<ConsumerId>,
+    /// Consumers registered at run time (`Model::start_consumer`), as the registry file names them.
+    pub registered: BTreeSet<ConsumerId>,
     /// Every recovery entry written, by position, as the registry file and
     /// each tree checkpoint keep them (§2.1, §11 Health): a `possible_loss`
     /// stays listed when its entry is later lost.
@@ -1820,7 +1844,11 @@ impl Disk {
 #[derive(Clone, Debug)]
 enum Mode {
     Live,
-    CatchUp { next: Position },
+    CatchUp {
+        next: Position,
+    },
+    /// Its cursor file was lost: nothing is queued until it is started again (§4 Resync, Q-131).
+    Dormant,
 }
 
 #[derive(Clone, Debug)]
@@ -2229,22 +2257,20 @@ impl Model {
         for (i, c) in self.consumers.iter().enumerate() {
             let s = self.sessions.entry(c.id).or_insert(0);
             *s += 1;
-            let cursor = self
-                .disk
-                .cursors
-                .get(&c.id)
-                .copied()
-                .unwrap_or(Position::ORIGIN);
+            let kept = self.disk.cursors.get(&c.id).copied();
+            let cursor = kept.unwrap_or(Position::ORIGIN);
             let behind = d.entries.range(cursor.next()..).next().is_some()
                 || points.iter().any(|r| r.id > cursor);
-            let mode = if *s == 1 && behind && !sync_failed {
+            let mode = if kept.is_none() {
+                Mode::Dormant
+            } else if *s == 1 && behind && !sync_failed {
                 Mode::CatchUp {
                     next: cursor.next(),
                 }
             } else {
                 Mode::Live
             };
-            if *s > 1 && !sync_failed {
+            if *s > 1 && !sync_failed && kept.is_some() {
                 resuming.push((i, cursor));
             }
             consumers.push(ConsumerRt {
@@ -3487,7 +3513,7 @@ impl Model {
                         self.counters.overflows += 1;
                     }
                 }
-                Mode::CatchUp { .. } => {}
+                Mode::CatchUp { .. } | Mode::Dormant => {}
             }
         }
     }
@@ -3756,7 +3782,7 @@ impl Model {
         c.pending = None;
         if behind.is_empty() && !reset {
             c.mode = Mode::Live;
-            self.issue_resync(i, stop, None, None);
+            self.issue_resync(i, stop, None, None, ResyncCause::Resume);
         } else if behind.iter().all(|p| local.contains(p)) {
             c.mode = Mode::CatchUp {
                 next: cursor.next(),
@@ -3767,7 +3793,13 @@ impl Model {
             // confirmed, also past reset points it covers.
             c.mode = Mode::CatchUp { next: stop.next() };
             c.awaiting = Some(stop);
-            self.issue_resync(i, stop, Some((cursor, stop)), Some(cursor));
+            self.issue_resync(
+                i,
+                stop,
+                Some((cursor, stop)),
+                Some(cursor),
+                ResyncCause::CursorBehindLog,
+            );
         }
     }
 
@@ -3781,6 +3813,7 @@ impl Model {
         position: Position,
         replaced: Option<(Position, Position)>,
         forget_above: Option<Position>,
+        cause: ResyncCause,
     ) {
         let v = self.vol.as_ref().expect("up");
         let decl = v.consumers[i].decl.clone();
@@ -3838,6 +3871,11 @@ impl Model {
             .count();
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
+        let cause = if gc.is_some() {
+            ResyncCause::GenerationChanged
+        } else {
+            cause
+        };
         if let Some((cursor, restored_end)) = gc {
             c.queue.push_back(Envelope {
                 position: restored_end,
@@ -3862,6 +3900,7 @@ impl Model {
                 replaced,
                 issued,
                 forget_above,
+                cause,
             }),
         });
         signals.push(Signal::ResyncDue);
@@ -3989,7 +4028,13 @@ impl Model {
                 if flush.is_some() {
                     c.awaiting = Some(position);
                 }
-                self.issue_resync(i, position, None, flush.map(|rp| rp.forget_above));
+                self.issue_resync(
+                    i,
+                    position,
+                    None,
+                    flush.map(|rp| rp.forget_above),
+                    ResyncCause::Resume,
+                );
                 continue;
             }
             if let Some(rp) = flush {
@@ -4002,6 +4047,7 @@ impl Model {
                         replaced: None,
                         issued: 0,
                         forget_above: Some(rp.forget_above),
+                        cause: ResyncCause::ResetPoint,
                     }),
                 });
                 c.awaiting = Some(rp.id);
@@ -4034,7 +4080,14 @@ impl Model {
         let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) else {
             return Ok(Vec::new());
         };
-        let n = max.min(c.queue.len());
+        // Nothing after a `resync` awaiting its confirmation is handed out (§4 Resync).
+        let held = c.awaiting.map(|a| {
+            c.queue
+                .iter()
+                .position(|d| d.position == a && d.resync().is_some())
+                .map_or(0, |k| k + 1)
+        });
+        let n = max.min(held.unwrap_or(c.queue.len()));
         let out: Vec<Envelope> = c.queue.drain(..n).collect();
         let session = c.session;
         for d in &out {
@@ -4204,6 +4257,9 @@ impl Model {
         c.pending = None;
         c.session = session;
         c.last_received = cursor;
+        if matches!(c.mode, Mode::Dormant) {
+            return Ok(());
+        }
         self.begin_resume(i, cursor);
         Ok(())
     }
@@ -4243,7 +4299,7 @@ impl Model {
                 .vol()?
                 .consumers
                 .iter()
-                .all(|c| matches!(c.mode, Mode::Live) && c.queue.is_empty());
+                .all(|c| matches!(c.mode, Mode::Live | Mode::Dormant) && c.queue.is_empty());
             if quiet && !progress {
                 return Ok(());
             }

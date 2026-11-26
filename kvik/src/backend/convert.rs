@@ -192,6 +192,7 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
         },
         E::Tree(km::tree::TreeError::UnknownZone(z)) => Error::UnknownZone(z),
         E::BadConfirm => Error::BadConfirm,
+        E::UnknownPoint => Error::UnknownPoint,
         E::Restoring => Error::Restoring,
         // What the model does not support is refused before it is called
         // (`Slot::route`); every other refusal is the specification's.
@@ -402,5 +403,18 @@ pub(crate) fn trigger_cause(c: km::engine::TriggerCause) -> TriggerCause {
         km::engine::TriggerCause::Fact => TriggerCause::Fact,
         km::engine::TriggerCause::Timer => TriggerCause::Timer,
         km::engine::TriggerCause::Reattach => TriggerCause::Reattach,
+    }
+}
+
+/// The interface's resync cause of the model's, one to one.
+pub(crate) fn resync_cause(c: km::engine::ResyncCause) -> crate::consume::ResyncCause {
+    use crate::consume::ResyncCause as R;
+    use km::engine::ResyncCause as M;
+    match c {
+        M::Resume => R::Resume,
+        M::ResetPoint => R::ResetPoint,
+        M::GenerationChanged => R::GenerationChanged,
+        M::CursorBehindLog => R::CursorBehindLog,
+        M::NoCursor => R::NoCursor,
     }
 }

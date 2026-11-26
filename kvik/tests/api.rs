@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use common::world::World;
 use common::{
     BACKENDS, Flag, at, block_on, config, config_on, poll_once, reader_on, start, store, store_on,
 };
@@ -1120,12 +1121,6 @@ fn unsupported_items_say_so_on(b: Backend) {
             period: Duration::from_secs(86_400)
         }
     );
-    if !s.is_durable() {
-        assert!(matches!(
-            block_on(s.consumer("late", Start::Position(SavedPoint::default()), Select::None)),
-            Err(ConsumerError::NotSupportedYet { .. })
-        ));
-    }
     assert!(matches!(
         block_on(s.rebuild(kvik::Rebuild::Derived)),
         Err(BackupError::NotSupportedYet { .. })
@@ -1868,4 +1863,203 @@ fn a_state_name_declared_twice_is_refused() {
             "{b:?}"
         );
     }
+}
+
+/// A store on either backend that can be stopped with a fault in between: the durable one on a [`World`], the model
+/// one through [`kvik::model_fault`].
+struct Rig {
+    b: Backend,
+    w: World,
+    model: kvik::StoreConfig,
+}
+
+impl Rig {
+    fn new(b: Backend, name: &str) -> Rig {
+        let w = World::new(name);
+        let model = config_on(Backend::Model, &format!("rig/{name}"), &w.clock);
+        Rig { b, w, model }
+    }
+
+    fn open(&self) -> Store {
+        match self.b {
+            Backend::Model => block_on(Store::open(self.model.clone())).unwrap(),
+            _ => self.w.open(),
+        }
+    }
+
+    fn power_loss(&mut self, s: Store, cs: Vec<Consumer>) {
+        match self.b {
+            Backend::Model => {
+                drop(cs);
+                block_on(s.shutdown()).unwrap();
+                assert!(kvik::model_fault(
+                    &self.model.dir,
+                    kvik::ModelFault::PowerLoss
+                ));
+            }
+            _ => self.w.crash(s, cs, true),
+        }
+    }
+
+    /// The consumer's cursor file is unreadable at the next start; the store is shut down.
+    fn lose_cursor(&self, name: &str) {
+        match self.b {
+            Backend::Model => assert!(kvik::model_fault(
+                &self.model.dir,
+                kvik::ModelFault::LoseCursorFile(name.into())
+            )),
+            _ => {
+                let path = self
+                    .w
+                    .path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
+                    .unwrap();
+                self.w.fs.poke(&path, 0, &[0; 16]);
+            }
+        }
+    }
+}
+
+fn four_facts(rig: &Rig, s: &Store, g: SeriesId, v: f64) -> Vec<Position> {
+    (0..4)
+        .map(|i| {
+            let p = block_on(s.emit(&[num(g, i, v)])).unwrap().last().unwrap();
+            rig.w.clock.advance(Duration::from_secs(1));
+            p
+        })
+        .collect()
+}
+
+fn stamp0(position: Position) -> SavedPoint {
+    SavedPoint {
+        position,
+        stamp: kvik::ResetStamp::default(),
+    }
+}
+
+fn cursor_of(s: &Store, name: &str) -> Position {
+    s.consumer_stats(name).unwrap().cursor
+}
+
+#[test]
+fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync() {
+    for b in BACKENDS {
+        a_new_consumer_starts_after_the_position_before_its_start_with_no_resync_on(b);
+    }
+}
+
+fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync_on(b: Backend) {
+    let mut rig = Rig::new(b, "start-kinds");
+    let s = rig.open();
+    let g = block_on(s.define_series(gauge("plant/a/power", 1))).unwrap();
+    let ps = four_facts(&rig, &s, g, 1.0);
+    let mut now = new_consumer(&s, "now");
+    assert!(now.try_next().unwrap().is_none(), "{b:?}");
+    assert!(cursor_of(&s, "now") >= ps[3], "{b:?}");
+    let mut time = block_on(s.consumer("time", Start::Time(at(2)), Select::None)).unwrap();
+    assert!(time.try_next().unwrap().is_none(), "{b:?}");
+    assert!(
+        ps[1] <= cursor_of(&s, "time") && cursor_of(&s, "time") < ps[2],
+        "{b:?}"
+    );
+    let kept = block_on(s.consumer("kept", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
+    assert_eq!(cursor_of(&s, "kept"), ps[1], "{b:?}");
+    let head = s.stats().log.durable;
+    let above = Position {
+        generation: head.generation,
+        sequence: head.sequence + 5,
+    };
+    // Q-1401: a kept point above the last position starts there.
+    let high = block_on(s.consumer("high", Start::Position(stamp0(above)), Select::None)).unwrap();
+    assert_eq!(cursor_of(&s, "high"), head, "{b:?}");
+    block_on(now.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    let p = block_on(s.emit(&[num(g, 9, 9.0)])).unwrap().last().unwrap();
+    let ds = drain(&mut now);
+    assert!(
+        matches!(&ds[..], [d] if matches!(&d.kind, DeliveryKind::Fact(f) if f.position == p)),
+        "{b:?}"
+    );
+    let durable = s.stats().log.durable;
+    let beyond = Position {
+        generation: durable.generation,
+        sequence: durable.sequence + 3,
+    };
+    rig.power_loss(s, vec![now, time, kept, high]);
+    let s = rig.open();
+    let mut void =
+        block_on(s.consumer("void", Start::Position(stamp0(beyond)), Select::None)).unwrap();
+    assert_eq!(cursor_of(&s, "void"), durable, "{b:?}");
+    let d = void.try_next().unwrap().unwrap();
+    let r = common::world::resync(&d).unwrap();
+    assert_eq!(
+        (r.cause, r.forget_above),
+        (ResyncCause::ResetPoint, Some(durable)),
+        "{b:?}"
+    );
+    assert!(r.funnels.is_empty(), "{b:?}");
+    let _again =
+        block_on(s.consumer("kept-again", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
+    assert_eq!(cursor_of(&s, "kept-again"), ps[1], "{b:?}");
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
+    for b in BACKENDS {
+        a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind_on(b);
+    }
+}
+
+fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind_on(b: Backend) {
+    let rig = Rig::new(b, "lost-cursor");
+    let s = rig.open();
+    let g = block_on(s.define_series(gauge("plant/a/power", 1))).unwrap();
+    let names = ["now", "time", "pos"];
+    let mut cs: Vec<Consumer> = names.iter().map(|n| new_consumer(&s, n)).collect();
+    let mut ids = Vec::new();
+    for c in &cs {
+        ids.push(
+            block_on(c.route(Funnel {
+                series: Select::Ids(vec![g]),
+                operator: None,
+                condition: Some(Condition::above(10.0)),
+            }))
+            .unwrap(),
+        );
+    }
+    let ps = four_facts(&rig, &s, g, 20.0);
+    for c in &mut cs {
+        assert!(triggers(&drain(c)).contains(&ConditionState::True), "{b:?}");
+    }
+    block_on(s.shutdown()).unwrap();
+    drop((cs, s));
+    for n in names {
+        rig.lose_cursor(n);
+    }
+    let s = rig.open();
+    let starts = [
+        Start::Now,
+        Start::Time(at(2)),
+        Start::Position(stamp0(ps[0])),
+    ];
+    for ((n, start), id) in names.iter().zip(starts).zip(&ids) {
+        let mut c = block_on(s.consumer(n, start, Select::None)).unwrap();
+        let ds = common::world::ready(&mut c);
+        let d: &Delivery = &ds[0];
+        let r = common::world::resync(d).unwrap();
+        assert_eq!(r.cause, ResyncCause::NoCursor, "{b:?} {n}");
+        assert!(r.last);
+        let forget = r.forget_above.unwrap();
+        match *n {
+            "now" => assert!(forget >= ps[3], "{b:?}"),
+            "time" => assert!(ps[1] <= forget && forget < ps[2], "{b:?} {forget:?} {ps:?}"),
+            _ => assert_eq!(forget, ps[0], "{b:?}"),
+        }
+        let f = r.funnels.iter().find(|f| f.funnel == *id).unwrap();
+        assert_eq!(f.condition, Some(ConditionState::True), "{b:?}");
+        assert!(f.transition, "{b:?}: no latch to compare");
+        assert_eq!(ds.len(), 1, "{b:?}: nothing before it is confirmed");
+        block_on(c.confirm(d.id)).unwrap();
+        assert_eq!(cursor_of(&s, n), d.position, "{b:?}");
+    }
+    block_on(s.shutdown()).unwrap();
 }

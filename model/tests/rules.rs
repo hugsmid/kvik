@@ -1453,6 +1453,7 @@ fn s4_resync_for_a_cursor_behind_the_log_waits_for_its_confirmation() {
     let r = got[0].resync().unwrap();
     assert_eq!(r.forget_above, Some(cursor));
     assert!(r.replaced.is_some());
+    assert_eq!(r.cause, kvik_model::engine::ResyncCause::CursorBehindLog);
     m.confirm(C, got[0].position).unwrap();
     m.catch_up(C, 100).unwrap();
     let after: Vec<Position> = m.poll(C, 100).unwrap().iter().map(|d| d.position).collect();
@@ -2984,6 +2985,14 @@ fn s4_generation_changed_and_resync_follow_catch_up_after_restore() {
             (end, "generation_changed"),
             (end, "resync")
         ]
+    );
+    let cause = r.received[&C]
+        .last()
+        .and_then(|x| x.delivery.resync())
+        .map(|r| r.cause);
+    assert_eq!(
+        cause,
+        Some(kvik_model::engine::ResyncCause::GenerationChanged)
     );
 }
 

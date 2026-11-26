@@ -27,7 +27,7 @@ pub(crate) use error::Result;
 use crate::config::StoreConfig;
 use crate::consume::{
     Condition, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId, FunnelState,
-    RESYNC_PART_FUNNELS, ResyncCause, ResyncPart, Select, Start, Trigger,
+    RESYNC_PART_FUNNELS, ResyncPart, Select, Start, Trigger,
 };
 use crate::env::{Clock, Monotonic};
 use crate::error::{Fault, Refusal, Wait};
@@ -93,6 +93,27 @@ impl Shared {
     pub(crate) fn store_id(&self) -> [u8; 16] {
         self.with(|s| s.store_id)
     }
+}
+
+/// A fault the model backend applies at the next open of a stopped store (spec §3 Recovery rule 3), so that tests
+/// can stand it beside a fault on the durable backend's file system.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelFault {
+    /// The machine loses power: what the mark had not synced is lost and the next start is a new boot.
+    PowerLoss,
+    /// The named consumer's cursor file is missing or unreadable.
+    LoseCursorFile(String),
+}
+
+/// Queues a fault for the next open of the in-memory store of `dir`. False if no such store exists.
+#[doc(hidden)]
+pub fn model_fault(dir: &Path, fault: ModelFault) -> bool {
+    let Some(shared) = lock(&STORES).get(dir).cloned() else {
+        return false;
+    };
+    shared.with(|s| s.faults.push(fault));
+    true
 }
 
 /// Finds the in-memory store of a directory, for a reader.
@@ -197,6 +218,8 @@ pub(crate) struct Slot {
     last_jump: Option<ClockJump>,
     /// Loss identities acknowledged.
     acknowledged: BTreeSet<Position>,
+    /// Applied at the next open.
+    faults: Vec<ModelFault>,
 }
 
 fn mark_sync_mode(config: &StoreConfig) -> crate::health::MarkSyncMode {
@@ -220,6 +243,20 @@ fn model_config(config: &StoreConfig) -> Result<km::engine::Config> {
         site_zone: config.time_zone.clone(),
         ..km::engine::Config::default()
     })
+}
+
+fn model_start(start: Start) -> km::engine::Start {
+    match start {
+        Start::Now => km::engine::Start::Now,
+        Start::Time(t) => km::engine::Start::Time(nanos(t)),
+        Start::Position(p) => km::engine::Start::Point(km::recovery::SavedPoint {
+            position: mpos(p.position),
+            stamp: km::recovery::ResetStamp {
+                sequence: p.stamp.sequence,
+                nonce: p.stamp.nonce,
+            },
+        }),
+    }
 }
 
 fn without_name(spec: &SeriesSpec) -> SeriesSpec {
@@ -270,6 +307,7 @@ impl Slot {
             clock_jumps: 0,
             last_jump: None,
             acknowledged: BTreeSet::new(),
+            faults: Vec::new(),
         })
     }
 
@@ -300,6 +338,20 @@ impl Slot {
                 .filter(|((id, _), _)| *id == c.id)
                 .map(|((_, f), n)| (f.0, *n))
                 .collect();
+        }
+        let faults = std::mem::take(&mut self.faults);
+        if !faults.is_empty() {
+            self.model.crash();
+        }
+        for f in faults {
+            match f {
+                ModelFault::PowerLoss => self.model.power_loss(),
+                ModelFault::LoseCursorFile(name) => {
+                    if let Some(c) = self.consumers.get(&name) {
+                        self.model.lose_cursor_file(c.id).map_err(convert::error)?;
+                    }
+                }
+            }
         }
         self.model.restart();
         if !self.model.is_up() {
@@ -921,44 +973,31 @@ impl Slot {
             // it resumes from its durable cursor (spec §6 Restart and
             // resume). After a store restart the model has begun that resume
             // already.
+            let id = c.id;
             if c.attached == Some(self.epoch) {
-                self.model.reconnect(c.id).map_err(convert::error)?;
+                self.model.reconnect(id).map_err(convert::error)?;
                 // What was handed out is dropped with the old handle, a resync awaiting confirmation included.
                 c.parts.clear();
                 c.awaiting_resync = None;
+            } else if self.model.cursor_lost(id) {
+                // Its cursor file was lost at the start: it starts as a new consumer would (Q-131).
+                self.model
+                    .start_consumer(id, model_start(start))
+                    .map_err(convert::error)?;
             }
+            let c = self.consumers.get_mut(name).expect("found above");
             c.attached = Some(self.epoch);
             c.handle = true;
             return Ok(());
-        }
-        match start {
-            Start::Now => {}
-            Start::Position(_) => {
-                return Err(Error::NotSupportedYet(
-                    "a new consumer starting at a position",
-                ));
-            }
-            Start::Time(_) => {
-                return Err(Error::NotSupportedYet("a new consumer starting at a time"));
-            }
         }
         let used: BTreeSet<ConsumerId> = self.consumers.values().map(|c| c.id).collect();
         let id = (0..self.max_consumers)
             .filter_map(|i| u32::try_from(i).ok().map(ConsumerId))
             .find(|i| !used.contains(i))
             .ok_or(Error::TooManyConsumers(self.max_consumers))?;
-        // A fresh slot: drop whatever it queued while unbound and confirm up
-        // to now, so that it starts after the last committed position.
-        self.model.reconnect(id).map_err(convert::error)?;
         self.model
-            .catch_up(id, usize::MAX)
+            .start_consumer(id, model_start(start))
             .map_err(convert::error)?;
-        let got = self.model.receive(id, usize::MAX).map_err(convert::error)?;
-        if let Some(last) = got.last() {
-            self.model
-                .confirm_delivery(id, last.id())
-                .map_err(convert::error)?;
-        }
         self.forget_observations();
         self.consumers.insert(
             name.to_string(),
@@ -1285,13 +1324,7 @@ impl Slot {
                 flags,
             ),
             K::Resync(r) => {
-                let cause = if r.replaced.is_some() {
-                    ResyncCause::CursorBehindLog
-                } else if r.forget_above.is_some() && r.funnels.is_empty() {
-                    ResyncCause::ResetPoint
-                } else {
-                    ResyncCause::Resume
-                };
+                let cause = convert::resync_cause(r.cause);
                 let forget_above = r.forget_above.map(pos);
                 let mut states: Vec<FunnelState> = r
                     .funnels

@@ -112,6 +112,9 @@ mod types;
 
 pub mod env;
 
+#[doc(hidden)]
+pub use backend::{ModelFault, model_fault};
+
 pub use backup::{
     BackupSink, Encryption, ListPage, Rebuild, RestoreMode, RestoreScope, SinkError, SinkFuture,
     Stored, Verified, VerifyError,

@@ -70,6 +70,9 @@ struct Seen {
     flagged_remounts: usize,
     forget_resyncs: usize,
     behind_resyncs: usize,
+    /// Starts accepted, and `NoCursor` resyncs received after them.
+    starts: usize,
+    no_cursor: usize,
     forced_syncs: usize,
     stale: usize,
     gaps: usize,
@@ -135,6 +138,8 @@ struct RWorld {
     t: Nanos,
     defs: usize,
     last: [Option<kvik_model::engine::DeliveryId>; 2],
+    /// Each consumer's cursor after its last confirmation, with the stamp it was confirmed under.
+    saved: [Option<kvik_model::recovery::SavedPoint>; 2],
     checks: Checks,
 }
 
@@ -183,6 +188,7 @@ impl RWorld {
             t: T0,
             defs: 0,
             last: [None, None],
+            saved: [None, None],
             checks,
         }
     }
@@ -222,6 +228,28 @@ impl RWorld {
         seen.lost_in_bucket += in_bucket(&self.m) - before;
         self.restart_after_run_time_loss(lost);
         Ok(())
+    }
+
+    /// Starts consumer `c` now, at a time, or at its last saved point, by `kind` modulo 3.
+    fn start(&mut self, c: usize, kind: u8, seen: &mut Seen) {
+        use kvik_model::engine::Start;
+        let lost = self.m.cursor_lost(RC[c]);
+        let start = match kind % 3 {
+            0 => Start::Now,
+            1 => Start::Time(self.m.wall - Nanos::from(kind % 4) * SECOND),
+            _ => Start::Point(self.saved[c].unwrap_or(kvik_model::recovery::SavedPoint {
+                position: kvik_model::types::Position::ORIGIN,
+                stamp: kvik_model::recovery::ResetStamp::ZERO,
+            })),
+        };
+        if self.m.start_consumer(RC[c], start).is_ok() {
+            seen.starts += 1;
+            self.last[c] = None;
+            // A new consumer remembers nothing; a lost one forgets by its `NoCursor` resync.
+            if !lost {
+                seen.known.retain(|(k, _), _| *k != c);
+            }
+        }
     }
 
     fn down(&mut self) {
@@ -302,6 +330,11 @@ impl RWorld {
             }
             ROp::SyncMark => self.m.sync_mark_file(),
             ROp::Take { c, n } if up => {
+                // Taking a handle starts a consumer whose cursor file was lost, here from the origin (Q-131).
+                if self.m.cursor_lost(RC[*c]) {
+                    self.saved[*c] = None;
+                    self.start(*c, 2, seen);
+                }
                 // The engine's catch-up runs as the consumer takes.
                 self.m.catch_up(RC[*c], 32).unwrap();
                 let got = self.m.receive(RC[*c], *n).unwrap();
@@ -310,6 +343,11 @@ impl RWorld {
                 for d in &got {
                     if let Some(x) = d.resync().and_then(|r| r.forget_above) {
                         seen.known.retain(|(k, p), _| *k != *c || *p <= x);
+                    }
+                    if d.resync()
+                        .is_some_and(|r| r.cause == kvik_model::engine::ResyncCause::NoCursor)
+                    {
+                        seen.no_cursor += 1;
                     }
                     if let Some(r) = d.resync()
                         && r.forget_above.is_some()
@@ -365,9 +403,18 @@ impl RWorld {
                     if r.is_ok() && self.m.disk.synced_mark != before {
                         seen.forced_syncs += 1;
                     }
+                    if r.is_ok() {
+                        self.saved[*c] = self.m.disk.cursors.get(&RC[*c]).map(|&position| {
+                            kvik_model::recovery::SavedPoint {
+                                position,
+                                stamp: self.m.stamp(),
+                            }
+                        });
+                    }
                 }
             }
             ROp::CatchUp { c } if up => self.m.catch_up(RC[*c], 32).unwrap(),
+            ROp::Start { c, kind } if up => self.start(*c, *kind, seen),
             ROp::Reconnect { c } if up => {
                 self.m.reconnect(RC[*c]).unwrap();
                 self.last[*c] = None;
@@ -1110,13 +1157,15 @@ fn recovery_generator_coverage() {
     let strat = proptest::collection::vec(arb_rop(), 80..120);
     let mut seen = Seen::default();
     let (mut possible, mut data_lost) = (0, 0);
-    for _ in 0..300 {
+    for _ in 0..450 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let mut s = Seen::default();
         run_recovery(&ops, &mut s, ALL).unwrap();
         seen.reassigned += s.reassigned;
         seen.forget_resyncs += s.forget_resyncs;
         seen.behind_resyncs += s.behind_resyncs;
+        seen.starts += s.starts;
+        seen.no_cursor += s.no_cursor;
         seen.forced_syncs += s.forced_syncs;
         seen.stale += s.stale;
         seen.gaps += s.gaps;
@@ -1151,6 +1200,8 @@ fn recovery_generator_coverage() {
     );
     assert!(seen.reassigned > 7 && seen.forget_resyncs > 1500 && seen.forced_syncs > 30);
     assert!(seen.behind_resyncs > 200);
+    eprintln!("starts {} no-cursor {}", seen.starts, seen.no_cursor);
+    assert!(seen.starts > 100 && seen.no_cursor > 10);
     assert!(seen.stale > 60 && seen.gaps > 7 && seen.rule_1_resets > 180);
     assert!(seen.flagged_kept > 20 && seen.written_resets > 20);
     assert!(seen.flagged_reassigned > 0 && seen.flagged_remounts > 20);

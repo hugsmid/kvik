@@ -14,10 +14,9 @@ pub enum Start {
     #[default]
     Now,
     /// After a saved point: a position and the reset stamp it was read under, checked against the resets since
-    /// (spec §4 New consumer, §7 Readers). Not supported by the model backend yet.
+    /// (spec §4 New consumer, §7 Readers).
     Position(SavedPoint),
-    /// After the last position committed at or before a time. Not supported
-    /// by the model backend yet.
+    /// After the last position committed before a time (Q-1403).
     Time(Timestamp),
 }
 
@@ -254,7 +253,7 @@ pub enum ResyncCause {
     /// The consumer's cursor file was missing or unreadable at the start:
     /// sent before its first delivery, with `forget_above` the position
     /// before its start and each funnel's state (spec §4 Resync; Q-131). A
-    /// new consumer receives none. Never produced by the model backend.
+    /// new consumer receives none.
     NoCursor,
 }
 
