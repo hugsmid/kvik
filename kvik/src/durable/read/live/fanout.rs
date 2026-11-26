@@ -483,3 +483,22 @@ fn a_latest_opened_while_a_small_tail_stops_at_its_row_limit_holds_the_old_paths
     ));
     assert!(r.is_ok(), "{r:?}");
 }
+
+#[test]
+fn a_small_tail_that_stops_where_the_old_path_lagged_may_lag_later_over_a_fact_the_old_path_delivers()
+ {
+    let r = run((
+        vec![(2, 20, true), (0, 0, false), (0, 0, false), (0, 0, false)],
+        vec![
+            Step::Define,
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Race(1, vec![(179, 0, 0)]),
+            Step::Emit(vec![(0, 0, 0), (0, 0, 1), (0, 0, 38)]),
+            Step::Emit(vec![(0, 0, 3), (0, 0, 4), (0, 0, 59)]),
+            Step::Poll,
+            Step::Emit(vec![(97, 0, 253)]),
+            Step::Poll,
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
