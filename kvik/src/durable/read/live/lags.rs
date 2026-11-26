@@ -138,3 +138,53 @@ fn a_backlog_of_entries_past_its_bytes_lags_by_what_their_names_hold() {
     latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
+
+/// Q-1203: a round that fails after taking events finishes as not whole, so the `Tail` is told `Lagged` rather than
+/// left without the facts the log reader will not return again.
+#[test]
+fn a_round_failing_after_taking_events_lags_the_tail_it_took_them_for() {
+    let mut w = World::new("lag-failed-round");
+    w.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let r = w.reader();
+    r.durable().unwrap().unwrap().set_part(1);
+    let (mut session, _, t, mut held) = watched(&r, LiveOptions::default());
+    let sealed = |text: &[u8]| {
+        for _ in 0..500 {
+            if w.segments().iter().any(|(p, b)| {
+                p.extension().is_some_and(|e| e == "kvl") && b.windows(text.len()).any(|x| x == text)
+            }) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("not sealed");
+    };
+    note(&w, &s, id, 0, "FR-ONE");
+    sealed(b"FR-ONE");
+    note(&w, &s, id, 1, "FR-TWO");
+    sealed(b"FR-TWO");
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"FR-TWO"))
+        .unwrap();
+    let away = path.with_extension("away");
+    crate::env::Fs::rename(&*w.env.fs, &path, &away).unwrap();
+    assert!(r.refresh().is_err());
+    crate::env::Fs::rename(&*w.env.fs, &away, &path).unwrap();
+    for _ in 0..4 {
+        w.clock.advance(std::time::Duration::from_millis(200));
+        let _ = r.refresh();
+        let _ = poll(&w, &mut session, &mut held);
+    }
+    let h = &held[&t];
+    assert!(
+        !h.lagged.is_empty() || h.tail.len() == 2,
+        "{} facts, {} lagged",
+        h.tail.len(),
+        h.lagged.len()
+    );
+    block_on(s.shutdown()).unwrap();
+}

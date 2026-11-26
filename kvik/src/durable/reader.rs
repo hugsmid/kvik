@@ -598,6 +598,12 @@ impl DurableReader {
         Ok(Arc::new(v))
     }
 
+    /// Reads a round in parts of `part` items.
+    #[cfg(test)]
+    pub(crate) fn set_part(&self, part: usize) {
+        self.lock().part = part;
+    }
+
     /// Live values found in the log because a state could not tell.
     #[cfg(test)]
     pub(crate) fn searches(&self) -> u64 {
