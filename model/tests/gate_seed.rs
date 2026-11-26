@@ -5,11 +5,275 @@
 mod gate_common;
 
 use gate_common::*;
-use kvik_model::gate::{Entry, Gate, GateState, Kind, Level, Transition, judge};
+use kvik_model::gate::{Entry, Gate, GateState, Kind, Level, Selector, Transition, judge};
 use kvik_model::types::{DAY, Fact, Nanos, Position, Quality, SECOND, SeriesId, Value};
 use proptest::prelude::*;
 
 const OTHER: SeriesId = SeriesId(2);
+const END: i64 = 10_000;
+
+fn run(h: &H) -> kvik_model::gate::Judgement {
+    judge(&h.entries, END * SECOND).expect("judge")
+}
+
+fn fact_at(h: H, commit: i64, t: i64, v: f64) -> H {
+    h.fact_on(S, commit * SECOND, t * SECOND, Value::Num(v), Quality::Good)
+}
+
+fn hold_5_both_ways() -> Gate {
+    levels(&[Level::at(10.0).hold(5 * SECOND, 5 * SECOND)])
+}
+
+#[test]
+fn a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now_judged_from_history()
+{
+    let h = H::new().num(1, 25.0).watch(
+        20,
+        C,
+        levels(&[
+            Level::at(10.0).hold(5 * SECOND, 0),
+            Level::at(20.0).hold(5 * SECOND, 0),
+        ]),
+    );
+    let watch = h.last();
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(2))]);
+    assert_eq!(j.transitions[0].id.at, watch);
+    assert_eq!(j.transitions[0].value, Some(Value::Num(25.0)));
+    assert_eq!(j.transitions[0].event_time, Some(SECOND));
+    assert_eq!(
+        j.states[&(C, S)],
+        (GateState::Level(2), j.transitions[0].id)
+    );
+}
+
+#[test]
+fn a_hold_is_seeded_from_before_the_watch_so_a_value_long_above_starts_crossed() {
+    let h = H::new()
+        .num(1, 11.0)
+        .watch(100, C, levels(&[Level::at(10.0).hold(5 * SECOND, 0)]));
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(1))]);
+    assert_eq!(instants(&j.transitions), vec![100]);
+}
+
+#[test]
+fn a_seed_reads_twice_the_longest_hold_back_and_counts_from_the_first_reading_inside() {
+    let gate = levels(&[Level::at(10.0).hold(5 * SECOND, 0)]);
+    let h = H::new()
+        .num(1, 0.0)
+        .num(91, 11.0)
+        .num(99, 11.0)
+        .watch(100, C, gate);
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(1))]);
+}
+
+#[test]
+fn a_value_that_rose_shortly_before_the_watch_completes_its_hold_late_never_early() {
+    let h = H::new().num(1, 0.0).num(98, 11.0).watch(
+        100,
+        C,
+        levels(&[Level::at(10.0).hold(5 * SECOND, 0)]),
+    );
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
+    assert_eq!(instants(&j.transitions), vec![100, 103]);
+}
+
+#[test]
+fn the_look_back_is_at_most_a_day() {
+    let gate = levels(&[
+        Level::at(10.0).clear(5.0),
+        Level::at(100.0).hold(84_600 * SECOND, 0),
+    ]);
+    let h = H::new()
+        .num(0, 11.0)
+        .num(3_600, 7.0)
+        .watch(26 * 3_600, C, gate);
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(0))]);
+}
+
+#[test]
+fn a_gate_without_holds_reads_no_history_so_its_boundaries_start_uncrossed() {
+    let h = H::new()
+        .num(1, 30.0)
+        .num(2, 15.0)
+        .watch(10, C, levels(&[Level::at(20.0).clear(10.0)]));
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(0))]);
+}
+
+#[test]
+fn a_set_hold_is_seeded_too() {
+    let set = gate(Kind::Set {
+        members: vec![Value::Num(3.0)],
+        hold_on: 5 * SECOND,
+        hold_off: 0,
+    });
+    let h = H::new().num(1, 3.0).watch(100, C, set);
+    assert_eq!(
+        moves(&run(&h).transitions),
+        vec![(None, Some(GateState::Match(true)))]
+    );
+}
+
+#[test]
+fn a_series_joining_an_each_is_seeded_from_its_history_at_the_join() {
+    let mut each = levels(&[Level::at(10.0).hold(5 * SECOND, 0)]);
+    each.selector = Selector::Each("room/*/temp".into());
+    let s2 = SeriesId(2);
+    let h = H::new()
+        .watch(0, C, each)
+        .num_on(s2, 1, 11.0)
+        .define(100, s2, &["room/b/temp"]);
+    let join = h.last();
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(1))]);
+    assert_eq!(j.transitions[0].id.at, join);
+}
+
+#[test]
+fn a_backfill_committed_inside_the_look_back_is_not_the_live_value_in_the_seed() {
+    let h = fact_at(fact_at(H::new(), 50, 50, 5.0), 92, 40, 50.0).watch(100, C, hold_5_both_ways());
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(0))]);
+}
+
+#[test]
+fn an_outranked_fact_committed_inside_the_look_back_is_not_the_live_value_in_the_seed() {
+    let mut live = fact(
+        S,
+        Position::ORIGIN,
+        50 * SECOND,
+        50 * SECOND,
+        Value::Num(5.0),
+        Quality::Good,
+    );
+    live.changed_at = Some(9);
+    let mut outranked = fact(
+        S,
+        Position::ORIGIN,
+        92 * SECOND,
+        50 * SECOND,
+        Value::Num(50.0),
+        Quality::Good,
+    );
+    outranked.changed_at = Some(1);
+    let h = H::new()
+        .push_fact(50 * SECOND, live)
+        .push_fact(92 * SECOND, outranked)
+        .watch(100, C, hold_5_both_ways());
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(0))]);
+}
+
+#[test]
+fn a_backfill_before_a_late_rise_does_not_start_the_hold_early() {
+    let h = fact_at(
+        fact_at(fact_at(H::new(), 60, 60, 5.0), 91, 40, 50.0),
+        99,
+        99,
+        50.0,
+    )
+    .watch(100, C, hold_5_both_ways());
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
+    assert_eq!(instants(&j.transitions), vec![100, 104]);
+}
+
+#[test]
+fn a_future_fact_replaced_before_the_look_back_takes_effect_as_its_replacement() {
+    let h = fact_at(
+        fact_at(fact_at(fact_at(H::new(), 0, 0, 0.0), 0, 0, 0.0), 0, 27, 0.0),
+        5,
+        27,
+        5.0,
+    )
+    .watch(15, C, levels(&[Level::at(4.0).hold(7 * SECOND, 0)]));
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
+    assert_eq!(instants(&j.transitions), vec![15, 34]);
+}
+
+#[test]
+fn a_fact_committed_at_the_look_backs_start_is_read() {
+    let h = fact_at(fact_at(H::new(), 1, 1, 0.0), 90, 90, 11.0).watch(
+        100,
+        C,
+        levels(&[Level::at(10.0).hold(5 * SECOND, 0)]),
+    );
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(1))]);
+}
+
+#[test]
+fn the_longest_hold_counts_hold_down() {
+    let h = fact_at(fact_at(H::new(), 1, 1, 11.0), 98, 98, 0.0).watch(
+        100,
+        C,
+        levels(&[Level::at(10.0).hold(0, 5 * SECOND)]),
+    );
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(1)), (lv(1), lv(0))]);
+    assert_eq!(instants(&j.transitions), vec![100, 103]);
+}
+
+#[test]
+fn a_sets_longest_hold_counts_hold_off() {
+    let set = gate(Kind::Set {
+        members: vec![Value::Num(3.0)],
+        hold_on: 0,
+        hold_off: 5 * SECOND,
+    });
+    let h = fact_at(fact_at(H::new(), 1, 1, 3.0), 98, 98, 0.0).watch(100, C, set);
+    let j = run(&h);
+    assert_eq!(
+        moves(&j.transitions),
+        vec![
+            (None, Some(GateState::Match(true))),
+            (Some(GateState::Match(true)), Some(GateState::Match(false)))
+        ]
+    );
+    assert_eq!(instants(&j.transitions), vec![100, 103]);
+}
+
+#[test]
+fn a_bad_fact_inside_the_look_back_leaves_the_earlier_live_value_in_the_seed() {
+    let h = fact_at(H::new(), 1, 1, 11.0)
+        .fact_on(S, 95 * SECOND, 95 * SECOND, Value::Num(0.0), Quality::Bad)
+        .watch(100, C, levels(&[Level::at(10.0).hold(5 * SECOND, 0)]));
+    assert_eq!(moves(&run(&h).transitions), vec![(None, lv(1))]);
+}
+
+#[test]
+fn a_future_fact_taking_effect_inside_the_look_back_holds_from_its_t() {
+    let h = fact_at(fact_at(H::new(), 1, 1, 0.0), 1, 97, 11.0).watch(
+        100,
+        C,
+        levels(&[Level::at(10.0).hold(5 * SECOND, 0)]),
+    );
+    let j = run(&h);
+    assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
+    assert_eq!(instants(&j.transitions), vec![100, 102]);
+}
+
+#[test]
+fn a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed() {
+    let mut g = levels(&[Level::at(10.0).hold(5 * SECOND, 0)]);
+    g.stale_after = Some(8 * SECOND);
+    let h = fact_at(
+        fact_at(H::new(), 1, 1, 50.0).watch(100, C, g),
+        110,
+        110,
+        50.0,
+    );
+    let j = run(&h);
+    assert_eq!(
+        moves(&j.transitions[..2]),
+        vec![
+            (None, Some(GateState::Stale)),
+            (Some(GateState::Stale), lv(1))
+        ]
+    );
+    assert_eq!(instants(&j.transitions[..2]), vec![100, 110]);
+}
 
 #[derive(Clone, Debug)]
 enum Op {
@@ -171,12 +435,17 @@ fn live(h: &[Entry], upto: Position, x: Nanos) -> Option<Fact> {
 }
 
 /// The early watch the seed stands for, built from the history alone, as entries renumbered in order:
-/// the watch at the look-back's start; the live fact at the start when no fact committed inside the
-/// look-back has a value; those facts; the live fact at the start committed at it (the start's own
-/// evaluation); facts committed before the look-back that take effect after the start; then every later
-/// fact of `S`. Returns the entries and how many precede the later facts.
+/// the watch at the look-back's start; the series' state then, the current fact per event time among
+/// those committed before the look-back, committed at its start in descending event time so the watch
+/// first sees a value when it sees the live one; the facts committed inside the look-back; the live fact
+/// at the start committed at it (the start's own evaluation); then every later fact of `S`. Returns the
+/// entries and how many precede the later facts.
 fn early_watch(c: &Case, h: &[Entry], watch: Position, start: Nanos) -> (Vec<Entry>, usize) {
     let from = start - (2 * longest_hold(&c.gate)).min(DAY);
+    let mut earlier: std::collections::BTreeMap<Nanos, Fact> = Default::default();
+    for (_, f) in s_facts(h).filter(|(ct, f)| f.position < watch && *ct < from) {
+        earlier.insert(f.t, f.clone());
+    }
     let inside: Vec<(Nanos, Fact)> = s_facts(h)
         .filter(|(ct, f)| f.position < watch && *ct >= from)
         .map(|(ct, f)| (ct, f.clone()))
@@ -194,23 +463,13 @@ fn early_watch(c: &Case, h: &[Entry], watch: Position, start: Nanos) -> (Vec<Ent
         id: C,
         gate: c.gate.clone(),
     });
-    let now_live = live(h, watch, start);
-    if !inside.iter().any(|(_, f)| usable(f))
-        && let Some(f) = now_live.clone()
-    {
+    for f in earlier.into_values().rev() {
         push(&mut out, from, f);
     }
     for (ct, f) in inside {
         push(&mut out, ct, f);
     }
-    if let Some(f) = now_live {
-        push(&mut out, start, f);
-    }
-    let late: Vec<Fact> = s_facts(h)
-        .filter(|(ct, f)| f.position < watch && *ct < from && f.t > start)
-        .map(|(_, f)| f.clone())
-        .collect();
-    for f in late {
+    if let Some(f) = live(h, watch, start) {
         push(&mut out, start, f);
     }
     let before = out.len();
