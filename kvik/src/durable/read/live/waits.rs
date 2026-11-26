@@ -7,6 +7,8 @@ use super::tests::{TICK, World, apply, emit, gauge, watched};
 use crate::config::ReaderConfig;
 use crate::durable::tests::block_on;
 use crate::read::{Live, LiveOptions, SessionOptions};
+use crate::time::Timestamp;
+use crate::types::{Quality, Reading, Value};
 use crate::{Query, Reader, Selection};
 
 #[test]
@@ -330,5 +332,32 @@ fn a_fan_out_thread_that_panics_rings_every_session_and_leaves_them_rung_by_ever
     assert!(d.fanout_failed.load(Ordering::SeqCst));
     assert!(session.durable_mut().and_then(|x| x.rung()).unwrap() > before);
     drop(session);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// A `Latest` whose series is unsure (a good reading corrected to bad at the same `t`) is not due at once on every
+/// turn: `next` sleeps rather than turns while it waits.
+#[test]
+fn next_sleeps_while_a_latest_series_is_unsure() {
+    let w = World::new("unsure-sleep");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let t = Timestamp(w.clock.wall().0 - 5_000_000_000);
+    block_on(s.emit(&[Reading::new(id, t, Value::F64(1.0))])).unwrap();
+    block_on(s.emit(&[Reading::new(id, t, Value::F64(1.0)).with_quality(Quality::Bad)])).unwrap();
+    let r = s.reader();
+    let (mut session, ..) = watched(&r, LiveOptions::default());
+    let before = session.turns();
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            for _ in 0..300 {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(session.next(Duration::from_millis(300)).unwrap().is_none());
+        ticking.join().unwrap();
+    });
+    assert!(session.turns() - before < 100, "{}", session.turns() - before);
     block_on(s.shutdown()).unwrap();
 }
