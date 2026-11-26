@@ -394,7 +394,7 @@ proptest! {
     }
 }
 
-/// A checkpoint frontier that covers only confirmed transitions (design G5), drawn by `pick`.
+/// A checkpoint frontier that covers only confirmed transitions (Q-1391), drawn by `pick`.
 fn checkpoint(
     h: &[Entry],
     all: &[Transition],

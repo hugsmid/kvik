@@ -1,4 +1,4 @@
-//! The seed at a gate's start (Q-1145 (b), Q-1390; design G11): an instance started mid-history has the
+//! The seed at a gate's start (Q-1145 (b), Q-1390): an instance started mid-history has the
 //! state, and then the transitions, of the same gate watched at the look-back's start over what the seed
 //! reads, and emits nothing before its start.
 
