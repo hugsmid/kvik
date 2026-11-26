@@ -33,6 +33,7 @@ mod level;
 mod node;
 pub mod part;
 pub mod root;
+pub mod set;
 mod window;
 
 pub use bytes::{DecodeError, NotStorable, decode, encode, form};

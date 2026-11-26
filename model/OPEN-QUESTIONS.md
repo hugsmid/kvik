@@ -5228,6 +5228,69 @@ size below v1 is damage.
 **Pinned by.** `tests/refusals.rs` vectors `RecordSize`, `RecordSizeSmall`;
 `root_refusals_shared_with_parts`.
 
+## Q-1550 — A roll-up over a stale child
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merge writes each roll-up as the merge of its visible children (design 7.1b T2). A child may be
+marked `stale`, so its node is not the canonical one, or has none.
+**Options.** (a) The roll-up is `stale` with no node bytes, at the children's highest version; (b) merge the nodes
+that are present and mark it `stale`; (c) leave the roll-up out.
+**Decision (provisional).** (a): the reader takes facts for a stale entry anyway, so bytes would never be read, and
+(c) would read as an empty node where the span is covered.
+**Pinned by.** `tests/set.rs` `a_merge_leaves_visible_unchanged_and_writes_the_rollups_of_t2` (`check_rollups`).
+
+## Q-1551 — The age of a delta part
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design merges two deltas of a day once the oldest is two hours old. A root records no write time
+per part.
+**Options.** (a) The age of the lowest-`seq` delta's greatest entry end; (b) add a write time to the root's part
+record.
+**Decision (provisional).** (a): no format change, and a delta's newest entry ends near the checkpoint that wrote it.
+A delta of late data looks old at once, which only merges it sooner.
+**Pinned by.** `tests/plan.rs` `two_deltas_merge_once_the_oldest_ends_two_hours_before_now`.
+
+## Q-1552 — Where weeks and 13- and 52-week periods start
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** Merged parts span a UTC day, a week, 13 weeks or 52 weeks; the design does not fix their alignment.
+**Options.** (a) Weeks from Monday 1970-01-05 UTC, and 13 and 52 weeks counted from the same Monday; (b) ISO weeks
+and quarters or years, which are not whole numbers of weeks.
+**Decision (provisional).** (a): every period is a whole number of the next shorter one, so a 52-week part is the
+merge of four 13-week parts. Periods are internal; no reader sees them.
+**Pinned by.** `tree/src/set/plan.rs` `weeks_start_on_monday_and_each_period_lies_inside_the_next`; `tests/plan.rs`
+`a_week_of_day_parts_merges_two_weeks_after_it_ends`.
+
+## Q-1553 — A delta part that spans day boundaries
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** A checkpoint writes one delta part, so late data can give it a period over many days. Day, week and
+longer merges take parts inside their period, so such a part would never be merged.
+**Options.** (a) The planner first splits it into one part per UTC day that holds an entry, of the same `seq`;
+(b) day merges take it whole and widen their period; (c) the checkpoint writes one delta per day.
+**Decision (provisional).** (a): (b) breaks the period tiers and (c) multiplies syncs at a checkpoint; the split is
+one more merge and keeps every later rule per day.
+**Pinned by.** `tests/plan.rs` `a_delta_crossing_a_day_boundary_is_split_by_day`.
+
+## Q-1554 — The `seq` of a merged part
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merged part overlays other live parts by its `seq`. If it took a new, higher `seq`, a live part
+outside the merge that overlaid one of its inputs would fall beneath it.
+**Options.** (a) The inputs' highest `seq` (as Q-1540 settles), refusing a merge when a live part outside it has a
+`seq` inside the inputs' range, a period overlapping an input's or an output period, and a series range overlapping
+the inputs'; (b) a new `seq`, taking as inputs every overlapping part above the lowest input.
+**Decision (provisional).** (a): order against every part outside the merge is kept, and the planner can merge a
+run of deltas without waiting for parts that interleave them. Every entry of the output keeps the version it had.
+**Pinned by.** `tests/plan.rs` `merge_refuses_a_part_between_the_inputs_seqs`,
+`a_delta_between_the_seqs_of_others_breaks_their_run`.
+
+## Q-1555 — When a day counts as merged
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design writes a day's roll-ups when its day part is written, and the planner must know which days
+have one. The root records roll-up spans only through `covered`.
+**Options.** (a) A day is merged when every roll-up span inside it that the finest cover level covers is covered at
+its own level, so a day with nothing covered counts as merged; (b) a day is merged when a merged part spans it.
+**Decision (provisional).** (a): it follows the level table rather than fixed levels, and a day with nothing covered
+would otherwise be merged again at every pass, since its roll-ups can never be covered.
+**Pinned by.** `tests/plan.rs` `a_day_past_its_late_window_gets_its_day_part_with_rollups`,
+`without_rollup_levels_a_day_never_waits_for_a_day_part`, `the_planner_reads_level_widths_from_the_table`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
