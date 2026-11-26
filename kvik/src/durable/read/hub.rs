@@ -8,9 +8,8 @@
 //! only the subscribers it reaches, and passes a subscriber that has taken every earlier round over one that holds
 //! nothing it selects: a commit costs no turn of a session it does not touch (Q-1118).
 //!
-//! A round of facts alone decodes the facts of each set of series once, for every session that takes that set
-//! ([`Hub::facts_of`]). Rounds are dropped when the last subscriber holding the oldest advances past it: an advance
-//! counts down the holders, and only the advance that frees a round scans the subscribers again.
+//! Rounds are dropped when the last subscriber holding the oldest advances past it: an advance counts down the
+//! holders, and only the advance that frees a round scans the subscribers again.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,9 +22,8 @@ use kvik_log::facts::Value as LogValue;
 use kvik_log::reader::ReadEvent;
 use kvik_log::writer::Position as LogPos;
 
-use crate::durable::index::{Stored, fact_out};
+use crate::durable::index::Stored;
 use crate::durable::loss::Find;
-use crate::types::Fact;
 
 /// One thing a refresh read, in log order.
 #[derive(Clone, Debug)]
@@ -127,12 +125,6 @@ pub(crate) struct Round {
     pub(crate) whole: bool,
     rows: u64,
     bytes: u64,
-    /// Held whole, with no entry, void or gap: a session takes from it the facts of the series it selects.
-    pub(crate) facts_only: bool,
-    /// The series of its facts.
-    pub(crate) series: BTreeSet<u32>,
-    /// The facts of each set of its series, decoded once for every session that takes that set.
-    shared: Mutex<BTreeMap<BTreeSet<u32>, Arc<[Fact]>>>,
 }
 
 impl Round {
@@ -162,24 +154,6 @@ impl Round {
             whole: false,
             rows: 0,
             bytes: 0,
-            facts_only: false,
-            series: self.series.clone(),
-            shared: Mutex::default(),
-        }
-    }
-
-    fn empty(seq: u64, last: u64) -> Round {
-        Round {
-            seq,
-            last,
-            pieces: Vec::new(),
-            index: Vec::new(),
-            whole: true,
-            rows: 0,
-            bytes: 0,
-            facts_only: true,
-            series: BTreeSet::new(),
-            shared: Mutex::default(),
         }
     }
 }
@@ -301,9 +275,6 @@ struct State {
     /// Scans of every subscriber for the rounds to drop.
     #[cfg(test)]
     trims: u64,
-    /// Sets of series whose facts a round decoded for its sessions.
-    #[cfg(test)]
-    decoded: u64,
 }
 
 /// See the module documentation.
@@ -374,19 +345,24 @@ impl Hub {
             match s.rounds.back_mut() {
                 // An idle subscriber keeps one round for a run of refreshes that read nothing (Q-1013).
                 Some(b) if nothing && b.whole && b.is_empty() => {
-                    *b = Arc::new(Round::empty(b.seq, seq));
+                    *b = Arc::new(Round {
+                        seq: b.seq,
+                        last: seq,
+                        pieces: Vec::new(),
+                        index: Vec::new(),
+                        whole: true,
+                        rows: 0,
+                        bytes: 0,
+                    });
                 }
                 _ => s.rounds.push_back(Arc::new(Round {
                     seq,
                     last: seq,
-                    facts_only: c.whole && !c.other,
                     pieces: c.pieces,
                     index: Vec::new(),
                     whole: c.whole,
                     rows: c.rows,
                     bytes: c.bytes,
-                    series: c.series,
-                    shared: Mutex::default(),
                 })),
             }
         }
@@ -446,6 +422,7 @@ impl Hub {
             x.cap = cap;
             s.holders = holders(&s);
         }
+        debug_assert_eq!(s.holders, holders(&s));
     }
 
     /// A read was opened: sets a subscriber's backlog limit and has it reach anything until its next
@@ -560,29 +537,7 @@ impl Hub {
                 drop_taken(&mut s);
             }
         }
-    }
-
-    /// The facts of `series` in round `r`, a round of facts alone, in position order: decoded by the first session
-    /// that takes that set and shared by the others.
-    pub(crate) fn facts_of(&self, r: &Round, series: &BTreeSet<u32>) -> Arc<[Fact]> {
-        let mut shared = r.shared.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(f) = shared.get(series) {
-            return f.clone();
-        }
-        let f: Arc<[Fact]> = r
-            .pieces
-            .iter()
-            .filter_map(|p| match p {
-                Piece::Fact(s) if series.contains(&s.row.series_id) => Some(fact_out(s)),
-                _ => None,
-            })
-            .collect();
-        shared.insert(series.clone(), f.clone());
-        #[cfg(test)]
-        {
-            self.lock().decoded += 1;
-        }
-        f
+        debug_assert_eq!(s.holders, holders(&s));
     }
 
     /// Facts and bytes held and rounds kept, for the memory tests.
@@ -598,11 +553,10 @@ impl Hub {
         self.lock().peak
     }
 
-    /// Scans of every subscriber for rounds to drop, and sets of series decoded for sessions.
+    /// Scans of every subscriber for rounds to drop.
     #[cfg(test)]
-    pub(crate) fn work(&self) -> (u64, u64) {
-        let s = self.lock();
-        (s.trims, s.decoded)
+    pub(crate) fn scans(&self) -> u64 {
+        self.lock().trims
     }
 }
 

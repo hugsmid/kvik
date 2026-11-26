@@ -145,18 +145,18 @@ fn rounds_every_subscriber_took_are_dropped_by_one_scan_when_the_last_holder_adv
         hub.start(*s, 0, cap);
     }
     let seq = round(&hub, vec![fact(1, 1)]);
-    let (scans, _) = hub.work();
+    let scans = hub.scans();
     for s in &subs[..49] {
         hub.advance(*s, seq, (Reach::All, Reach::All));
     }
     assert_eq!(hub.held(), (1, std::mem::size_of::<Piece>() as u64, 1));
-    assert_eq!(hub.work().0, scans);
+    assert_eq!(hub.scans(), scans);
     hub.advance(subs[49], seq, (Reach::All, Reach::All));
     assert_eq!(hub.held(), (0, 0, 0));
-    assert_eq!(hub.work().0, scans + 1);
+    assert_eq!(hub.scans(), scans + 1);
     // A subscriber advancing again over a round it took frees nothing and scans nothing.
     hub.advance(subs[0], seq, (Reach::All, Reach::All));
-    assert_eq!(hub.work().0, scans + 1);
+    assert_eq!(hub.scans(), scans + 1);
 }
 
 #[test]
@@ -176,30 +176,6 @@ fn the_oldest_round_waits_for_a_subscriber_started_below_it() {
 }
 
 #[test]
-fn a_round_of_facts_alone_decodes_each_set_of_series_once_for_every_session_taking_it() {
-    let hub = Hub::default();
-    let cap = (100, 1 << 20);
-    let (sub, _) = hub.subscribe(cap, Duration::ZERO);
-    hub.start(sub, 0, cap);
-    let seq = round(&hub, vec![fact(1, 1), fact(2, 2), fact(1, 3)]);
-    let t = hub.take(sub, seq, Duration::ZERO);
-    let r = &t.rounds[0];
-    assert!(r.facts_only);
-    assert_eq!(r.series, [1, 2].into());
-    let one = hub.facts_of(r, &[1].into());
-    let again = hub.facts_of(r, &[1].into());
-    assert!(Arc::ptr_eq(&one, &again));
-    let at: Vec<u64> = one.iter().map(|f| f.position.sequence).collect();
-    assert_eq!(at, [1, 3]);
-    assert_eq!(hub.work().1, 1);
-    assert_eq!(hub.facts_of(r, &[1, 2].into()).len(), 3);
-    assert_eq!(hub.work().1, 2);
-    let seq = round(&hub, vec![fact(1, 4), Piece::Void(LogPos::default())]);
-    let t = hub.take(sub, seq, Duration::ZERO);
-    assert!(!t.rounds.last().unwrap().facts_only);
-}
-
-#[test]
 fn only_a_holder_of_the_oldest_round_counts_down_and_a_start_above_it_stops_holding_it() {
     let hub = Hub::default();
     let cap = (100, 1 << 20);
@@ -215,11 +191,11 @@ fn only_a_holder_of_the_oldest_round_counts_down_and_a_start_above_it_stops_hold
     let mut c = hub.collector().unwrap();
     c.push(fact(1, 1));
     let seq = hub.finish(Some(c), Duration::from_secs(200), Duration::from_secs(50));
-    let (scans, _) = hub.work();
+    let scans = hub.scans();
     hub.advance(subs[2], seq, (Reach::All, Reach::All));
     hub.advance(subs[1], seq, (Reach::All, Reach::All));
     hub.advance(subs[1], seq, (Reach::All, Reach::All));
-    assert_eq!((hub.held().2, hub.work().0), (1, scans));
+    assert_eq!((hub.held().2, hub.scans()), (1, scans));
     hub.start(subs[0], seq, cap);
     let seq = round(&hub, vec![fact(1, 2)]);
     hub.start(subs[0], seq, cap);
