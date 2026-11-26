@@ -94,3 +94,25 @@ fn a_row_limit_met_inside_a_shared_round_stops_that_session_alone() {
     assert!(first.durable < second.durable);
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn the_rest_of_a_round_a_batch_stopped_inside_is_not_delivered_again() {
+    let w = World::new("shared-rest");
+    let s = w.open();
+    let a = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = w.reader();
+    let (mut small, st, mut held) = tail(&r, &[a], LiveOptions::default().max_rows(2));
+    emit(&w, &s, &[(a, 1.0)]);
+    r.refresh().unwrap();
+    emit(&w, &s, &[(a, 2.0), (a, 3.0)]);
+    r.refresh().unwrap();
+    for _ in 0..3 {
+        w.clock.advance(TICK);
+        if let Some(b) = small.next(Duration::ZERO).unwrap() {
+            apply(&mut held, &b);
+        }
+    }
+    let values: Vec<_> = held[&st].tail.iter().map(|f| f.value.clone()).collect();
+    assert_eq!(values, [Value::F64(1.0), Value::F64(2.0), Value::F64(3.0)]);
+    block_on(s.shutdown()).unwrap();
+}

@@ -198,3 +198,31 @@ fn a_round_of_facts_alone_decodes_each_set_of_series_once_for_every_session_taki
     let t = hub.take(sub, seq, Duration::ZERO);
     assert!(!t.rounds.last().unwrap().facts_only);
 }
+
+#[test]
+fn only_a_holder_of_the_oldest_round_counts_down_and_a_start_above_it_stops_holding_it() {
+    let hub = Hub::default();
+    let cap = (100, 1 << 20);
+    let subs: Vec<u64> = (0..3)
+        .map(|_| hub.subscribe(cap, Duration::from_secs(100)).0)
+        .collect();
+    for s in &subs {
+        hub.start(*s, 0, cap);
+    }
+    // Subscriber 2 is idle: it holds nothing back, and its advance counts nothing down.
+    hub.touch(subs[0], Duration::from_secs(200));
+    hub.touch(subs[1], Duration::from_secs(200));
+    let mut c = hub.collector().unwrap();
+    c.push(fact(1, 1));
+    let seq = hub.finish(Some(c), Duration::from_secs(200), Duration::from_secs(50));
+    let (scans, _) = hub.work();
+    hub.advance(subs[2], seq, (Reach::All, Reach::All));
+    hub.advance(subs[1], seq, (Reach::All, Reach::All));
+    hub.advance(subs[1], seq, (Reach::All, Reach::All));
+    assert_eq!((hub.held().2, hub.work().0), (1, scans));
+    hub.start(subs[0], seq, cap);
+    let seq = round(&hub, vec![fact(1, 2)]);
+    hub.start(subs[0], seq, cap);
+    hub.advance(subs[1], seq, (Reach::All, Reach::All));
+    assert_eq!(hub.held().2, 0);
+}
