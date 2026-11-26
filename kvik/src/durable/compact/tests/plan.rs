@@ -241,3 +241,35 @@ fn a_listed_segment_at_or_below_c_g_without_a_trailer_is_passed_by_its_manifest_
     assert_eq!(ids(&plan(&cs, &BTreeMap::from([(0, 1)]), 1000)), vec![2, 3]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_description_range_in_another_generation_does_not_pass_a_segment_without_a_trailer() {
+    let dir = temp_dir("other-generation");
+    let desc = FileDescription {
+        kind: 1,
+        class: FileClass::None,
+        generation: 0,
+        file_id: 1,
+        range: Some(((1, 1), (1, 1))),
+        hash: [0; 32],
+        inputs: Vec::new(),
+    };
+    let mut m = encode_initial(STORE, 0);
+    m.extend(
+        Record::new(2, 0, 0, Body::Sealed(vec![desc]))
+            .encode()
+            .unwrap(),
+    );
+    StdFs
+        .open(&dir.join(MANIFEST), OpenMode::CreateNew)
+        .unwrap()
+        .write_at(&m, 0)
+        .unwrap();
+    let cs = candidates(&StdFs, &dir, &STORE).unwrap();
+    assert_eq!(cs[0].range, None);
+    assert!(matches!(
+        plan(&cs, &BTreeMap::from([(0, 1)]), 1000),
+        Plan::Stalled(Stall { file_id: 1, .. })
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
