@@ -87,7 +87,7 @@ refusals! {
     Directory => "the directory does not match the nodes blocks",
     DirectoryRoot => "the directory root does not match the directory",
     Summary => "the trailer's summary fields do not match the nodes",
-    PartOrder => "parts not in ascending file_id, or two with one seq",
+    PartOrder => "parts not in ascending file_id, or two of one seq overlapping in period and series",
     FileId => "a file_id at or above next_file_id",
     CoveredRange => "covered ranges empty, out of order, overlapping or touching",
     FloorOrder => "floors not in ascending series",

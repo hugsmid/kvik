@@ -1,7 +1,8 @@
 //! The tree root (`kind = 19`, `format-tree.md` T.12): the live parts, the checkpoint K, what the parts cover, the
 //! floors and the retired files. An A.1 header and one block that ends the file, as the derived files of A.18.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use kvik_log::block::encode_block;
 use kvik_log::header::FileHeader;
@@ -219,8 +220,8 @@ impl Root {
         }
         let levels = crate::frame::levels(&mut c, counts[0])?;
 
+        let parts_at = c.at();
         let mut parts: Vec<PartRef> = Vec::with_capacity(counts[1]);
-        let mut seqs = BTreeSet::new();
         for _ in 0..counts[1] {
             let at = c.at();
             let file_id = c.u64()?;
@@ -243,7 +244,7 @@ impl Root {
                 greatest_series: c.u64()?,
                 byte_len: c.u64()?,
             };
-            if parts.last().is_some_and(|q| q.file_id >= file_id) || !seqs.insert(seq) {
+            if parts.last().is_some_and(|q| q.file_id >= file_id) {
                 return fail(at, Refusal::PartOrder);
             }
             if file_id >= next_file_id {
@@ -257,6 +258,9 @@ impl Root {
                 return fail(at + 24, Refusal::Period);
             }
             parts.push(p);
+        }
+        if let Some(i) = overlapping_seq(&parts) {
+            return fail(parts_at + (i * SIZES[1]) as u64, Refusal::PartOrder);
         }
 
         let mut covered: Vec<Covered> = Vec::with_capacity(counts[2]);
@@ -337,4 +341,40 @@ impl Root {
             retired,
         })
     }
+}
+
+/// The later, in file order, of two parts of one `seq` whose periods and series ranges both overlap (T.12, Q-1540).
+/// Periods are half-open, series ranges inclusive; a range with its least above its greatest overlaps nothing.
+fn overlapping_seq(parts: &[PartRef]) -> Option<usize> {
+    let mut order: Vec<usize> = (0..parts.len())
+        .filter(|&i| parts[i].least_series <= parts[i].greatest_series)
+        .collect();
+    order.sort_by_key(|&i| (parts[i].seq, parts[i].period_start, i));
+    // Every active part's period holds the current part's start, so active series ranges are pairwise disjoint.
+    let mut active: BTreeMap<u64, (u64, usize)> = BTreeMap::new();
+    let mut ends: BinaryHeap<Reverse<(i64, u64)>> = BinaryHeap::new();
+    let mut seq = None;
+    for i in order {
+        let p = &parts[i];
+        if seq != Some(p.seq) {
+            seq = Some(p.seq);
+            active.clear();
+            ends.clear();
+        }
+        while let Some(&Reverse((end, lo))) = ends.peek()
+            && end <= p.period_start
+        {
+            active.remove(&lo);
+            ends.pop();
+        }
+        if let Some((_, &(hi, j))) = active.range(..=p.greatest_series).next_back()
+            && hi >= p.least_series
+        {
+            return Some(i.max(j));
+        }
+        active.insert(p.least_series, (p.greatest_series, i));
+        let end = p.period_start + p.period_len as i64;
+        ends.push(Reverse((end, p.least_series)));
+    }
+    None
 }

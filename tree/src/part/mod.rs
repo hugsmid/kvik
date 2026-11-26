@@ -96,7 +96,7 @@ pub struct Run {
 pub struct Part {
     /// The A.1 header: kind 6, the tree's own `file_id`.
     pub header: FileHeader,
-    /// The root sequence the part was written for; a higher one overlays.
+    /// The first listing root's `seq`, or for a merged part its inputs' highest (Q-1540); a higher one overlays.
     pub seq: u64,
     /// Why it was written.
     pub class: Class,

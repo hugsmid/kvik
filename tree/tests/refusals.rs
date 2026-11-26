@@ -571,3 +571,25 @@ fn parts_of_one_seq_overlapping_in_period_and_series_are_refused() {
         );
     }
 }
+
+proptest::proptest! {
+    #[test]
+    fn parts_of_one_seq_are_refused_exactly_when_a_pair_overlaps_in_period_and_series(
+        raw in proptest::collection::vec((0u64..2, 0i64..4, 1i64..3, 0u64..6, 0u64..6), 1..7)
+    ) {
+        let parts: Vec<_> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &(seq, day, days, lo, hi))| (i as u64 + 1, seq, day, days, lo, hi))
+            .collect();
+        let clash = |a: &(u64, u64, i64, i64, u64, u64), b: &(u64, u64, i64, i64, u64, u64)| {
+            a.1 == b.1 && a.2 < b.2 + b.3 && b.2 < a.2 + a.3 && a.4.max(b.4) <= a.5.min(b.5)
+        };
+        let any = parts
+            .iter()
+            .enumerate()
+            .any(|(i, a)| parts[..i].iter().any(|b| clash(a, b)));
+        let got = root_refusal(&root_bytes_with_parts(&parts));
+        proptest::prop_assert_eq!(got, if any { Err(Refusal::PartOrder) } else { Ok(()) });
+    }
+}

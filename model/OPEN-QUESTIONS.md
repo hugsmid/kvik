@@ -5226,7 +5226,23 @@ file whose records carry such a tail would not encode to itself.
 **Decision (provisional).** (a): the reader leaves the file to the newer writer that wrote it and takes facts; a
 size below v1 is damage.
 **Pinned by.** `tests/refusals.rs` vectors `RecordSize`, `RecordSizeSmall`;
-`root_refusals_shared_with_parts`.
+`root_refusals_shared_with_parts`, `a_directory_or_directory_root_record_size_above_v1_is_a_version_refusal`.
+
+## Q-1540 — What a part's `seq` is, and whether two live parts may share one
+Settled by the lead with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12).
+**Scenario.** A part split on series ranges above 256 MiB gives two parts written for one root; a merge that leaves
+out a newer delta of its period (a week merged from day parts of `seq` 100 to 107 while a late-data delta of `seq`
+150 sits on one day) must not overlay that delta, so its `seq` has to be the highest of its inputs, equal to an
+input's and, split, to its sibling's. Distinct `seq`s in a root cannot hold either.
+**Options.** (a) Delta and rebuilt parts take the `seq` of the root that first lists them, a merged part the highest
+`seq` of its inputs; parts of one `seq` are allowed when their series ranges or periods are disjoint, and the root
+refuses two of one `seq` whose periods and series ranges both overlap; (b) as (a), overlay order `(seq, file_id)` and
+no refusal; (c) distinct `seq` kept, every merge taking every live part overlapping its output.
+**Decision.** (a). Periods are half-open and series ranges inclusive, as the trailer records them (an empty part's
+is 0 to 0); a range whose least is above its greatest overlaps nothing.
+**Pinned by.** `tests/refusals.rs` `parts_of_one_seq_are_accepted_when_periods_or_series_ranges_are_disjoint`,
+`parts_of_one_seq_overlapping_in_period_and_series_are_refused`,
+`parts_of_one_seq_are_refused_exactly_when_a_pair_overlaps_in_period_and_series`.
 
 ## Open at v0.2
 
