@@ -232,3 +232,57 @@ fn a_lookup_from_a_sealed_segments_last_time_of_the_series_reads_that_segment() 
     assert_eq!(got.facts, expected);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn a_lookup_under_a_new_reset_stamp_or_generation_drops_the_segment_maps_and_one_under_the_same_keeps_them()
+ {
+    let (fs, log) = store(40);
+    log.shutdown().unwrap();
+    let path = Path::new("s")
+        .join(crate::store::LOG_DIR)
+        .join(crate::store::MARK);
+    let wanted = [Wanted {
+        series_id: 3,
+        from: i64::MIN,
+        to: i64::MAX,
+    }];
+    let moved: [fn(crate::mark::MarkSlot) -> crate::mark::MarkSlot; 3] = [
+        |m| m,
+        |m| crate::mark::MarkSlot {
+            stamp: crate::mark::ResetStamp {
+                sequence: m.last_sequence,
+                nonce: 7,
+            },
+            ..m
+        },
+        |m| crate::mark::MarkSlot {
+            generation: m.generation + 1,
+            ..m
+        },
+    ];
+    let original = fs.read(&path).unwrap();
+    for (k, change, at) in (0..6).map(|i| (i / 2, moved[i / 2], i % 2 == 1)) {
+        fs.poke(&path, 0, &original);
+        let mut r = reader(&fs, 3);
+        r.lookup(&wanted, &|_, _, _| false).unwrap();
+        assert!(r.caches.maps_held() > 0);
+        let (_, m) = crate::mark::read_mark(&fs.read(&path).unwrap(), &[1; 16])
+            .unwrap()
+            .unwrap();
+        let next = crate::mark::MarkSlot {
+            counter: m.counter + 1,
+            ..change(m)
+        };
+        fs.poke(&path, 0, &crate::mark::encode_mark_file([Some(next), None]));
+        if at {
+            r.lookup_at(&[], &|_, _, _| false).unwrap();
+        } else {
+            r.lookup(&[], &|_, _, _| false).unwrap();
+        }
+        assert_eq!(
+            r.caches.maps_held() > 0,
+            k == 0,
+            "change {k}, lookup_at {at}"
+        );
+    }
+}

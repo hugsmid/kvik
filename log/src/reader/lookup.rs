@@ -273,6 +273,11 @@ impl Caches {
         !self.stood.iter().all(|id| listed.contains(id))
     }
 
+    #[cfg(test)]
+    pub(in crate::reader) fn maps_held(&self) -> usize {
+        self.maps.len()
+    }
+
     fn put_index(&mut self, file_id: u64, value: SealIndex) {
         self.tick += 1;
         let bytes = 64
