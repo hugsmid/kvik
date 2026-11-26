@@ -105,6 +105,7 @@ fn put_segment(dir: &Path, generation: u32, file_id: u64, bytes: &[u8]) -> Candi
         seal: kvik_log::directory::catalogue::read_trailer(&StdFs, &path),
         path,
         listed: true,
+        range: None,
     }
 }
 

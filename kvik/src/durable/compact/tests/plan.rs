@@ -29,6 +29,7 @@ fn cand(file_id: u64, first: u64, last: u64, len: u64, listed: bool) -> Candidat
         path: PathBuf::new(),
         seal: Some((len, trailer)),
         listed,
+        range: None,
     }
 }
 
