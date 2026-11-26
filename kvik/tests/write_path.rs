@@ -105,6 +105,15 @@ impl Fs for CountFs {
 
 /// A durable store on a counting file system, with `n` gauges defined.
 fn counted(name: &str, n: usize) -> (Store, ManualClock, Arc<Mutex<Counts>>, Vec<SeriesId>) {
+    counted_sealing(name, n, LogConfig::default().seal_interval)
+}
+
+/// [`counted`] with segments sealed every `seal`.
+fn counted_sealing(
+    name: &str,
+    n: usize,
+    seal: Duration,
+) -> (Store, ManualClock, Arc<Mutex<Counts>>, Vec<SeriesId>) {
     let clock = ManualClock::new(start());
     let counts = Arc::new(Mutex::new(Counts::default()));
     let mut env = Env::test(clock.clone());
@@ -114,6 +123,7 @@ fn counted(name: &str, n: usize) -> (Store, ManualClock, Arc<Mutex<Counts>>, Vec
     });
     let mut log = LogConfig::default();
     log.min_sync_interval = Duration::ZERO;
+    log.seal_interval = seal;
     let dir = format!("write-path/{name}");
     let store = block_on(Store::open(
         StoreConfig::new(&dir, "Etc/UTC")
@@ -178,18 +188,42 @@ fn deliver_reads(c: &Mutex<Counts>) -> u64 {
     c.lock().unwrap().deliver_reads
 }
 
-#[test]
-fn with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit() {
-    let (store, _clock, counts, ids) = counted("no-consumer-reads", 1);
+/// The `kvik-deliver` thread's reads over a burst of 50 emits with no consumer, once `before` has passed.
+fn reads_over_a_burst(name: &str, seal: Duration, before: Duration) -> u64 {
+    let (store, _clock, counts, ids) = counted_sealing(name, 1, seal);
+    block_on(store.emit(&[num(ids[0], -1, 1.0)])).unwrap();
+    std::thread::sleep(before);
     let r0 = deliver_reads(&counts);
     for i in 0..50 {
         block_on(store.emit(&[num(ids[0], i, 1.0)])).unwrap();
         std::thread::sleep(Duration::from_millis(2));
     }
     let reads = deliver_reads(&counts) - r0;
+    block_on(store.shutdown()).unwrap();
+    reads
+}
+
+#[test]
+fn with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit() {
+    // Past the first interval, so the burst is counted in the thread's steady state.
+    let reads = reads_over_a_burst(
+        "no-consumer-reads",
+        LogConfig::default().seal_interval,
+        Duration::from_millis(1_200),
+    );
     // One refresh's reads at most: the burst is shorter than the interval between reads with no consumer (Q-1490).
     assert!(reads <= 16, "{reads} reads for 50 emits");
-    block_on(store.shutdown()).unwrap();
+}
+
+#[test]
+fn with_no_consumer_the_delivery_thread_reads_once_at_a_seal_and_not_on_each_emit_after_it() {
+    // A seal at about a second, then a burst before the next.
+    let reads = reads_over_a_burst(
+        "no-consumer-seal",
+        Duration::from_secs(1),
+        Duration::from_millis(1_300),
+    );
+    assert!(reads <= 32, "{reads} reads for 50 emits");
 }
 
 #[test]

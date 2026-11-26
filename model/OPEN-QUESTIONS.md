@@ -2471,7 +2471,11 @@ a second (`IDLE_READ`, `kvik/src/durable/deliver/hub.rs`) after its last read, o
 series directory written for a seal covers only what the read-back has folded (`format.md` A.18); once the flag is
 raised it reads on every progress, as before. Skipping the read-back for the whole stretch was not taken: the reader's lease would hold
 the log at the first batch of the stretch, and a first consumer would read the whole stretch at its take.
-**Pinned by.** `with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit` (`kvik/tests/write_path.rs`);
+**Pinned by.** `with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit`,
+`with_no_consumer_the_delivery_thread_reads_once_at_a_seal_and_not_on_each_emit_after_it` (`kvik/tests/write_path.rs`);
+`with_no_consumer_and_no_timers_the_delivery_thread_still_takes_a_batch_within_its_idle_interval`,
+`with_a_consumer_the_delivery_thread_takes_each_batch_on_progress_not_at_the_idle_interval`
+(`kvik/src/durable/registering.rs`);
 `a_consumer_taken_after_a_long_idle_stretch_starts_after_the_last_batch_with_nothing_skipped_or_repeated`,
 `a_consumer_taken_after_a_restart_without_one_starts_after_the_last_batch_with_nothing_skipped_or_repeated`
 (`kvik/tests/emit_without_consumers.rs`); the read at a seal by

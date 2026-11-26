@@ -26,14 +26,33 @@ fn open_clock(name: &str) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualC
     open_queue(name, crate::config::Limits::default().consumer_queue)
 }
 
+/// [`open_queue`] with background timers on or off.
+fn open_timers(
+    name: &str,
+    queue: usize,
+    timers: bool,
+) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(MemFs::new());
+    env.background_timers = timers;
+    finish_open(name, queue, clock, env)
+}
+
 /// [`open_clock`] with each consumer's queue holding `queue` deliveries.
 fn open_queue(
     name: &str,
     queue: usize,
 ) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
-    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
-    let mut env = Env::test(clock.clone());
-    env.fs = Arc::new(MemFs::new());
+    open_timers(name, queue, true)
+}
+
+fn finish_open(
+    name: &str,
+    queue: usize,
+    clock: ManualClock,
+    env: Env,
+) -> (Arc<Writer>, SeriesId, PathBuf, Timestamp, ManualClock) {
     let log = LogConfig {
         segment_size: 16 << 20,
         min_sync_interval: Duration::ZERO,
@@ -236,6 +255,53 @@ fn with_a_consumer_an_emit_returns_before_its_batch_is_taken_and_the_delivery_th
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(facts(&w, "c"), vec![p.sequence]);
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn with_no_consumer_and_no_timers_the_delivery_thread_still_takes_a_batch_within_its_idle_interval()
+{
+    let (w, id, _dir, t, _) = open_timers(
+        "idle-read",
+        crate::config::Limits::default().consumer_queue,
+        false,
+    );
+    let p = emit(&w, id, t, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while taken(&w) < p.sequence {
+        assert!(
+            Instant::now() < deadline,
+            "the delivery thread never took it"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn with_a_consumer_the_delivery_thread_takes_each_batch_on_progress_not_at_the_idle_interval() {
+    let (w, id, _dir, t) = open("prompt");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &Funnel::facts(Select::All)).unwrap();
+    for i in 0..5 {
+        let woken = Arc::new(Woken::default());
+        assert!(
+            w.poll_delivery("c", Some(&Waker::from(woken.clone())))
+                .unwrap()
+                .is_none()
+        );
+        let p = emit(&w, id, t, i);
+        let since = Instant::now();
+        while !woken.0.load(Ordering::SeqCst) {
+            // Well inside the second the thread waits between reads with no consumer (Q-1490).
+            assert!(
+                since.elapsed() < Duration::from_millis(500),
+                "emit {i} waited"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(facts(&w, "c"), vec![p.sequence]);
+    }
     w.shutdown().unwrap();
 }
 
