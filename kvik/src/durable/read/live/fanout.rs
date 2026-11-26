@@ -430,3 +430,42 @@ fn a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it() {
     ));
     assert!(r.is_ok(), "{r:?}");
 }
+
+#[test]
+fn a_small_session_raced_after_a_late_open_holds_the_old_paths_latest() {
+    let r = run((
+        vec![
+            (0, 0, false),
+            (0, 81, true),
+            (2, 14, false),
+            (0, 0, false),
+            (0, 0, false),
+            (0, 0, false),
+        ],
+        vec![
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Advance(0),
+            Step::Open(253, 1, 46),
+            Step::Race(2, vec![(1, 0, 0)]),
+            Step::Emit(vec![(0, 0, 16), (0, 0, 14), (20, 0, 0)]),
+            Step::Emit(vec![(141, 0, 8), (0, 0, 0), (0, 0, 28)]),
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_latest_opened_while_a_small_tail_stops_at_its_row_limit_holds_the_old_paths_latest_once_caught_up()
+ {
+    let r = run((
+        vec![(1, 8, true), (0, 0, false)],
+        vec![
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Race(7, vec![(80, 0, 11), (29, 0, 3)]),
+            Step::Emit(vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (31, 0, 0), (0, 1, 0)]),
+            Step::Open(14, 0, 35),
+            Step::Define,
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
