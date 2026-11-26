@@ -1,13 +1,13 @@
 <h1>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-    <img src="docs/assets/banner.svg" width="100%" alt="kvik: durable time series for devices, in one Rust library. Design stage: specification v0.2 and an exact reference model; the engine is not built yet.">
+    <img src="docs/assets/banner.svg" width="100%" alt="kvik: durable time series for devices, in one Rust library. In development: specification v0.2, an exact reference model and a durable log with its interface; compaction, the summary tree, tiers and query are not built yet.">
   </picture>
 </h1>
 
 [![CI](https://github.com/hugsmid/kvik/actions/workflows/ci.yml/badge.svg)](https://github.com/hugsmid/kvik/actions/workflows/ci.yml)
 
-**A planned embedded time-series store for device and sensor data, in Rust: a durable ordered log and an analytical store
+**An embedded time-series store for device and sensor data, in Rust: a durable ordered log and an analytical store
 in one library, with no database service.**
 
 kvik is designed to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
@@ -19,7 +19,14 @@ edge devices: places where per-second data from many sources must be acted on qu
 a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 
 > [!IMPORTANT]
-> **Status: design stage. The engine does not exist yet.**
+> **Status: in development. The durable log and the interface on it work; delivery is partly built, and compaction, the summary tree, tiers, restore and query are not finished.**
+>
+> - **Works today:** writing and reading facts and series through the `kvik` crate on the durable log, in this or
+>   another process; recovery after a crash; routing, conditions, consumer queues and durable cursors; backup upload
+>   to an S3-compatible sink, tested against a local fake; the Parquet export; the compacted-file catalogue; and the
+>   summary-node fold and layout.
+> - **Next:** the open delivery items (roadmap 5), then compaction and the summary tree (6 and 7), tiers and restore
+>   (8), and query (9). Several wait on the owner's rulings, named in the table below.
 >
 > - The [specification](docs/spec.md) is tagged **v0.2**.
 > - A slow, exact [reference model](model/) of its semantics exists, with property tests and edge-case tests; a few
@@ -98,7 +105,7 @@ From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 ## Who it is for
 kvik is meant for places where the [principles](#principles) above are requirements rather than preferences. The
-engine does not exist yet, so each item below says what it is designed to do, not what has been shown.
+engine is only partly built, so each item below says what it is designed to do, not what has been shown.
 
 - **Regulated data that needs a complete change history**, such as pharmaceutical and food production, water
   treatment or energy metering. Besides keeping every fact and every correction, the store answers as-of queries:
