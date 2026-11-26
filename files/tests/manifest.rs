@@ -11,7 +11,7 @@ use kvik_files::catalogue::{Catalogue, CatalogueError};
 use kvik_files::desc::FileClass;
 use kvik_files::image::read;
 use kvik_files::record::{AckedLoss, Acknowledgement, Body, Publish, Record};
-use kvik_log::fs::{FaultOp, MemFs};
+use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::manifest::LossCause;
 use proptest::prelude::*;
 use support::*;
@@ -358,4 +358,24 @@ fn settling_a_record_not_yet_written_is_refused_and_no_false_proof_is_given() {
     assert_eq!(m.settle(1, T0).unwrap().epoch(), 1);
     assert_eq!(m.irreversible(1).unwrap().epoch(), 1);
     assert!(m.settled(m.catalogue().last_epoch()).is_none());
+}
+
+/// Q-871, `format.md` A.12 Open: the open makes the name `MANIFEST` durable before anything is appended to it, as a
+/// rename stopped before its directory sync on the same boot leaves it in the page cache only.
+#[test]
+fn the_open_syncs_the_directory_so_a_renamed_manifest_survives_a_power_loss() {
+    let fs = MemFs::new();
+    let new = dir().join(kvik_files::MANIFEST_NEW);
+    let f = fs.open(&new, kvik_log::fs::OpenMode::CreateNew).unwrap();
+    f.write_at(&manifest_bytes(&[Record::new(1, 0, T0, Body::Empty)]), 0)
+        .unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_dir(&dir()).unwrap();
+    fs.rename(&new, &manifest_path()).unwrap();
+    let mut m = open(&fs);
+    m.append(Body::Empty, T0).unwrap();
+    drop(m);
+    fs.power_loss();
+    assert_eq!(reread(&fs).len(), 2);
 }
