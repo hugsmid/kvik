@@ -237,6 +237,7 @@ impl Judge<'_> {
             Entry::Unwatch { id, .. } => {
                 self.gates.remove(id).ok_or(GateError::Id(*id))?;
             }
+            Entry::Other { .. } => {}
         }
         Ok(())
     }

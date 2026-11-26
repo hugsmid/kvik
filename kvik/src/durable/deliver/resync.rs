@@ -419,6 +419,7 @@ impl Deliverer {
                                     part,
                                     last,
                                     funnels,
+                                    gates: Vec::new(),
                                 }),
                                 flags: DeliveryFlags {
                                     unchecked,

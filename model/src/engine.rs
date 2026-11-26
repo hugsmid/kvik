@@ -17,6 +17,7 @@ use crate::recovery::{
 
 mod cuts;
 mod faults;
+mod gates;
 mod provisional;
 mod recovery;
 mod repair;
@@ -261,6 +262,24 @@ pub enum RouteChange {
         consumer: ConsumerId,
         /// Funnel identifier.
         funnel: FunnelId,
+    },
+    /// A gate is watched by a consumer (spec §6 Gates).
+    Watch {
+        /// Consumer.
+        consumer: ConsumerId,
+        /// Gate identifier.
+        id: crate::gate::ConditionId,
+        /// Its name.
+        name: String,
+        /// The gate.
+        gate: crate::gate::Gate,
+    },
+    /// A gate is unwatched.
+    Unwatch {
+        /// Consumer.
+        consumer: ConsumerId,
+        /// Gate identifier.
+        id: crate::gate::ConditionId,
     },
 }
 

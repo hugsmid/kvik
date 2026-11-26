@@ -94,6 +94,7 @@ kvik-latest     kvik  lib         durable::read::latest::
 kvik-live       kvik  lib         durable::read::live::differential::
 kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
+kvik-gates      kvik  lib         backend::gates::tests::the_model_backend_delivers_what_judge_computes_from_its_log
 '
 
 cd "$(dirname "$0")/.."

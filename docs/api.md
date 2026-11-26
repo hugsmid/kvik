@@ -424,9 +424,10 @@ enum Live { Value(Fact), None, Unknown }
 pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySegment, PartialWildcard }
 ```
 
-### Gates (proposal; no backend yet)
-In-store conditions on one stream (spec §6 Gates). Not built: the model backend's judgement (`kvik_model::gate`)
-defines them; the durable engine and this interface follow (Q-1140).
+### Gates
+In-store conditions on one stream (spec §6 Gates). The model backend serves them from its judgement
+(`kvik_model::gate`); the durable backend validates a watch and refuses it `NotSupportedYet` until its engine is
+built (Q-1140, Q-1583).
 ```rust
 let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity), [
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),
@@ -436,7 +437,7 @@ consumer.watch("pump-faults", Gate::set(Input::value_each(), [Value::Num(0.0)]).
 consumer.unwatch("bathroom-humidity").await?;
 while let Some(d) = consumer.next().await {
     match d.kind {
-        DeliveryKind::Transition(t) => { /* t.from, t.to: GateState; act unless t.flags.replayed; de-duplicate by t.id */ }
+        DeliveryKind::Transition(t) => { /* t.from, t.to: GateState; act unless d.flags.replayed; de-duplicate by t.id */ }
         DeliveryKind::Resync(s) => { /* s.gates: each instance's state now and the TransitionId that set it */ }
         _ => {}
     }
@@ -446,9 +447,10 @@ pub struct TransitionId { pub at: Position, pub due: Option<Timestamp>, pub cond
 pub enum GateState { Unknown, Stale, Level(u8), Match(bool), Value(Value) }
 pub struct Transition { pub id: TransitionId, pub name: String, pub series: SeriesId,
     pub from: Option<GateState>, pub to: Option<GateState>,      // None: the instance starts / leaves
-    pub cause: Cause /* Fact { position, t } | Timer { due, kind: Hold | Stale | Mature | Window } | Entry { position } */,
-    pub value: Option<Value>, pub event_time: Option<Timestamp>, pub now: Timestamp, pub flags: DeliveryFlags }
-pub struct GateInstanceState { pub condition: GateId, pub series: SeriesId, pub state: GateState, pub set_by: TransitionId }
+    pub cause: TransitionCause /* Fact { position, t } | Timer { due, kind: Hold | Stale | Mature | Window } | Entry { position } */,
+    pub value: Option<Value>, pub event_time: Option<Timestamp>, pub now: Timestamp }   // flags: the delivery's
+pub struct GateInstanceState { pub condition: GateId, pub series: SeriesId, pub state: GateState, pub set_by: Option<TransitionId> }
+// DeliveryId::Transition(TransitionId); ResyncPart.gates: Vec<GateInstanceState>; consumer.gates() -> Vec<(GateId, String, Gate)>
 ```
 | Item | Rule |
 |---|---|
@@ -457,7 +459,7 @@ pub struct GateInstanceState { pub condition: GateId, pub series: SeriesId, pub 
 | Naming | A name is unique within its consumer (1–64 bytes, the series-name segment grammar). `watch` with an equal spec returns the id in force and writes nothing, so applications watch at every start, as `route` (Q-91 (c)); a different spec under a name in force is refused (`ConsumerError::Gate`). `watch` and `unwatch` are routing entries and take effect at their positions. |
 | Delivery | Transitions at a position follow that position's fact deliveries; timer transitions in `TransitionId` order. Each instance starts with a transition from `None` (state now at the watch or join, its holds seeded from up to twice the longest hold of history, at most 24 h, spec §6 Gates, Q-1145) and an `Each` instance that leaves ends with one to `None`. Timers run on the commit clock (provisional, Q-1393). |
 | Resume | One gate cursor per consumer: the last confirmed `TransitionId`, or the frontier of the last confirmed resync, kept with a checkpoint at or after it (Q-1391). On resume: transitions after both, `replayed`, under their first ids, then a resync carrying `gates`. Beyond `conditions.replay_max` (default 24 h or 1,000,000 facts, measured from the checkpoint) nothing is replayed, counted as `transitions_not_replayed`. |
-| Limits and errors | 4,096 gates per consumer, 65,536 per store. New errors: `ConsumerError::Gate(GateError)` with `GateError` { `Levels`, `Set`, `Deadband`, `Duration`, `Coverage`, `Selector`, `Pattern(RouteError)`, `NameInUse`, `TooMany` }. |
+| Limits and errors | 4,096 gates per consumer, 65,536 per store. New errors: `ConsumerError::Gate(GateError)` with `GateError` { `Levels`, `Set`, `Deadband`, `Duration`, `Coverage`, `Selector`, `Pattern(RouteError)`, `Name`, `NameInUse`, `NoSuchGate`, `TooMany` } (Q-1581); `set_by` is `None` after a reseed (Q-1392). Constants `MAX_GATES_PER_CONSUMER`, `MAX_GATES_PER_STORE`, `MAX_GATE_LEVELS`, `MAX_GATE_MEMBERS`, `MAX_GATE_INSTANCES`, `MAX_GATE_NAME`, `MAX_GATE_DURATION`. |
 | Raw series | A consumer watching raw series receives at attach and after a restart each watched series' latest value with its event time; deliveries carry event time (built with the public API, conditions step 3, Q-1140). |
 
 ## Reader processes (accepted at gate 3.3)

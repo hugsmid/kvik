@@ -18,7 +18,7 @@ use crate::health::ConsumerStats;
 use crate::types::{Ack, Intent, Outcome, Reading};
 
 impl Writer {
-    fn hub(&self) -> Result<&Arc<Hub>, Error> {
+    pub(super) fn hub(&self) -> Result<&Arc<Hub>, Error> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Closed);
         }
@@ -99,7 +99,11 @@ impl Writer {
     }
 
     /// Commits a routing change and writes the registry file after it.
-    fn commit_routing(&self, d: &mut super::ingest::Decider, change: Routing) -> Result<(), Error> {
+    pub(super) fn commit_routing(
+        &self,
+        d: &mut super::ingest::Decider,
+        change: Routing,
+    ) -> Result<(), Error> {
         self.commit_entry_held(d, Entry::Routing(Box::new(change)))?;
         self.write_registry_file()
     }

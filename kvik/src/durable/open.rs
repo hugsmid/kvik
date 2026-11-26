@@ -262,6 +262,7 @@ impl Writer {
             bucket_warning: config.log.bucket_warning(),
             fast: Arc::default(),
             env,
+            gates_live: AtomicBool::new(super::gates::LIVE),
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
         // Opening). A release whose name is not a valid entry is left out.

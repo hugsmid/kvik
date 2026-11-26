@@ -402,6 +402,9 @@ pub enum ConsumerError {
     /// A confirmation names a delivery that was not received.
     #[error("confirmation of a delivery that was not received")]
     BadConfirm,
+    /// A gate is refused (spec §6 Gates).
+    #[error("gate refused: {0}")]
+    Gate(#[from] crate::gate::GateError),
     /// Writing the routing entry failed.
     #[error(transparent)]
     Write(#[from] WriteError),

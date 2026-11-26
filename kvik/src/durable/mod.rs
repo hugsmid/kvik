@@ -23,6 +23,7 @@ mod derived;
 mod emit;
 mod entries;
 pub(crate) mod fast;
+mod gates;
 #[cfg(test)]
 mod held_state;
 mod history;
@@ -266,6 +267,8 @@ pub(crate) struct Writer {
     bucket_warning: Option<String>,
     /// The provisional streams' ring (spec §4 Provisional streams).
     fast: Arc<fast::Fast>,
+    /// Whether `watch` writes its entry; off until gates are judged live ([`gates::LIVE`]).
+    gates_live: AtomicBool,
 }
 
 impl Drop for Writer {

@@ -11,6 +11,7 @@
 
 pub(crate) mod convert;
 mod error;
+mod gates;
 pub(crate) mod live;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -31,6 +32,7 @@ use crate::consume::{
 };
 use crate::env::{Clock, Monotonic};
 use crate::error::{Fault, Refusal, Wait};
+use crate::gate::GateInstanceState;
 use crate::health::{
     ClockJump, ClockStats, ConsumerStats, DiskStats, Health, IngestStats, LogStats, LossCause,
     LossKind, LossReport, MarkState, Reason, SeriesStats, Stats,
@@ -151,6 +153,8 @@ struct ConsumerSlot {
     /// Per model funnel, the last condition delivery sequence the model issued before this store session: the model
     /// keeps sequences across restarts, the interface starts them at 1 at every start (spec §4 Order).
     sequence_base: BTreeMap<u32, u64>,
+    /// Gates and their delivery state.
+    gates: gates::GateFeed,
 }
 
 #[derive(Debug)]
@@ -318,6 +322,7 @@ impl Slot {
             c.attached = None;
             c.parts.clear();
             c.awaiting_resync = None;
+            c.gates.reattach();
         }
         self.waiting.clear();
         Ok(self.epoch)
@@ -926,6 +931,7 @@ impl Slot {
                 // What was handed out is dropped with the old handle, a resync awaiting confirmation included.
                 c.parts.clear();
                 c.awaiting_resync = None;
+                c.gates.reattach();
             }
             c.attached = Some(self.epoch);
             c.handle = true;
@@ -973,6 +979,7 @@ impl Slot {
                 sequence_base: BTreeMap::new(),
                 parts: VecDeque::new(),
                 awaiting_resync: None,
+                gates: gates::GateFeed::default(),
             },
         );
         Ok(())
@@ -1199,10 +1206,30 @@ impl Slot {
         self.model
             .catch_up(cid, usize::MAX)
             .map_err(convert::error)?;
-        let mut got = self.model.receive(cid, 1).map_err(convert::error)?;
+        let peeked = match self.consumers[name].gates.peeked.is_some() {
+            true => None,
+            false => self.model.receive(cid, 1).map_err(convert::error)?.pop(),
+        };
         self.forget_observations();
-        let Some(e) = got.pop() else { return Ok(None) };
-        let parts = self.deliveries(name, e);
+        let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
+        let e = c.gates.peeked.take().or(peeked);
+        // Gate transitions interleave with the model's deliveries by position (spec §4 Order, §6 Gates).
+        if let Some(t) = self.next_transition(name)?
+            && e.as_ref().is_none_or(|e| gates::before(&t, e))
+        {
+            self.consumers
+                .get_mut(name)
+                .ok_or(Error::Closed)?
+                .gates
+                .peeked = e;
+            return Ok(Some(self.hand_transition(name, t)));
+        }
+        let Some(e) = e else { return Ok(None) };
+        let gate_states = match &e.kind {
+            km::engine::DeliveryKind::Resync(_) => self.gate_states(name)?,
+            _ => Vec::new(),
+        };
+        let parts = self.deliveries(name, e, gate_states);
         let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
         c.parts.extend(parts);
         let d = c.parts.pop_front();
@@ -1232,7 +1259,12 @@ impl Slot {
     }
 
     /// The deliveries of one model envelope: one, or the parts of a resync.
-    fn deliveries(&self, name: &str, e: km::engine::Envelope) -> Vec<Delivery> {
+    fn deliveries(
+        &self,
+        name: &str,
+        e: km::engine::Envelope,
+        gate_states: Vec<GateInstanceState>,
+    ) -> Vec<Delivery> {
         use km::engine::DeliveryKind as K;
         let mut flags = DeliveryFlags {
             replayed: e.replayed,
@@ -1315,19 +1347,13 @@ impl Slot {
                     .collect();
                 // In the interface's funnel order: a re-routed pattern funnel has a later model id.
                 states.sort_by_key(|f| f.funnel);
-                let chunks: Vec<Vec<FunnelState>> = if states.is_empty() {
-                    vec![Vec::new()]
-                } else {
-                    states
-                        .chunks(RESYNC_PART_FUNNELS)
-                        .map(<[FunnelState]>::to_vec)
-                        .collect()
-                };
-                let n = chunks.len();
-                chunks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(k, funnels)| {
+                let mut funnel_parts = states.chunks(RESYNC_PART_FUNNELS);
+                let mut gate_parts = gate_states.chunks(RESYNC_PART_FUNNELS);
+                let n = funnel_parts.len().max(gate_parts.len()).max(1);
+                (0..n)
+                    .map(|k| {
+                        let funnels = funnel_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
+                        let gates = gate_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
                         let part = u32::try_from(k + 1).unwrap_or(u32::MAX);
                         Delivery {
                             id: DeliveryId::Resync { part },
@@ -1338,6 +1364,7 @@ impl Slot {
                                 part,
                                 last: k + 1 == n,
                                 funnels,
+                                gates,
                             }),
                             flags,
                             delivered_at,
@@ -1360,6 +1387,7 @@ impl Slot {
                 sequence: sequence + self.sequence_base(name, funnel.0),
             },
             DeliveryId::GenerationChanged => km::engine::DeliveryId::GenerationChanged,
+            DeliveryId::Transition(t) => return self.confirm_transition(name, &t),
             DeliveryId::Resync { part } => {
                 // Only the last part confirms the resync; an earlier part
                 // does nothing.

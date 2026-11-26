@@ -192,6 +192,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1203 | `api.md` Live reads; Q-1011, Q-1118 | A fan-out round that fails after taking events (settled by the owner) |
 | Q-1390 | §6 Gates, Transitions; Q-1145 | The seed at a gate's start: how far back, and the value before the first reading (settled by the owner: the default) |
 | Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (settled by the owner: the default) |
+| Q-1580 | `format.md` A.6 | The routing field ids of a watch and an unwatch, and the member value form (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1581 | `api.md` Gates | The gate interface as built: `Transition` without flags, `TransitionCause`, `gates()`, two more `GateError`s (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1582 | §6 Gates; Q-1140 | Entries other than facts, definitions and the consumer's own gates move the judgement's frontier (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1583 | `api.md` Gates; crate README | What the model backend's gates do not do yet (decided by the lead, provisional; settle with conditions step 5) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5260,6 +5264,53 @@ equals the per-instance latch filter); `tests/gates.rs`
 `the_replay_bound_counts_facts_and_time_from_the_checkpoint_not_the_gate_cursor`,
 `a_frontier_gate_cursor_covers_timer_transitions_due_by_its_instant_only`; `tests/gate_edges.rs`
 `the_replay_bound_runs_from_the_checkpoint_not_from_an_old_gate_cursor`.
+
+## Q-1580 — The routing fields of a watch and an unwatch
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** Routing changes 4 and 5 need field ids after 66 (cond2 design section 3.4). Ids are per entry type,
+but `format.md` A.6 names field 70 as the label item of type 10, and one id meaning two things across types invites
+mistakes. A set gate's members need a value form in the entry codec, which had none.
+**Decision.** 67 gate id, 68 name, 69 selector, 71 input, 72 kind, 73 level, 74 member, 75 holds, 76 dead-band,
+77 stale after; 70 is skipped and stays an unknown critical field of a routing change. A member is a tag byte then
+the value: 1 `f64`, 2 decimal (`i64` units, `u8` scale), 3 named state index `u32`, 4 boolean byte, 5 text of 1 to
+255 bytes. Window inputs (71 = 2) are refused when read until their fold exists.
+**Pinned by.** `log/tests/entries_gates.rs` (every field check, the byte vector of `format.md` A.6),
+`log/tests/batches.rs` round trip.
+
+## Q-1581 — The gate interface as built
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** `api.md` Gates sketched `Transition.flags`, a `Cause` enum and no error for an unknown name or a name
+the grammar refuses.
+**Decision.** A transition's flags are its delivery's (`Delivery.flags`, as for facts and triggers); the cause enum is
+`TransitionCause`; `Consumer::gates()` returns `(GateId, String, Gate)` with the series by id; `GateError::Name` (not
+1 to 64 bytes, or holding `/`) and `GateError::NoSuchGate` (unwatch of a name not in force) are added;
+`GateInstanceState.set_by` is an `Option` (Q-1392). An equal spec is compared after resolving a series name, so a
+watch by name and one by id of the same series are equal. A builder method of another kind (`deadband` on a levels
+gate) has no effect.
+**Pinned by.** `kvik/tests/gates.rs`, `kvik/src/gate.rs` tests, `kvik/src/durable/gates/tests.rs`.
+
+## Q-1582 — Every entry moves a gate's frontier
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** A timer transition's `at` is the last position of the whole log before its instant (cond2 design
+section 3.2), but `kvik_model::gate::Entry` could carry only facts, definitions and the consumer's own gates, so the
+model backend could not hand `judge` a funnel change, another consumer's watch or a site-zone entry.
+**Decision.** `gate::Entry::Other { position, commit_time }` carries any other entry; it changes no state.
+`Model::gate_history` maps the whole log so.
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition`.
+
+## Q-1583 — The model backend's gates for now
+Decided by the lead, provisional (settle with conditions step 5).
+**Scenario.** The model backend serves gates from `judge` so that the durable engine has an oracle; some parts of the
+interface have no model counterpart yet.
+**Decision.** A decimal member is compared as the `f64` it denotes; a named-state member on a gate whose series has
+no named states (every `each` gate) is `NotSupportedYet`. The gate cursor is the last confirmed transition, kept in
+the process with the store; after a restart every transition after it comes again flagged `replayed`, with no
+replay bound, and a resync carries each instance's state at the model's now. The durable backend refuses window
+inputs and, until conditions step 4, every watch, with `NotSupportedYet`.
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_resync_carries_gate_states`,
+`kvik/tests/gates.rs` `the_durable_backend_validates_a_watch_and_refuses_not_supported_yet`.
 
 ## Open at v0.2
 

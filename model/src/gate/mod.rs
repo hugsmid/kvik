@@ -365,6 +365,14 @@ pub enum Entry {
         /// Id.
         id: ConditionId,
     },
+    /// Any other log entry: it moves the frontier only, so a timer's `at` is the last position of the whole log
+    /// before its instant (cond2 design section 3.2).
+    Other {
+        /// Position.
+        position: Position,
+        /// Commit time.
+        commit_time: Nanos,
+    },
 }
 
 impl Entry {
@@ -374,7 +382,8 @@ impl Entry {
             Entry::Fact { fact, .. } => fact.position,
             Entry::Define { position, .. }
             | Entry::Watch { position, .. }
-            | Entry::Unwatch { position, .. } => *position,
+            | Entry::Unwatch { position, .. }
+            | Entry::Other { position, .. } => *position,
         }
     }
 
@@ -384,7 +393,8 @@ impl Entry {
             Entry::Fact { commit_time, .. }
             | Entry::Define { commit_time, .. }
             | Entry::Watch { commit_time, .. }
-            | Entry::Unwatch { commit_time, .. } => *commit_time,
+            | Entry::Unwatch { commit_time, .. }
+            | Entry::Other { commit_time, .. } => *commit_time,
         }
     }
 }
