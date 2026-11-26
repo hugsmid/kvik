@@ -725,3 +725,66 @@ fn the_period_of_a_time_at_the_edges_of_i64_is_the_models() {
         }
     }
 }
+
+/// The digest's share of a run (§3.2 step 2, Q-1410): run with `--release -- --ignored --nocapture`, once with
+/// `RUSTFLAGS='--cfg sha2_backend="soft"'` for a core without SHA instructions.
+#[test]
+#[ignore = "a measurement"]
+fn measure_the_digest_against_the_run() {
+    let dir = temp_dir("digest");
+    let (series, per_batch, batches) = (100u32, 100u64, 400u64);
+    let t0 = 1_767_225_600_000_000_000i64;
+    let mut segs = Vec::new();
+    let mut first = 1u64;
+    for file in 0..4u64 {
+        let bs: Vec<TestBatch> = (0..batches / 4)
+            .map(|b| {
+                let k = file * batches / 4 + b;
+                let items = (0..per_batch)
+                    .map(|i| {
+                        let n = k * per_batch + i;
+                        let v = (n as f64 * 0.37).sin();
+                        reading(
+                            (n % u64::from(series)) as u32,
+                            t0 + n as i64 * 10_000_000,
+                            Value::F64(v.to_bits()),
+                        )
+                    })
+                    .collect();
+                let tb = batch(first, t0 + k as i64 * 1_000_000_000, items);
+                first += per_batch;
+                tb
+            })
+            .collect();
+        segs.push(put_segment(
+            &dir,
+            1,
+            1 + file,
+            &segment_bytes(1, 1 + file, &bs),
+        ));
+    }
+    let set_aside = SetAside::default();
+    let weeks = BTreeSet::new();
+    let facts = per_batch * batches;
+    let t = std::time::Instant::now();
+    let outputs = run(&input(&dir, &set_aside, &weeks), &segs).unwrap();
+    let whole = t.elapsed();
+    let sample = Fact::value(1, (1, 1), t0, 1, 0x4000_0000_0000_0000);
+    let t = std::time::Instant::now();
+    let mut acc = 0u128;
+    for i in 0..facts * 2 {
+        let mut f = sample.clone();
+        f.position.1 = i;
+        acc = acc.wrapping_add(super::fact_digest(&f, t0, t0));
+    }
+    let digest = t.elapsed();
+    std::hint::black_box(acc);
+    println!(
+        "facts {facts}, outputs {}, run {:.1} ns/fact, digest (input and output) {:.1} ns/fact, share {:.1} %",
+        outputs.len(),
+        whole.as_nanos() as f64 / facts as f64,
+        digest.as_nanos() as f64 / facts as f64,
+        100.0 * digest.as_secs_f64() / whole.as_secs_f64()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
