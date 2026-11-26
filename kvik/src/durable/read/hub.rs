@@ -250,6 +250,7 @@ impl Collector {
     /// Positions found lost by another read of the process (Q-938).
     pub(crate) fn gap(&mut self, first: LogPos, last: LogPos) {
         if first <= last {
+            self.taken = true;
             self.push(Piece::Gap(first, last));
         }
     }
