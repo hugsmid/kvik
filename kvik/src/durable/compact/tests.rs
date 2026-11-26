@@ -682,3 +682,39 @@ fn an_interval_definition_gives_its_reach() {
     d.kind = Kind::Gauge;
     assert_eq!(super::series_info(&d).1, Reach::Point);
 }
+
+proptest! {
+    #[test]
+    fn the_period_of_a_time_is_the_models(
+        day in -1_000i64..1_000,
+        within in 0i64..DAY,
+        delta in -2i64..=2,
+        ahead in 0i64..20,
+        merged in any::<bool>(),
+    ) {
+        let t = day * DAY + within;
+        let last = (day + ahead) * DAY + delta;
+        let weeks = if merged { BTreeSet::from([day.div_euclid(7)]) } else { BTreeSet::new() };
+        prop_assert_eq!(super::period(t, last, &weeks), kvik_model::compaction::period(t, last, &weeks));
+    }
+}
+
+#[test]
+fn the_period_of_a_time_at_the_edges_of_i64_is_the_models() {
+    let none = BTreeSet::new();
+    for t in [
+        i64::MIN,
+        i64::MIN + DAY,
+        i64::MAX - 20 * DAY,
+        i64::MAX - DAY,
+        i64::MAX,
+    ] {
+        for last in [i64::MIN, 0, i64::MAX] {
+            assert_eq!(
+                super::period(t, last, &none),
+                kvik_model::compaction::period(t, last, &none),
+                "{t} {last}"
+            );
+        }
+    }
+}

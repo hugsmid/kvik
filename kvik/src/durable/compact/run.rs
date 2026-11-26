@@ -95,15 +95,21 @@ pub(crate) fn run(input: &RunInput<'_>, segments: &[Candidate]) -> Result<Vec<Ou
     let taken = take(input, segments)?;
     let parts = place(input, &taken)?;
     let written = write(input, &taken, parts)?;
-    match verify(input, &taken, &written) {
-        Ok(out) => Ok(out),
-        Err(e) => {
-            for w in &written {
-                let _ = input.fs.remove_file(&w.path);
-            }
-            Err(e.into())
+    verified_or_removed(input, &taken, &written)
+}
+
+/// The verified outputs, or none: on a failed check every output is removed and the inputs stay as they are (§3.2).
+pub(super) fn verified_or_removed(
+    input: &RunInput<'_>,
+    taken: &Inputs,
+    written: &[Written],
+) -> Result<Vec<Output>, RunError> {
+    verify(input, taken, written).map_err(|e| {
+        for w in written {
+            let _ = input.fs.remove_file(&w.path);
         }
-    }
+        e.into()
+    })
 }
 
 pub(crate) fn read_whole(f: &dyn FsFile) -> io::Result<Vec<u8>> {
@@ -168,9 +174,6 @@ pub(super) fn take(input: &RunInput<'_>, segments: &[Candidate]) -> Result<Input
         let mut positions = 0u64;
         let mut facts: BTreeMap<u32, u64> = BTreeMap::new();
         for batch in &report.batches {
-            if batch.blocks.iter().any(|d| d.prefix.is_none()) {
-                return Err(stall(Cause::Unknown));
-            }
             let content = BatchContent::decode_canonical(batch).map_err(|e| match e {
                 BodyError::NonCanonical => stall(Cause::Unknown),
                 _ => stall(Cause::Unreadable("a batch body")),
