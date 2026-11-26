@@ -183,3 +183,89 @@ fn every_field_of_a_fact_reaches_its_digest() {
     }
     assert!(changed.iter().all(|&x| x != d0));
 }
+
+/// Writes the outputs of a run over two small segments, lets `tamper` change what verification is given, and
+/// verifies.
+fn verified_against(
+    tamper: impl FnOnce(
+        &mut super::super::run::RunInput<'_>,
+        &mut super::super::run::Inputs,
+        &mut Vec<super::super::verify::Written>,
+    ),
+) -> Result<usize, String> {
+    let dir = temp_dir("verify-desc");
+    let a = put_segment(
+        &dir,
+        0,
+        1,
+        &segment_bytes(
+            0,
+            1,
+            &[batch(1, 30 * DAY, vec![reading(1, T + 1, Value::F64(1))])],
+        ),
+    );
+    let b = put_segment(
+        &dir,
+        0,
+        2,
+        &segment_bytes(
+            0,
+            2,
+            &[batch(2, 30 * DAY, vec![reading(1, T + 1, Value::F64(2))])],
+        ),
+    );
+    let (sa, weeks) = (SetAside::new(vec![]), BTreeSet::new());
+    let mut inp = input(&dir, &sa, &weeks);
+    let mut taken = take(&inp, &[a, b]).unwrap();
+    let parts = place(&inp, &taken).unwrap();
+    let mut written = write(&inp, &taken, parts).unwrap();
+    tamper(&mut inp, &mut taken, &mut written);
+    let r = verified_or_removed(&inp, &taken, &written)
+        .map(|o| o.len())
+        .map_err(|e| e.to_string());
+    std::fs::remove_dir_all(&dir).unwrap();
+    r
+}
+
+#[test]
+fn outputs_of_two_inputs_verify_untampered() {
+    assert_eq!(verified_against(|_, _, _| {}), Ok(2));
+}
+
+#[test]
+fn a_description_naming_other_inputs_than_the_run_took_fails() {
+    let e = verified_against(|_, t, _| {
+        t.names.pop();
+    });
+    assert_eq!(e, Err("description disagrees with the run: inputs".into()));
+}
+
+#[test]
+fn a_description_with_another_run_id_fails() {
+    let e = verified_against(|i, _, _| i.first_file_id += 1);
+    assert_eq!(e, Err("description disagrees with the run: run id".into()));
+}
+
+#[test]
+fn a_description_with_another_run_count_fails() {
+    let e = verified_against(|_, _, w| {
+        w.pop();
+    });
+    assert_eq!(
+        e,
+        Err("description disagrees with the run: run count".into())
+    );
+}
+
+#[test]
+fn a_fact_position_in_two_outputs_is_held_twice() {
+    let e = verified(&SetAside::new(vec![]), |p| {
+        let part = p.get_mut(&day(T)).unwrap();
+        let copy = part.current[&2][0].clone();
+        part.revision.entry(2).or_default().push(copy);
+    });
+    assert!(
+        matches!(e, Err(VerifyError::Placement("a position held twice"))),
+        "{e:?}"
+    );
+}

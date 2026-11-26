@@ -1,4 +1,5 @@
 mod plan;
+mod run;
 mod verify;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -293,6 +294,8 @@ fn check_lossless(segments: &[(u32, Vec<TestBatch>)], set_aside: &SetAside, week
         assert!(o.path.to_string_lossy().ends_with(".kvc.tmp"));
         assert_eq!(o.layout.run_id, 100);
         assert_eq!(o.layout.run_count as usize, outputs.len());
+        let named: Vec<u64> = o.layout.inputs.iter().map(|i| i.file_id).collect();
+        assert_eq!(named, (1..=segments.len() as u64).collect::<Vec<_>>());
         assert!(o.layout.complete);
         assert_eq!(o.len, std::fs::metadata(&o.path).unwrap().len());
         let bytes = std::fs::read(&o.path).unwrap();
