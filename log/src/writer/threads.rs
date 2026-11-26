@@ -623,6 +623,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signalling_a_detached_stop_sets_every_flag_and_lets_go_of_both_threads() {
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("s"), Some(&new)).unwrap();
+        let w = LogWriter::open(
+            store,
+            WriterConfig::default(),
+            Some([2; 16]),
+            Duration::ZERO,
+            0,
+        )
+        .unwrap();
+        let mut log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        let shared = log.shared.clone();
+        log.signal_stop_detached();
+        assert!(shared.stopping.load(Ordering::SeqCst));
+        assert!(lock(&shared.front).shutdown);
+        assert!(lock(&shared.maint).stop);
+        assert!(log.writer.is_none() && log.maint.is_none());
+    }
+
     /// A clock moved by hand whose wall reads on the writer thread can be held, each returning the time it was
     /// read at once released.
     #[derive(Debug, Default)]
