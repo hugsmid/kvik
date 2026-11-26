@@ -209,6 +209,8 @@ struct At<'a> {
     cut: LogPos,
     inside: bool,
     now: i64,
+    /// When a state that cannot tell is judged again: a batch cannot come sooner than the interval.
+    unsure: i64,
 }
 
 impl At<'_> {
@@ -234,7 +236,10 @@ impl At<'_> {
         let s = registry.get(id.0)?;
         let p = windows::params(&s.def);
         let versioned = s.def.versioning != Versioning::None;
-        let state = self.v.latest().due(id.0, versioned, &p, self.now);
+        let state = self
+            .v
+            .latest()
+            .due(id.0, versioned, &p, (self.now, self.unsure));
         let stale = match (live, p.staleness) {
             (Live::Value(v), Some(limit)) if !v.stale => Some(
                 match (p.timing, self.r.clocks().since_refresh(id.0)) {
@@ -406,10 +411,13 @@ impl Session {
             None => Duration::MAX,
             Some(d) => {
                 let ns = u64::try_from(d.saturating_sub(self.reader.now())).unwrap_or(0);
-                // A state that cannot tell is due at `now + 1` on every turn; a batch cannot come sooner than the interval.
-                Duration::from_nanos(ns)
-                    .max(self.opts.min_batch_interval)
-                    .min(FULL_REFRESH_EVERY)
+                // A due time inside the interval passes before the next batch may come; waiting on it would spin.
+                let rest = self.last_batch.map_or(Duration::ZERO, |t| {
+                    self.opts
+                        .min_batch_interval
+                        .saturating_sub(self.mono().saturating_sub(t))
+                });
+                Duration::from_nanos(ns).max(rest).min(FULL_REFRESH_EVERY)
             }
         }
     }
@@ -671,6 +679,9 @@ impl Session {
             cut,
             inside,
             now,
+            unsure: now.saturating_add(
+                i64::try_from(self.opts.min_batch_interval.as_nanos()).unwrap_or(i64::MAX),
+            ),
         };
         let registry = at_cut.registry();
         let refreshed: BTreeSet<u32> = if refreshes == self.refreshes {
