@@ -26,7 +26,10 @@ fn a_log_dropped_by_a_panic_releases_the_store() {
         match StoreDir::open(Arc::new(fs.clone()), &dir(), None) {
             Ok(_) => break,
             Err(e) => {
-                assert!(Instant::now() < deadline, "the store is still locked: {e:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "the store is still locked: {e:?}"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
