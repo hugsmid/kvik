@@ -1,17 +1,18 @@
 //! The canonical checks (`docs/format-compacted.md` B.1): the writer's read-back, golden files and the scrub. The
-//! file is read whole through the reader's checks, written again from what it holds with the same registry state,
-//! and must come out byte for byte; a data block in the XOR class keeps the file's own compressed payload where
+//! file is read through the reader's checks, written again from what it holds with the same registry state, and
+//! must come out byte for byte; a data block in the XOR class keeps the file's own compressed payload where
 //! that is a canonical body of the same rows (`docs/format-chunk.md` C.10).
 
-use std::collections::BTreeMap;
-
+use super::Position;
 use super::access::facts_of;
 use super::error::FileError;
 use super::layout::{Identity, Ignored};
+use super::parts::{Directory, IndexEntry, SET_ASIDE};
 use super::read::CompactedFile;
+use super::source::ReadAt;
 use super::stats::Reach;
-use super::write::{Fact, FileWriter, Series, Tweaks, WriteError};
-use super::{Position, parts::SET_ASIDE};
+use super::times::Batch;
+use super::write::{FileWriter, WriteError};
 
 /// What the registry says about a series at a file's greatest position.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,118 +49,332 @@ pub fn check_canonical(
     id: &Identity,
     registry: &dyn Fn(u32) -> SeriesInfo,
 ) -> Result<(), CanonicalError> {
-    let file = CompactedFile::open(bytes, id, None)?;
-    let mut index = file.index()?;
-    index.sort_by_key(|e| e.chunk_offset);
-    let mut bodies = Vec::new();
-    let mut series: BTreeMap<u32, (Vec<Fact>, Vec<Fact>)> = BTreeMap::new();
-    let mut positions: Vec<Position> = Vec::new();
-    let batches = file.batches()?;
-    for e in &index {
-        let d = file.directory(e)?;
-        let s = series.entry(e.series_id).or_default();
-        let facts = if e.flags & SET_ASIDE != 0 {
-            &mut s.1
-        } else {
-            &mut s.0
+    let mut c = CanonicalCheck::new(bytes, id, registry)?;
+    while !c.step()? {}
+    Ok(())
+}
+
+/// The canonical checks a data block at a time (Q-811): the file is read through a [`ReadAt`] series by series and
+/// written again into a sink that compares as it goes, holding a series' set-aside facts, one block and a bit per
+/// position.
+pub struct CanonicalCheck<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> {
+    file: CompactedFile<S>,
+    writer: Option<FileWriter<Compare<S>>>,
+    registry: R,
+    /// Chunks in file order, each with the number of its first data block.
+    order: Vec<(IndexEntry, usize)>,
+    batches: Vec<Batch>,
+    held: Vec<Vec<u64>>,
+    /// The next chunk and data block.
+    at: (usize, usize),
+    dir: Option<Directory>,
+    /// The chunk that ends the open series.
+    series_end: Option<usize>,
+}
+
+impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
+    /// Opens the file through the reader's checks and starts the writer.
+    pub fn new(src: S, id: &Identity, registry: R) -> Result<Self, CanonicalError> {
+        let file = CompactedFile::open(src.clone(), id, None)?;
+        let mut index = file.index()?;
+        index.sort_by_key(|e| e.chunk_offset);
+        let mut order = Vec::with_capacity(index.len());
+        let mut n = 0;
+        for e in index {
+            let blocks = file.directory(&e)?.blocks.len();
+            order.push((e, n));
+            n += blocks;
+        }
+        let batches = file.batches()?;
+        let compare = Compare {
+            source: src,
+            at: 0,
+            first_difference: None,
+            window: Vec::new(),
+            window_at: 0,
         };
-        for i in 0..d.blocks.len() {
-            let (block, body) = file.data_block_raw(e, &d, i)?;
-            for f in facts_of(e.series_id, &block) {
-                file.batch(f.position)?;
-                positions.push(f.position);
-                facts.push(f);
-            }
-            bodies.push(body);
-        }
-    }
-    let mut entries = Vec::new();
-    for r in file.entries()? {
-        if matches!(r.entry, kvik_log::entries::Entry::Ignored { .. }) {
-            return Err(CanonicalError::Unknown(file.ignored()));
-        }
-        positions.push(r.position);
-        entries.push((r.position, r.entry));
-    }
-    if !file.ignored().is_empty() {
-        return Err(CanonicalError::Unknown(file.ignored()));
-    }
-    positions.sort_unstable();
-    if !positions.windows(2).all(|w| w[0] < w[1]) {
-        return Err(CanonicalError::Positions);
-    }
-    let mut ordered: Vec<Series> = series
-        .into_iter()
-        .map(|(series_id, (facts, set_aside))| {
-            let info = registry(series_id);
-            Series {
-                series_id,
-                name: info.name,
-                reach: info.reach,
-                facts,
-                set_aside,
-            }
+        let writer = FileWriter::new(
+            compare,
+            *id,
+            file.header().created_at,
+            file.description(),
+            batches.clone(),
+        )?;
+        let held = vec![Vec::new(); batches.len()];
+        Ok(Self {
+            file,
+            writer: Some(writer),
+            registry,
+            order,
+            batches,
+            held,
+            at: (0, 0),
+            dir: None,
+            series_end: None,
         })
-        .collect();
-    ordered.sort_by(|a, b| {
-        let key = |s: &Series| (s.name.is_none(), s.name.clone(), s.series_id);
-        key(a).cmp(&key(b))
-    });
-    #[allow(
-        clippy::needless_update,
-        reason = "the other fields exist only with the `tweaks` feature"
-    )]
-    let tweaks = Tweaks {
-        bodies,
-        ..Tweaks::default()
-    };
-    let compare = Compare {
-        source: bytes,
-        at: 0,
-        first_difference: None,
-    };
-    let mut w = FileWriter::new(
-        compare,
-        *id,
-        file.header().created_at,
-        file.description(),
-        batches,
-    )?
-    .with_tweaks(tweaks);
-    for s in ordered {
-        w.series(s)?;
     }
-    w.entries(&entries)?;
-    let (compare, _) = w.finish()?;
-    match compare.first_difference {
-        None if compare.at == bytes.len() => Ok(()),
-        None => Err(CanonicalError::Bytes(compare.at.min(bytes.len()) as u64)),
-        Some(at) => Err(CanonicalError::Bytes(at as u64)),
+
+    fn writer(&mut self) -> &mut FileWriter<Compare<S>> {
+        self.writer.as_mut().expect("until the last step")
+    }
+
+    /// Counts `p` as held once, in a batch of the file.
+    fn hold(&mut self, p: Position) -> Result<(), CanonicalError> {
+        let i = self
+            .batches
+            .partition_point(|b| (b.generation, b.last_sequence) < p);
+        let Some(b) = self.batches.get(i).filter(|b| b.holds(p.0, p.1)) else {
+            self.file.batch(p)?;
+            return Err(CanonicalError::Positions);
+        };
+        let k = (p.1 - b.first_sequence) as usize;
+        let bits = &mut self.held[i];
+        if bits.is_empty() {
+            *bits = vec![0; ((b.last_sequence - b.first_sequence) as usize / 64) + 1];
+        }
+        if bits[k / 64] & (1 << (k % 64)) != 0 {
+            return Err(CanonicalError::Positions);
+        }
+        bits[k / 64] |= 1 << (k % 64);
+        Ok(())
+    }
+
+    /// Opens the series of the chunk at `i`: its run of chunks, and its set-aside facts read whole.
+    fn open_series(&mut self, i: usize) -> Result<(), CanonicalError> {
+        let id = self.order[i].0.series_id;
+        let end = i + self.order[i..]
+            .iter()
+            .take_while(|(e, _)| e.series_id == id)
+            .count();
+        let mut aside = Vec::new();
+        for k in i..end {
+            let (e, first) = self.order[k];
+            if e.flags & SET_ASIDE == 0 {
+                continue;
+            }
+            let d = self.file.directory(&e)?;
+            for b in 0..d.blocks.len() {
+                let (block, body) = self.file.data_block_raw(&e, &d, b)?;
+                for f in facts_of(id, &block) {
+                    self.hold(f.position)?;
+                    aside.push(f);
+                }
+                self.writer().offer_body(first + b, body);
+            }
+        }
+        let info = (self.registry)(id);
+        self.writer()
+            .begin_series(id, info.name.as_deref(), info.reach, aside)?;
+        self.series_end = Some(end);
+        Ok(())
+    }
+
+    /// Checks one data block, or ends a series, or at the end the entries and the tail; `true` once the file passed.
+    pub fn step(&mut self) -> Result<bool, CanonicalError> {
+        let (i, b) = self.at;
+        if i == self.order.len() {
+            return self.finish().map(|()| true);
+        }
+        if self.series_end.is_none() {
+            self.open_series(i)?;
+        }
+        let (e, first) = self.order[i];
+        if e.flags & SET_ASIDE == 0 {
+            if self.dir.is_none() {
+                self.dir = Some(self.file.directory(&e)?);
+            }
+            let d = self.dir.take().expect("read above");
+            if b < d.blocks.len() {
+                let (block, body) = self.file.data_block_raw(&e, &d, b)?;
+                self.writer().offer_body(first + b, body);
+                for f in facts_of(e.series_id, &block) {
+                    self.hold(f.position)?;
+                    self.writer().push(f)?;
+                }
+                self.dir = Some(d);
+                self.at.1 += 1;
+                return Ok(false);
+            }
+        }
+        self.dir = None;
+        self.at = (i + 1, 0);
+        if self.series_end == Some(i + 1) {
+            self.writer().end_series()?;
+            self.series_end = None;
+        }
+        Ok(false)
+    }
+
+    fn finish(&mut self) -> Result<(), CanonicalError> {
+        let mut entries = Vec::new();
+        for r in self.file.entries()? {
+            if matches!(r.entry, kvik_log::entries::Entry::Ignored { .. }) {
+                return Err(CanonicalError::Unknown(self.file.ignored()));
+            }
+            self.hold(r.position)?;
+            entries.push((r.position, r.entry));
+        }
+        if !self.file.ignored().is_empty() {
+            return Err(CanonicalError::Unknown(self.file.ignored()));
+        }
+        let mut w = self.writer.take().expect("finished once");
+        w.entries(&entries)?;
+        let (compare, _) = w.finish()?;
+        let len = self.file.source().len();
+        match compare.first_difference {
+            None if compare.at == len => Ok(()),
+            None => Err(CanonicalError::Bytes(compare.at.min(len))),
+            Some(at) => Err(CanonicalError::Bytes(at)),
+        }
     }
 }
 
-/// A sink that compares what the writer writes with the file as it is produced, holding no copy.
-struct Compare<'a> {
-    source: &'a [u8],
-    at: usize,
-    first_difference: Option<usize>,
+/// Bytes the comparing sink reads from the file at a time.
+const WINDOW: u64 = 128 * 1024;
+
+/// A sink that compares what the writer writes with the file as it is produced, a window at a time.
+struct Compare<S: ReadAt> {
+    source: S,
+    at: u64,
+    first_difference: Option<u64>,
+    window: Vec<u8>,
+    window_at: u64,
 }
 
-impl std::io::Write for Compare<'_> {
+impl<S: ReadAt> Compare<S> {
+    fn compare(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        let len = self.source.len();
+        let mut at = self.at;
+        while !buf.is_empty() {
+            if at >= len {
+                self.first_difference = Some(at);
+                return Ok(());
+            }
+            let end = self.window_at + self.window.len() as u64;
+            if at < self.window_at || at >= end {
+                let n = WINDOW.min(len - at) as usize;
+                self.window = self.source.read_at(at, n)?;
+                self.window_at = at;
+            }
+            let off = (at - self.window_at) as usize;
+            let have = &self.window[off..];
+            let n = have.len().min(buf.len());
+            if let Some(k) = buf[..n].iter().zip(have).position(|(a, b)| a != b) {
+                self.first_difference = Some(at + k as u64);
+                return Ok(());
+            }
+            buf = &buf[n..];
+            at += n as u64;
+        }
+        Ok(())
+    }
+}
+
+impl<S: ReadAt> std::io::Write for Compare<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.first_difference.is_none() {
-            let have = self.source.get(self.at..).unwrap_or_default();
-            if let Some(k) = buf.iter().zip(have).position(|(a, b)| a != b) {
-                self.first_difference = Some(self.at + k);
-            } else if have.len() < buf.len() {
-                self.first_difference = Some(self.at + have.len());
-            }
+            self.compare(buf)?;
         }
-        self.at += buf.len();
+        self.at += buf.len() as u64;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::super::desc::{Class, Description, Input, Level};
+    use super::super::write::{Fact, Series};
+    use super::*;
+
+    struct Counting<'a>(&'a [u8], &'a Cell<usize>);
+
+    impl ReadAt for Counting<'_> {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            self.1.set(self.1.get().max(len));
+            self.0.read_at(offset, len)
+        }
+    }
+
+    impl Clone for Counting<'_> {
+        fn clone(&self) -> Self {
+            Counting(self.0, self.1)
+        }
+    }
+
+    #[test]
+    fn the_check_of_a_file_of_two_chunks_reads_at_most_a_window_at_a_time() {
+        let n = super::super::CHUNK_ROWS as u64 + 10_000;
+        let id = Identity {
+            store_id: [5; 16],
+            generation: 1,
+            file_id: 7,
+        };
+        let d = Description {
+            class: Class::Current,
+            level: Level::L0,
+            period_start: 0,
+            period_len: i64::MAX / 2,
+            run_id: 7,
+            run_count: 1,
+            inputs: vec![Input {
+                kind: 1,
+                file_id: 1,
+            }],
+            name_range: None,
+            positions: vec![(1, n)],
+            has_entries: false,
+            has_set_aside: false,
+            complete: true,
+        };
+        let batches = vec![Batch {
+            generation: 1,
+            first_sequence: 0,
+            last_sequence: n - 1,
+            received_at: 0,
+            commit_time: 0,
+        }];
+        let mut w = FileWriter::new(Vec::new(), id, 0, &d, batches).unwrap();
+        w.series(Series {
+            series_id: 1,
+            name: Some("s".into()),
+            reach: Reach::Point,
+            facts: (0..n)
+                .map(|i| {
+                    Fact::value(1, (1, i), i as i64 * 1_000, 1, {
+                        let x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        x ^ (x >> 29) ^ (x << 17)
+                    })
+                })
+                .collect(),
+            set_aside: Vec::new(),
+        })
+        .unwrap();
+        let (bytes, _) = w.finish().unwrap();
+        let largest = Cell::new(0);
+        let info = |_| SeriesInfo {
+            name: Some("s".into()),
+            reach: Reach::Point,
+        };
+        let mut c = CanonicalCheck::new(Counting(&bytes, &largest), &id, info).unwrap();
+        let mut steps = 0;
+        while !c.step().unwrap() {
+            steps += 1;
+        }
+        assert!(steps > (n as usize).div_ceil(super::super::BLOCK_ROWS));
+        assert!(
+            largest.get() as u64 <= WINDOW && (bytes.len() as u64) > 4 * WINDOW,
+            "largest read {} of a file of {}",
+            largest.get(),
+            bytes.len()
+        );
     }
 }

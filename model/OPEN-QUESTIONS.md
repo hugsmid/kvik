@@ -191,6 +191,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1412 | §7; `format-compacted.md` B.1 | The name and reach a compacted file gives a series (provisional) |
 | Q-1413 | §7, §8 Restore step 1; Q-796 | A non-fact entry set aside beyond a restored end (provisional) |
 | Q-1414 | §7, §9 row 10 | Where a run's outputs wait before publishing (provisional) |
+| Q-1530 | `format-compacted.md` B.1 Canonical writing; Q-811 | A chunk the streaming writer holds whole (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5250,6 +5251,12 @@ leaves them there; the outputs carry the writer's current generation and consecu
 the first being the run id. 6.3e renames, publishes, and discards unpublished outputs at start (§9 row 10).
 **Pinned by.** `kvik/src/durable/compact/tests.rs` `every_input_position_lands_in_exactly_one_output_where_the_model_places_it`.
 
+## Q-1530 — A chunk the streaming writer holds whole
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** B.1 orders a series' chunks by first `t`, then least position. A writer that takes a series' rows a block at a time (Q-811) cannot place a chunk while a later chunk could still sort before it: when every row of the chunk so far shares one `t` (a chunk boundary inside a run of one key, revision files only) or a set-aside chunk shares its first `t`.
+**Decision (provisional).** `FileWriter::push` streams a chunk block by block once a row with a greater `t` has arrived, no set-aside chunk shares its first `t` and no chunk is held; otherwise it holds the chunk's rows whole and writes the held chunks in B.1 order once the next chunk's first `t` is greater. Set-aside facts, which only a restore makes, come whole with the series. Held rows count against the maintenance cap (`FileWriter::held_rows`). Reason: the format is unchanged, the bytes equal the whole-series writer's, and the held case needs more than 4,096 revisions of one key or a restore.
+**Pinned by.** `chunk/src/file/stream.rs` tests (`a_streamed_revision_series_writes_the_bytes_of_the_whole_one`, `a_chunk_boundary_inside_one_key_orders_chunks_by_least_position`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5411,6 +5418,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1412 | 6.3e | The name and reach of a series in a compacted file, from the definition in force at its greatest position; provisional |
 | Q-1413 | 6.2c | A set-aside non-fact entry stalls a run; provisional |
 | Q-1414 | 6.3e | Unpublished outputs wait under `.tmp` names in `data/`; provisional |
+| Q-1530 | 6.2c | The streaming writer holds a chunk only while its place is undecided; provisional |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 | Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give, which 9.0c adds a case of (a registry file that could not be written, Q-1001); for review |
