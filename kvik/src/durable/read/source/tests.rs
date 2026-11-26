@@ -159,7 +159,7 @@ fn facts_and_at_equal_the_fact_index_and_the_model_at_every_cap() {
         ..ProptestConfig::default()
     });
     let log = LogConfig {
-        seal_interval: Duration::from_millis(250),
+        seal_interval: Duration::from_millis(20),
         ..LogConfig::default()
     };
     runner
