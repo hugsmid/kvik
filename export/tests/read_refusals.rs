@@ -4,7 +4,8 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, new_null_array};
+use arrow_array::{RecordBatch, make_array};
+use arrow_buffer::NullBuffer;
 use arrow_schema::Schema;
 use common::{export_to_vec, f64_series, read_back, row};
 use kvik::Value;
@@ -123,7 +124,15 @@ fn a_null_in_any_never_null_column_is_refused() {
                     schema.fields().iter().map(|c| c.as_ref().clone()).collect();
                 fields[k] = fields[k].clone().with_nullable(true);
                 let mut columns = b.columns().to_vec();
-                columns[k] = new_null_array(columns[k].data_type(), b.num_rows());
+                // One null among valid rows: the last only.
+                let valid: Vec<bool> = (0..b.num_rows()).map(|i| i + 1 < b.num_rows()).collect();
+                let data = columns[k]
+                    .to_data()
+                    .into_builder()
+                    .nulls(Some(NullBuffer::from(valid)))
+                    .build()
+                    .unwrap();
+                columns[k] = make_array(data);
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
             },
         );

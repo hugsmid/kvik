@@ -16,6 +16,7 @@ parquet = { version = "60.1", default-features = false, features = ["arrow", "zs
 thiserror = "2"
 
 [dev-dependencies]
+arrow-buffer = "60.1"
 bytes = "1"
 proptest = "1"
 
