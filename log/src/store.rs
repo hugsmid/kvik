@@ -272,25 +272,27 @@ impl StoreDir {
             });
         }
         // No descriptor: only what creation makes may be present, with its directories empty.
-        let unfinished = top.iter().all(|n| {
-            [LOCK, MANIFEST, STORE_TMP].contains(&n.as_str()) || DIRS.contains(&n.as_str())
+        let unfinished = Self::unfinished(&*fs, dir)?.is_some();
+        let Some(new) = new.filter(|_| unfinished) else {
+            return Err(StoreError::NotAStore);
+        };
+        Self::create(fs, dir, new)
+    }
+
+    /// Whether `dir` holds only what a creation that did not finish leaves, judged from a fresh listing.
+    fn unfinished(fs: &dyn Fs, dir: &Path) -> io::Result<Option<Vec<String>>> {
+        let top = names(fs, dir)?;
+        let only_creation = top.iter().all(|n| {
+            [LOCK, MANIFEST, STORE_TMP, STORE].contains(&n.as_str()) || DIRS.contains(&n.as_str())
         });
         let mut empty_dirs = true;
         for d in DIRS {
-            empty_dirs &= names(&*fs, &dir.join(d))?.is_empty();
+            empty_dirs &= names(fs, &dir.join(d))?.is_empty();
         }
-        let Some(new) = new.filter(|_| unfinished && empty_dirs) else {
-            return Err(StoreError::NotAStore);
-        };
-        Self::create(fs, dir, &top, new)
+        Ok((only_creation && empty_dirs).then_some(top))
     }
 
-    fn create(
-        fs: Arc<dyn Fs>,
-        dir: &Path,
-        left: &[String],
-        new: &NewStore,
-    ) -> Result<Self, StoreError> {
+    fn create(fs: Arc<dyn Fs>, dir: &Path, new: &NewStore) -> Result<Self, StoreError> {
         let descriptor = StoreDescriptor {
             store_id: new.store_id,
             created_at: new.created_at,
@@ -303,6 +305,14 @@ impl StoreDir {
         // A stop before this sync leaves no `STORE`, so the next open creates again and syncs it then.
         sync_parent(&*fs, dir)?;
         let lock = take_lock(&*fs, dir)?;
+        // Another process may have finished a creation since the listing that led here: judge again under the lock.
+        let Some(left) = Self::unfinished(&*fs, dir)? else {
+            return Err(StoreError::NotAStore);
+        };
+        if left.iter().any(|n| n == STORE) {
+            drop(lock);
+            return Self::open(fs, dir, Some(new));
+        }
         for n in left
             .iter()
             .filter(|n| *n != LOCK && !DIRS.contains(&n.as_str()))
