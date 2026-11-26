@@ -21,6 +21,6 @@ cargo +nightly fuzz run root
 
 Its `Cargo.lock` is committed, so `libfuzzer-sys` is pinned.
 
-The same entry functions run on stable in `tests/fuzz_inputs.rs` over random bytes, generated nodes, parts and roots, and mutated
-golden files, so the code path is exercised in CI. The libFuzzer macro needs `unsafe` attributes, so this crate does
-not forbid unsafe code; the library it calls does.
+The same entry functions run on stable in `tests/fuzz_inputs.rs` over random bytes, generated nodes, parts and
+roots, and mutated golden files, so the code path is exercised in CI. The libFuzzer macro needs `unsafe` attributes,
+so this crate does not forbid unsafe code; the library it calls does.

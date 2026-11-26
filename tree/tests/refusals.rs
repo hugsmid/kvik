@@ -235,25 +235,33 @@ fn root_bytes_with_parts(parts: &[(u64, u64, i64, i64, u64, u64)]) -> Vec<u8> {
 
 #[test]
 fn parts_of_one_seq_overlapping_in_period_and_series_are_refused() {
-    for parts in [
-        vec![(3, 9, 0, 1, 7, 20), (5, 9, 0, 1, 20, 40)],
-        vec![(3, 9, 0, 7, 7, 40), (5, 9, 6, 1, 0, 7)],
-        vec![
-            (3, 9, 0, 7, 0, 10),
-            (4, 9, 0, 7, 20, 30),
-            (5, 9, 2, 1, 10, 19),
-        ],
-        vec![
-            (3, 9, 2, 1, 11, 19),
-            (4, 9, 0, 7, 20, 30),
-            (5, 9, 0, 7, 0, 11),
-        ],
+    for (later, parts) in [
+        (1, vec![(3, 9, 0, 1, 7, 20), (5, 9, 0, 1, 20, 40)]),
+        (1, vec![(3, 9, 0, 7, 7, 40), (5, 9, 6, 1, 0, 7)]),
+        (
+            2,
+            vec![
+                (3, 9, 0, 7, 0, 10),
+                (4, 9, 0, 7, 20, 30),
+                (5, 9, 2, 1, 10, 19),
+            ],
+        ),
+        (
+            2,
+            vec![
+                (3, 9, 2, 1, 11, 19),
+                (4, 9, 0, 7, 20, 30),
+                (5, 9, 0, 7, 0, 11),
+            ],
+        ),
     ] {
         assert!(root_with_parts(&parts).encode().is_err(), "{parts:?}");
+        let e = Root::decode(&root_bytes_with_parts(&parts)).unwrap_err();
+        assert_eq!(e.refusal, Refusal::PartOrder, "{parts:?}");
         assert_eq!(
-            root_refusal(&root_bytes_with_parts(&parts)),
-            Err(Refusal::PartOrder),
-            "{parts:?}"
+            e.at,
+            (PARTS + 80 * later) as u64,
+            "{parts:?}: the later of the pair"
         );
     }
 }

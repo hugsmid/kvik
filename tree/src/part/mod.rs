@@ -119,7 +119,7 @@ impl Part {
         let again = decode::decode(&bytes)?;
         if again != *self {
             return Err(EncodeError::Shape(
-                "runs not one per series and level, or an empty run",
+                "a part that does not decode to itself (runs not one per series and level, or empty)",
             ));
         }
         Ok(bytes)
