@@ -362,3 +362,15 @@ impl Fact {
         self.quality != Quality::Bad
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_to_saturates_at_the_first_instant() {
+        assert_eq!(floor_to(Nanos::MIN, 60), Nanos::MIN);
+        assert_eq!(floor_to(Nanos::MIN + 1, 60), Nanos::MIN);
+        assert_eq!(floor_to(-1, 60), -60);
+    }
+}

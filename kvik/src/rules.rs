@@ -238,6 +238,35 @@ mod tests {
         }
     }
 
+    const MIN: i64 = 60_000_000_000;
+
+    #[test]
+    fn auto_step_picks_a_minute_exactly_when_the_buckets_fit() {
+        assert_eq!(auto_step(0, 5 * MIN, 5), MIN);
+        assert_ne!(auto_step(0, 5 * MIN, 4), MIN);
+        assert_eq!(auto_step(0, 5 * MIN + 1, 5), 15 * MIN);
+    }
+
+    #[test]
+    fn auto_step_counts_buckets_from_the_aligned_floor() {
+        assert_eq!(auto_step(MIN - 1, MIN + 1, 2), MIN);
+        assert_eq!(auto_step(MIN - 1, MIN + 1, 1), 15 * MIN);
+    }
+
+    #[test]
+    fn a_fixed_step_allows_a_million_buckets_and_no_more() {
+        let d = std::time::Duration::from_secs(1);
+        assert!(fixed_step(d, 0, 1_000_000_000_000_000).is_ok());
+        assert!(fixed_step(d, 0, 1_000_001_000_000_000).is_err());
+    }
+
+    #[test]
+    fn a_fixed_step_measures_a_range_wider_than_i64() {
+        let d = std::time::Duration::from_secs(1);
+        assert!(fixed_step(d, i64::MIN, i64::MAX).is_err());
+        assert!(fixed_step(std::time::Duration::from_nanos(1 << 50), i64::MIN, i64::MAX).is_ok());
+    }
+
     #[test]
     fn a_range_ending_at_the_last_instant_ends() {
         let spans: Vec<_> = bucket_spans(0, i64::MAX, 60_000_000_000).take(2).collect();

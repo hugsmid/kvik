@@ -170,3 +170,24 @@ fn auto_buckets_of_many_facts_up_to_the_last_instant_return() {
             .map(|_| ())
     }));
 }
+
+#[test]
+fn a_fixed_interval_is_the_aligned_span_around_the_instant() {
+    for b in BACKENDS {
+        let (s, _, i) = store(b, &format!("interval-value-{b:?}"));
+        let t = at(0);
+        let (d, phase) = (4_000_000_000_i64, 1_000_000_000_i64);
+        let start = (t.0 - phase).div_euclid(d) * d + phase;
+        let got = s.reader().interval(i, t).unwrap();
+        assert_eq!(got, (Timestamp(start), Timestamp(start + d)), "{b:?}");
+    }
+}
+
+#[test]
+fn an_interval_beyond_either_end_of_time_is_refused() {
+    for b in BACKENDS {
+        let (s, _, i) = store(b, &format!("interval-refused-{b:?}"));
+        assert!(s.reader().interval(i, MIN).is_err(), "{b:?} at MIN");
+        assert!(s.reader().interval(i, MAX).is_err(), "{b:?} at MAX");
+    }
+}
