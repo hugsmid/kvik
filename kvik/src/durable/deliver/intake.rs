@@ -114,19 +114,14 @@ impl Deliverer {
         }
     }
 
-    /// Drops the records no consumer can read again: at or below the lowest cursor (a consumer without one starts
-    /// at the last position).
+    /// Drops the records no consumer taken in this run can read again: at or below the lowest cursor (a consumer
+    /// without one starts at the last position). One not taken holds none; its take reads the log again (Q-1201).
     pub(super) fn prune(&mut self) {
-        let floor = self
-            .consumers
-            .values()
+        let taken = || self.consumers.values().filter(|rt| rt.attached);
+        let floor = taken()
             .filter(|rt| rt.has_cursor)
             .map(|rt| rt.cursor)
-            .chain(
-                self.consumers
-                    .values()
-                    .filter_map(|rt| rt.behind.map(before)),
-            )
+            .chain(taken().filter_map(|rt| rt.behind.map(before)))
             .min()
             .unwrap_or(self.head);
         let keep = self.items.split_off(&next(floor));

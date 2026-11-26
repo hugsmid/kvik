@@ -276,6 +276,13 @@ mod jiff_conversions {
     }
 }
 
+/// The instant `timeout` from now; a timeout no instant can hold is a deadline far ahead.
+pub(crate) fn deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,11 +307,4 @@ mod tests {
         );
         assert!(LocalTime::from_hms(24, 0, 0).is_none());
     }
-}
-
-/// The instant `timeout` from now; a timeout no instant can hold is a deadline far ahead.
-pub(crate) fn deadline(timeout: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }

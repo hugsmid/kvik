@@ -139,6 +139,23 @@ fn a_window_falling_below_min_coverage_breaks_a_pending_hold_which_restarts_when
     assert_eq!(at(lv(1)), vec![33]);
 }
 
+/// Q-1143: a refused series is counted once each time it starts to match, not again while it keeps matching.
+#[test]
+fn a_refused_series_is_counted_again_only_when_it_starts_to_match_again() {
+    let mut h = H::new().watch(0, C, each("room/*/temp"));
+    for i in 0..257u32 {
+        h = h.define(1, SeriesId(i + 1), &[&format!("room/r{i}/temp")]);
+    }
+    let late = SeriesId(257);
+    h = h
+        .define(2, late, &["room/r256/temp", "room/x/temp"])
+        .define(3, late, &["store/r256/temp"])
+        .define(4, late, &["room/r256/temp"]);
+    let j = judge(&h.entries, 5 * SECOND).unwrap();
+    assert_eq!(j.instances_refused, 2);
+    assert!(!j.states.contains_key(&(C, late)));
+}
+
 #[test]
 fn a_series_refused_by_a_full_each_joins_with_a_start_transition_when_room_frees() {
     let mut h = H::new().watch(0, C, each("room/*/temp"));

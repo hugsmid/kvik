@@ -231,6 +231,8 @@ struct Rt {
     reset_open: bool,
     /// Reading stopped at a reset point until its resync is confirmed and its cursor file synced.
     paused: bool,
+    /// The `forget_above` of a `NoCursor` resync not yet confirmed: a second take in this run sends it again.
+    forget: Option<LogPos>,
     runners: BTreeMap<u32, Runner>,
     /// A void changed the funnels in force: the runners are synced at the next evaluation.
     stale_runners: bool,

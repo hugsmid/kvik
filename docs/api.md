@@ -89,8 +89,9 @@ yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), an
 bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
 latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
 sealed segments' indexes and the maps of their batches, also during one lookup; a batch read again, or appended
-since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
-cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
+since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a consumer taken in this run from
+its cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms; none
+are kept for one not taken in this run, whose take reads the log again (Q-1201). A start reads the whole log once, a part at a time (Q-752); the public
 `Reader` still holds every fact it has read (roadmap 9.0a), and so does the store's own reader, opened by the first
 `facts`, `at` or `interval` call on a `Store`. `series`, `series_stats` and the registry file written after a
 routing change and at a clean shutdown are answered from the deliverer's held state (registry and per-series
@@ -369,6 +370,8 @@ enum Live { Value(Fact), None, Unknown }
   and all carrying the same `cause` and `forget_above`. The consumer confirms the delivery id of the `last` part
   (confirming an earlier part does nothing); nothing further is delivered until then. `funnels` carries one
   `FunnelState` per funnel and series on the resync that ends a resume (spec §4 Resync). Details in roadmap 5.3.
+- `CursorBehindLog` is model only until the log trims: the durable backend never trims below a cursor and never
+  issues it (Q-1202).
 - During a restore a condition evaluation with no local detail, and live state whose fact may not be local yet (spec §2.3), are
   `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
   unchanged, the resync carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
