@@ -604,6 +604,41 @@ fn a_latch_change_within_a_second_of_the_last_cursor_write_survives_a_crash() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Spec §4 Overflow: a condition delivery that meets a full queue is not dropped; the consumer catches up and gets it.
+#[test]
+fn a_condition_delivery_meeting_a_full_queue_arrives_through_catch_up() {
+    let w = World::new("trigger-overflow");
+    let mut cfg = w.config();
+    cfg.limits.consumer_queue = 4;
+    let s = block_on(Store::open(cfg)).unwrap();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let h = block_on(s.define_series(gauge("plant/b/power"))).unwrap();
+    let mut c = new_consumer(&s, "alarms", Select::None);
+    block_on(c.route(Funnel::facts(Select::Ids(vec![h])))).unwrap();
+    let cond = block_on(c.route(Funnel {
+        series: Select::Ids(vec![g]),
+        operator: None,
+        condition: Some(Condition::above(10.0)),
+    }))
+    .unwrap();
+    for i in 0..4 {
+        block_on(s.emit(&[num(h, i, 1.0)])).unwrap();
+        w.clock.advance(Duration::from_secs(1));
+    }
+    block_on(s.emit(&[num(g, 4, 20.0)])).unwrap();
+    assert!(s.consumer_stats("alarms").unwrap().catching_up);
+    let ds = drain(&mut c);
+    let triggers: Vec<_> = ds
+        .iter()
+        .filter_map(|d| match &d.kind {
+            DeliveryKind::Trigger(t) => Some((t.funnel, t.state.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(triggers, vec![(cond, ConditionState::True)]);
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Spec §4 Resync: a `NoCursor` resync the consumer never confirmed is sent again, with the same `forget_above` and
 /// nothing before it, when the consumer is taken again in the same run.
 #[test]
