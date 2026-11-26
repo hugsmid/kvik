@@ -6,7 +6,7 @@ mod support;
 use kvik_files::appender::{Appender, Opened};
 use kvik_files::catalogue::Catalogue;
 use kvik_files::image::read;
-use kvik_files::rebuild::{Finality, plan, rebuild_manifest};
+use kvik_files::rebuild::{Finality, encode_manifest, plan, rebuild_manifest, replace_manifest};
 use kvik_files::record::{Body, Record};
 use std::sync::Arc;
 
@@ -372,33 +372,18 @@ fn store_holding(bytes: &[u8]) -> (MemFs, Arc<dyn Fs>) {
     (fs, afs)
 }
 
-/// `spec.md` §7 step 4: once `rebuild_manifest` returns, the rename is durable, so a power loss keeps the rebuilt
-/// manifest and what is appended to it, with no other directory sync in between.
+/// `spec.md` §7 step 4: once `replace_manifest` returns, the rename is durable on its own, whatever opens the manifest
+/// next.
 #[test]
-fn a_completed_rebuild_survives_a_power_loss_with_what_was_appended_to_it() {
+fn a_replaced_manifest_survives_a_power_loss_with_no_other_directory_sync() {
     let (h, i) = lost_record_history();
     let (bytes, _) = image_with_corrupt(&h, &[i]);
+    let new = encode_manifest(&h.records, STORE_ID, 0, T0).unwrap();
     for seed in 0..32 {
         let (fs, _afs) = store_holding(&bytes);
-        rebuild_manifest(
-            &fs,
-            &dir(),
-            STORE_ID,
-            state(&h),
-            &FakeVerifier::default(),
-            Finality::Final,
-            NOW,
-        )
-        .unwrap();
-        let Opened::Ready(mut app) = Appender::open(&fs, &dir(), STORE_ID, 0).unwrap() else {
-            panic!("the rebuilt manifest reads")
-        };
-        let appended = app.append(Body::Empty, NOW).unwrap();
-        drop(app);
+        replace_manifest(&fs, &dir(), &new).unwrap();
         fs.power_loss_partial(seed);
         fs.restart();
-        let img = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
-        assert!(!img.is_corrupt(), "seed {seed}");
-        assert_eq!(img.last_epoch(), appended, "seed {seed}");
+        assert_eq!(fs.read(&manifest_path()).unwrap(), new, "seed {seed}");
     }
 }
