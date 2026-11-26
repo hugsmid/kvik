@@ -19,7 +19,7 @@ use crate::durable::tests::block_on;
 use crate::env::Env;
 use crate::read::{LiveId, LiveOptions, Query, Selection};
 use crate::time::Timestamp;
-use crate::types::{Reading, SeriesId, Value};
+use crate::types::{Fact, Reading, SeriesId, Value};
 use crate::{LiveSession, Select, Store};
 
 const S: i64 = 1_000_000_000;
@@ -342,9 +342,10 @@ fn stopped(s: &mut LiveSession) -> bool {
 }
 
 /// A small backlog counted every row before Q-1118, so the old path also lagged over rounds holding nothing the
-/// session selects: the fan-out session holds every fact the old one does, and others only inside a range the old one
-/// was told it lagged over; its `Latest`s are the same once neither has stopped short of the view, as a session that
-/// does not lag may stop where the old one lagged past.
+/// session selects: the fan-out session holds facts the old one lacks only inside a range the old one was told it
+/// lagged over. A session that does not lag may stop at a row limit where the old one lagged past, and lag later over
+/// facts the old one then delivers, so once neither has stopped short of the view the fan-out session holds every fact
+/// the old one does or was told it lagged over it, and its `Latest`s are the same.
 fn passed_over(
     fan: &BTreeMap<LiveId, Held>,
     old: &BTreeMap<LiveId, Held>,
@@ -356,19 +357,19 @@ fn passed_over(
     );
     for (id, f) in fan {
         let o = &old[id];
+        let within = |h: &Held, x: &Fact| {
+            h.lagged
+                .iter()
+                .any(|(a, b)| *a <= x.position && x.position <= *b)
+        };
         if same_cut {
             prop_assert_eq!(&f.latest, &o.latest);
+            for x in o.tail.iter().filter(|x| !f.tail.contains(x)) {
+                prop_assert!(within(f, x), "{:?} {:?}", f, o);
+            }
         }
-        prop_assert!(o.tail.iter().all(|x| f.tail.contains(x)), "{:?} {:?}", f, o);
         for x in f.tail.iter().filter(|x| !o.tail.contains(x)) {
-            prop_assert!(
-                o.lagged
-                    .iter()
-                    .any(|(a, b)| *a <= x.position && x.position <= *b),
-                "{:?} {:?}",
-                f,
-                o
-            );
+            prop_assert!(within(o, x), "{:?} {:?}", f, o);
         }
         prop_assert!(f.lagged.len() <= o.lagged.len(), "{:?} {:?}", f, o);
     }
