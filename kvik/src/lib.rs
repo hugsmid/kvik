@@ -100,6 +100,8 @@ mod consume;
 mod durable;
 mod error;
 mod fold;
+#[cfg_attr(not(test), allow(dead_code))]
+mod gates;
 mod health;
 mod pattern;
 mod provisional;
