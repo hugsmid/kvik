@@ -365,3 +365,49 @@ fn next_sleeps_while_a_latest_series_is_unsure() {
     );
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn a_latest_value_falling_due_long_after_the_last_batch_arrives_at_its_due_time_not_an_interval_later()
+ {
+    let w = World::new("due-latency");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let now = w.clock.wall().0;
+    block_on(s.emit(&[Reading::new(
+        id,
+        Timestamp(now - 5_000_000_000),
+        Value::F64(1.0),
+    )]))
+    .unwrap();
+    block_on(s.emit(&[Reading::new(
+        id,
+        Timestamp(now + 2_050_000_000),
+        Value::F64(2.0),
+    )]))
+    .unwrap();
+    let r = s.reader();
+    let opts = SessionOptions::new(Duration::from_secs(1), Duration::from_millis(100));
+    let mut session = r.session_with(opts).unwrap();
+    session
+        .open(Query::Latest(Selection::all()), LiveOptions::default())
+        .unwrap();
+    assert!(session.next(Duration::ZERO).unwrap().is_some());
+    w.clock.advance(Duration::from_secs(2));
+    while session.next(Duration::ZERO).unwrap().is_some() {}
+    let start = w.clock.wall().0;
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let got = session.next(Duration::from_secs(5)).unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waited = (w.clock.wall().0 - start) / 1_000_000;
+        assert!(got.is_some());
+        assert!(waited < 500, "due in 50 ms, arrived after {waited} ms");
+    });
+    block_on(s.shutdown()).unwrap();
+}
