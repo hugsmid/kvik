@@ -210,7 +210,7 @@ fn change_points(h: &[Entry], from: Nanos, to: Nanos) -> Vec<Nanos> {
 }
 
 /// Last arrival of `series` at instant `x` over the entries up to `upto` (a timer at `x` precedes the
-/// entries committed at `x`, Q-1144).
+/// entries committed at `x`, Q-1144; a future fact outranked before its `t` is none, Q-1200).
 fn last_arrival(h: &[Entry], series: SeriesId, x: Nanos, upto: Position) -> Option<Nanos> {
     let mut best: BTreeMap<Nanos, (u64, Position)> = BTreeMap::new();
     let mut arrivals = Vec::new();
@@ -224,6 +224,9 @@ fn last_arrival(h: &[Entry], series: SeriesId, x: Nanos, upto: Position) -> Opti
                 continue;
             }
             best.insert(fact.t, fact.rank());
+            if fact.t > *commit_time {
+                arrivals.retain(|a| *a != fact.t);
+            }
             if fact.quality != Quality::Bad && !matches!(fact.value, Value::Absent) {
                 arrivals.push((*commit_time).max(fact.t));
             }
