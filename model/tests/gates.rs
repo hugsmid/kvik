@@ -442,6 +442,24 @@ fn a_window_below_its_min_coverage_is_unknown_and_known_once_covered() {
     assert_eq!(known.from, Some(GateState::Unknown));
 }
 
+#[test]
+fn a_window_gate_empty_and_past_stale_after_is_stale_not_unknown() {
+    let mut g = window_gate(5, 0);
+    g.stale_after = Some(10 * SECOND);
+    let h = H::new().watch(0, C, g).num(1, 1.0);
+    let j = run(&h);
+    let last = j.transitions.last().unwrap();
+    assert_eq!(
+        (last.now, last.to.clone()),
+        (11 * SECOND, Some(GateState::Stale))
+    );
+    assert!(
+        j.transitions
+            .iter()
+            .any(|t| t.to == Some(GateState::Unknown) && t.now == 7 * SECOND)
+    );
+}
+
 fn each(pattern: &str) -> kvik_model::gate::Gate {
     let mut g = levels(&[Level::at(10.0)]);
     g.selector = Selector::Each(pattern.into());
