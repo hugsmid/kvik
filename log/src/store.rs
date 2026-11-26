@@ -250,6 +250,13 @@ pub fn read_descriptor(fs: &dyn Fs, dir: &Path) -> Result<StoreDescriptor, Store
     }
 }
 
+/// What a fresh listing of a store directory shows.
+enum Judged {
+    HasStore,
+    Unfinished(Vec<String>),
+    Other,
+}
+
 impl StoreDir {
     /// Opens the store in `dir`, creating it from `new` if the directory does not exist, is empty, or holds only
     /// what a creation that did not finish leaves (A.12). Without `new`, such a directory is [`StoreError::NotAStore`].
@@ -272,24 +279,32 @@ impl StoreDir {
             });
         }
         // No descriptor: only what creation makes may be present, with its directories empty.
-        let unfinished = Self::unfinished(&*fs, dir)?.is_some();
+        let unfinished = matches!(Self::judge(&*fs, dir)?, Judged::Unfinished(_));
         let Some(new) = new.filter(|_| unfinished) else {
             return Err(StoreError::NotAStore);
         };
         Self::create(fs, dir, new)
     }
 
-    /// Whether `dir` holds only what a creation that did not finish leaves, judged from a fresh listing.
-    fn unfinished(fs: &dyn Fs, dir: &Path) -> io::Result<Option<Vec<String>>> {
+    /// Judges `dir` from a fresh listing, looking for `STORE` first: a finished store is never "unfinished", whatever
+    /// its directories hold.
+    fn judge(fs: &dyn Fs, dir: &Path) -> io::Result<Judged> {
         let top = names(fs, dir)?;
+        if top.iter().any(|n| n == STORE) {
+            return Ok(Judged::HasStore);
+        }
         let only_creation = top.iter().all(|n| {
-            [LOCK, MANIFEST, STORE_TMP, STORE].contains(&n.as_str()) || DIRS.contains(&n.as_str())
+            [LOCK, MANIFEST, STORE_TMP].contains(&n.as_str()) || DIRS.contains(&n.as_str())
         });
         let mut empty_dirs = true;
         for d in DIRS {
             empty_dirs &= names(fs, &dir.join(d))?.is_empty();
         }
-        Ok((only_creation && empty_dirs).then_some(top))
+        Ok(if only_creation && empty_dirs {
+            Judged::Unfinished(top)
+        } else {
+            Judged::Other
+        })
     }
 
     fn create(fs: Arc<dyn Fs>, dir: &Path, new: &NewStore) -> Result<Self, StoreError> {
@@ -306,13 +321,14 @@ impl StoreDir {
         sync_parent(&*fs, dir)?;
         let lock = take_lock(&*fs, dir)?;
         // Another process may have finished a creation since the listing that led here: judge again under the lock.
-        let Some(left) = Self::unfinished(&*fs, dir)? else {
-            return Err(StoreError::NotAStore);
+        let left = match Self::judge(&*fs, dir)? {
+            Judged::Unfinished(left) => left,
+            Judged::HasStore => {
+                drop(lock);
+                return Self::open(fs, dir, Some(new));
+            }
+            Judged::Other => return Err(StoreError::NotAStore),
         };
-        if left.iter().any(|n| n == STORE) {
-            drop(lock);
-            return Self::open(fs, dir, Some(new));
-        }
         for n in left
             .iter()
             .filter(|n| *n != LOCK && !DIRS.contains(&n.as_str()))

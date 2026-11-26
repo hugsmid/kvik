@@ -71,11 +71,17 @@ fn a_store_finished_and_written_to_after_the_listing_is_opened_not_refused() {
             let inner = inner.clone();
             move || {
                 drop(StoreDir::open(a_fs, &dir, Some(&new_store(1))).unwrap());
-                let f = inner.open(&dir.join("log").join("seg"), OpenMode::CreateNew).unwrap();
+                let f = inner
+                    .open(&dir.join("log").join("seg"), OpenMode::CreateNew)
+                    .unwrap();
                 f.write_at(b"x", 0).unwrap();
             }
         }))),
     };
     let b = StoreDir::open(Arc::new(racing), dir, Some(&new_store(2)));
-    assert_eq!(b.map(|b| b.descriptor().store_id).map_err(|e| format!("{e:?}")), Ok([1; 16]));
+    assert_eq!(
+        b.map(|b| b.descriptor().store_id)
+            .map_err(|e| format!("{e:?}")),
+        Ok([1; 16])
+    );
 }
