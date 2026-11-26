@@ -73,7 +73,8 @@ pub struct Resume {
 /// The resume, at commit-clock instant `until`, of a consumer whose replay starts at `start` (its gate
 /// checkpoint, at or after its gate cursor) and whose gate cursor is `cursor` (`None`: nothing confirmed
 /// yet). The bound is measured from `start`, so a consumer whose gates are quiet for days still replays
-/// (Q-1391).
+/// (Q-1391). `start.now` is at or after the commit time of `start.at`, which keeps a frontier
+/// downward closed in id order.
 pub fn resume(
     history: &[Entry],
     until: Nanos,
