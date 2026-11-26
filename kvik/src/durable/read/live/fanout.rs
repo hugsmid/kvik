@@ -307,7 +307,8 @@ impl Rig {
         for (k, s) in self.subs.iter_mut().enumerate() {
             any |= s.poll(racing == Some(k))?;
             if s.small {
-                passed_over(&s.held[0], &s.held[1])?;
+                let same_cut = !stopped(&mut s.fan) && !stopped(&mut s.every);
+                passed_over(&s.held[0], &s.held[1], same_cut)?;
             } else {
                 prop_assert_eq!(&s.held[0], &s.held[1]);
             }
@@ -322,8 +323,11 @@ impl Rig {
                 break;
             }
         }
-        for s in &self.subs {
-            if !s.small {
+        for s in &mut self.subs {
+            if s.small {
+                prop_assert!(!stopped(&mut s.fan) && !stopped(&mut s.every));
+                passed_over(&s.held[0], &s.held[1], true)?;
+            } else {
                 prop_assert_eq!(plain(&s.held[0]), plain(&s.held[2]));
             }
         }
@@ -331,12 +335,20 @@ impl Rig {
     }
 }
 
+/// Whether the session's last batch stopped at a row limit inside its rounds (Q-1014): its `Latest`s then stand at that
+/// cut.
+fn stopped(s: &mut LiveSession) -> bool {
+    s.durable_mut().is_some_and(|d| d.rest)
+}
+
 /// A small backlog counted every row before Q-1118, so the old path also lagged over rounds holding nothing the
 /// session selects: the fan-out session holds every fact the old one does, and others only inside a range the old one
-/// was told it lagged over; its `Latest`s are the same.
+/// was told it lagged over; its `Latest`s are the same once neither has stopped short of the view, as a session that
+/// does not lag may stop where the old one lagged past.
 fn passed_over(
     fan: &BTreeMap<LiveId, Held>,
     old: &BTreeMap<LiveId, Held>,
+    same_cut: bool,
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(
         fan.keys().collect::<Vec<_>>(),
@@ -344,7 +356,9 @@ fn passed_over(
     );
     for (id, f) in fan {
         let o = &old[id];
-        prop_assert_eq!(&f.latest, &o.latest);
+        if same_cut {
+            prop_assert_eq!(&f.latest, &o.latest);
+        }
         prop_assert!(o.tail.iter().all(|x| f.tail.contains(x)), "{:?} {:?}", f, o);
         for x in f.tail.iter().filter(|x| !o.tail.contains(x)) {
             prop_assert!(
