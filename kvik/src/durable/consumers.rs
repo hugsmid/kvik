@@ -153,6 +153,7 @@ impl Writer {
                 operator: None,
                 emits: emits.clone(),
                 condition: None,
+                gate: None,
             };
             if let Some(cycle) = view.cycle_with(Some(&change), None) {
                 return Err(Error::RouteCycle(cycle.join(" -> ")));
@@ -239,6 +240,7 @@ impl Writer {
                 operator: None,
                 emits: view.emits(name),
                 condition: None,
+                gate: None,
             })
         })?;
         self.commit_routing(&mut d, change)?;
@@ -438,6 +440,7 @@ mod tests {
             operator: None,
             emits: Selection::None,
             condition: None,
+            gate: None,
         };
         {
             let mut d = lock(&w.decider);

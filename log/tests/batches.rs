@@ -7,8 +7,9 @@ use kvik_log::batch::BatchBuilder;
 use kvik_log::block::block_type;
 use kvik_log::content::{BatchContent, Item};
 use kvik_log::entries::{
-    CounterRules, DAY, Definition, EntriesBlock, Entry, ExcessPrecision, IntervalLength, Kind,
-    MarkState, ParameterChange, Recovery, Retention, RouteCondition, RouteOp, RouteOperator,
+    CounterRules, DAY, Definition, EntriesBlock, Entry, ExcessPrecision, GATE_LEVELS, GATE_MEMBERS,
+    GateKind, GateLevel, GateSelector, GateSpec, GateValue, IntervalLength, Kind, MarkState,
+    ParameterChange, Recovery, Retention, RouteCondition, RouteGate, RouteOp, RouteOperator,
     Routing, Selection, StateArg, Timing, Versioning,
 };
 use kvik_log::facts::{FactFlags, FactRow, FactsBlock, Quality, Value, ValueType};
@@ -327,29 +328,117 @@ fn route_operator() -> impl Strategy<Value = RouteOperator> {
     })
 }
 
+fn gate_value() -> impl Strategy<Value = GateValue> {
+    prop_oneof![
+        level().prop_map(GateValue::F64),
+        (any::<i64>(), any::<u8>()).prop_map(|(units, scale)| GateValue::Decimal { units, scale }),
+        any::<u32>().prop_map(GateValue::State),
+        any::<bool>().prop_map(GateValue::Bool),
+        "[a-z ]{1,40}".prop_map(GateValue::Text),
+    ]
+}
+
+/// Rising boundaries by construction: each `at` and `clear` is the previous one plus a positive step.
+fn gate_levels() -> impl Strategy<Value = Vec<GateLevel>> {
+    (
+        level(),
+        prop::collection::vec(
+            (1f64..1e6, 0f64..1e3, 0..i64::MAX, 0..i64::MAX),
+            1..=GATE_LEVELS,
+        ),
+    )
+        .prop_map(|(base, steps)| {
+            let mut at = base;
+            steps
+                .into_iter()
+                .map(|(step, gap, hold_up, hold_down)| {
+                    at += step;
+                    GateLevel {
+                        at,
+                        clear: at - gap.min(step / 2.0),
+                        hold_up,
+                        hold_down,
+                    }
+                })
+                .collect()
+        })
+}
+
+fn gate_kind() -> impl Strategy<Value = GateKind> {
+    prop_oneof![
+        gate_levels().prop_map(GateKind::Levels),
+        (
+            prop::collection::vec(gate_value(), 1..=GATE_MEMBERS),
+            0..i64::MAX,
+            0..i64::MAX
+        )
+            .prop_map(|(members, hold_on, hold_off)| GateKind::Set {
+                members,
+                hold_on,
+                hold_off
+            }),
+        (0f64..1e6).prop_map(|deadband| GateKind::Change { deadband }),
+    ]
+}
+
+fn gate_spec() -> impl Strategy<Value = GateSpec> {
+    (
+        "[a-z0-9][a-z0-9_-]{0,63}",
+        prop_oneof![
+            any::<u32>().prop_map(GateSelector::One),
+            "[a-z]{1,8}/\\*".prop_map(GateSelector::Each),
+        ],
+        gate_kind(),
+        prop::option::of(1..i64::MAX),
+    )
+        .prop_map(|(name, selector, kind, stale_after)| GateSpec {
+            name,
+            selector,
+            input: 1,
+            kind,
+            stale_after,
+        })
+}
+
 fn routing() -> impl Strategy<Value = Routing> {
     (
         "[a-z0-9][a-z0-9._-]{0,63}",
-        0u8..3,
+        0u8..5,
         any::<u32>(),
         selection(true),
         prop::option::of(route_operator()),
         selection(false),
         prop::option::of(route_condition()),
+        gate_spec(),
     )
-        .prop_map(|(consumer, op, funnel, sel, operator, emits, condition)| {
-            let op = [RouteOp::Add, RouteOp::Remove, RouteOp::Emits][usize::from(op)];
-            let add = op == RouteOp::Add;
-            Routing {
-                consumer,
-                op,
-                funnel: (op != RouteOp::Emits).then_some(funnel),
-                selection: add.then_some(sel),
-                operator: operator.filter(|_| add),
-                emits,
-                condition: condition.filter(|_| add),
-            }
-        })
+        .prop_map(
+            |(consumer, op, funnel, sel, operator, emits, condition, spec)| {
+                let op = [
+                    RouteOp::Add,
+                    RouteOp::Remove,
+                    RouteOp::Emits,
+                    RouteOp::Watch,
+                    RouteOp::Unwatch,
+                ][usize::from(op)];
+                let add = op == RouteOp::Add;
+                let gate = matches!(op, RouteOp::Watch | RouteOp::Unwatch).then(|| {
+                    Box::new(RouteGate {
+                        id: funnel,
+                        spec: (op == RouteOp::Watch).then_some(spec),
+                    })
+                });
+                Routing {
+                    consumer,
+                    op,
+                    funnel: matches!(op, RouteOp::Add | RouteOp::Remove).then_some(funnel),
+                    selection: add.then_some(sel),
+                    operator: operator.filter(|_| add),
+                    emits,
+                    condition: condition.filter(|_| add),
+                    gate,
+                }
+            },
+        )
 }
 
 /// Every entry type except the recovery entry, which is alone in its batch.
