@@ -415,7 +415,7 @@ impl Session {
     }
 
     pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError> {
-        let until = Instant::now() + timeout;
+        let until = crate::time::deadline(timeout);
         loop {
             // Read before the turn: a ring during it makes the wait below return at once.
             let rung = self.bell.as_ref().map(|b| b.rung());
