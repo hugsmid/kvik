@@ -411,3 +411,34 @@ fn a_latest_value_falling_due_long_after_the_last_batch_arrives_at_its_due_time_
     });
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn next_sleeps_out_the_batch_interval_after_a_due_time_inside_it_passes() {
+    let w = World::new("due-inside");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = s.reader();
+    let (mut session, ..) = watched(&r, LiveOptions::default());
+    w.clock.advance(Duration::from_secs(1));
+    let now = w.clock.wall().0;
+    block_on(s.emit(&[
+        Reading::new(id, Timestamp(now), Value::F64(1.0)),
+        Reading::new(id, Timestamp(now + 20_000_000), Value::F64(2.0)),
+    ]))
+    .unwrap();
+    while session.next(Duration::ZERO).unwrap().is_some() {}
+    let before = session.turns();
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            for _ in 0..180 {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(session.next(Duration::from_millis(180)).unwrap().is_none());
+        ticking.join().unwrap();
+    });
+    let turns = session.turns() - before;
+    assert!(turns < 100, "{turns}");
+    block_on(s.shutdown()).unwrap();
+}
