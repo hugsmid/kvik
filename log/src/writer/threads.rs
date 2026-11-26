@@ -500,6 +500,22 @@ impl Log {
         ))
     }
 
+    fn detach(&mut self) {
+        lock(&self.shared.maint).stop = true;
+        self.shared.maint_cv.notify_all();
+        self.writer = None;
+        self.maint = None;
+    }
+
+    /// Unwinding must not join (a thread's panic would abort); the threads end on their own and release the store.
+    fn signal_stop_detached(&mut self) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        lock(&self.shared.front).shutdown = true;
+        self.shared.writer_cv.notify_one();
+        self.shared.room_cv.notify_all();
+        self.detach();
+    }
+
     fn stop(&mut self) -> (Result<(), Fault>, Option<LogWriter>) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         {
@@ -513,10 +529,7 @@ impl Log {
         let writer = self.writer.as_ref().map(|h| h.thread().id());
         let maint = self.maint.as_ref().map(|h| h.thread().id());
         if writer == me || maint == me {
-            lock(&self.shared.maint).stop = true;
-            self.shared.maint_cv.notify_all();
-            self.writer = None;
-            self.maint = None;
+            self.detach();
             return (Ok(()), None);
         }
         let w = self.writer.take().map(JoinHandle::join);
@@ -540,7 +553,12 @@ impl Log {
 
 impl Drop for Log {
     fn drop(&mut self) {
-        if self.writer.is_some() && !std::thread::panicking() {
+        if self.writer.is_none() {
+            return;
+        }
+        if std::thread::panicking() {
+            self.signal_stop_detached();
+        } else {
             let _ = self.stop();
         }
     }
