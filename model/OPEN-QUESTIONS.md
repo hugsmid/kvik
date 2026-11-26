@@ -5190,6 +5190,16 @@ arithmetic, so a late commit clock plus the maximum never panics: a deadline bey
 **Pinned by.** `tests/gate_edges.rs` `durations_beyond_the_maximum_are_refused_and_the_maximum_is_accepted`,
 `the_longest_durations_late_on_the_commit_clock_judge_without_overflow`.
 
+## Q-1450 — A lost consumer taken again before it confirms its `NoCursor` resync
+
+§4 Resync, invariant 25; Q-95 (b), Q-131. Scenario: a power loss reassigns positions above P; the consumer's cursor
+file is lost; it is taken, sent `NoCursor` with `forget_above` = P, and its process restarts before confirming. The
+durable backend (`deliver/take.rs`: `dormant` is cleared at the first take and the cursor file waits for the
+confirmation) resumes it from P with a plain `Resume`, so facts above P reach a consumer that was never told to
+forget above P; `recovery_generator_coverage` at 1,024 cases finds the model doing the same. Recommended default:
+until the `NoCursor` resync is confirmed the consumer stays lost, and every take sends it again (model `reconnect`
+and the durable `take`, together, so the differential still agrees). Settle by: roadmap 5.3 step 2.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

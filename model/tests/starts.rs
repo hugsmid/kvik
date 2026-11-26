@@ -251,3 +251,25 @@ fn a_routed_consumer_started_again_is_sent_no_resync() {
         "only a lost cursor is sent `NoCursor`"
     );
 }
+
+#[test]
+fn a_lost_consumer_taken_again_before_confirming_resumes_from_its_start() {
+    let (mut m, s) = model(Selection::All);
+    facts(&mut m, s, 0, 1.0);
+    m.drain().unwrap();
+    m.crash();
+    m.lose_cursor_file(C).unwrap();
+    m.restart();
+    m.start_consumer(C, Start::Now).unwrap();
+    assert_eq!(
+        take(&mut m)[0].resync().unwrap().cause,
+        ResyncCause::NoCursor
+    );
+    m.reconnect(C).unwrap();
+    let got = take(&mut m);
+    assert!(
+        got.iter().all(|d| d.fact().is_none()),
+        "no replay from the origin"
+    );
+    assert_eq!(got[0].resync().unwrap().cause, ResyncCause::Resume);
+}

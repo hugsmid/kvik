@@ -84,6 +84,7 @@ impl Model {
         c.pending = None;
         c.session = session;
         c.last_received = p;
+        c.started = lost.then_some(p);
         c.mode = if behind {
             Mode::CatchUp { next: p.next() }
         } else {

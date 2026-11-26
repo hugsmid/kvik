@@ -1876,6 +1876,9 @@ struct ConsumerRt {
     /// Reset points catch-up has passed with nothing routed since, merged
     /// (the lowest `forget_above`, the highest id), not yet delivered.
     pending: Option<ResetPoint>,
+    /// For a consumer started after its cursor file was lost: the position before its start, its cursor in this
+    /// run until a confirmation writes one (Q-131).
+    started: Option<Position>,
 }
 
 /// State a crash discards.
@@ -2285,6 +2288,7 @@ impl Model {
                 emitted: BTreeMap::new(),
                 awaiting: None,
                 pending: None,
+                started: None,
             });
         }
         self.vol = Some(Volatile {
@@ -4234,12 +4238,16 @@ impl Model {
     /// from its durable cursor: catch-up, then `resync` (§6 Restart and
     /// resume, §9 rows 15 and 16).
     pub fn reconnect(&mut self, id: ConsumerId) -> Result<(), Error> {
+        let started = self
+            .consumer_index(id)
+            .and_then(|i| self.vol.as_ref().and_then(|v| v.consumers[i].started));
         self.vol()?;
         let cursor = self
             .disk
             .cursors
             .get(&id)
             .copied()
+            .or(started)
             .unwrap_or(Position::ORIGIN);
         let s = self.sessions.entry(id).or_insert(0);
         *s += 1;
