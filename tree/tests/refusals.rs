@@ -1,6 +1,7 @@
 //! Every refusal of `format-tree.md` T.11 and T.12 has a named vector here, and the table covers [`Refusal::ALL`].
 
 mod files;
+mod vectors;
 
 use std::collections::HashSet;
 
@@ -8,323 +9,8 @@ use files::*;
 use kvik_tree::fuzz::reframe;
 use kvik_tree::part::{Part, block_type};
 use kvik_tree::root::Root;
-use kvik_tree::{Kind, MINUTE, Node, Refusal, encode};
-
-enum File {
-    Part,
-    Root,
-}
-
-fn put(b: &mut [u8], at: usize, v: &[u8]) {
-    b[at..at + v.len()].copy_from_slice(v);
-}
-
-fn day() -> Vec<u8> {
-    day_part().encode().unwrap()
-}
-
-fn root_bytes() -> Vec<u8> {
-    sample_root().encode().unwrap()
-}
-
-fn trailer_at(b: &[u8]) -> usize {
-    u64::from_le_bytes(b[b.len() - 16..b.len() - 8].try_into().unwrap()) as usize
-}
-
-/// The day part with one block body changed, everything after it laid out again.
-fn edit_block(which: impl Fn(u8, usize) -> bool, f: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    let (h, mut blocks) = split(&day());
-    let mut seen = std::collections::HashMap::new();
-    for (t, body) in &mut blocks {
-        let n = seen.entry(*t).or_insert(0usize);
-        if which(*t, *n) {
-            f(body);
-        }
-        *n += 1;
-    }
-    assemble(&h, &blocks)
-}
-
-fn edit_trailer(f: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    edit_block(|t, _| t == block_type::TRAILER, f)
-}
-
-fn first_nodes(f: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    edit_block(|t, n| t == block_type::NODES && n == 0, f)
-}
-
-fn edit_root(f: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    let mut b = root_bytes();
-    f(&mut b);
-    reframe(&mut b);
-    b
-}
-
-fn header(f: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    let mut b = day();
-    f(&mut b);
-    reframe(&mut b);
-    b
-}
-
-const ROOT_BODY: usize = 80;
-const PARTS: usize = ROOT_BODY + 88 + 64;
-const COVERED: usize = PARTS + 3 * 80;
-const FLOORS: usize = COVERED + 4 * 24;
-const RETIRED: usize = FLOORS + 2 * 24;
-
-fn gauge(start: i64, n: u32) -> Vec<u8> {
-    encode(&node(Kind::Gauge, start, 15 * MINUTE, n, 1)).unwrap()
-}
-
-fn one(base_start: i64, entries: &[RawEntry]) -> Vec<u8> {
-    with_nodes(vec![nodes_body(1, 2, base_start, pos(3, 5), entries)])
-}
-
-fn vectors() -> Vec<(Refusal, File, Vec<u8>)> {
-    use File::*;
-    use Refusal as R;
-    let q = 15 * MINUTE;
-    let valid = |start| (0, 0, 0, 0, gauge(start, 3));
-    vec![
-        (R::Header, Part, {
-            let mut b = day();
-            b[0] = b'X';
-            b
-        }),
-        (R::Kind, Part, header(|b| b[4] = 19)),
-        (R::NewerMajor, Part, header(|b| b[5] = 2)),
-        (R::OlderMajor, Part, header(|b| b[5] = 0)),
-        (R::HeaderReserved, Part, header(|b| b[57] = 1)),
-        (R::EndMarker, Part, {
-            let mut b = day();
-            *b.last_mut().unwrap() = 1;
-            b
-        }),
-        (R::TrailerOffset, Part, {
-            let mut b = day();
-            let t = trailer_at(&b) as u64 + 4;
-            let n = b.len();
-            put(&mut b, n - 16, &t.to_le_bytes());
-            b
-        }),
-        (R::BlockHeader, Part, {
-            let mut b = day();
-            let t = trailer_at(&b);
-            b[t + 12] ^= 1;
-            b
-        }),
-        (R::BlockReserved, Part, header(|b| b[64 + 2] = 1)),
-        (R::BodyLength, Part, {
-            let mut b = day();
-            put(&mut b, 64 + 4, &(16u32 << 20 | 8).to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[64..76]);
-            put(&mut b, 76, &crc.to_le_bytes());
-            let (h, blocks) = split(&day());
-            let fixed = assemble(&h, &blocks);
-            let t = trailer_at(&fixed);
-            let crc = kvik_log::crc::crc32c(&b[..t]);
-            put(&mut b, t + 16 + 96, &crc.to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[t + 16..b.len() - 16]);
-            put(&mut b, t + 8, &crc.to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[t..t + 12]);
-            put(&mut b, t + 12, &crc.to_le_bytes());
-            b
-        }),
-        (R::BodyChecksum, Part, {
-            let mut b = day();
-            b[64 + 16 + 30] ^= 1;
-            let t = trailer_at(&b);
-            let crc = kvik_log::crc::crc32c(&b[..t]);
-            put(&mut b, t + 16 + 96, &crc.to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[t + 16..b.len() - 16]);
-            put(&mut b, t + 8, &crc.to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[t..t + 12]);
-            put(&mut b, t + 12, &crc.to_le_bytes());
-            b
-        }),
-        (R::Padding, Part, {
-            let entry = (0, 0, 0, 0, gauge(T0, 2));
-            let mut body = nodes_body(1, 2, T0, pos(3, 5), &[entry]);
-            while body.len() % 8 != 7 {
-                body = nodes_body(
-                    1,
-                    2,
-                    T0,
-                    pos(3, 5),
-                    &[(0, 0, 0, 0, gauge(T0, 2 + body.len() as u32 % 5))],
-                );
-            }
-            let mut b = with_nodes(vec![body.clone()]);
-            b[64 + 16 + body.len()] = 1;
-            reframe(&mut b);
-            b
-        }),
-        (R::UnknownBlock, Part, header(|b| b[64] = 0x70)),
-        (R::BlockOrder, Part, header(|b| b[64] = block_type::TRAILER)),
-        (R::Truncated, Part, first_nodes(|b| b.truncate(60))),
-        (
-            R::NotShortest,
-            Part,
-            first_nodes(|b| {
-                b[0] |= 0x80;
-                b.insert(1, 0);
-            }),
-        ),
-        (
-            R::OutOfRange,
-            Part,
-            first_nodes(|b| {
-                b.splice(0..1, [0xFF; 9].into_iter().chain([0x02]));
-            }),
-        ),
-        (R::Reserved, Part, edit_trailer(|b| b[9] = 1)),
-        (R::RecordSize, Part, edit_trailer(|b| b[12] = 24)),
-        (R::RecordSizeSmall, Part, edit_trailer(|b| b[12] = 8)),
-        (R::ArrayLength, Part, edit_trailer(|b| b[10] = 5)),
-        (
-            R::LevelTableEmpty,
-            Part,
-            edit_trailer(|b| {
-                b[10] = 0;
-                b.truncate(104);
-            }),
-        ),
-        (R::LevelId, Part, edit_trailer(|b| b[104 + 16] = 1)),
-        (
-            R::LevelWidth,
-            Part,
-            edit_trailer(|b| put(b, 104 + 8, &30_000_000_000i64.to_le_bytes())),
-        ),
-        (R::UnknownClass, Part, edit_trailer(|b| b[8] = 3)),
-        (
-            R::Period,
-            Part,
-            edit_trailer(|b| put(b, 24, &0u64.to_le_bytes())),
-        ),
-        (R::FileChecksum, Part, {
-            let mut b = day();
-            let t = trailer_at(&b);
-            b[t + 16 + 96] ^= 1;
-            let crc = kvik_log::crc::crc32c(&b[t + 16..b.len() - 16]);
-            put(&mut b, t + 8, &crc.to_le_bytes());
-            let crc = kvik_log::crc::crc32c(&b[t..t + 12]);
-            put(&mut b, t + 12, &crc.to_le_bytes());
-            b
-        }),
-        (R::EmptyBlock, Part, one(T0, &[])),
-        (R::UnknownLevel, Part, first_nodes(|b| b[1] = 9)),
-        (R::BaseStart, Part, first_nodes(|b| b[22] = 1)),
-        (R::Start, Part, one(i64::MAX / q * q, &[valid(T0)])),
-        (R::Alignment, Part, one(T0 + MINUTE, &[valid(T0)])),
-        (R::EntryFlag, Part, first_nodes(|b| b[23] = 2)),
-        (
-            R::AsOf,
-            Part,
-            with_nodes(vec![nodes_body(
-                1,
-                2,
-                T0,
-                pos(3, u64::MAX),
-                &[valid(T0), (0, 0, 0, 1, gauge(T0 + q, 3))],
-            )]),
-        ),
-        (R::BasePosition, Part, first_nodes(|b| b[25] = 1)),
-        (R::NodeForm, Part, first_nodes(|b| b[27] = 0x11)),
-        (R::Node, Part, first_nodes(|b| b[26] -= 1)),
-        (
-            R::NodeSpan,
-            Part,
-            one(T0, &[(0, 0, 0, 0, gauge(T0 + q, 3))]),
-        ),
-        (
-            R::NodeEmpty,
-            Part,
-            one(
-                T0,
-                &[(
-                    0,
-                    0,
-                    0,
-                    0,
-                    encode(&Node::empty(Kind::Gauge, T0, T0 + q)).unwrap(),
-                )],
-            ),
-        ),
-        (
-            R::NodeKind,
-            Part,
-            one(
-                T0,
-                &[
-                    valid(T0),
-                    (
-                        0,
-                        0,
-                        0,
-                        0,
-                        encode(&node(Kind::Counter, T0 + q, q, 3, 1)).unwrap(),
-                    ),
-                ],
-            ),
-        ),
-        (
-            R::Order,
-            Part,
-            with_nodes(vec![
-                nodes_body(1, 2, T0 + q, pos(3, 5), &[valid(T0 + q)]),
-                nodes_body(1, 2, T0, pos(3, 5), &[valid(T0)]),
-            ]),
-        ),
-        (R::OutsidePeriod, Part, one(T0 + DAY, &[valid(T0 + DAY)])),
-        (
-            R::Split,
-            Part,
-            with_nodes(vec![
-                nodes_body(1, 2, T0, pos(3, 5), &[valid(T0)]),
-                nodes_body(1, 2, T0 + q, pos(3, 5), &[valid(T0 + q)]),
-            ]),
-        ),
-        (
-            R::Directory,
-            Part,
-            edit_block(|t, _| t == block_type::DIRECTORY, |b| b[8 + 20] ^= 1),
-        ),
-        (
-            R::DirectoryRoot,
-            Part,
-            edit_block(|t, _| t == block_type::DIRECTORY_ROOT, |b| b[8 + 24] ^= 8),
-        ),
-        (R::Summary, Part, edit_trailer(|b| b[48] = 8)),
-        (
-            R::PartOrder,
-            Root,
-            edit_root(|b| put(b, PARTS + 80, &3u64.to_le_bytes())),
-        ),
-        (
-            R::FileId,
-            Root,
-            edit_root(|b| put(b, ROOT_BODY + 40, &18u64.to_le_bytes())),
-        ),
-        (
-            R::CoveredRange,
-            Root,
-            edit_root(|b| put(b, COVERED + 48 + 8, &(T0 - 10 * DAY).to_le_bytes())),
-        ),
-        (
-            R::FloorOrder,
-            Root,
-            edit_root(|b| put(b, FLOORS + 24, &7u64.to_le_bytes())),
-        ),
-        (R::FloorFlag, Root, edit_root(|b| b[FLOORS + 16] = 2)),
-        (
-            R::RetiredOrder,
-            Root,
-            edit_root(|b| put(b, RETIRED, &3u64.to_le_bytes())),
-        ),
-        (R::RootSeq, Root, edit_root(|b| b[16] = 13)),
-    ]
-}
+use kvik_tree::{Kind, MINUTE, Refusal, encode};
+use vectors::*;
 
 #[test]
 fn every_refusal_has_a_vector_and_each_vector_is_refused_as_named() {
@@ -592,4 +278,237 @@ proptest::proptest! {
         let got = root_refusal(&root_bytes_with_parts(&parts));
         proptest::prop_assert_eq!(got, if any { Err(Refusal::PartOrder) } else { Ok(()) });
     }
+}
+
+/// A part whose first block claims a body above 16 MiB that fits before the trailer.
+fn body_above_16_mib() -> Vec<u8> {
+    let (h, blocks) = split(&empty_part().encode().unwrap());
+    let body = vec![0u8; (16 << 20) + 8];
+    let mut prefix = h;
+    let bh = kvik_log::block::BlockHeader {
+        block_type: block_type::NODES,
+        flags: 0,
+        body_len: body.len() as u32,
+        body_crc32c: kvik_log::crc::crc32c(&body),
+    };
+    prefix.extend_from_slice(&bh.encode());
+    prefix.extend_from_slice(&body);
+    assemble(&prefix, &blocks)
+}
+
+fn with_tail_offset(at: u64) -> Vec<u8> {
+    let mut b = day();
+    let n = b.len();
+    put(&mut b, n - 16, &at.to_le_bytes());
+    b
+}
+
+#[test]
+fn each_condition_of_a_refusal_has_a_vector() {
+    use File::*;
+    use Refusal as R;
+    let q = 15 * MINUTE;
+    let valid = |start| (0, 0, 0, 0, gauge(start, 3));
+    let tail = day().len() as u64 - 16;
+    let far = (i64::MAX - T0) as u64 / MINUTE as u64;
+    let cases: Vec<(&str, Refusal, File, Vec<u8>)> = vec![
+        (
+            "entry before the period",
+            R::OutsidePeriod,
+            Part,
+            one(T0 - q, &[valid(T0 - q)]),
+        ),
+        (
+            "runs: series descending",
+            R::Order,
+            Part,
+            with_nodes(vec![
+                nodes_body(2, 2, T0, pos(3, 5), &[valid(T0)]),
+                nodes_body(1, 2, T0, pos(3, 5), &[valid(T0)]),
+            ]),
+        ),
+        (
+            "runs: level descending",
+            R::Order,
+            Part,
+            with_nodes(vec![
+                nodes_body(1, 3, T0, pos(3, 5), &[(0, 0, 0, 0, counter(T0, width(3)))]),
+                nodes_body(1, 2, T0, pos(3, 5), &[(0, 0, 0, 0, counter(T0, q))]),
+            ]),
+        ),
+        (
+            "trailer offset inside the header",
+            R::TrailerOffset,
+            Part,
+            with_tail_offset(8),
+        ),
+        (
+            "trailer offset at the tail",
+            R::TrailerOffset,
+            Part,
+            with_tail_offset(tail),
+        ),
+        (
+            "trailer block not ending at the tail",
+            R::TrailerOffset,
+            Part,
+            with_tail_offset(64),
+        ),
+        (
+            "body above 16 MiB inside the file",
+            R::BodyLength,
+            Part,
+            body_above_16_mib(),
+        ),
+        (
+            "gap beyond i64 nanoseconds",
+            R::Start,
+            Part,
+            one(T0, &[valid(T0), (u64::MAX, 0, 0, 0, gauge(T0 + q, 3))]),
+        ),
+        (
+            "gap past i64 from the previous end",
+            R::Start,
+            Part,
+            one(T0, &[valid(T0), (far, 0, 0, 0, gauge(T0 + q, 3))]),
+        ),
+        (
+            "level id zero",
+            R::LevelId,
+            Part,
+            edit_trailer(|b| b[104] = 0),
+        ),
+        (
+            "level width negative",
+            R::LevelWidth,
+            Part,
+            edit_trailer(|b| put(b, 104 + 8, &(-MINUTE).to_le_bytes())),
+        ),
+        (
+            "level width zero",
+            R::LevelWidth,
+            Part,
+            edit_trailer(|b| put(b, 104 + 8, &0i64.to_le_bytes())),
+        ),
+        (
+            "part period ending beyond i64",
+            R::Period,
+            Part,
+            edit_trailer(|b| put(b, 16, &(i64::MAX - DAY + 1).to_le_bytes())),
+        ),
+        (
+            "root part period ending beyond i64",
+            R::Period,
+            Root,
+            edit_root(|b| put(b, PARTS + 24, &i64::MAX.to_le_bytes())),
+        ),
+        (
+            "covered range empty",
+            R::CoveredRange,
+            Root,
+            edit_root(|b| put(b, COVERED + 16, &(T0 - 35 * DAY).to_le_bytes())),
+        ),
+        (
+            "retired file_id twice",
+            R::RetiredOrder,
+            Root,
+            edit_root(|b| put(b, RETIRED + 16, &4u64.to_le_bytes())),
+        ),
+        (
+            "retired file_id at next_file_id",
+            R::FileId,
+            Root,
+            edit_root(|b| put(b, RETIRED + 16, &20u64.to_le_bytes())),
+        ),
+        (
+            "two parts of one seq overlapping",
+            R::PartOrder,
+            Root,
+            edit_root(|b| put(b, PARTS + 80 + 8, &4u64.to_le_bytes())),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, want, file, bytes) in cases {
+        let got = match file {
+            File::Part => part_refusal(&bytes),
+            File::Root => root_refusal(&bytes),
+        };
+        if got != Err(want) {
+            wrong.push((name, want, got));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// T.11: a refusal names its offset. Offsets of the trailer's fields are the day part's trailer body (152,568)
+/// plus the T.11 offset; of the root's records, the T.12 offsets from the body at 80.
+#[test]
+fn every_vector_is_refused_at_its_offset() {
+    use Refusal as R;
+    let want: &[(Refusal, u64)] = &[
+        (R::Header, 0),
+        (R::Kind, 4),
+        (R::NewerMajor, 5),
+        (R::OlderMajor, 5),
+        (R::HeaderReserved, 8),
+        (R::EndMarker, 152744),
+        (R::TrailerOffset, 152736),
+        (R::BlockHeader, 152552),
+        (R::BlockReserved, 64),
+        (R::BodyLength, 68),
+        (R::BodyChecksum, 72),
+        (R::Padding, 199),
+        (R::UnknownBlock, 64),
+        (R::BlockOrder, 64),
+        (R::Truncated, 107),
+        (R::NotShortest, 80),
+        (R::OutOfRange, 80),
+        (R::Reserved, 152577),
+        (R::RecordSize, 152580),
+        (R::RecordSizeSmall, 152580),
+        (R::ArrayLength, 152672),
+        (R::LevelTableEmpty, 152672),
+        (R::LevelId, 152688),
+        (R::LevelWidth, 152680),
+        (R::UnknownClass, 152576),
+        (R::Period, 152584),
+        (R::FileChecksum, 152664),
+        (R::EmptyBlock, 102),
+        (R::UnknownLevel, 81),
+        (R::BaseStart, 102),
+        (R::Start, 102),
+        (R::Alignment, 102),
+        (R::EntryFlag, 103),
+        (R::AsOf, 201),
+        (R::BasePosition, 80),
+        (R::NodeForm, 107),
+        (R::Node, 192),
+        (R::NodeSpan, 107),
+        (R::NodeEmpty, 107),
+        (R::NodeKind, 64),
+        (R::Order, 200),
+        (R::OutsidePeriod, 64),
+        (R::Split, 68),
+        (R::Directory, 152144),
+        (R::DirectoryRoot, 152504),
+        (R::Summary, 152560),
+        (R::PartOrder, 312),
+        (R::FileId, 392),
+        (R::CoveredRange, 528),
+        (R::FloorOrder, 592),
+        (R::FloorFlag, 584),
+        (R::RetiredOrder, 616),
+        (R::RootSeq, 16),
+    ];
+    let got: Vec<(Refusal, u64)> = vectors()
+        .into_iter()
+        .map(|(r, file, bytes)| {
+            let e = match file {
+                File::Part => Part::decode(&bytes).map(|_| ()),
+                File::Root => Root::decode(&bytes).map(|_| ()),
+            };
+            (r, e.unwrap_err().at)
+        })
+        .collect();
+    assert_eq!(got, want);
 }
