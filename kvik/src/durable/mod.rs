@@ -16,6 +16,9 @@
 
 mod by_id;
 mod clock;
+// Wired into the maintenance loop with publishing (roadmap 6.3e); until then only its tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod compact;
 mod completion;
 mod consumers;
 mod deliver;

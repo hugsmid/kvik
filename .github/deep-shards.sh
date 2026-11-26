@@ -93,6 +93,7 @@ kvik-latest     kvik  lib         durable::read::latest::
 kvik-live       kvik  lib         durable::read::live::differential::
 kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
+kvik-compact    kvik  lib         durable::compact::tests::every_input_position_lands_in_exactly_one_output_where_the_model_places_it
 '
 
 cd "$(dirname "$0")/.."

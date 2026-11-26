@@ -186,6 +186,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1147 | §6 Gates, Windows | Window inputs in the model: sampling and the reading at `now` (decided by the lead, provisional) |
 | Q-1148 | §6 Gates; §4 Future facts, Outranked facts; Q-16 | What counts as an arrival for a gate's staleness (decided by the lead, provisional) |
 | Q-1149 | §6 Gates, Durations | The longest duration of a gate (decided by the lead, provisional) |
+| Q-1410 | §7; Q-801, Q-811 | Roadmap 6.2a2 in two parts (provisional) |
+| Q-1411 | §7; Q-809 | Unknown elements in a run's inputs, found by canonical form |
+| Q-1412 | §7; `format-compacted.md` B.1 | The name and reach a compacted file gives a series (provisional) |
+| Q-1413 | §7, §8 Restore step 1; Q-796 | A non-fact entry set aside beyond a restored end (provisional) |
+| Q-1414 | §7, §9 row 10 | Where a run's outputs wait before publishing (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3219,7 +3224,8 @@ its blocks follow each other in a fixed order.
 length 0 or one whose end leaves `i64`, a run count of 0, or names out of order are invalid.
 (j) The reader records the ignorable elements it skips (`Ignored`), and the canonical checks do not judge a file
 holding any, so a scrub by an older binary does not call a newer minor version's file damaged.
-**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate:
+**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate (the first part moved to
+6.2a2b by Q-1410; the second built by 6.2a2 as a stall, `Cause::CommitTimeDecreases`):
 - the writer takes a series' facts whole and the canonical check holds every fact of the file as decoded rows (80
   bytes a fact; about 175 MB for 2,000,000 facts). Section 4's caps (32 MiB minimal, 256 MiB desktop) need a writer
   that takes a series' rows in order a block at a time and a canonical check that reads from a `ReadAt` and compares
@@ -5190,6 +5196,60 @@ arithmetic, so a late commit clock plus the maximum never panics: a deadline bey
 **Pinned by.** `tests/gate_edges.rs` `durations_beyond_the_maximum_are_refused_and_the_maximum_is_accepted`,
 `the_longest_durations_late_on_the_commit_clock_judge_without_overflow`.
 
+## Q-1410 — Roadmap 6.2a2 in two parts
+Decided with roadmap 6.2a2, provisional.
+**Scenario.** As designed, 6.2a2 holds the run, its verification and the L0 planner, and also the governor, the
+stepping on `kvik-maint`, the measured gate for a fourth thread (Q-801), the streaming writer and canonical check
+within the memory cap (Q-811), the 16-partition bound and the digest's measured cost: about 5,000 lines.
+**Decision (provisional).** 6.2a2 builds the run, the verification, the planner, the model's placement and the
+stalls; its outputs are verified and left unpublished, and nothing outside its tests calls it. Roadmap 6.2a2b builds
+the governor, the background-task trait and the stepping, the gate of Q-801, the streaming writer and canonical check
+with the 16-partition bound, and the digest's cost on a core without SHA instructions (the digest function stays
+provisional until then, Q-800). 6.3e follows 6.2a2b. Reason: the design allows the governor to be cut out as its own
+item; the run is testable alone, and the memory work changes the writer's signatures, which belongs with the cap it
+serves.
+**Pinned by.** `kvik/src/durable/compact/tests.rs`.
+
+## Q-1411 — Unknown elements in a run's inputs, found by canonical form
+Decided with roadmap 6.2a2.
+**Scenario.** The log's decoders skip unknown ignorable columns and fields without a trace, so a run that rearranged
+their batches would drop them (Q-809).
+**Decision.** A batch that holds a skipped block, an ignored entry, or does not decode to exactly its canonical
+blocks (`BatchContent::decode_canonical`) stalls the run with the cause "unknown". A writer of this version writes only
+canonical batches (`format.md` A.4), so the stall arises only where something would be dropped or another writer
+made the bytes; both are lossless.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_segment_with_a_block_of_unknown_type_stalls`.
+
+## Q-1412 — The name and reach a compacted file gives a series
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** `format-compacted.md` B.1 orders a file's series by the name in force at the file's greatest position;
+the durable store holds only the registry as of now.
+**Decision (provisional).** The definition's name (field 2), not an alias, from the last definition entry of the
+run's inputs at or below the file's greatest position, else from the registry the caller passes as in force below the
+run's first position; the reach from the same definition's kind and interval (`format.md` A.8). Until 6.3e wires the
+run into the store, its caller passes the current registry, which differs only for a series defined again after the
+run's inputs.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_definition_in_the_inputs_names_its_series_only_in_files_ending_after_it`,
+`an_interval_definition_gives_its_reach`.
+
+## Q-1413 — A non-fact entry set aside beyond a restored end
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.2c.
+**Scenario.** Set-aside facts go to set-aside chunks of a revision file (Q-796); a compacted file's entries are in
+its current file, with no way to mark one set aside.
+**Decision (provisional).** A run whose inputs hold a set-aside non-fact entry stalls (cause "set-aside entry"):
+lossless, and rare (a restore whose generation wrote entries past the restored end). 6.2c gives the entries a mark or
+a rule.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_set_aside_entry_stalls`.
+
+## Q-1414 — Where a run's outputs wait before publishing
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §3.2 of the compaction design renames outputs to their final names just before the publish record;
+publishing is roadmap 6.3e.
+**Decision (provisional).** A run writes, syncs and verifies its outputs under their `.tmp` names in `data/` and
+leaves them there; the outputs carry the writer's current generation and consecutive `file_id`s the caller gives,
+the first being the run id. 6.3e renames, publishes, and discards unpublished outputs at start (§9 row 10).
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `every_input_position_lands_in_exactly_one_output_where_the_model_places_it`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5203,7 +5263,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. Roadmap 6.2a2 (the compaction run) recorded and decided Q-1410 to Q-1414, all but Q-1411 provisional.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -5346,7 +5406,11 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
 | Q-854 | 9.0b2 | The lease records the highest epoch read; decided by the lead at 9.0b1's review, to be confirmed at the re-check |
-| Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
+| Q-811 | 6.2a2b | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; the stall on decreasing commit times is built by 6.2a2; open for the memory of the writer and the canonical check (Q-1410) |
+| Q-1410 | 6.2a2b | Roadmap 6.2a2 in two parts: the governor, stepping, gate of Q-801, streaming writer and digest cost in 6.2a2b; provisional |
+| Q-1412 | 6.3e | The name and reach of a series in a compacted file, from the definition in force at its greatest position; provisional |
+| Q-1413 | 6.2c | A set-aside non-fact entry stalls a run; provisional |
+| Q-1414 | 6.3e | Unpublished outputs wait under `.tmp` names in `data/`; provisional |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 | Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give, which 9.0c adds a case of (a registry file that could not be written, Q-1001); for review |

@@ -225,7 +225,8 @@ impl FactRow {
             }
     }
 
-    fn flag_bits(&self) -> u16 {
+    /// The row's flags word (A.5).
+    pub fn flag_bits(&self) -> u16 {
         let f = &self.flags;
         let mut b = 0;
         for (on, bit) in [
