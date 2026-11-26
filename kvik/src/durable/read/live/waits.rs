@@ -358,6 +358,10 @@ fn next_sleeps_while_a_latest_series_is_unsure() {
         assert!(session.next(Duration::from_millis(300)).unwrap().is_none());
         ticking.join().unwrap();
     });
-    assert!(session.turns() - before < 100, "{}", session.turns() - before);
+    assert!(
+        session.turns() - before < 100,
+        "{}",
+        session.turns() - before
+    );
     block_on(s.shutdown()).unwrap();
 }
