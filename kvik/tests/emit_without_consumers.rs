@@ -50,6 +50,56 @@ fn a_consumer_taken_after_many_emits_without_one_receives_what_its_start_promise
     block_on(s.shutdown()).unwrap();
 }
 
+/// Takes a consumer routed to every fact on `s` and checks it receives exactly the facts emitted after it.
+fn starts_after_the_last_batch(s: &Store, g: SeriesId, from: i64) {
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    assert!(
+        c.try_next().unwrap().is_none(),
+        "a new consumer is sent no resync"
+    );
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    assert!(fact_positions(&mut c).is_empty());
+    let later: Vec<Position> = (from..from + 10).map(|i| recorded(s, g, i)).collect();
+    assert_eq!(fact_positions(&mut c), later);
+}
+
+#[test]
+fn a_consumer_taken_after_a_long_idle_stretch_starts_after_the_last_batch_with_nothing_skipped_or_repeated()
+ {
+    let w = World::new("after-idle");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("p/a/power"))).unwrap();
+    for i in 0..500 {
+        recorded(&s, g, i);
+    }
+    // Past the interval at which the delivery thread reads back with no consumer (Q-1490), then a burst it has not
+    // read yet.
+    std::thread::sleep(Duration::from_millis(1_500));
+    for i in 500..700 {
+        recorded(&s, g, i);
+    }
+    starts_after_the_last_batch(&s, g, 700);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_consumer_taken_after_a_restart_without_one_starts_after_the_last_batch_with_nothing_skipped_or_repeated()
+ {
+    let w = World::new("after-restart");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("p/a/power"))).unwrap();
+    for i in 0..500 {
+        recorded(&s, g, i);
+    }
+    block_on(s.shutdown()).unwrap();
+    let s = w.open();
+    for i in 500..700 {
+        recorded(&s, g, i);
+    }
+    starts_after_the_last_batch(&s, g, 700);
+    block_on(s.shutdown()).unwrap();
+}
+
 #[test]
 fn a_consumer_taken_during_emits_receives_every_fact_after_its_route_once_and_in_order() {
     let mut raced = 0;

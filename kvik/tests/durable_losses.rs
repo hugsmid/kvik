@@ -73,8 +73,8 @@ fn the_deliverer_alone_finds_damage_to_the_newest_batch_and_its_replay_is_record
         block_on(s.emit(&[note(id, 1, "DV-TWO")])).unwrap();
         damage(&w, b"DV-TWO");
         block_on(s.emit(&[note(id, 2, "DV-THREE")])).unwrap();
-        // With no consumer the `kvik-deliver` thread takes the batch, woken by the writer's progress.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // With no consumer the `kvik-deliver` thread takes the batch within a second (Q-1490).
+        std::thread::sleep(std::time::Duration::from_millis(1_300));
         let ack = block_on(s.emit(&[note(id, 1, "DV-TWO")])).unwrap();
         assert!(
             matches!(
