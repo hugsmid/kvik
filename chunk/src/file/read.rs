@@ -200,7 +200,24 @@ impl<S: ReadAt> CompactedFile<S> {
         Layout::of(&id, &self.description, &self.trailer)
     }
 
-    fn index_block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
+    /// The number of index blocks the root names.
+    pub(crate) fn index_blocks(&self) -> usize {
+        self.index.records.len()
+    }
+
+    /// The entries the root lists, bounded by the room the file has for them.
+    pub(crate) fn listed_entries(&self) -> usize {
+        let listed: u64 = self
+            .index
+            .records
+            .iter()
+            .map(|r| u64::from(r.entry_count))
+            .sum();
+        let room = self.src.len() / super::parts::ENTRY_LEN as u64;
+        usize::try_from(listed.min(room)).unwrap_or(0)
+    }
+
+    pub(crate) fn index_block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
         let (entries, skipped) = self.index.block(&self.src, i)?;
         self.skip(skipped);
         let at = self.index.base + self.index.records[i].offset;
@@ -232,14 +249,7 @@ impl<S: ReadAt> CompactedFile<S> {
     /// Every index entry, in index order.
     pub fn index(&self) -> Result<Vec<IndexEntry>, FileError> {
         // Exact when the root is honest; never more entries than the file has room for.
-        let listed: u64 = self
-            .index
-            .records
-            .iter()
-            .map(|r| u64::from(r.entry_count))
-            .sum();
-        let room = self.src.len() / super::parts::ENTRY_LEN as u64;
-        let mut out = Vec::with_capacity(usize::try_from(listed.min(room)).unwrap_or(0));
+        let mut out = Vec::with_capacity(self.listed_entries());
         for i in 0..self.index.records.len() {
             out.extend(self.index_block(i)?);
         }

@@ -1,6 +1,8 @@
+mod gate;
 mod plan;
 mod publish;
 mod run;
+mod steps;
 mod task;
 mod verify;
 

@@ -11,15 +11,15 @@ use super::super::plan::Candidate;
 use super::super::reference::{place, take, verified_or_removed, write};
 use super::super::run::{MINIMAL_MEMORY, RunInput};
 use super::super::segment::PIECE;
-use super::super::task::RunTask;
+use super::super::task::{RunTask, window};
 use super::{
     DAY, TestBatch, batch, input, put_segment, reading, restored_after_first, segment_bytes,
     segments, temp_dir,
 };
 
-type Segments = Vec<(u32, Vec<TestBatch>)>;
+pub(super) type Segments = Vec<(u32, Vec<TestBatch>)>;
 
-fn put_all(dir: &std::path::Path, segs: &[(u32, Vec<TestBatch>)]) -> Vec<Candidate> {
+pub(super) fn put_all(dir: &std::path::Path, segs: &[(u32, Vec<TestBatch>)]) -> Vec<Candidate> {
     segs.iter()
         .enumerate()
         .map(|(i, (g, b))| {
@@ -243,7 +243,7 @@ fn peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes() {
 }
 
 /// The shapes that reach the cap hardest: many series, many series by many days, many batches by many days.
-fn heavy_shapes() -> Vec<(&'static str, Segments)> {
+pub(super) fn heavy_shapes() -> Vec<(&'static str, Segments)> {
     vec![
         (
             "many-series",
@@ -360,4 +360,76 @@ fn allocated_peaks() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
     assert!(over.is_empty(), "above the cap: {over:?}");
+}
+
+/// A writer at its fullest: its index reserved for `series`, `batches` commit-time rows, and a block of rows held.
+fn fullest_writer(series: u64, batches: u64) -> u64 {
+    use kvik_chunk::file::{
+        BLOCK_ROWS, Batch, Class, Description, Fact, FileWriter, Identity, Input, Level, Reach,
+    };
+    let per = (BLOCK_ROWS as u64).div_ceil(batches);
+    let rows = batches * per;
+    let d = Description {
+        class: Class::Current,
+        level: Level::L0,
+        period_start: 0,
+        period_len: DAY,
+        run_id: 1,
+        run_count: 1,
+        inputs: vec![Input {
+            kind: 1,
+            file_id: 1,
+        }],
+        name_range: None,
+        positions: vec![(1, rows)],
+        has_entries: false,
+        has_set_aside: false,
+        complete: true,
+    };
+    let batches: Vec<Batch> = (0..batches)
+        .map(|b| Batch {
+            generation: 1,
+            first_sequence: b * per,
+            last_sequence: b * per + per - 1,
+            received_at: 0,
+            commit_time: 0,
+        })
+        .collect();
+    let id = Identity {
+        store_id: [1; 16],
+        generation: 1,
+        file_id: 1,
+    };
+    let mut w = FileWriter::new(Vec::new(), id, 0, &d, batches).unwrap();
+    w.reserve_index(usize::try_from(2 * series).unwrap());
+    w.begin_series(1, Some("s"), Reach::Point, Vec::new())
+        .unwrap();
+    let mut most = w.held_bytes();
+    for i in 0..BLOCK_ROWS as u64 {
+        w.push(Fact::value(1, (1, i), i as i64, 1, i)).unwrap();
+        most = most.max(w.held_bytes());
+    }
+    assert!(w.data_blocks() <= 1);
+    most
+}
+
+#[test]
+fn a_window_of_writers_at_their_fullest_holds_at_most_half_the_cap() {
+    for (cap, series, batches) in [
+        (MINIMAL_MEMORY, 1_000, 1_000),
+        (MINIMAL_MEMORY, 20_000, 17_000),
+        (MINIMAL_MEMORY / 4, 10, 10),
+        (8 * MINIMAL_MEMORY, 100, 100),
+    ] {
+        let (open, per_writer) = window(cap, series, batches);
+        let held = fullest_writer(series, batches) + 2 * PIECE as u64;
+        assert!(
+            held <= per_writer,
+            "a writer holds {held}, reserved {per_writer}"
+        );
+        assert!(
+            open as u64 * held <= cap / 2,
+            "{open} writers of {held} bytes under a cap of {cap}"
+        );
+    }
 }
