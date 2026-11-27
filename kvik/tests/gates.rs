@@ -314,6 +314,57 @@ fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_st
 }
 
 #[test]
+fn a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_take_while_quiet() {
+    let clock = kvik::env::ManualClock::new(common::start());
+    let mut limits = kvik::Limits::default();
+    limits.consumer_queue = 2;
+    let config =
+        common::config_on(Backend::Durable, "gates-api-retake-quiet", &clock).limits(limits);
+    let s = block_on(Store::open(config)).unwrap();
+    let a = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let b = block_on(s.define_series(gauge("hall/air/temperature"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.watch("a", Gate::change(Input::value(a)).deadband(5.0))).unwrap();
+    block_on(c.watch("b", Gate::change(Input::value(b)).deadband(5.0))).unwrap();
+    clock.advance(Duration::from_secs(1));
+    block_on(s.emit(&[kvik::Reading::new(b, clock.wall(), Value::F64(1.0))])).unwrap();
+    let mut confirmed = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let kvik::DeliveryKind::Transition(t) = &d.kind {
+            confirmed.push(t.id);
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    assert!(!confirmed.is_empty());
+    for k in 0..12 {
+        clock.advance(Duration::from_secs(1));
+        block_on(s.emit(&[kvik::Reading::new(
+            a,
+            clock.wall(),
+            Value::F64(f64::from(k) * 10.0),
+        )]))
+        .unwrap();
+    }
+    assert!(s.stats().delivery.transitions_not_delivered > 0);
+    drop(c);
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut again = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let kvik::DeliveryKind::Transition(t) = &d.kind
+            && confirmed.contains(&t.id)
+        {
+            again.push((t.name.clone(), t.id, d.flags.replayed));
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    assert!(
+        again.is_empty(),
+        "confirmed transitions delivered again: {again:#?}"
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
 fn every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor()
  {
     let clock = kvik::env::ManualClock::new(common::start());
