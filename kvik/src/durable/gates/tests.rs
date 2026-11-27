@@ -318,7 +318,7 @@ fn cursor(
 }
 
 #[test]
-fn a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot() {
+fn a_confirmed_transition_or_resync_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot() {
     let (w, _, clock) = open_clocked("gates-confirm");
     let s = gauge(&w, "hall/air/humidity");
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
@@ -351,6 +351,19 @@ fn a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_sna
         .unwrap();
     let (_, held, outstanding) = cursor(&w);
     assert_eq!((held, outstanding), (None, 0));
+    w.release("c");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    let at = head(&w);
+    let mut resyncs = 0;
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        resyncs += usize::from(matches!(d.kind, crate::consume::DeliveryKind::Resync(_)));
+        w.confirm("c", d.id).unwrap();
+    }
+    assert_eq!(resyncs, 1);
+    assert!(matches!(
+        cursor(&w).0,
+        Some(super::super::deliver::GatePoint::Frontier(f)) if f.at.sequence == at.sequence
+    ));
 }
 
 #[test]
