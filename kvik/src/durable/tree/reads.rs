@@ -2,20 +2,23 @@
 //! timing, step and edge, with quarter-hours dirty in the stretch, uncovered, in damaged parts or past the credit
 //! limit.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kvik_log::fs::{Fs, OpenMode};
+use kvik_tree::part::Part;
 use kvik_tree::read::newest_root;
 use kvik_tree::root::{Covered, Root};
-use kvik_tree::write::{DIR, part_name, root_name};
+use kvik_tree::set::{Policy, merge, next_root, plan};
+use kvik_tree::write::{DIR, Identity, Opening, TreeFiles, part_name, root_name};
 use proptest::prelude::*;
 
 use super::tests::{open, wait};
 use crate::durable::reader::DurableReader;
 use crate::durable::windows::nodes::NODES_USED;
-use crate::durable::{Writer, buckets_of};
+use crate::durable::{Writer, buckets_of, windows};
 use crate::env::{ManualClock, MemFs};
 use crate::read::{ChartData, Resolution};
 use crate::series::{IntervalLength, Kind, SeriesSpec, StateValues, Timing, ValueType};
@@ -217,6 +220,7 @@ fn resolutions() -> Vec<Resolution> {
         step(45),
         step(60),
         step(240),
+        step(1_440),
         step(7),
     ]
 }
@@ -224,16 +228,19 @@ fn resolutions() -> Vec<Resolution> {
 /// Charts of every series over `ranges` at every resolution, through the tree and from facts, compared; returns the
 /// stored nodes the tree reads used.
 fn assert_t7(rig: &Rig, ranges: &[(i64, i64)]) -> u64 {
-    let r = rig.reader();
+    assert_t7_on(&rig.reader(), rig, ranges)
+}
+
+fn assert_t7_on(r: &Arc<DurableReader>, rig: &Rig, ranges: &[(i64, i64)]) -> u64 {
     let ids: Vec<SeriesId> = rig.ids.iter().map(|(id, _)| *id).collect();
     let before = NODES_USED.with(std::cell::Cell::get);
     for &(a, b) in ranges {
         let range = TimeRange::new(Timestamp(a), Timestamp(b));
         for res in resolutions() {
             r.no_tree.store(true, std::sync::atomic::Ordering::Relaxed);
-            let want = buckets_of(&r, &ids, range, res);
+            let want = buckets_of(r, &ids, range, res);
             r.no_tree.store(false, std::sync::atomic::Ordering::Relaxed);
-            let got = buckets_of(&r, &ids, range, res);
+            let got = buckets_of(r, &ids, range, res);
             match (&got, &want) {
                 (Ok(g), Ok(w)) => {
                     for ((g, w), (_, shape)) in g.iter().zip(w).zip(&rig.ids) {
@@ -263,6 +270,7 @@ fn ranges(now: i64) -> Vec<(i64, i64)> {
         (now - 26 * HOUR + 7 * MIN + 3 * S, now - 2 * HOUR - 11 * S),
         (now - 3 * HOUR - 29 * MIN, now - 20 * MIN + S),
         (now - 72 * HOUR, now - 24 * HOUR),
+        (now - 10 * 24 * HOUR, now + 24 * HOUR),
         (now - 50 * MIN, now),
     ]
 }
@@ -385,6 +393,103 @@ fn a_reader_in_a_second_process_reads_the_tree_with_no_writer() {
     let before = NODES_USED.with(std::cell::Cell::get);
     assert_eq!(charts(&other), want);
     assert!(NODES_USED.with(std::cell::Cell::get) > before);
+}
+
+impl Rig {
+    /// Every series' node parameters, from the writer's registry.
+    fn node_params(&self) -> BTreeMap<u64, kvik_tree::Params> {
+        let d = crate::durable::lock(&self.w.decider);
+        self.ids
+            .iter()
+            .map(|(id, _)| {
+                let s = d.registry.get(id.0).unwrap();
+                (
+                    u64::from(id.0),
+                    crate::fold::node_params(&windows::params(&s.def)),
+                )
+            })
+            .collect()
+    }
+
+    /// Runs every merge the planner gives at `now`, roll-ups included, as the writer's merges publish them.
+    fn merge_all(&self, params: &BTreeMap<u64, kvik_tree::Params>, now: i64) -> usize {
+        let root = self.newest_root();
+        let id = Identity {
+            generation: root.header.generation,
+            reset: root.reset,
+            store_id: root.header.store_id,
+        };
+        let at = Opening {
+            mark: root.checkpoint,
+            fresh: false,
+            wall: now,
+            now: Duration::ZERO,
+        };
+        let (mut files, _) =
+            TreeFiles::start(Arc::new(self.fs.clone()), &self.dir, id, at, |_| false).unwrap();
+        let policy = Policy {
+            late_window: 0,
+            minute_keep: i64::MAX / 4,
+        };
+        let mut merged = 0;
+        for _ in 0..16 {
+            let Some(plan) = plan(files.root(), now, &policy).into_iter().next() else {
+                break;
+            };
+            let parts: Vec<Part> = files
+                .read_parts()
+                .into_iter()
+                .map(|(_, p)| p.unwrap())
+                .collect();
+            let root = files.root().clone();
+            let mut out = merge(&root, &parts, &plan, &root.header, |s| {
+                params.get(&s).copied()
+            })
+            .unwrap();
+            for p in &mut out {
+                p.header.file_id = files.take_file_id();
+            }
+            files
+                .publish(next_root(&root, &plan, &[], now), out, now, Duration::ZERO)
+                .unwrap();
+            merged += 1;
+        }
+        merged
+    }
+}
+
+#[test]
+fn a_second_process_reads_through_merges_and_roll_ups_and_equals_the_fact_path() {
+    let mut rig = Rig::new("merges");
+    let first: Vec<(i64, u8)> = (0..3_000i64)
+        .map(|k| (k * 71 * S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[(5 * HOUR, 1)], true);
+    rig.checkpoint();
+    let params = rig.node_params();
+    let now = rig.now();
+    rig.w.shutdown().unwrap();
+    let mut env = crate::env::Env::test(rig.clock.clone());
+    env.fs = Arc::new(rig.fs.clone());
+    env.background_timers = false;
+    let hour = Duration::from_secs(3_600);
+    let other = Arc::new(DurableReader::open(&rig.dir, &env, hour, hour).unwrap());
+    assert!(assert_t7_on(&other, &rig, &ranges(now)) > 0);
+    let before = rig.newest_root().parts.len();
+    assert!(rig.merge_all(&params, now + 30 * 24 * HOUR) > 0);
+    let root = rig.newest_root();
+    assert!(
+        root.parts.len() < before,
+        "{before} parts merged to {}",
+        root.parts.len()
+    );
+    assert!(
+        root.covered.iter().any(|c| c.level == 4),
+        "day roll-ups covered"
+    );
+    let used = assert_t7_on(&other, &rig, &ranges(now));
+    assert!(used > 0);
+    assert_eq!(other.tree_counts().damaged, 0);
 }
 
 proptest! {
