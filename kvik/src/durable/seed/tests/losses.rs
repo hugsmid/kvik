@@ -25,10 +25,12 @@ pub(super) fn without_identity(line: &str) -> String {
 
 /// Whether two starts report the same losses once identities are set aside, in any order.
 pub(super) fn alike_without_identity(whole: &[String], seeded: &[String]) -> bool {
-    whole
-        .iter()
-        .map(|l| without_identity(l))
-        .eq(seeded.iter().map(|l| without_identity(l)))
+    let strip = |ls: &[String]| {
+        let mut v: Vec<String> = ls.iter().map(|l| without_identity(l)).collect();
+        v.sort();
+        v
+    };
+    strip(whole) == strip(seeded)
 }
 
 #[cfg(test)]
