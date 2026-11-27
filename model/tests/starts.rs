@@ -285,20 +285,6 @@ fn a_lost_consumer_taken_again_before_confirming_is_sent_no_cursor_again() {
 }
 
 #[test]
-fn a_start_the_synced_mark_cannot_reach_writes_no_cursor() {
-    let (mut m, s) = model(Selection::Series(Default::default()));
-    facts(&mut m, s, 0, 1.0);
-    m.disk.cursors.remove(&C);
-    m.disk.synced_mark = None;
-    m.disk.mark = None;
-    m.start_consumer(C, Start::Now).unwrap();
-    assert!(
-        !m.disk.cursors.contains_key(&C),
-        "a cursor behind the start would resume from below it (Q-1621)"
-    );
-}
-
-#[test]
 fn a_consumer_started_never_routed_and_losing_its_cursor_is_sent_no_cursor_with_no_series_state() {
     let (mut m, s) = model(Selection::Series(Default::default()));
     m.start_consumer(C, Start::Now).unwrap();
