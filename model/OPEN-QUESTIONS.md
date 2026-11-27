@@ -221,7 +221,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2160 | §6 Gates, Resume; `format.md` A.15; Q-1392, Q-2084 | `set_by` of a reseeded instance after a restart: a flag in the checkpoint keeps it `None` (decided at review) |
 | Q-2161 | §6 Gates, Resume | The crash property's cases and checks (decided at review) |
 | Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
-| Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (decided at review, provisional; settle with cond2 step 6) |
+| Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (bounded at 12,288 `Each` instances a consumer, provisional) |
 | Q-2170 | §6 Gates, Resume; §4 Resync; Q-2082 | A reset point or a new generation in the judgement: a reseed entry; a replay reseeds where the reset point lies (decided by the builder, provisional) |
 | Q-2171 | §6 Gates, Resume; §8 | A new generation on the durable backend reseeds at the take, not at the generation's first position (decided by the builder, provisional) |
 | Q-2172 | §6 Gates; §4 Resync | A lost range recorded at run time, after the engine judged its facts (decided by the builder, provisional) |
@@ -5635,11 +5635,17 @@ bytes show, write a checkpoint on a confirmation at most once per `conditions.ch
 **Pinned by.** none: a measurement.
 
 ## Q-2163 — A checkpoint larger than a block once `Each` lands
-Decided at review of cond2 step 5, provisional.
+Decided at review of cond2 step 5; bound chosen by the builder with cond2 step 6, provisional.
 **Scenario.** `Each` allows 4,096 gates of up to 256 instances on one consumer; their checkpoint would pass the 16 MiB
 block limit. Today's limit, 4,096 single-series gates, stays under 3 MiB.
-**Decision (provisional).** Cond2 step 6 bounds the instances per consumer or splits the checkpoint across blocks.
-**Pinned by.** none yet.
+**Decision (provisional).** A consumer holds at most 12,288 `Each` instances across its gates (`MAX_EACH_INSTANCES`);
+a series that would pass it is refused and counted like one beyond a gate's 256 (Q-1143), and joins at the first
+definition entry that finds room, gates taken in id order. With 4,096 single-series gates that is 16,384 instances;
+at every field's widest (255-byte text values, 16 pending holds) an instance with its series takes about 1,009 bytes,
+so the largest checkpoint is about 16.5 MB, under the block. Splitting the checkpoint across blocks was the
+alternative; it changes the format and is not needed at this bound.
+**Pinned by.** `kvik/src/gates/each_tests.rs` (`the_largest_checkpoint_a_consumer_can_hold_fits_one_block`,
+`a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gate_frees_room`, core against `judge`).
 
 ## Q-2170 — A reset point or a new generation in the judgement
 Decided by the builder with cond2 step 6, provisional. Supersedes Q-2082.
@@ -5944,7 +5950,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2160 | cond2 review | Decided at review: a reseed flag in the instance's `set_by` |
 | Q-2161 | cond2 review | Decided at review: every case; two continuity checks; floors on checks reached |
 | Q-2162 | cond2 step 6 | Decided at review, provisional: keep the rule; measure bytes in the step 6 bench notes |
-| Q-2163 | cond2 step 6 | Decided at review, provisional: bound instances per consumer or split the checkpoint |
+| Q-2163 | cond2 step 6 | Provisional: at most 12,288 `Each` instances per consumer, refused and counted beyond |
 | Q-2170 | cond2 review | Decided by the builder, provisional: a reseed entry; the replay reseeds at the reset point |
 | Q-2171 | cond2 review | Decided by the builder, provisional: reseed at the take; the differentials hold no restore |
 | Q-2172 | cond2 review | Decided by the builder, provisional: the engine keeps what it judged; reseeded at the next replay across it |

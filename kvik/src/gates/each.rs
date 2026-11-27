@@ -4,7 +4,8 @@
 use std::collections::BTreeSet;
 
 use kvik_model::gate::{
-    Cause, ConditionId, MAX_INSTANCES, Selector, Transition, TransitionId, pattern_matches,
+    Cause, ConditionId, MAX_EACH_INSTANCES, MAX_INSTANCES, Selector, Transition, TransitionId,
+    pattern_matches,
 };
 use kvik_model::types::{Nanos, Position, SeriesId};
 
@@ -31,6 +32,7 @@ impl Core {
                 Selector::Series(_) => None,
             })
             .collect();
+        let mut total = self.each_instances();
         // One series changes, and each gate gives it at most one transition, in gate order: already in id order.
         for (id, p) in each {
             // Instances and refusals hold every series the pattern matches (the invariant `reconcile` keeps), so only
@@ -41,9 +43,25 @@ impl Core {
             } else {
                 wanted.remove(&series);
             }
-            self.reconcile(id, wanted.into_iter().collect(), at, now, history, out)?;
+            self.reconcile(
+                id,
+                wanted.into_iter().collect(),
+                &mut total,
+                at,
+                now,
+                history,
+                out,
+            )?;
         }
         Ok(())
+    }
+
+    /// Instances of every `Each` gate in force.
+    pub(super) fn each_instances(&self) -> usize {
+        self.instances
+            .keys()
+            .filter(|k| matches!(self.defs[&k.0].selector, Selector::Each(_)))
+            .count()
     }
 
     /// The series an `Each` gate has an instance on or refused.
@@ -56,12 +74,15 @@ impl Core {
     }
 
     /// Brings an `Each` gate's instances in line with `wanted` (in id order) at the entry at `at`: leaves end with a
-    /// transition to none, joins start with one from none, up to [`MAX_INSTANCES`]; the rest are refused, counted
-    /// once each time one starts to match while the gate is full (Q-1143).
+    /// transition to none, joins start with one from none, up to [`MAX_INSTANCES`] and `total` (the consumer's `Each`
+    /// instances, kept current) up to [`MAX_EACH_INSTANCES`]; the rest are refused, counted once each time one starts
+    /// to match while the gate or the consumer is full (Q-1143, Q-2163).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn reconcile(
         &mut self,
         id: ConditionId,
         wanted: Vec<SeriesId>,
+        total: &mut usize,
         at: Position,
         now: Nanos,
         history: &dyn History,
@@ -77,6 +98,7 @@ impl Core {
         let cause = Cause::Entry { position: at };
         for s in leaving {
             let i = self.drop_instance((id, s)).expect("an instance");
+            *total -= 1;
             out.push(Transition {
                 id: TransitionId {
                     at,
@@ -103,7 +125,7 @@ impl Core {
                 .take_while(|(k, _)| k.0 == id)
                 .count();
             let refused = self.refused.entry(id).or_default();
-            if count >= MAX_INSTANCES {
+            if count >= MAX_INSTANCES || *total >= MAX_EACH_INSTANCES {
                 if refused.insert(s) {
                     self.instances_refused += 1;
                 }
@@ -121,6 +143,7 @@ impl Core {
                 None
             };
             self.start(id, s, state, seeded, at, now, out);
+            *total += 1;
         }
         Ok(())
     }

@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Cause, ConditionId, Entry, Gate, GateError, GateState, Input, Kind, MAX_INSTANCES, Selector,
-    TimerKind, Transition, TransitionId, pattern_matches,
+    Cause, ConditionId, Entry, Gate, GateError, GateState, Input, Kind, MAX_EACH_INSTANCES,
+    MAX_INSTANCES, Selector, TimerKind, Transition, TransitionId, pattern_matches,
 };
 use crate::summary::{AggValue, Params};
 use crate::types::{DAY, Fact, Kind as SeriesKind, Nanos, Position, Quality, SeriesId, Value};
@@ -16,8 +16,8 @@ pub struct Judgement {
     pub transitions: Vec<Transition>,
     /// Each instance in force at the end: its state and the id of the transition that set it.
     pub states: BTreeMap<(ConditionId, SeriesId), (GateState, TransitionId)>,
-    /// Series an `Each` could not take beyond [`MAX_INSTANCES`], counted once each time one starts to
-    /// match while the gate is full (Q-1143).
+    /// Series an `Each` could not take beyond [`MAX_INSTANCES`] or [`MAX_EACH_INSTANCES`], counted once each time
+    /// one starts to match while the gate or the consumer is full (Q-1143, Q-2163).
     pub instances_refused: u64,
 }
 
@@ -307,11 +307,12 @@ impl Judge<'_> {
             });
         }
         for s in wanted {
+            let consumer_full = self.each_instances() >= MAX_EACH_INSTANCES;
             let w = self.gates.get_mut(&id).expect("watched");
             if w.instances.contains_key(&s) {
                 continue;
             }
-            if w.instances.len() >= MAX_INSTANCES {
+            if w.instances.len() >= MAX_INSTANCES || consumer_full {
                 if w.refused.insert(s) {
                     self.out.instances_refused += 1;
                 }
@@ -326,6 +327,15 @@ impl Judge<'_> {
                 .insert(s, instance);
             self.evaluate_start(id, s, now, at, cause.clone());
         }
+    }
+
+    /// Instances of every `Each` gate in force.
+    fn each_instances(&self) -> usize {
+        self.gates
+            .values()
+            .filter(|w| matches!(w.gate.selector, Selector::Each(_)))
+            .map(|w| w.instances.len())
+            .sum()
     }
 
     /// Every instance in force seeded again at the entry at `at`, `now`, as a start there with no transition: its

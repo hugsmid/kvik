@@ -27,7 +27,7 @@ pub enum Selector {
     /// One series, by id.
     Series(SeriesId),
     /// One instance per series a name pattern selects (spec §4 Funnel grammar), joining and leaving as
-    /// definitions commit; at most [`MAX_INSTANCES`] at a time (Q-1143).
+    /// definitions commit; at most [`MAX_INSTANCES`] at a time (Q-1143), and [`MAX_EACH_INSTANCES`] across a consumer.
     Each(String),
 }
 
@@ -134,6 +134,8 @@ pub const MAX_LEVELS: usize = 16;
 pub const MAX_MEMBERS: usize = 64;
 /// Most instances of one [`Selector::Each`] gate at a time.
 pub const MAX_INSTANCES: usize = 256;
+/// Most [`Selector::Each`] instances across one consumer's gates at a time, so its checkpoint fits a block (Q-2163).
+pub const MAX_EACH_INSTANCES: usize = 12_288;
 /// Longest hold, staleness limit, window width or cadence: ten years of 365 days.
 pub const MAX_DURATION: Nanos = 10 * 365 * crate::types::DAY;
 

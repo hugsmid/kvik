@@ -244,7 +244,8 @@ impl Core {
                 let wanted = history.matching(p, at)?;
                 self.defs.insert(id, gate.clone());
                 self.refused.insert(id, BTreeSet::new());
-                self.reconcile(id, wanted, at, now, history, out)?;
+                let mut total = self.each_instances();
+                self.reconcile(id, wanted, &mut total, at, now, history, out)?;
             }
         }
         Ok(())
