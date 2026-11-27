@@ -3,7 +3,8 @@
 //!
 //! The writer judges a new publish record's shape ([`publish_shape`]) and the state it would make ([`judge`]) and
 //! refuses a breach or an undecided state (Q-2121); a start judges the replayed state and, when a rule cannot be
-//! decided or fails, holds runs, merges, removals and releases instead of refusing the manifest.
+//! decided or fails, holds runs, merges, removals and releases instead of refusing the manifest. Rule 3 for a
+//! replacement and rule 5 are not built: replacements and releases come with later items.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -88,7 +89,7 @@ pub fn judge(c: &Catalogue) -> Judgement {
         unknown: BTreeSet::new(),
     };
     // Rule 4, shape of a file's inputs; rule 1, one run per segment.
-    let mut runs_of: BTreeMap<FileRef, BTreeSet<Option<u64>>> = BTreeMap::new();
+    let mut runs_of: BTreeMap<FileRef, BTreeSet<u64>> = BTreeMap::new();
     for e in compacted(c) {
         let d = &e.description;
         let logs = d
@@ -106,13 +107,15 @@ pub fn judge(c: &Catalogue) -> Judgement {
         if logs == 0 {
             continue;
         }
-        let run = s.layout(d.file_ref()).map(|l| l.run_id);
+        let Some(run) = c.layout(d.file_ref()).map(|l| l.run_id) else {
+            continue;
+        };
         for i in &d.inputs {
             runs_of.entry(*i).or_default().insert(run);
         }
     }
     for (seg, runs) in &runs_of {
-        if runs.iter().flatten().count() > 1 {
+        if runs.len() > 1 {
             return breach(1, *seg, "a log segment named by the files of two runs");
         }
     }
@@ -242,6 +245,8 @@ fn runs(s: &mut State<'_>) -> Result<(), Judgement> {
                 .push((d.file_ref(), l.clone(), d.inputs.clone()));
         }
     }
+    // Any file without a layout may be a missing file of any short run, so a short run is undecided rather than
+    // broken; either verdict holds compaction.
     let unlaid = s.c.files().any(|e| {
         e.description.kind == kind::COMPACTED && s.c.layout(e.description.file_ref()).is_none()
     });
