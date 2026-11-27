@@ -208,7 +208,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
 | Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (decided by the lead, provisional; settle with cond2 step 5) |
 | Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided by the lead, provisional; settle with cond2 step 5) |
-| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: the transitions that set the changed states, not a resync (decided by the lead, provisional) |
+| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: a resync, cause `Resume` (decided at review, provisional) |
 | Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
@@ -5465,16 +5465,20 @@ live one (one). Fine for the tests' logs; a store of 30 days needs the bounded r
 **Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`.
 
 ## Q-2002 — Gate state after an overflow catch-up
-Decided by the lead with cond2 step 4, provisional.
+Decided by the lead with cond2 step 4; replaced at its review, provisional.
 **Scenario.** Spec §6 Gates, Resume says the overflow catch-up's resync carries gate states, but §4 Overflow ends a
-catch-up with no resync: condition funnels re-attach by sending each changed state.
+catch-up with no resync: condition funnels re-attach by sending each changed state. The first decision re-sent, on
+re-attaching, the transition that set each changed state. That transition was judged before any snapshot the run
+still holds, so G5 cannot hold for it, and after a second take it came again unflagged though confirmed.
 **Decision (provisional).** Transitions judged while a consumer is behind wait in a buffer as large as its queue and
-are queued as the catch-up passes their positions, so a short catch-up loses none. A buffer that fills makes the
-gates quiet: judged, counted `transitions_not_delivered`, not queued. On re-attaching, before any live delivery, each
-instance whose state differs from the last it was sent receives the transition that set its present state (a real id
-from the judgement), in id order. No new resync cause.
+are queued as the catch-up passes their positions, so a short catch-up loses none and needs no resync. A buffer that
+fills makes the gates quiet: judged, counted `transitions_not_delivered`, not queued. Any resync queued while quiet
+ends it (its states are taken as it is handed out, Q-2003); a catch-up still quiet at its end issues one at the last
+position taken, as a resume does: cause `Resume`, funnel states included, so funnels re-attach by it (§4 Overflow, a
+resync counts as emitting the states it carries). No new resync cause.
 **Pinned by.** `kvik/tests/gates.rs`
-`a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_state_on_reattaching` (the model backend
+`a_gate_that_overflows_its_queue_counts_what_it_drops_and_ends_its_catch_up_with_a_resync_of_the_present_state` and
+`a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_take_while_quiet` (the model backend
 has no overflow: its transitions are computed when handed out).
 
 ## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
@@ -5718,7 +5722,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
 | Q-2000 | cond2 step 5 | Decided by the lead, provisional: gate cursor in memory; every start reseeds |
 | Q-2001 | cond2 step 5 | Decided by the lead, provisional: a log scan per read; the bounded read with replay |
-| Q-2002 | cond2 step 6 | Decided by the lead, provisional: buffered while behind; changed states re-sent on re-attaching |
+| Q-2002 | cond2 step 6 | Decided at review, provisional: buffered while behind; a quiet catch-up ends with a resync |
 | Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

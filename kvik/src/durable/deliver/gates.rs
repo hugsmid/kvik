@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use kvik_log::entries::{RouteOp, Routing};
 use kvik_log::writer::Position as LogPos;
-use kvik_model::gate::{ConditionId, GateState, Transition as MTransition, TransitionId};
+use kvik_model::gate::{ConditionId, Transition as MTransition, TransitionId};
 use kvik_model::types::{Nanos, SeriesId};
 
 use super::gate_history::{LogHistory, core_pos, log_pos};
@@ -40,12 +40,9 @@ pub(super) struct GateRun {
     confirmed: Option<GatePoint>,
     /// Judged while the consumer is behind; queued as its catch-up passes their positions, `true` if replayed.
     deferred: VecDeque<(MTransition, bool)>,
-    /// `deferred` was full: judging, queuing nothing, until the catch-up ends (design §4.3 Overflow).
+    /// `deferred` was full: judging, queuing nothing, until a resync carries the states (design §4.3 Overflow;
+    /// Q-2002).
     quiet: bool,
-    /// Per instance, the state last queued or carried by a resync.
-    emitted: BTreeMap<Key, GateState>,
-    /// Per instance, the transition that set its state now.
-    last: BTreeMap<Key, MTransition>,
     /// Instances a reseed set and nothing has moved since: their `set_by` is none (Q-1392).
     reseeded: BTreeMap<Key, TransitionId>,
     /// The highest id handed out: one at or below it comes again flagged `replayed`.
@@ -66,8 +63,6 @@ impl GateRun {
             confirmed: None,
             deferred: VecDeque::new(),
             quiet: false,
-            emitted: BTreeMap::new(),
-            last: BTreeMap::new(),
             reseeded: BTreeMap::new(),
             seen: None,
             names: BTreeMap::new(),
@@ -84,9 +79,7 @@ impl GateRun {
     }
 
     fn note(&mut self, t: &MTransition) {
-        let k = (t.id.condition, t.id.series);
-        self.reseeded.remove(&k);
-        self.last.insert(k, t.clone());
+        self.reseeded.remove(&(t.id.condition, t.id.series));
     }
 
     /// Each instance's state now as a resync carries it.
@@ -232,7 +225,6 @@ impl Deliverer {
             if let Some(h) = run.held.take() {
                 run.pre = Some(h);
             }
-            run.emitted.clear();
             return;
         }
         let in_force = self
@@ -371,8 +363,6 @@ impl Deliverer {
             Err(_) => {
                 self.stats.gate_errors += 1;
                 let mut fresh = self.reseeded(name, ctx).expect("a run");
-                fresh.emitted = run.emitted;
-                fresh.last = run.last;
                 fresh.seen = run.seen;
                 fresh.names.extend(run.names);
                 fresh.outstanding = run.outstanding;
@@ -441,41 +431,32 @@ impl Deliverer {
         }
     }
 
-    /// At the end of a catch-up: the rest of what was deferred, then, if it went quiet, for each instance whose
-    /// state differs from the last it was sent, the transition that set it (as condition funnels re-attach, `spec.md`
-    /// §4 Overflow; Q-2002).
-    pub(super) fn gate_reattach(&mut self, name: &str) {
+    /// At the end of a catch-up: the rest of what was deferred; whether it went quiet, so a resync must carry the
+    /// gate states (design §4.3 Overflow; Q-2002).
+    pub(super) fn gate_reattach(&mut self, name: &str) -> bool {
         self.gate_flush(name, None, false);
-        let Some(rt) = self.consumers.get_mut(name) else {
-            return;
-        };
-        let Some(run) = rt.gates.as_mut() else { return };
-        if !run.quiet {
-            return;
-        }
-        run.quiet = false;
-        let mut send: Vec<MTransition> = run
-            .core
-            .states()
-            .into_iter()
-            .filter(|(k, (state, _))| run.emitted.get(k) != Some(state))
-            .filter_map(|(k, _)| run.last.get(&k).cloned())
-            .collect();
-        send.sort_by_key(|t| t.id);
-        for t in send {
-            rt.queue.push_back(Pend::Transition {
-                t: Box::new(t.clone()),
-                replayed: false,
-            });
-            push_outstanding(rt.gates.as_mut().expect("looked at above"), t);
+        self.consumers
+            .get_mut(name)
+            .and_then(|rt| rt.gates.as_mut())
+            .is_some_and(|run| std::mem::take(&mut run.quiet))
+    }
+
+    /// A resync queued for `name`: it carries every gate state, so what a quiet run dropped is superseded.
+    pub(super) fn gate_resynced(&mut self, name: &str) {
+        if let Some(run) = self
+            .consumers
+            .get_mut(name)
+            .and_then(|rt| rt.gates.as_mut())
+        {
+            run.quiet = false;
         }
     }
 
     /// Each instance's state now for a resync of `name` at `position`, with the gate cursor its confirmation sets:
     /// the resync's place in delivery order, since every transition at or below its position is queued before it
-    /// and none above. The states count as sent.
+    /// and none above.
     pub(super) fn gate_resync(
-        &mut self,
+        &self,
         name: &str,
         position: LogPos,
     ) -> (Vec<GateInstanceState>, Option<Frontier>) {
@@ -487,14 +468,6 @@ impl Deliverer {
             at: core_pos(position),
             now: run.core.frontier().now,
         };
-        let rt = self.consumers.get_mut(name).expect("looked at above");
-        let run = rt.gates.as_mut().expect("looked at above");
-        run.emitted = run
-            .core
-            .states()
-            .into_iter()
-            .map(|(k, (s, _))| (k, s))
-            .collect();
         (states, Some(frontier))
     }
 
@@ -565,10 +538,6 @@ fn push_outstanding(run: &mut GateRun, t: MTransition) {
     debug_assert!(
         run.held.as_ref().is_none_or(|h| after(&t.id, h.frontier())),
         "G5: the held snapshot is after an outstanding transition"
-    );
-    run.emitted.insert(
-        (t.id.condition, t.id.series),
-        t.to.clone().unwrap_or(GateState::Unknown),
     );
     run.outstanding.push_back(t);
 }

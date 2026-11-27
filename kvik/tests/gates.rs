@@ -277,8 +277,8 @@ fn a_backward_clock_step_pauses_timers_until_the_clock_catches_up() {
 }
 
 #[test]
-fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_state_on_reattaching()
-{
+fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_ends_its_catch_up_with_a_resync_of_the_present_state()
+ {
     let clock = kvik::env::ManualClock::new(common::start());
     let mut limits = kvik::Limits::default();
     limits.consumer_queue = 2;
@@ -297,19 +297,29 @@ fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_st
         .unwrap();
     }
     let mut got = Vec::new();
+    let mut resyncs = Vec::new();
     while let Some(d) = c.try_next().unwrap() {
-        if let kvik::DeliveryKind::Transition(t) = &d.kind {
-            got.push(t.clone());
+        match &d.kind {
+            kvik::DeliveryKind::Transition(t) => got.push(t.clone()),
+            kvik::DeliveryKind::Resync(r) => {
+                resyncs.push((r.cause, got.len(), r.gates.clone()));
+            }
+            _ => {}
         }
         block_on(c.confirm(d.id)).unwrap();
     }
     assert!(s.stats().delivery.transitions_not_delivered > 0);
     assert!(got.windows(2).all(|w| w[0].id < w[1].id), "{got:#?}");
-    assert_eq!(
-        got.last().and_then(|t| t.to.clone()),
-        Some(kvik::GateState::Value(Value::F64(90.0)))
-    );
     assert!(got.len() < 11);
+    // Q-2002, Q-2091: after the transitions buffered before it went quiet.
+    let [(cause, after, gates)] = &resyncs[..] else {
+        panic!("{resyncs:#?}")
+    };
+    assert_eq!((*cause, *after), (kvik::ResyncCause::Resume, got.len()));
+    assert_eq!(
+        gates.iter().map(|g| g.state.clone()).collect::<Vec<_>>(),
+        [kvik::GateState::Value(Value::F64(90.0))]
+    );
     block_on(s.shutdown()).unwrap();
 }
 
