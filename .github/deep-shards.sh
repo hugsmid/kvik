@@ -64,6 +64,7 @@ kvik-differential-small kvik durable_differential small_windows_decide_
 kvik-loss-open  kvik  durable_losses_open
 kvik-provisional kvik provisional
 kvik-restore-plan kvik restore_plan_model
+kvik-saved-points kvik saved_points
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 chunk-file-properties chunk file_properties
@@ -92,6 +93,7 @@ kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
 kvik-latest     kvik  lib         durable::read::latest::
 kvik-live       kvik  lib         durable::read::live::differential::
 kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
+kvik-saved      kvik  lib         durable::saved::tests::s1_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
 '
 

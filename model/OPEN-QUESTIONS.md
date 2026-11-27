@@ -5203,6 +5203,40 @@ recommended default; built with roadmap 5.3 step 1:** every take before the conf
 again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`;
 `kvik/tests/consumers.rs`).
 
+## Q-1400 — Restore records in the saved-point check
+
+§7 Readers, Reset stamp and saved points. Scenario: a point of generation 1 checked in generation 2. The log does not
+yet expose restore records with their stamps, so the durable check (`kvik/src/durable/saved.rs`) has the restore case
+and never fills it. **Provisional default:** a point judged after a restore is `Unknown` by the ordinary rule (no kept
+entry carries the mark's stamp), which is safe; the restore records join the check with roadmap 8.3.
+
+## Q-1406 — `Tail` from a saved point
+
+`api.md` Live reads. Scenario: a live read opened at a saved point rather than at the cut of its `Opened`.
+**Provisional default:** moves to roadmap 9.0f, which builds the static-prefix-then-live mechanism for "from a time";
+5.3 supplies the check (`Reader::check`).
+
+## Q-1630 — A lost range at the tail and a consumer at the position before it
+
+§4 Resync. Scenario: a fact's batch, the last of the log, is damaged and the store restarts on the same boot; the
+lost range is a reset point whose id is the mark's last position. A consumer started then (now, or at a kept saved
+point) begins at the last kept position before the range. The model sends it the reset point, a resync whose
+`forget_above` is the consumer's own position; the durable backend's last position is below the range and it sends
+none (`kvik/tests/saved_points.rs`
+`a_lost_range_at_the_tail_gives_a_new_consumer_a_resync_with_nothing_to_forget_on_the_model_only`). Nothing above the
+consumer's position is affected either way. **Provisional default:** the two differ only by that resync; the history
+property ignores reset points with nothing to forget at the start; align with the run-time lost range of step 5.
+
+## Q-1631 — A power loss after a lost recovery entry
+
+§3 Recovery. Scenario: a power loss writes a recovery entry; the entry's batch is damaged and the store restarts on
+the same boot (the lost range takes the entry; the check answers `Unknown` on both backends, as row 7b); a fact and a
+consumer registration follow; a second power loss. The durable backend's last position is then one above the
+model's (`kvik/tests/saved_points.rs` `a_power_loss_after_a_lost_recovery_entry_keeps_the_model_s_last_position`,
+ignored while open). **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
+kept entry carries before deciding which is right; until then the history property stops restarting once an entry
+is lost.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5414,6 +5448,10 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1133 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
 | Q-1150 | 6.2 | Decided by the lead: series batches at seal (A.8a), one-series lookups from their own batches, read without the lookups' lock; the halves, gap, pair limit and reference size provisional; for review |
 | Q-1151 | 6.2 | For review: concurrent many-series reads; (a) as built until callers' reads arrive together |
+| Q-1400 | 8.3 | Provisional: restore records are not read by the check; a point judged after a restore is `Unknown` |
+| Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
+| Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
+| Q-1631 | 5.3 step 5 | Open: recovery after a lost recovery entry, then a power loss; the history property stops restarting once an entry is lost |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |

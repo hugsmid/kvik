@@ -104,6 +104,16 @@ pub enum ModelFault {
     PowerLoss,
     /// The named consumer's cursor file is missing or unreadable.
     LoseCursorFile(String),
+    /// From this open on the mark is synced only where the model must (Q-630), as on the durable backend with a long
+    /// `log.mark_sync` interval.
+    TimedMark,
+    /// From this open on a segment is sealed by `log.seal_interval` only, as on the durable backend with large
+    /// segments.
+    LongSegments,
+    /// The machine loses power and the last `n` batches of facts above the synced mark are found invalid.
+    PowerLossLosing(usize),
+    /// The batch holding this position, in the open segment below the mark, is damaged.
+    Damage(Position),
 }
 
 /// Queues a fault for the next open of the in-memory store of `dir`. False if no such store exists.
@@ -354,6 +364,25 @@ impl Slot {
                     if let Some(c) = self.consumers.get(&name) {
                         self.model.lose_cursor_file(c.id).map_err(convert::error)?;
                     }
+                }
+                ModelFault::TimedMark => self.model.config.mark_sync = km::engine::MarkSync::Timed,
+                ModelFault::LongSegments => self.model.config.seal_after_batches = usize::MAX,
+                ModelFault::PowerLossLosing(n) => {
+                    self.model.power_loss_losing(n);
+                }
+                ModelFault::Damage(p) => {
+                    let at = mpos(p);
+                    let batch = self.model.disk.active.and_then(|f| {
+                        self.model.disk.files[&f]
+                            .batches
+                            .iter()
+                            .position(|b| b.iter().any(|e| e.position == at))
+                    });
+                    let batch =
+                        batch.ok_or(Error::Internal("no batch holds the position".into()))?;
+                    self.model
+                        .corrupt_open_batch(batch)
+                        .map_err(convert::error)?;
                 }
             }
         }
@@ -1662,12 +1691,9 @@ impl Slot {
             .files
             .values()
             .rev()
-            .find_map(|f| {
-                f.batches
-                    .last()
-                    .and_then(|b| b.last())
-                    .map(|e| pos(e.position))
-            })
+            .find_map(|f| f.batches.iter().rev().find_map(|b| b.last()))
+            .map(|e| pos(e.position))
+            .max(self.model.disk.mark.map(|m| pos(m.last)))
             .unwrap_or(Position::ORIGIN)
     }
 
