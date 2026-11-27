@@ -1,9 +1,9 @@
 //! The dirty set (design 7.1b section 5 Commit path): the `(series, quarter-hour)` pairs whose nodes a checkpoint
 //! must bring up to its K, and the series whose nodes a registry entry changed.
 //!
-//! A call's pairs are marked before its facts are offered to the log, so every fact at or below a position the
-//! checkpoint takes as K after taking the set had its pair marked first. A pair stays while a call that marked it is
-//! unsettled or its last acknowledged position is above the K of the checkpoint that cleared it.
+//! A call's pairs are marked before its facts are offered to the log, and a checkpoint takes K first and the set
+//! after (Q-1830), so the set it takes holds the pair of every fact at or below K. A pair stays while a call that
+//! marked it is unsettled or its last acknowledged position is above the K of the checkpoint that cleared it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;

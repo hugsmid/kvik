@@ -56,5 +56,10 @@ loom = "0.7.2"
 name = "read"
 harness = false
 
+# Ingest latency through `emit` (Q-2184): `cargo bench -p kvik --bench emit`.
+[[bench]]
+name = "emit"
+harness = false
+
 [lints]
 workspace = true
