@@ -705,7 +705,9 @@ mod tests {
         let pending = log.submit(vec![alias(2)]).unwrap();
         clock.hold(false);
         pending.wait().unwrap();
-        let committed = log.shutdown_then(|w| w.last_commit_time).unwrap();
+        let committed = log
+            .shutdown_then(|w| w.commit_clock().floor(i64::MIN).0)
+            .unwrap();
         assert_eq!(committed, 157);
     }
 }

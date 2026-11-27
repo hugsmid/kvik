@@ -92,6 +92,11 @@ impl Core {
         self.frontier
     }
 
+    /// Whether a fact of `series` can change anything but the frontier.
+    pub fn reads(&self, series: SeriesId) -> bool {
+        self.series.contains_key(&series)
+    }
+
     /// Each instance's state and the transition that set it.
     pub fn states(&self) -> BTreeMap<(ConditionId, SeriesId), (GateState, TransitionId)> {
         self.instances

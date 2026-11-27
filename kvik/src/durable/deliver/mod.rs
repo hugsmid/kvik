@@ -334,6 +334,12 @@ pub(crate) struct Deliverer {
     /// A floor the tests set in place of the commit clock's.
     #[cfg(test)]
     floor_hold: Option<(i64, LogPos)>,
+    /// The position whose gate call the tests make fail.
+    #[cfg(test)]
+    gate_fail_at: Option<LogPos>,
+    /// Gate history reads from the log.
+    #[cfg(test)]
+    gate_reads: Cell<u64>,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
     resets: BTreeMap<LogPos, LogPos>,
     /// Per consumer named in a recovery entry (field 47: its cursor file was missing or unreadable), the lowest
@@ -480,6 +486,10 @@ impl Deliverer {
             gate_config: gate_resume::GateConfig::default(),
             #[cfg(test)]
             floor_hold: None,
+            #[cfg(test)]
+            gate_fail_at: None,
+            #[cfg(test)]
+            gate_reads: Cell::new(0),
             resets: BTreeMap::new(),
             lost: BTreeMap::new(),
             consumers: BTreeMap::new(),

@@ -592,7 +592,6 @@ pub struct LogWriter {
     requested: bool,
     next_file_id: u64,
     last_sequence: u64,
-    last_commit_time: i64,
     /// Shared with the deliverer's floor (spec §6 Gates, Clock).
     commit_clock: Arc<CommitClock>,
     max_series_id: u32,
@@ -732,7 +731,6 @@ impl LogWriter {
             requested: false,
             next_file_id: r.next_file_id,
             last_sequence: r.last_sequence,
-            last_commit_time: r.last_commit_time,
             commit_clock: Arc::new(CommitClock::new(
                 r.last_commit_time,
                 Position {
@@ -1356,9 +1354,7 @@ impl LogWriter {
         };
         let mut content = BatchContent {
             first_sequence: first.sequence,
-            received_at: self
-                .commit_clock
-                .begin(wall.max(self.last_commit_time), first),
+            received_at: self.commit_clock.begin(wall, first),
             items,
         };
         let done = self.commit_content(&mut calls, counts, &mut content, now, back);
@@ -1509,7 +1505,6 @@ impl LogWriter {
             self.roll_to(n);
         }
         self.last_sequence = last;
-        self.last_commit_time = commit_time;
         self.stats.bytes += bytes.len() as u64;
         self.stats.batches += 1;
         self.stats.max_series_id = self.max_series_id;

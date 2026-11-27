@@ -215,6 +215,14 @@ impl Deliverer {
         let commit = b.content.received_at;
         // Each item's call fires the timers due by `commit` first (Q-1144); they queue by position.
         let mut gating = !self.loading && self.gating();
+        if gating {
+            self.gate_batch();
+        }
+        let mut gate_names = if gating {
+            self.gate_names()
+        } else {
+            Vec::new()
+        };
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();
         // The consumers with more to take after the batch; an entry may change what any of them takes.
@@ -316,14 +324,19 @@ impl Deliverer {
                 }
             }
             match (core_fact, &gate_route) {
-                (Some(f), _) => {
-                    self.gate_item(p, commit, &gates::Feed::Fact(f, fact_outranked), ctx)
-                }
+                (Some(f), _) => self.gate_item(
+                    p,
+                    commit,
+                    &gates::Feed::Fact(f, fact_outranked),
+                    &mut gate_names,
+                ),
                 (None, Some(r)) => {
-                    self.gate_item(p, commit, &gates::Feed::Routing(r), ctx);
+                    self.gate_item(p, commit, &gates::Feed::Routing(r), &mut gate_names);
                     gating = self.gating();
                 }
-                (None, None) if gating => self.gate_item(p, commit, &gates::Feed::Other, ctx),
+                (None, None) if gating => {
+                    self.gate_item(p, commit, &gates::Feed::Other, &mut gate_names)
+                }
                 _ => {}
             }
         }

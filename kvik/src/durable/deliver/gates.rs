@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use kvik_log::entries::{RouteOp, Routing};
 use kvik_log::writer::Position as LogPos;
-use kvik_model::gate::{ConditionId, GateState, Transition as MTransition, TransitionId};
+use kvik_model::gate::{ConditionId, Transition as MTransition, TransitionId};
 use kvik_model::types::{Nanos, SeriesId};
 
 use super::gate_history::{LogHistory, core_pos, log_pos};
@@ -41,15 +41,12 @@ pub(super) struct GateRun {
     pub(super) confirmed: Option<GatePoint>,
     /// Judged while the consumer is behind; queued as its catch-up passes their positions, `true` if replayed.
     pub(super) deferred: VecDeque<(MTransition, bool)>,
-    /// `deferred` was full: judging, queuing nothing, until the catch-up ends (design §4.3 Overflow).
+    /// `deferred` was full: judging, queuing nothing, until a resync carries the states (design §4.3 Overflow;
+    /// Q-2002).
     quiet: bool,
     /// The highest transition dropped while quiet and not yet covered by the gate cursor: the checkpoint stays before
-    /// it (Q-1396).
+    /// it until the resync ending the catch-up is confirmed (Q-1396, Q-2270).
     dropped: Option<TransitionId>,
-    /// Per instance, the state last queued or carried by a resync.
-    emitted: BTreeMap<Key, GateState>,
-    /// Per instance, the transition that set its state now.
-    pub(super) last: BTreeMap<Key, MTransition>,
     /// The id each reseeded instance was set by: while its `set_by` is still that id it reports none (Q-1392), and
     /// a checkpoint flags it (Q-2160). Never pruned: a reseed id names the frontier it started at, so no later
     /// transition has it, and the held snapshot may be older than the core.
@@ -75,8 +72,6 @@ impl GateRun {
             deferred: VecDeque::new(),
             quiet: false,
             dropped: None,
-            emitted: BTreeMap::new(),
-            last: BTreeMap::new(),
             reseeded: BTreeMap::new(),
             seen: None,
             restart: None,
@@ -110,10 +105,6 @@ impl GateRun {
     /// Whether `id` comes again flagged `replayed`: handed out before, or replayed at this run's first take.
     pub(super) fn again(&self, id: &TransitionId) -> bool {
         self.seen.is_some_and(|s| *id <= s) || self.restart.is_some_and(|f| !after(id, f))
-    }
-
-    fn note(&mut self, t: &MTransition) {
-        self.last.insert((t.id.condition, t.id.series), t.clone());
     }
 
     /// Each instance's state now as a resync carries it.
@@ -171,7 +162,8 @@ pub(super) enum Feed<'a> {
 impl Deliverer {
     /// The floor live gate timers fire under (Q-1393, provisional: the commit clock; spec §6 Gates, Clock): an
     /// instant no later batch commits below, with the position every batch committing below it is at or below.
-    /// The monotonic alternative replaces this function alone.
+    /// The monotonic alternative replaces this function and clamps `commit` in [`Deliverer::gate_item`] to the
+    /// floor given, since no batch may commit below a core's `now` (G3).
     pub(super) fn floor(&self, ctx: &Ctx<'_>) -> Option<(Nanos, LogPos)> {
         #[cfg(test)]
         if let Some(f) = self.floor_hold {
@@ -186,8 +178,30 @@ impl Deliverer {
         self.floor_hold = f;
     }
 
-    pub(super) fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
-        LogHistory { d: self, ctx }
+    /// Makes the gate call for the item at `p` fail, as a failed history read does (Q-1881).
+    #[cfg(test)]
+    pub(crate) fn fail_gate_at(&mut self, p: Option<LogPos>) {
+        self.gate_fail_at = p;
+    }
+
+    /// Gate history reads from the log so far.
+    #[cfg(test)]
+    pub(crate) fn gate_reads(&self) -> u64 {
+        self.gate_reads.get()
+    }
+
+    pub(super) fn history(&self) -> LogHistory<'_> {
+        LogHistory::new(self)
+    }
+
+    /// The instant a reseed at a take starts at: the floor, not the head's commit time, so a hold that completed by
+    /// now is in the state, not a transition (spec §6 Gates, Resume: beyond replay the resync alone is sent; Q-2087).
+    /// G3 allows it once the head is at the floor's position.
+    pub(super) fn take_commit(&self, ctx: &Ctx<'_>) -> Nanos {
+        match self.floor(ctx) {
+            Some((f, p)) if self.head >= p => f.max(self.last_commit_time),
+            _ => self.last_commit_time,
+        }
     }
 
     /// The gates in force for `name`, as the core judges them.
@@ -204,19 +218,12 @@ impl Deliverer {
             .unwrap_or_default()
     }
 
-    /// A core for `name` with its gates in force started at the head by the seed rule (cond2 design §3.3, reseed).
-    pub(super) fn reseeded(&mut self, name: &str, ctx: &Ctx<'_>) -> Option<GateRun> {
+    /// A core for `name` with its gates in force started at `at`, committed at `commit`, by the seed rule (cond2
+    /// design §3.3, reseed).
+    pub(super) fn reseeded(&mut self, name: &str, at: LogPos, commit: Nanos) -> Option<GateRun> {
         let gates = self.gates_in_force(name);
         let mut core = Core::new();
-        let at = core_pos(self.head);
-        // At the floor, not the head's commit time: a hold that completed by now is in the state, not a transition
-        // (spec §6 Gates, Resume: beyond replay the resync alone is sent). G3 allows it once the head is at the
-        // floor's position.
-        let now = match self.floor(ctx) {
-            Some((f, p)) if self.head >= p => f.max(self.last_commit_time),
-            _ => self.last_commit_time,
-        };
-        let r = core.reseed(&gates, at, now, &self.history(ctx));
+        let r = core.reseed(&gates, core_pos(at), commit, &self.history());
         if r.is_err() {
             self.stats.gate_errors += 1;
             core = Core::new();
@@ -261,7 +268,6 @@ impl Deliverer {
                 .collect();
             back.extend(run.deferred.drain(..));
             run.deferred = back;
-            run.emitted.clear();
             return;
         }
         let in_force = self
@@ -282,9 +288,15 @@ impl Deliverer {
         }
     }
 
-    /// One item of a batch committed at `commit`, at `p`, for every consumer judging gates; a consumer's first
-    /// watch starts its run.
-    pub(super) fn gate_item(&mut self, p: LogPos, commit: Nanos, feed: &Feed<'_>, ctx: &Ctx<'_>) {
+    /// One item of a batch committed at `commit`, at `p`, for every consumer judging gates (`names`, kept by the
+    /// caller for the batch and renewed here at a routing entry); a consumer's first watch starts its run.
+    pub(super) fn gate_item(
+        &mut self,
+        p: LogPos,
+        commit: Nanos,
+        feed: &Feed<'_>,
+        names: &mut Vec<String>,
+    ) {
         if let Feed::Routing(r) = feed
             && r.op == RouteOp::Watch
             && self
@@ -297,8 +309,7 @@ impl Deliverer {
                 at: core_pos(super::before(p)),
                 now: commit,
             });
-            let core =
-                Core::restore(empty, BTreeMap::new(), &self.history(ctx)).unwrap_or_default();
+            let core = Core::restore(empty, BTreeMap::new(), &self.history()).unwrap_or_default();
             let rt = self
                 .consumers
                 .get_mut(&r.consumer)
@@ -317,14 +328,22 @@ impl Deliverer {
         {
             run.names.insert(g.id, spec.name.clone());
         }
-        let names = self.gate_names();
-        for name in names {
+        if let Feed::Routing(_) = feed {
+            *names = self.gate_names();
+        }
+        for name in names.iter() {
+            let reads = |s| {
+                self.consumers
+                    .get(name)
+                    .and_then(|rt| rt.gates.as_ref())
+                    .is_some_and(|run| run.core.reads(s))
+            };
             let body = match feed {
-                Feed::Fact(f, outranked) => Body::Fact {
+                Feed::Fact(f, outranked) if reads(f.series) => Body::Fact {
                     fact: f.clone(),
                     outranked: *outranked,
                 },
-                Feed::Routing(r) if r.consumer == name => match (r.op, &r.gate) {
+                Feed::Routing(r) if r.consumer == *name => match (r.op, &r.gate) {
                     (RouteOp::Watch, Some(g)) => match &g.spec {
                         Some(spec) => Body::Watch {
                             id: ConditionId(g.id),
@@ -343,14 +362,36 @@ impl Deliverer {
                 position: core_pos(p),
                 body,
             };
-            self.gate_call(&name, ctx, |core, h| {
+            #[cfg(test)]
+            let fail = self.gate_fail_at == Some(p);
+            self.gate_call(name, (p, commit), |core, h| {
+                #[cfg(test)]
+                if fail {
+                    return Err(crate::gates::CoreError::Id(ConditionId(u32::MAX)));
+                }
                 core.apply_batch(commit, std::slice::from_ref(&item), h)
             });
         }
     }
 
+    /// Before a batch's items: each run with nothing unconfirmed takes `pre` afresh, so the snapshot held for its
+    /// next transition is at most a batch behind its judgement (design §4.3; a replay from it stays short, step 5).
+    pub(super) fn gate_batch(&mut self) {
+        for rt in self.consumers.values_mut().filter(|rt| rt.attached) {
+            if let Some(run) = rt.gates.as_mut()
+                && run.held.is_none()
+            {
+                run.pre = Some(run.core.snapshot());
+            }
+        }
+    }
+
     /// The commit floor: once every batch assigned below it has been taken, timers due by it fire.
     pub(super) fn gate_timers(&mut self, ctx: &Ctx<'_>) {
+        // The floor raises the commit clock: on a store with no gate, commit times stay as without gates (§2).
+        if !self.gating() {
+            return;
+        }
         let Some((f, p)) = self.floor(ctx) else {
             return;
         };
@@ -360,7 +401,8 @@ impl Deliverer {
         self.gate_floor = Some(f);
         let names = self.gate_names();
         for name in names {
-            self.gate_call(&name, ctx, |core, _| Ok(core.advance(f)));
+            let at = (self.head, self.last_commit_time);
+            self.gate_call(&name, at, |core, _| Ok(core.advance(f)));
         }
     }
 
@@ -383,7 +425,7 @@ impl Deliverer {
             .any(|rt| rt.attached && rt.gates.is_some())
     }
 
-    fn gate_names(&self) -> Vec<String> {
+    pub(super) fn gate_names(&self) -> Vec<String> {
         self.consumers
             .iter()
             .filter(|(_, rt)| rt.attached && rt.gates.is_some())
@@ -391,12 +433,13 @@ impl Deliverer {
             .collect()
     }
 
-    /// Runs one core call for `name` and queues what it emits. A failed call rebuilds the core by a reseed at the
-    /// head (Q-1881): what it would have emitted is lost, counted.
+    /// Runs one core call for `name` on the item at `at.0` (committed at `at.1`), or the head for a timer, and
+    /// queues what it emits. A failed call rebuilds the core by a reseed there (Q-1881): what it would have emitted
+    /// is lost, counted; the item's deliveries are already queued, so the catch-up starts after it.
     fn gate_call(
         &mut self,
         name: &str,
-        ctx: &Ctx<'_>,
+        at: (LogPos, Nanos),
         f: impl FnOnce(
             &mut Core,
             &dyn crate::gates::History,
@@ -406,7 +449,7 @@ impl Deliverer {
             return;
         };
         run.ready();
-        let r = f(&mut run.core, &self.history(ctx));
+        let r = f(&mut run.core, &self.history());
         match r {
             Ok(ts) => {
                 if let Some(rt) = self.consumers.get_mut(name) {
@@ -418,9 +461,7 @@ impl Deliverer {
             }
             Err(_) => {
                 self.stats.gate_errors += 1;
-                let mut fresh = self.reseeded(name, ctx).expect("a run");
-                fresh.emitted = run.emitted;
-                fresh.last = run.last;
+                let mut fresh = self.reseeded(name, at.0, at.1).expect("a run");
                 fresh.seen = run.seen;
                 fresh.names.extend(run.names);
                 fresh.outstanding = run.outstanding;
@@ -433,7 +474,7 @@ impl Deliverer {
                 fresh.failed = true;
                 if let Some(rt) = self.consumers.get_mut(name) {
                     rt.gates = Some(fresh);
-                    rt.behind.get_or_insert(next(self.head));
+                    rt.behind.get_or_insert(next(at.0));
                 }
             }
         }
@@ -447,7 +488,6 @@ impl Deliverer {
         };
         let Some(run) = rt.gates.as_mut() else { return };
         run.hold();
-        run.note(&t);
         if run.quiet {
             run.dropped = run.dropped.max(Some(t.id));
             self.stats.transitions_not_delivered += 1;
@@ -460,6 +500,7 @@ impl Deliverer {
         if rt.behind.is_some() || rt.dormant {
             if run.deferred.len() >= capacity {
                 run.quiet = true;
+                run.dropped = run.dropped.max(Some(t.id));
                 self.stats.transitions_not_delivered += 1;
             } else {
                 run.deferred.push_back((t, false));
@@ -493,41 +534,32 @@ impl Deliverer {
         }
     }
 
-    /// At the end of a catch-up: the rest of what was deferred, then, if it went quiet, for each instance whose
-    /// state differs from the last it was sent, the transition that set it (as condition funnels re-attach, `spec.md`
-    /// §4 Overflow; Q-2002).
-    pub(super) fn gate_reattach(&mut self, name: &str) {
+    /// At the end of a catch-up: the rest of what was deferred; whether it went quiet, so a resync must carry the
+    /// gate states (design §4.3 Overflow; Q-2002).
+    pub(super) fn gate_reattach(&mut self, name: &str) -> bool {
         self.gate_flush(name, None, false);
-        let Some(rt) = self.consumers.get_mut(name) else {
-            return;
-        };
-        let Some(run) = rt.gates.as_mut() else { return };
-        if !run.quiet {
-            return;
-        }
-        run.quiet = false;
-        let mut send: Vec<MTransition> = run
-            .core
-            .states()
-            .into_iter()
-            .filter(|(k, (state, _))| run.emitted.get(k) != Some(state))
-            .filter_map(|(k, _)| run.last.get(&k).cloned())
-            .collect();
-        send.sort_by_key(|t| t.id);
-        for t in send {
-            rt.queue.push_back(Pend::Transition {
-                t: Box::new(t.clone()),
-                replayed: false,
-            });
-            push_outstanding(rt.gates.as_mut().expect("looked at above"), t);
+        self.consumers
+            .get_mut(name)
+            .and_then(|rt| rt.gates.as_mut())
+            .is_some_and(|run| std::mem::take(&mut run.quiet))
+    }
+
+    /// A resync queued for `name`: it carries every gate state, so what a quiet run dropped is superseded.
+    pub(super) fn gate_resynced(&mut self, name: &str) {
+        if let Some(run) = self
+            .consumers
+            .get_mut(name)
+            .and_then(|rt| rt.gates.as_mut())
+        {
+            run.quiet = false;
         }
     }
 
     /// Each instance's state now for a resync of `name` at `position`, with the gate cursor its confirmation sets:
     /// the resync's place in delivery order, since every transition at or below its position is queued before it
-    /// and none above. The states count as sent.
+    /// and none above.
     pub(super) fn gate_resync(
-        &mut self,
+        &self,
         name: &str,
         position: LogPos,
     ) -> (Vec<GateInstanceState>, Option<Frontier>) {
@@ -539,14 +571,6 @@ impl Deliverer {
             at: core_pos(position),
             now: run.core.frontier().now,
         };
-        let rt = self.consumers.get_mut(name).expect("looked at above");
-        let run = rt.gates.as_mut().expect("looked at above");
-        run.emitted = run
-            .core
-            .states()
-            .into_iter()
-            .map(|(k, (s, _))| (k, s))
-            .collect();
         (states, Some(frontier))
     }
 
@@ -626,10 +650,6 @@ fn push_outstanding(run: &mut GateRun, t: MTransition) {
     debug_assert!(
         run.held.as_ref().is_none_or(|h| after(&t.id, h.frontier())),
         "G5: the held snapshot is after an outstanding transition"
-    );
-    run.emitted.insert(
-        (t.id.condition, t.id.series),
-        t.to.clone().unwrap_or(GateState::Unknown),
     );
     run.outstanding.push_back(t);
 }

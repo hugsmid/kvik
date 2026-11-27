@@ -98,6 +98,8 @@ impl Deliverer {
             unchecked,
         });
         self.unchecked += u64::from(unchecked);
+        self.gate_resynced(name);
+        let rt = self.consumers.get_mut(name).expect("looked up above");
         rt.evaluated = runners.keys().map(|id| (*id, ctx.now)).collect();
         rt.runners = runners;
         rt.emitted = emitted;
@@ -240,7 +242,10 @@ impl Deliverer {
             }
             rt.behind = None;
             rt.view = None;
-            self.gate_reattach(name);
+            if self.gate_reattach(name) {
+                let at = self.head;
+                self.issue_resync(name, ResyncCause::Resume, None, at, false, ctx);
+            }
             self.reattach(name);
             return;
         }
