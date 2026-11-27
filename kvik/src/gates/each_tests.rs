@@ -72,6 +72,63 @@ fn a_full_each_refuses_and_counts_a_series_and_takes_it_when_another_leaves() {
 }
 
 #[test]
+fn an_each_over_thousands_of_matches_refuses_all_beyond_its_limit_as_judge_does() {
+    let mut log = Log::default();
+    let n = 5_000;
+    for i in 1..=n {
+        log.define(0, SeriesId(i), &[&room(i)]);
+    }
+    log.watch(SECOND, ConditionId(1), each(&[Level::at(10.0)]));
+    log.define(2 * SECOND, SeriesId(1), &["hall/1/temp"]);
+    let until = 10 * SECOND;
+    let model = judge(&log.entries, until).unwrap();
+    let (got, mut core) = run(&log, &one_batch_each(), until);
+    assert_eq!(got, model.transitions);
+    assert_eq!(core.states(), model.states);
+    assert_eq!(core.instances.len(), MAX_INSTANCES);
+    assert_eq!(model.instances_refused, u64::from(n) - MAX_INSTANCES as u64);
+    assert_eq!(core.take_refused(), model.instances_refused);
+}
+
+#[test]
+fn a_restored_full_each_still_refuses_its_series_and_takes_one_when_another_leaves() {
+    let mut log = Log::default();
+    let n = u32::try_from(MAX_INSTANCES).unwrap() + 1;
+    for i in 1..=n {
+        log.define(0, SeriesId(i), &[&room(i)]);
+    }
+    log.watch(SECOND, ConditionId(1), each(&[Level::at(10.0)]));
+    log.fact(
+        SeriesId(n),
+        2 * SECOND,
+        2 * SECOND,
+        Value::Num(12.0),
+        Quality::Good,
+    );
+    log.define(3 * SECOND, SeriesId(1), &["hall/1/temp"]);
+    let drive = Drive {
+        cuts: vec![true],
+        floors: vec![0],
+        restores: vec![true],
+    };
+    let until = 10 * SECOND;
+    let (got, mut core) = run(&log, &drive, until);
+    let model = judge(&log.entries, until).unwrap();
+    assert_eq!(got, model.transitions);
+    assert_eq!(core.states(), model.states);
+    let joined = got.iter().find(|t| t.id.series == SeriesId(n)).unwrap();
+    assert_eq!(
+        (joined.from.clone(), joined.to.clone()),
+        (None, Some(GateState::Level(1)))
+    );
+    assert_eq!(
+        core.take_refused(),
+        0,
+        "the refusal was counted before the restore"
+    );
+}
+
+#[test]
 fn a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gate_frees_room() {
     let mut log = Log::default();
     let per = u32::try_from(MAX_INSTANCES).unwrap();

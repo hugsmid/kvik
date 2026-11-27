@@ -205,3 +205,90 @@ fn a_reset_point_after_the_checkpoint_reseeds_where_it_lies_after_replaying_up_t
     assert_eq!(s.stats().delivery.gates_reseeded, 1);
     block_on(s.shutdown()).unwrap();
 }
+
+/// Damages the eight bytes of `v` in every log segment that holds them.
+fn damage_value(w: &World, v: f64) {
+    let bytes = v.to_bits().to_le_bytes();
+    let held: Vec<_> =
+        w.fs.paths()
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "open" || e == "kvl"))
+            .filter_map(|p| w.fs.read(&p).map(|b| (p, b)))
+            .filter(|(_, b)| b.windows(8).any(|x| x == bytes))
+            .collect();
+    assert!(!held.is_empty());
+    for (p, b) in held {
+        let at = b.windows(8).position(|x| x == bytes).unwrap();
+        w.fs.poke(&p, at, &[b[at] ^ 0xFF]);
+    }
+}
+
+/// The replayed transitions as `(from, to)` and the resync's gate states with whether `set_by` is none.
+type Replayed = (
+    Vec<(Option<GateState>, Option<GateState>)>,
+    Vec<(GateState, bool)>,
+);
+
+/// A hold-up gate checkpointed at 80, then 81 six seconds later, a lost range a second after it and 82 a second
+/// later still; restarted after the damage. Returns the replayed transitions and the resync's gate states.
+fn replay_across_a_lost_range(name: &str, hold_up: Duration) -> Replayed {
+    let mut w = World::quiet(name);
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let other = block_on(s.define_series(gauge("hall/air/other"))).unwrap();
+    let mut c = take(&s);
+    let gate = Gate::levels(Input::value(id), [Level::above(70.0).hold_up(hold_up)]);
+    block_on(c.watch("humidity", gate)).unwrap();
+    emit(&w, &s, id, 80.0);
+    let got = ready(&mut c);
+    confirm_all(&mut c, &got);
+    w.clock.advance(Duration::from_secs(6));
+    emit(&w, &s, id, 81.0);
+    w.clock.advance(Duration::from_secs(1));
+    emit(&w, &s, other, 1_234.5);
+    w.clock.advance(Duration::from_secs(1));
+    emit(&w, &s, id, 82.0);
+    ready(&mut c);
+    w.crash(s, vec![c], false);
+    damage_value(&w, 1_234.5);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    let moved = moves(&got).into_iter().map(|m| (m.1, m.2)).collect();
+    let r = got
+        .iter()
+        .rev()
+        .find_map(common::world::resync)
+        .expect("a resync");
+    let states = r
+        .gates
+        .iter()
+        .map(|g| (g.state.clone(), g.set_by.is_none()))
+        .collect();
+    assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    block_on(s.shutdown()).unwrap();
+    (moved, states)
+}
+
+/// Q-2172: a lost range after the checkpoint with no recovery entry is a reset point at its last position, met
+/// during the replay: the gate is reseeded there, `set_by` none, and the transition before it is replayed.
+#[test]
+fn a_lost_range_after_the_checkpoint_reseeds_the_gate_there_with_set_by_none() {
+    let (moved, states) = replay_across_a_lost_range("gates-lost-reset", Duration::from_secs(5));
+    assert_eq!(
+        moved,
+        [(Some(GateState::Level(0)), Some(GateState::Level(1)))]
+    );
+    assert_eq!(states, [(GateState::Level(1), true)]);
+}
+
+/// Q-2172: the reset is judged at the commit time of the entry before it, not at the lost batch's own time: a hold
+/// that ends between the two is still running at the reset and `set_by` names its timer transition.
+#[test]
+fn a_lost_range_reset_is_judged_at_the_commit_time_before_it_so_a_hold_ending_after_it_still_fires()
+{
+    let (moved, states) =
+        replay_across_a_lost_range("gates-lost-reset-time", Duration::from_millis(6500));
+    assert!(moved.is_empty());
+    assert_eq!(states, [(GateState::Level(1), false)]);
+}
