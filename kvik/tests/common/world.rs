@@ -25,6 +25,8 @@ pub struct World {
     pub mark_sync: MarkSync,
     /// `limits.window_memory`, if not the default.
     pub window_memory: Option<u64>,
+    /// `conditions.*`, if not the default.
+    pub conditions: Option<kvik::ConditionsConfig>,
 }
 
 impl World {
@@ -38,6 +40,7 @@ impl World {
             background_timers: true,
             mark_sync: LogConfig::default().mark_sync,
             window_memory: None,
+            conditions: None,
         }
     }
 
@@ -63,6 +66,9 @@ impl World {
             .log(log);
         if let Some(m) = self.window_memory {
             config.limits.window_memory = m;
+        }
+        if let Some(c) = self.conditions {
+            config = config.conditions(c);
         }
         config
     }

@@ -40,6 +40,8 @@ provisional     model provisional
 gates           model gates
 gate-properties model gate_properties
 gate-edges      model gate_edges
+gate-seed       model gate_seed
+gate-reset      model gate_reset
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
@@ -56,8 +58,11 @@ log-pacing      log   pacing
 log-directories log   directories
 log-scan-differential log scan_differential
 log-body-check  log   body_check
+log-cursor-checkpoint log cursor_checkpoint
 kvik-windows    kvik  windows
-kvik-consumers  kvik  consumer_properties
+kvik-consumers  kvik  consumer_properties --rest
+kvik-consumers-gates kvik consumer_properties gate_deliveries_follow_the_model_
+kvik-gates-durable kvik gates_durable
 kvik-patterns   kvik  patterns
 kvik-differential kvik durable_differential --rest
 kvik-differential-small kvik durable_differential small_windows_decide_
@@ -101,6 +106,9 @@ kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 kvik-saved      kvik  lib         durable::saved::tests::s1_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
 kvik-compact    kvik  lib         durable::compact::tests::every_input_position_lands_in_exactly_one_output_where_the_model_places_it
+kvik-gates-core kvik  lib         gates::differential::
+kvik-gates      kvik  lib         backend::gates::tests::the_model_backend_delivers_what_judge_computes_from_its_log
+kvik-gates-history kvik lib      durable::gates::tests::bounded_history_reads_
 '
 
 cd "$(dirname "$0")/.."

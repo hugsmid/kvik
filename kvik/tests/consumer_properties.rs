@@ -13,8 +13,8 @@ use common::{block_on, start};
 use kvik::env::{Env, ManualClock};
 use kvik::{
     Backend, Condition, ConditionState, Consumer, Delivery, DeliveryId, DeliveryKind, Funnel,
-    FunnelId, Outcome, Position, Reading, ResetStamp, ResyncCause, SavedPoint, Select, SeriesId,
-    Start, Store, StoreConfig, Value,
+    FunnelId, Gate, Input, Level, Outcome, Position, Reading, ResetStamp, ResyncCause, SavedPoint, Select,
+    SeriesId, Start, Store, StoreConfig, TransitionCause, Value,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -38,7 +38,18 @@ enum FunnelKind {
 }
 
 #[derive(Clone, Debug)]
+enum GateKind {
+    Levels(usize),
+    Set(usize),
+    Change(usize),
+    /// Levels on each series a pattern selects: definitions and aliases join it (Q-1143).
+    Each(usize),
+}
+
+#[derive(Clone, Debug)]
 enum Step {
+    Watch(usize, GateKind),
+    Unwatch(usize, usize),
     Emit(usize, u8),
     Advance(u64),
     Tick,
@@ -73,6 +84,34 @@ fn funnel_kind() -> impl Strategy<Value = FunnelKind> {
         (0usize..3).prop_map(FunnelKind::HeldFor),
         (0usize..3).prop_map(FunnelKind::StaleFor),
     ]
+}
+
+fn gate_kind() -> impl Strategy<Value = GateKind> {
+    prop_oneof![
+        (0usize..4).prop_map(GateKind::Levels),
+        (0usize..3).prop_map(GateKind::Set),
+        (0usize..3).prop_map(GateKind::Change),
+        (0usize..2).prop_map(GateKind::Each),
+    ]
+}
+
+/// Histories with gates, clean restarts among them.
+fn gate_steps() -> impl Strategy<Value = Vec<Step>> {
+    let step = prop_oneof![
+        10 => (0usize..4, any::<u8>()).prop_map(|(i, v)| Step::Emit(i, v)),
+        4 => (0u64..3).prop_map(Step::Advance),
+        1 => (1_000u64..3_000).prop_map(Step::Advance),
+        1 => Just(Step::Tick),
+        2 => (0usize..2, funnel_kind()).prop_map(|(c, k)| Step::Route(c, k)),
+        4 => (0usize..2, gate_kind()).prop_map(|(c, k)| Step::Watch(c, k)),
+        1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unwatch(c, n)),
+        5 => (0usize..2, 0usize..8).prop_map(|(c, n)| Step::Drain(c, n)),
+        1 => (0usize..2).prop_map(Step::Retake),
+        1 => Just(Step::Restart),
+        1 => Just(Step::Define),
+        1 => Just(Step::Alias),
+    ];
+    prop::collection::vec(step, 1..40)
 }
 
 fn steps(crashes: bool) -> impl Strategy<Value = Vec<Step>> {
@@ -123,6 +162,46 @@ fn funnel(k: &FunnelKind, ids: &[SeriesId]) -> Funnel {
     }
 }
 
+fn gate(k: &GateKind, ids: &[SeriesId]) -> (String, Gate) {
+    let id = |i: usize| ids.get(i).copied().unwrap_or(SeriesId(999));
+    match k {
+        GateKind::Levels(i) => (
+            format!("levels-{i}"),
+            Gate::levels(
+                Input::value(id(*i)),
+                [
+                    Level::above(40.0)
+                        .clear(25.0)
+                        .hold_up(Duration::from_secs(2))
+                        .hold_down(Duration::from_secs(1)),
+                    Level::above(80.0),
+                ],
+            )
+            .stale_after(Duration::from_secs(5)),
+        ),
+        GateKind::Set(i) => (
+            format!("set-{i}"),
+            Gate::set(Input::value(id(*i)), [Value::F64(0.0), Value::F64(15.0)])
+                .hold_on(Duration::from_secs(1))
+                .hold_off(Duration::from_secs(2)),
+        ),
+        GateKind::Change(i) => (
+            format!("change-{i}"),
+            Gate::change(Input::value(id(*i))).deadband(20.0),
+        ),
+        GateKind::Each(i) => (
+            format!("each-{i}"),
+            Gate::levels(
+                Input::value_each(),
+                [Level::above(40.0)
+                    .clear(25.0)
+                    .hold_up(Duration::from_secs(2))],
+            )
+            .each(["site/*/power", "*/a/*"][*i]),
+        ),
+    }
+}
+
 /// One history's record on one backend: what it gave, in a comparable form, and the positions of the facts it
 /// emitted, in order.
 #[derive(Default)]
@@ -163,6 +242,31 @@ impl Record {
                     t.funnel.0, t.state, t.cause
                 )
             }
+            DeliveryKind::Transition(t) => {
+                let cause = match &t.cause {
+                    TransitionCause::Fact { position, t } => {
+                        format!("fact@{} {}", self.ordinal(*position), t.0)
+                    }
+                    TransitionCause::Timer { due, kind } => format!("timer {} {kind:?}", due.0),
+                    TransitionCause::Entry { position } => {
+                        format!("entry@{}", self.ordinal(*position))
+                    }
+                    other => format!("{other:?}"),
+                };
+                format!(
+                    "transition @{} {:?} {} s{} {:?}->{:?} {cause} {:?} {:?} now={} r={}",
+                    self.ordinal(t.id.at),
+                    t.id.due.map(|d| d.0),
+                    t.name,
+                    t.series.0,
+                    t.from,
+                    t.to,
+                    t.value,
+                    t.event_time.map(|e| e.0),
+                    t.now.0,
+                    d.flags.replayed
+                )
+            }
             DeliveryKind::Resync(r) => {
                 let fs: Vec<String> = r
                     .funnels
@@ -180,13 +284,31 @@ impl Record {
                         )
                     })
                     .collect();
+                let gs: Vec<String> = r
+                    .gates
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "g{} s{} {:?} {:?}",
+                            g.condition.0,
+                            g.series.0,
+                            g.state,
+                            g.set_by.map(|i| (
+                                self.ordinal(i.at),
+                                i.due.map(|d| d.0),
+                                i.condition.0
+                            ))
+                        )
+                    })
+                    .collect();
                 format!(
-                    "resync @{at} {:?} {:?} {}/{} [{}]",
+                    "resync @{at} {:?} {:?} {}/{} [{}] [{}]",
                     r.cause,
                     r.forget_above.map(|p| self.ordinal(p)),
                     r.part,
                     r.last,
-                    fs.join("; ")
+                    fs.join("; "),
+                    gs.join("; ")
                 )
             }
             other => format!("{other:?}"),
@@ -275,6 +397,24 @@ fn run(
                         "route {:?}",
                         r.map_err(|e| format!("{e:?}").split('(').next().unwrap().to_string())
                     ));
+                }
+            }
+            Step::Watch(c, k) => {
+                if let Some(c) = &cs[*c] {
+                    let (name, g) = gate(k, &ids);
+                    let r = block_on(c.watch(&name, g));
+                    rec.out.push(format!(
+                        "watch {name} {:?}",
+                        r.map_err(|e| format!("{e:?}").split('(').next().unwrap().to_string())
+                    ));
+                }
+            }
+            Step::Unwatch(c, n) => {
+                if let Some(c) = &cs[*c] {
+                    let gates = c.gates().unwrap();
+                    if let Some((_, name, _)) = gates.get(*n) {
+                        block_on(c.unwatch(name)).unwrap();
+                    }
                 }
             }
             Step::Unroute(c, n) => {
@@ -447,6 +587,122 @@ fn deliveries_follow_the_model_over_restarts() {
         NO_CURSOR.load(Ordering::Relaxed) > 0,
         "some history loses the cursor file of a routed consumer"
     );
+}
+
+/// Gates through the public interface: the durable backend's transitions, their order among the other deliveries,
+/// the states in every resync, a second take in a run and the replay after each clean restart (G6, G7: what the
+/// model backend gives from `judge`, every transition after the gate cursor again, `replayed`), every configured
+/// case: a history opens two stores.
+#[test]
+fn gate_deliveries_follow_the_model_over_restarts() {
+    let watched = AtomicU64::new(0);
+    let transitions = AtomicU64::new(0);
+    let replayed = AtomicU64::new(0);
+    TestRunner::new(ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })
+    .run(&gate_steps(), |history| {
+        let (m, d) = gate_history_on_both(&history);
+        if m.iter().any(|l| l.starts_with("watch") && l.contains("Ok")) {
+            watched.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = m.iter().filter(|l| l.contains(": transition ")).count();
+        transitions.fetch_add(n as u64, Ordering::Relaxed);
+        let r = m
+            .iter()
+            .filter(|l| l.contains(": transition ") && l.ends_with("r=true"))
+            .count();
+        replayed.fetch_add(r as u64, Ordering::Relaxed);
+        prop_assert_eq!(m, d);
+        Ok(())
+    })
+    .unwrap();
+    assert!(watched.into_inner() > 0, "some history watches a gate");
+    assert!(
+        transitions.into_inner() > 0,
+        "some history delivers transitions"
+    );
+    assert!(
+        replayed.into_inner() > 0,
+        "some history replays transitions"
+    );
+}
+
+/// One gate history on both backends.
+fn gate_history_on_both(history: &[Step]) -> (Vec<String>, Vec<String>) {
+    let m_clock = ManualClock::new(start());
+    let dir = format!("kvik-test/gates-differential/{}", next_id());
+    let mut env = Env::test(m_clock.clone());
+    env.background_timers = false;
+    let m_config = StoreConfig::new(&dir, "Europe/London")
+        .create_if_missing(true)
+        .backend(Backend::Model)
+        .env(env);
+    let model = block_on(Store::open(m_config.clone())).unwrap();
+    let m = run(
+        model,
+        &|| block_on(Store::open(m_config.clone())).unwrap(),
+        &m_clock,
+        history,
+    );
+    let mut w = World::quiet(&format!("gates-differential-{}", next_id()));
+    // The model backend replays without bound.
+    w.conditions = Some(
+        kvik::ConditionsConfig::default()
+            .replay_max(kvik::ReplayMax::new(Duration::from_secs(1 << 30), u64::MAX)),
+    );
+    let d = run(w.open(), &|| w.open(), &w.clock, history);
+    (m, d)
+}
+
+#[test]
+fn an_unconfirmed_start_transition_is_replayed_after_a_restart_not_reseeded() {
+    let (m, d) = gate_history_on_both(&[Step::Watch(0, GateKind::Levels(0)), Step::Restart]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn an_each_gates_instances_are_restored_from_the_checkpoint_after_a_restart_not_reseeded() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(1, GateKind::Each(0)),
+        Step::Drain(1, 4),
+        Step::Restart,
+    ]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn a_transition_replayed_after_its_gate_was_unwatched_keeps_the_gate_name() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(1, GateKind::Change(0)),
+        Step::Watch(1, GateKind::Levels(0)),
+        Step::Unwatch(1, 0),
+        Step::Restart,
+    ]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn a_consumer_whose_gates_were_all_unwatched_still_replays_after_a_restart() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(0, GateKind::Set(0)),
+        Step::Unwatch(0, 0),
+        Step::Restart,
+    ]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(1, GateKind::Levels(0)),
+        Step::Retake(1),
+        Step::Watch(1, GateKind::Levels(1)),
+        Step::Drain(1, 1),
+        Step::Retake(1),
+    ]);
+    assert_eq!(m, d);
 }
 
 /// What the crash test knows of one consumer.
@@ -664,7 +920,9 @@ fn deliveries_after_crashes_follow_the_rules() {
                     | Step::LoseCursor(_)
                     | Step::Restart
                     | Step::Define
-                    | Step::Alias => {}
+                    | Step::Alias
+                    | Step::Watch(..)
+                    | Step::Unwatch(..) => {}
                 }
             }
             drop(cs);

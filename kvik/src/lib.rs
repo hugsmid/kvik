@@ -109,6 +109,7 @@ pub(crate) fn heap() -> &'static peak_alloc::PeakAlloc {
 }
 mod error;
 mod fold;
+mod gate;
 mod health;
 mod pattern;
 mod provisional;
@@ -118,6 +119,9 @@ mod series;
 mod store;
 mod time;
 mod types;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod gates;
 
 pub mod env;
 
@@ -129,8 +133,8 @@ pub use backup::{
     Stored, Verified, VerifyError,
 };
 pub use config::{
-    Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
-    WINDOW_MEMORY_DESKTOP, WINDOW_MEMORY_MINIMAL,
+    Backend, ConditionsConfig, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, ReplayMax,
+    StoreConfig, TierConfig, WINDOW_MEMORY_DESKTOP, WINDOW_MEMORY_MINIMAL,
 };
 pub use consume::{
     Condition, ConditionState, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId,
@@ -140,6 +144,12 @@ pub use consume::{
 pub use error::{
     BackupError, ConsumerError, DefineError, EmitError, Fault, OpenError, QueryError, Refusal,
     RouteError, Wait, WriteError,
+};
+pub use gate::{
+    Gate, GateError, GateId, GateInstanceState, GateKind, GateState, Input, InputWindow, Level,
+    MAX_GATE_DURATION, MAX_GATE_INSTANCES, MAX_GATE_LEVELS, MAX_GATE_MEMBERS, MAX_GATE_NAME,
+    MAX_GATES_PER_CONSUMER, MAX_GATES_PER_STORE, TimerKind, Transition, TransitionCause,
+    TransitionId,
 };
 pub use health::{
     BackupRefusal, BackupStats, ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats,

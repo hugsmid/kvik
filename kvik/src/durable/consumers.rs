@@ -18,7 +18,7 @@ use crate::health::ConsumerStats;
 use crate::types::{Ack, Intent, Outcome, Reading};
 
 impl Writer {
-    fn hub(&self) -> Result<&Arc<Hub>, Error> {
+    pub(super) fn hub(&self) -> Result<&Arc<Hub>, Error> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Closed);
         }
@@ -99,7 +99,11 @@ impl Writer {
     }
 
     /// Commits a routing change and writes the registry file after it.
-    fn commit_routing(&self, d: &mut super::ingest::Decider, change: Routing) -> Result<(), Error> {
+    pub(super) fn commit_routing(
+        &self,
+        d: &mut super::ingest::Decider,
+        change: Routing,
+    ) -> Result<(), Error> {
         self.commit_entry_held(d, Entry::Routing(Box::new(change)))?;
         self.write_registry_file()
     }
@@ -153,6 +157,7 @@ impl Writer {
                 operator: None,
                 emits: emits.clone(),
                 condition: None,
+                gate: None,
             };
             if let Some(cycle) = view.cycle_with(Some(&change), None) {
                 return Err(Error::RouteCycle(cycle.join(" -> ")));
@@ -239,6 +244,7 @@ impl Writer {
                 operator: None,
                 emits: view.emits(name),
                 condition: None,
+                gate: None,
             })
         })?;
         self.commit_routing(&mut d, change)?;
@@ -438,6 +444,7 @@ mod tests {
             operator: None,
             emits: Selection::None,
             condition: None,
+            gate: None,
         };
         {
             let mut d = lock(&w.decider);

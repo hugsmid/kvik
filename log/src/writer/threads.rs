@@ -203,6 +203,7 @@ struct Shared {
     clock: Arc<dyn Clock>,
     sync: Arc<SyncSignal>,
     waits: Mutex<MaintWaits>,
+    commit_clock: Arc<super::CommitClock>,
     /// The writer's held batch entries and calls as the last acknowledgements were delivered, and just after.
     #[cfg(test)]
     held: Mutex<Option<(usize, usize)>>,
@@ -389,6 +390,7 @@ impl Log {
             stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
+            commit_clock: writer.commit_clock(),
             clock,
             sync,
             waits: Mutex::new(MaintWaits::default()),
@@ -804,7 +806,9 @@ mod tests {
         let pending = log.submit(vec![alias(2)]).unwrap();
         clock.hold(false);
         pending.wait().unwrap();
-        let committed = log.shutdown_then(|w| w.last_commit_time).unwrap();
+        let committed = log
+            .shutdown_then(|w| w.commit_clock().floor(i64::MIN).0)
+            .unwrap();
         assert_eq!(committed, 157);
     }
 }

@@ -5,8 +5,41 @@ use std::collections::BTreeMap;
 use super::{ConditionId, Entry, GateError, GateState, Transition, TransitionId, judge};
 use crate::types::{DAY, Nanos, Position, SeriesId};
 
-/// A consumer's latches: per instance, the id of the last transition it confirmed.
-pub type Latches = BTreeMap<(ConditionId, SeriesId), TransitionId>;
+/// The point after every transition with `at` at or below `at` and due at or before `now`: where a
+/// checkpoint or a confirmed resync leaves the judgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frontier {
+    /// Last position applied.
+    pub at: Position,
+    /// Commit-clock instant reached.
+    pub now: Nanos,
+}
+
+/// A point in [`TransitionId`] order: a consumer's gate cursor (Q-1391).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatePoint {
+    /// After this transition, the last one confirmed.
+    Transition(TransitionId),
+    /// After a frontier, the one a confirmed resync was built at.
+    Frontier(Frontier),
+}
+
+impl Frontier {
+    /// Whether the transition `id` is at or before this frontier.
+    pub fn covers(&self, id: &TransitionId) -> bool {
+        id.at <= self.at && id.due.is_none_or(|d| d <= self.now)
+    }
+}
+
+impl GatePoint {
+    /// Whether the transition `id` is at or before this point.
+    pub fn covers(&self, id: &TransitionId) -> bool {
+        match self {
+            GatePoint::Transition(t) => id <= t,
+            GatePoint::Frontier(f) => f.covers(id),
+        }
+    }
+}
 
 /// How far back a resume replays (`conditions.replay_max`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +62,7 @@ impl Default for ReplayBound {
 /// What a consumer receives when it resumes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Resume {
-    /// Transitions after the latches, flagged `replayed`, in delivery order.
+    /// Transitions after the replay's start and the gate cursor, flagged `replayed`, in delivery order.
     pub replayed: Vec<Transition>,
     /// State now per instance and the id that set it, carried by the resync that ends the resume.
     pub states: BTreeMap<(ConditionId, SeriesId), (GateState, TransitionId)>,
@@ -37,40 +70,31 @@ pub struct Resume {
     pub not_replayed: bool,
 }
 
-/// The resume of a consumer whose cursor is `cursor` and whose latches are `latches`, at commit-clock
-/// instant `until`. An instance with a latch receives its transitions after it; one without, those at or
-/// after the cursor (transitions at a position follow its fact, so the cursor never covers them).
+/// The resume, at commit-clock instant `until`, of a consumer whose replay starts at `start` (its gate
+/// checkpoint, at or after its gate cursor) and whose gate cursor is `cursor` (`None`: nothing confirmed
+/// yet). The bound is measured from `start`, so a consumer whose gates are quiet for days still replays
+/// (Q-1391). `start.now` is at or after the commit time of `start.at`, which keeps a frontier
+/// downward closed in id order.
 pub fn resume(
     history: &[Entry],
     until: Nanos,
-    cursor: Position,
-    latches: &Latches,
+    start: Frontier,
+    cursor: Option<GatePoint>,
     bound: ReplayBound,
 ) -> Result<Resume, GateError> {
     let j = judge(history, until)?;
-    // Confirmation is cumulative, so latches only filter and never lengthen the replay (spec §6 Gates).
-    let start = cursor;
     let facts = history
         .iter()
-        .filter(|e| matches!(e, Entry::Fact { .. }) && e.position() > start)
+        .filter(|e| matches!(e, Entry::Fact { .. }) && e.position() > start.at)
         .count();
-    let from = history
-        .iter()
-        .take_while(|e| e.position() <= start)
-        .last()
-        .or(history.first())
-        .map_or(until, Entry::commit_time);
     let not_replayed = u64::try_from(facts).unwrap_or(u64::MAX) > bound.facts
-        || until.saturating_sub(from) > bound.span;
+        || until.saturating_sub(start.now) > bound.span;
     let replayed = if not_replayed {
         Vec::new()
     } else {
         j.transitions
             .into_iter()
-            .filter(|t| match latches.get(&(t.id.condition, t.id.series)) {
-                Some(l) => t.id > *l,
-                None => t.id.at >= cursor,
-            })
+            .filter(|t| !start.covers(&t.id) && cursor.is_none_or(|g| !g.covers(&t.id)))
             .collect()
     };
     Ok(Resume {

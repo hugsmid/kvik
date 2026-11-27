@@ -27,6 +27,7 @@ mod derived;
 mod emit;
 mod entries;
 pub(crate) mod fast;
+mod gates;
 #[cfg(test)]
 mod held_state;
 mod history;
@@ -276,6 +277,8 @@ pub(crate) struct Writer {
     dirty: Arc<tree::Dirty>,
     /// The summary tree's checkpoint job; `None` when the start left the store read-only.
     tree: Option<Arc<tree::Job>>,
+    /// Whether `watch` writes its entry; off until gates are judged live ([`gates::LIVE`]).
+    gates_live: AtomicBool,
 }
 
 impl Drop for Writer {

@@ -83,6 +83,7 @@ impl Deliverer {
             None
         };
         let rt = self.consumers.entry(name.to_string()).or_default();
+        let retake = rt.attached;
         let again = rt.attached.then_some(rt.forget).flatten();
         if rt.attached {
             // The consumer process restarted (Q-95 (b)): what it was handed is dropped and it resumes from its
@@ -102,6 +103,8 @@ impl Deliverer {
         }
         rt.handle = true;
         rt.attached = true;
+        self.gate_take(name, retake, ctx);
+        let rt = self.consumers.get_mut(name).expect("inserted above");
         let Some(point) = point.or(again) else {
             return Ok(Ok(()));
         };

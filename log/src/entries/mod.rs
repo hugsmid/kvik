@@ -21,6 +21,10 @@ use encode::encode_entry;
 pub const MAX_ENTRY_LEN: usize = 8 << 20;
 /// The most state names of one series.
 pub const MAX_STATE_NAMES: usize = 65_536;
+/// Most boundaries of a levels gate (field 73).
+pub const GATE_LEVELS: usize = 16;
+/// Most members of a set gate (field 74).
+pub const GATE_MEMBERS: usize = 64;
 /// One day in nanoseconds (the bound of a day start).
 pub const DAY: i64 = 86_400_000_000_000;
 
@@ -278,6 +282,108 @@ pub enum RouteOp {
     Remove = 2,
     /// 3: declares the consumer's `emits` only.
     Emits = 3,
+    /// 4: watches a gate.
+    Watch = 4,
+    /// 5: unwatches a gate.
+    Unwatch = 5,
+}
+
+/// The series a gate reads (field 69, with 54 or 55).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GateSelector {
+    /// 1: one series (field 54, one id).
+    One(u32),
+    /// 2: each series a name pattern selects (field 55).
+    Each(String),
+}
+
+/// One boundary of a levels gate (field 73, 32 bytes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GateLevel {
+    /// Crossed upwards above this, finite.
+    pub at: f64,
+    /// Crossed back below this, finite, at most `at`.
+    pub clear: f64,
+    /// Hold before the upward crossing, nanoseconds ≥ 0.
+    pub hold_up: i64,
+    /// Hold before the downward crossing, nanoseconds ≥ 0.
+    pub hold_down: i64,
+}
+
+/// A set member (field 74): a tag byte, then the value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GateValue {
+    /// 1: `f64`, finite.
+    F64(f64),
+    /// 2: decimal, `i64` units then `u8` scale.
+    Decimal {
+        /// Units.
+        units: i64,
+        /// Scale.
+        scale: u8,
+    },
+    /// 3: a named state's index, `u32`.
+    State(u32),
+    /// 4: a boolean byte.
+    Bool(bool),
+    /// 5: UTF-8 text, 1 to 255 bytes.
+    Text(String),
+}
+
+/// How a gate turns its input into a state (field 72, with 73 to 76).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GateKind {
+    /// 1: levels, 1 to 16 boundaries (73, repeated), rising.
+    Levels(Vec<GateLevel>),
+    /// 2: set, 1 to 64 members (74, repeated) and holds (75: `hold_on`, `hold_off`).
+    Set {
+        /// Members.
+        members: Vec<GateValue>,
+        /// Hold on, nanoseconds ≥ 0.
+        hold_on: i64,
+        /// Hold off, nanoseconds ≥ 0.
+        hold_off: i64,
+    },
+    /// 3: change, with a dead-band (76).
+    Change {
+        /// Dead-band, finite, ≥ 0.
+        deadband: f64,
+    },
+}
+
+/// A watched gate as its entry carries it (`format.md` A.6, fields 68 to 77).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateSpec {
+    /// 68: 1 to 64 bytes.
+    pub name: String,
+    /// 69 with 54 or 55.
+    pub selector: GateSelector,
+    /// 71: the input; 1 value (2, window, reserved).
+    pub input: u8,
+    /// 72 to 76.
+    pub kind: GateKind,
+    /// 77: staleness, nanoseconds > 0; `None` never.
+    pub stale_after: Option<i64>,
+}
+
+/// The gate part of a watch or unwatch change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteGate {
+    /// 67: the gate id, never reused by its consumer.
+    pub id: u32,
+    /// The gate, for [`RouteOp::Watch`] only.
+    pub spec: Option<GateSpec>,
+}
+
+impl Eq for RouteGate {}
+
+impl std::hash::Hash for RouteGate {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.id.hash(h);
+        if let Some(s) = &self.spec {
+            (&s.name, &s.selector, s.input, s.stale_after).hash(h);
+        }
+    }
 }
 
 /// The argument of a time-in-state operator (field 58).
@@ -362,6 +468,8 @@ pub struct Routing {
     pub emits: Selection,
     /// 63 to 66: the funnel's condition, for [`RouteOp::Add`].
     pub condition: Option<RouteCondition>,
+    /// 67 to 77: the gate, for [`RouteOp::Watch`] and [`RouteOp::Unwatch`].
+    pub gate: Option<Box<RouteGate>>,
 }
 
 /// One entry.

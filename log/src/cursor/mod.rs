@@ -1,9 +1,9 @@
 //! Cursor files (`format.md` A.15, `spec.md` §4 Consumer state): a consumer's durable cursor, the latch of each of its
 //! condition funnels and the last reset point it confirmed, in `cursors/<name>.cur`.
 //!
-//! A cursor file is an A.1 header (kind 4) followed by blocks of type `0x30`, appended, one per cursor sync. The
-//! state is the last valid block: a torn last block leaves the previous, older state, never one ahead of a
-//! confirmation. A file with no valid header or no valid block is unreadable. Only the writer opens cursor files;
+//! A cursor file is an A.1 header (kind 4) followed by blocks of type `0x30`, appended, one per cursor sync, each
+//! preceded in the same write by a gate checkpoint (`0x31`) when one is written. The state is the last valid block
+//! of each type: a torn last block leaves the previous, older state, never one ahead of a confirmation. A file with no valid header or no valid block is unreadable. Only the writer opens cursor files;
 //! once a file passes 16 MiB it is written again under `<name>.cur.new` with the current state, synced and renamed
 //! over the old one.
 //!
@@ -16,6 +16,7 @@
 //!     position: Position { generation: 0, sequence: 42 },
 //!     latches: Vec::new(),
 //!     reset: None,
+//!     gate: None,
 //! };
 //! let mut bytes = encode_header([1; 16], 0, 5).to_vec();
 //! bytes.extend(encode_block(&state).unwrap());
@@ -36,6 +37,16 @@ use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::store::read_all;
 use crate::writer::Position;
 use crate::writer::sources::{PositionSource, SourceContext, SourceReport};
+
+mod checkpoint;
+#[cfg(test)]
+mod tests;
+
+pub use checkpoint::{
+    CHECKPOINT_BLOCK, Checkpoint, CheckpointFact, CheckpointInstance, CheckpointSeries,
+    CheckpointState, CheckpointValue, GATE_POINT_LEN, GateCursor, GateId,
+    decode_body as decode_checkpoint, encode_body as encode_checkpoint,
+};
 
 /// The directory cursor files live in (`format.md` A.12).
 pub const CURSORS_DIR: &str = "cursors";
@@ -77,6 +88,8 @@ pub struct CursorState {
     pub latches: Vec<Latch>,
     /// Field 3: the id of the last reset point the consumer confirmed, if any (`spec.md` §4 Resync).
     pub reset: Option<Position>,
+    /// Field 4: the gate cursor, present once the consumer has gates (`spec.md` §6 Gates, Resume).
+    pub gate: Option<GateCursor>,
 }
 
 impl CursorState {
@@ -87,6 +100,7 @@ impl CursorState {
             .iter()
             .flat_map(|l| [l.incarnation, l.emitted])
             .chain(self.reset)
+            .chain(self.gate.and_then(|g| g.position()))
             .fold(self.position, Position::max)
     }
 }
@@ -96,10 +110,22 @@ impl CursorState {
 pub struct CursorFile {
     /// The header's generation.
     pub generation: u32,
-    /// The state of the last valid block.
+    /// The state of the last valid `0x30` block.
     pub state: CursorState,
-    /// The offset after the last valid block: where the next block goes.
+    /// The last valid `0x31` block.
+    pub checkpoint: Option<Checkpoint>,
+    /// The offset after the last valid block of either type: where the next block goes.
     pub end: u64,
+}
+
+impl CursorFile {
+    /// The highest position the file names: its state's and its checkpoint's.
+    pub fn highest(&self) -> Position {
+        self.checkpoint
+            .as_ref()
+            .map(Checkpoint::highest)
+            .map_or(self.state.highest(), |c| c.max(self.state.highest()))
+    }
 }
 
 /// Why a cursor file cannot be read.
@@ -134,12 +160,12 @@ pub fn encode_header(store_id: [u8; 16], generation: u32, created_at: i64) -> [u
     FileHeader::new(kind::CURSOR, generation, 0, created_at, store_id).encode()
 }
 
-fn put_pos(out: &mut Vec<u8>, p: Position) {
+pub(crate) fn put_pos(out: &mut Vec<u8>, p: Position) {
     out.extend_from_slice(&p.generation.to_le_bytes());
     out.extend_from_slice(&p.sequence.to_le_bytes());
 }
 
-fn pos_at(b: &[u8], at: usize) -> Position {
+pub(crate) fn pos_at(b: &[u8], at: usize) -> Position {
     Position {
         generation: u32_at(b, at),
         sequence: u64_at(b, at + 4),
@@ -185,6 +211,11 @@ pub fn encode_block(state: &CursorState) -> Result<Vec<u8>, EncodeError> {
         put_pos(&mut v, r);
         field(&mut body, 3, &v);
     }
+    if let Some(g) = &state.gate {
+        let mut v = Vec::with_capacity(GATE_POINT_LEN);
+        checkpoint::put_point(&mut v, g);
+        field(&mut body, 4, &v);
+    }
     let mut out = Vec::new();
     frame(CURSOR_BLOCK, 0, &body, &mut out)?;
     Ok(out)
@@ -200,6 +231,7 @@ fn decode_body(body: &[u8], offset: u64) -> Result<Option<CursorState>, CursorEr
     let mut consumer = None;
     let mut latches = Vec::new();
     let mut reset = None;
+    let mut gate = None;
     let mut prev = 0u16;
     while at < body.len() {
         let Some(h) = body.get(at..at + 4) else {
@@ -247,6 +279,15 @@ fn decode_body(body: &[u8], offset: u64) -> Result<Option<CursorState>, CursorEr
                 }
                 reset = Some(pos_at(v, 0));
             }
+            4 => {
+                if v.len() != GATE_POINT_LEN {
+                    return Ok(None);
+                }
+                match checkpoint::point_at(v) {
+                    Some(g) => gate = Some(g),
+                    None => return Ok(None),
+                }
+            }
             _ => {
                 return Err(CursorError::Unsupported(FormatError::Unsupported {
                     offset,
@@ -263,10 +304,12 @@ fn decode_body(body: &[u8], offset: u64) -> Result<Option<CursorState>, CursorEr
         position,
         latches,
         reset,
+        gate,
     }))
 }
 
-/// Reads a cursor file: its last valid block. Blocks after the first invalid one are not read (a torn append).
+/// Reads a cursor file: its last valid block of each type. Blocks after the first invalid one are not read (a torn
+/// append).
 pub fn decode(bytes: &[u8], store_id: &[u8; 16]) -> Result<CursorFile, CursorError> {
     let h = FileHeader::decode(bytes).ok_or(CursorError::Unreadable)?;
     if h.format_major > crate::FORMAT_MAJOR {
@@ -280,6 +323,8 @@ pub fn decode(bytes: &[u8], store_id: &[u8; 16]) -> Result<CursorFile, CursorErr
     }
     let mut at = HEADER_LEN;
     let mut last = None;
+    let mut checkpoint = None;
+    let mut end = None;
     while let Some(head) = bytes
         .get(at..at + BLOCK_HEADER_LEN)
         .and_then(|b| <&[u8; BLOCK_HEADER_LEN]>::try_from(b).ok())
@@ -297,7 +342,17 @@ pub fn decode(bytes: &[u8], store_id: &[u8; 16]) -> Result<CursorFile, CursorErr
         let next = at + bh.block_len() as usize;
         match bh.block_type {
             CURSOR_BLOCK => match decode_body(body, at as u64)? {
-                Some(s) => last = Some((s, next)),
+                Some(s) => {
+                    last = Some(s);
+                    end = Some(next);
+                }
+                None => break,
+            },
+            CHECKPOINT_BLOCK => match checkpoint::decode_body(body) {
+                Some(c) => {
+                    checkpoint = Some(c);
+                    end = Some(next);
+                }
                 None => break,
             },
             _ if bh.skippable() => {}
@@ -310,10 +365,11 @@ pub fn decode(bytes: &[u8], store_id: &[u8; 16]) -> Result<CursorFile, CursorErr
         }
         at = next;
     }
-    let (state, end) = last.ok_or(CursorError::Unreadable)?;
+    let (state, end) = last.zip(end).ok_or(CursorError::Unreadable)?;
     Ok(CursorFile {
         generation: h.generation,
         state,
+        checkpoint,
         end: end as u64,
     })
 }
@@ -372,7 +428,46 @@ pub fn append(
     state: &CursorState,
     end: Option<u64>,
 ) -> io::Result<u64> {
-    let block = encode_block(state).map_err(io::Error::other)?;
+    let rec = Record {
+        state,
+        checkpoint: None,
+        fresh: false,
+    };
+    append_record(fs, store_dir, store_id, generation, created_at, rec, end)
+}
+
+/// What one cursor write holds.
+#[derive(Clone, Copy, Debug)]
+pub struct Record<'a> {
+    /// The cursor state.
+    pub state: &'a CursorState,
+    /// The consumer's checkpoint: a new one, or the one the file holds, carried into a file written again.
+    pub checkpoint: Option<&'a Checkpoint>,
+    /// `checkpoint` is new: it is appended, before the state, in the same write and sync.
+    pub fresh: bool,
+}
+
+/// [`append`] with a checkpoint (A.15): a fresh one goes before the state block in one write and one sync; a file
+/// created or written again holds the checkpoint whether fresh or carried.
+pub fn append_record(
+    fs: &dyn Fs,
+    store_dir: &Path,
+    store_id: [u8; 16],
+    generation: u32,
+    created_at: i64,
+    rec: Record<'_>,
+    end: Option<u64>,
+) -> io::Result<u64> {
+    let state = rec.state;
+    let mut ck = Vec::new();
+    if let Some(c) = rec.checkpoint {
+        let body = checkpoint::encode_body(c)
+            .ok_or_else(|| io::Error::other("a checkpoint value cannot be written"))?;
+        frame(CHECKPOINT_BLOCK, 0, &body, &mut ck).map_err(io::Error::other)?;
+    }
+    let cursor = encode_block(state).map_err(io::Error::other)?;
+    let mut block = if rec.fresh { ck.clone() } else { Vec::new() };
+    block.extend_from_slice(&cursor);
     let dir = store_dir.join(CURSORS_DIR);
     let target = path(store_dir, &state.consumer);
     match end {
@@ -389,7 +484,8 @@ pub fn append(
                 fs.sync_dir(store_dir)?;
             }
             let mut bytes = encode_header(store_id, generation, created_at).to_vec();
-            bytes.extend_from_slice(&block);
+            bytes.extend_from_slice(&ck);
+            bytes.extend_from_slice(&cursor);
             let new = dir.join(format!("{}.new", file_name(&state.consumer)));
             let _ = fs.remove_file(&new);
             let f = fs.open(&new, OpenMode::CreateNew)?;
@@ -421,7 +517,7 @@ impl PositionSource for CursorSource {
         for (consumer, r) in read_all_cursors(ctx.fs, ctx.store_dir, &ctx.store_id) {
             match r {
                 Ok(f) => {
-                    let h = f.state.highest();
+                    let h = f.highest();
                     if h.generation == ctx.generation {
                         report.highest = report.highest.max(h.sequence);
                     }
@@ -436,119 +532,5 @@ impl PositionSource for CursorSource {
         named.extend(ctx.consumers.difference(&found).cloned());
         report.named = named.into_iter().collect();
         Ok(report)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fs::MemFs;
-
-    fn p(sequence: u64) -> Position {
-        Position {
-            generation: 0,
-            sequence,
-        }
-    }
-
-    fn state(position: u64) -> CursorState {
-        CursorState {
-            consumer: "alarms".into(),
-            position: p(position),
-            latches: vec![
-                Latch {
-                    funnel: 2,
-                    incarnation: p(3),
-                    emitted: p(9),
-                    state: LatchState::Active(true),
-                },
-                Latch {
-                    funnel: 4,
-                    incarnation: p(5),
-                    emitted: p(11),
-                    state: LatchState::Value(Some(2.5)),
-                },
-            ],
-            reset: Some(p(7)),
-        }
-    }
-
-    #[test]
-    fn the_last_valid_block_is_the_state_and_a_torn_one_falls_back() {
-        let fs = MemFs::new();
-        let dir = Path::new("/s");
-        let end = append(&fs, dir, [1; 16], 0, 5, &state(10), None).unwrap();
-        let end2 = append(&fs, dir, [1; 16], 0, 5, &state(12), Some(end)).unwrap();
-        let f = read(&fs, dir, &[1; 16], "alarms").unwrap().unwrap();
-        assert_eq!((f.state.clone(), f.end), (state(12), end2));
-        assert_eq!(f.state.highest(), p(12));
-        // A torn last block leaves the older state.
-        let file = path(dir, "alarms");
-        fs.poke(&file, end as usize + BLOCK_HEADER_LEN + 2, &[0xff]);
-        let f = read(&fs, dir, &[1; 16], "alarms").unwrap().unwrap();
-        assert_eq!((f.state, f.end), (state(10), end));
-        // No valid block: unreadable; another store's file too.
-        fs.poke(&file, HEADER_LEN + 20, &[0xff]);
-        assert!(matches!(
-            read(&fs, dir, &[1; 16], "alarms"),
-            Err(CursorError::Unreadable)
-        ));
-        assert!(read(&fs, dir, &[1; 16], "other").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_large_file_is_written_again() {
-        let fs = MemFs::new();
-        let dir = Path::new("/s");
-        let end = append(&fs, dir, [1; 16], 0, 5, &state(1), None).unwrap();
-        let again = append(&fs, dir, [1; 16], 0, 5, &state(2), Some(REWRITE_AT)).unwrap();
-        assert_eq!(again, end);
-        assert_eq!(
-            read(&fs, dir, &[1; 16], "alarms").unwrap().unwrap().state,
-            state(2)
-        );
-        assert!(
-            fs.paths()
-                .iter()
-                .all(|p| !p.to_string_lossy().ends_with(".new"))
-        );
-    }
-
-    #[test]
-    fn an_unknown_critical_field_is_a_version_refusal() {
-        let mut body = Vec::new();
-        put_pos(&mut body, p(1));
-        body.extend_from_slice(&[0; 4]);
-        field(&mut body, 1, b"alarms");
-        field(&mut body, 9, &[1]);
-        let mut bytes = encode_header([1; 16], 0, 0).to_vec();
-        frame(CURSOR_BLOCK, 0, &body, &mut bytes).unwrap();
-        assert!(matches!(
-            decode(&bytes, &[1; 16]),
-            Err(CursorError::Unsupported(_))
-        ));
-    }
-
-    #[test]
-    fn the_source_reports_the_highest_position_and_missing_or_unreadable_files() {
-        let fs = MemFs::new();
-        let dir = Path::new("/s");
-        append(&fs, dir, [1; 16], 0, 5, &state(10), None).unwrap();
-        let mut broken = state(1);
-        broken.consumer = "broken".into();
-        append(&fs, dir, [1; 16], 0, 5, &broken, None).unwrap();
-        fs.poke(&path(dir, "broken"), HEADER_LEN + 20, &[0xff]);
-        let consumers: BTreeSet<String> = ["alarms", "gone"].map(String::from).into();
-        let r = CursorSource
-            .read(&SourceContext {
-                fs: &fs,
-                store_dir: dir,
-                store_id: [1; 16],
-                generation: 0,
-                consumers: &consumers,
-            })
-            .unwrap();
-        assert_eq!(r.highest, 11);
-        assert_eq!(r.named, vec!["broken".to_string(), "gone".to_string()]);
     }
 }

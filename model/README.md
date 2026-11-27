@@ -39,7 +39,8 @@ sync budget (`spec.md` §3 Group commit) are tested on the log crate's writer (`
 | `tests/provisional.rs` | Provisional streams (§4, Q-1109): every call delivered ends durable or withdrawn over histories of faulty commits, crashes, power losses and remounts, a durable one is kept or its loss reported by a reset point, and consumers receive the same with streams open as without |
 | `tests/gates.rs` | Gates (spec §6 Gates), one test per rule: levels, holds both ways, jumps, sets, change, staleness, future, bad and outranked facts, windows, `Each`, identities, refusals and resume |
 | `tests/gate_properties.rs` | Gate properties over generated histories: id order and instance chains, crossings and holds, staleness, `Each` membership, prefix stability, and exact resume after a restart |
-| `tests/gate_edges.rs` | Gate edges: arrivals and staleness (bad and valueless readings, a series that never reports), unknown values breaking holds, `Each` room freeing, the replay bound from the cursor and at its facts edge, and the duration maximum |
+| `tests/gate_seed.rs` | The seed at a gate's start (Q-1145, Q-1390, Q-1560, Q-1561), one test per rule: the look-back, holds counted, backfilled, outranked, bad and future facts, staleness; and a property that a seeded start judges as the same gate watched at the look-back's start, guarded by `seed_generator_coverage` |
+| `tests/gate_edges.rs` | Gate edges: arrivals and staleness (bad and valueless readings, a series that never reports), unknown values breaking holds, `Each` room freeing, the replay bound from the checkpoint and at its facts edge, and the duration maximum |
 | `tests/open_questions.rs` | One test per open question that the model can show (`qNN_…`) |
 | `tests/model.rs` | Model behaviour where it implements a simpler rule than the specification |
 

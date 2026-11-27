@@ -181,7 +181,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1142 | §6 Gates; `api.md` Gates (proposal) | A transition's identity names the instance's series, not an instance number (decided by the lead, provisional) |
 | Q-1143 | §6 Gates | An `Each` past its 256 instances (decided by the lead, provisional) |
 | Q-1144 | §6 Gates | A timer due at an entry's commit time (decided by the lead, provisional) |
-| Q-1145 | §6 Gates | A gate's state when it starts (decided by the lead, provisional) |
+| Q-1145 | §6 Gates | A gate's state when it starts (settled by the owner: seeded from history) |
 | Q-1146 | §6 Gates | Holds across `Unknown` and `Stale` (decided by the lead, provisional) |
 | Q-1147 | §6 Gates, Windows | Window inputs in the model: sampling and the reading at `now` (decided by the lead, provisional) |
 | Q-1148 | §6 Gates; §4 Future facts, Outranked facts; Q-16 | What counts as an arrival for a gate's staleness (decided by the lead, provisional) |
@@ -218,6 +218,48 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2121 | compaction design §3.4 | Whether a new record may leave the rule undecided (provisional) |
 | Q-2122 | compaction design §3.5; Q-1851 | What a rebuild's held file holds (provisional) |
 | Q-2125 | compaction design §3.5; Q-1853 | Publish after an unsure record (provisional) |
+| Q-1390 | §6 Gates, Transitions; Q-1145 | The seed at a gate's start: how far back, and the value before the first reading (decided by the lead, provisional; amended by Q-1560) |
+| Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (decided by the lead, provisional) |
+| Q-1393 | §6 Gates, Clock; `api.md` Gates | The clock live gate timers run on (OWNER) |
+| Q-1560 | §6 Gates, Transitions; Q-1390 | Facts inside the seed's look-back that were never the live value: what the seed reads (decided by the lead, provisional) |
+| Q-1880 | §6 Gates; Q-1560 | What the gates core's history reads must return, and what they cost (decided by the lead, provisional) |
+| Q-1881 | §6 Gates; Q-1880 | How a failed or short history read reaches the gates core (decided by the lead, provisional) |
+| Q-1882 | §6 Gates; Q-1560 | Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start (decided by the lead, provisional) |
+| Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
+| Q-1580 | `format.md` A.6 | The routing field ids of a watch and an unwatch, and the member value form (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1581 | `api.md` Gates | The gate interface as built: `Transition` without flags, `TransitionCause`, `gates()`, two more `GateError`s (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1582 | §6 Gates; Q-1140 | Entries other than facts, definitions and the consumer's own gates move the judgement's frontier (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1583 | `api.md` Gates; crate README | What the model backend's gates do not do yet (decided by the lead, provisional; settle with conditions step 5) |
+| Q-1810 | `format.md` A.6; Q-1580 | The bounds of a set member: decimal scale and state index (decided at review, provisional) |
+| Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
+| Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
+| Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
+| Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (superseded by Q-2080) |
+| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided at review, provisional; settle with cond2 step 5) |
+| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: a resync, cause `Resume` (decided at review, provisional) |
+| Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
+| Q-2080 | §6 Gates, Resume; `format.md` A.15; Q-2000 | The durable gate cursor and checkpoint in the cursor file, replayed at the first take (decided by the builder, provisional) |
+| Q-2081 | `format.md` A.15; Q-1391 | The checkpoint block as built: series apart from instances, every field the core restores (decided by the builder, provisional) |
+| Q-2082 | §6 Gates, Resume; §4 Resync | A reset point or lost range after the checkpoint reseeds, until cond2 step 6 (decided by the builder, provisional) |
+| Q-2083 | §6 Gates, Resume | Facts counted for `replay_max` without reading them; entries of a newer format in a replay (decided by the builder, provisional) |
+| Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (superseded by Q-2160) |
+| Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
+| Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
+| Q-2087 | §6 Gates, Resume, Transitions; Q-1392 | The instant a reseed starts the gates at: the commit floor, not the head's commit time (decided by the builder, provisional) |
+| Q-2160 | §6 Gates, Resume; `format.md` A.15; Q-1392, Q-2084 | `set_by` of a reseeded instance after a restart: a flag in the checkpoint keeps it `None` (decided at review) |
+| Q-2161 | §6 Gates, Resume | The crash property's cases and checks (decided at review) |
+| Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
+| Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (bounded at 12,288 `Each` instances a consumer, provisional) |
+| Q-2170 | §6 Gates, Resume; §4 Resync; Q-2082 | A reset point or a new generation in the judgement: a reseed entry; a replay reseeds where the reset point lies (decided by the builder, provisional) |
+| Q-2171 | §6 Gates, Resume; §8 | A new generation on the durable backend reseeds at the take, not at the generation's first position (decided by the builder, provisional) |
+| Q-2172 | §6 Gates; §4 Resync | A lost range recorded at run time, after the engine judged its facts (decided by the builder, provisional) |
+| Q-2173 | §6 Gates, One stream; `format.md` A.15; Q-1143 | An `Each` gate's refused series are not in the checkpoint (decided by the builder, provisional) |
+| Q-2220 | §6 Gates, Resume; Q-132 | A resync's confirmation over replayed transitions is written at once (decided in the fix round) |
+| Q-2250 | §4.3 held snapshot; G5 | When a run takes the snapshot that becomes `held`: only with nothing outstanding and nothing deferred (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2251 | §6 Gates, Resume; Q-2003 | Deferred transitions older than a dropped one, delivered after the resync that ended the quiet (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2270 | §6 Gates, Resume; Q-1396, Q-2002 | The checkpoint while a quiet catch-up ends with a resync (decided at merge) |
+| Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (ruled by the lead: built with step 6, Q-2295) |
+| Q-2295 | §6 Gates; Q-1880, Q-2001, Q-2271 | How the durable gate history read is bounded: event-time windows and when they answer exactly |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5209,16 +5251,16 @@ last position before the entry, so it does not depend on what the entry holds.
 **Pinned by.** `tests/gates.rs` `a_timer_due_at_an_entrys_commit_time_fires_before_that_entry`.
 
 ## Q-1145 — A gate's state when it starts
-Decided by the lead with the gates model, provisional.
+Settled by the owner, 26 November: option (b).
 **Scenario.** A Levels gate with `hold_up` 5 min is watched (or its series joins an `Each`) while the value has been
 above its level for an hour.
 **Options.** (a) Boundaries start uncrossed and holds count from the start, so the state at the watch is the lower
 side and rises after the hold; (b) judge the holds over the facts before the start (the history is in the store).
-**Decision (provisional).** (a): it is the conservative reading of a hold (nothing is claimed for time before the
-gate existed), it needs no history scan at a watch, and it matches today's rule that a threshold resumes on its
-lower side between its levels (§6 Restart and resume). A hub that needs (b) can read the window itself.
-**Pinned by.** `tests/gates.rs` `a_hold_counts_from_the_watch_not_from_before_it`,
-`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now`.
+**Decision.** (b): a gate added mid-event seeds its holds from history, by the rule of Q-1390. (a) was the lead's
+provisional choice; it remains only for gates with no hold, which read no history.
+**Pinned by.** `tests/gate_seed.rs` `a_hold_is_seeded_from_before_the_watch_so_a_value_long_above_starts_crossed`,
+`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now_judged_from_history`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
 
 ## Q-1146 — Holds across `Unknown` and `Stale`
 Decided by the lead with the gates model, provisional.
@@ -5985,6 +6027,523 @@ itself.
 fetch holds at most about one pass's grant beside the passes it runs. A span past the bound is read twice, once by
 the abandoned fetch and once by the fact path. Settle with Q-2072's block-level decode, which brings tree reads
 under the cap.
+## Q-1390 — The seed at a gate's start
+Decided by the lead with cond2 step 1, provisional, to the design's default; what the seed reads amended by Q-1560.
+**Scenario.** Q-1145 (b) seeds a starting gate's holds from history; the rule must be a function of the log, cheap
+at a watch, and say what the value was before the first reading it reads.
+**Decision.** With `L` the gate's longest hold, the look-back is `[T − min(2L, 24 h), T)`, `T` the start's commit
+time. The instance is judged, emitting nothing, as if watched at the look-back's start with boundaries uncrossed,
+over the series' state then and its facts committed inside the look-back before the start entry (Q-1560). Then the start transition (from none to the state at
+`T`, evaluated with the live-state value then) is emitted at the start's position. `2L`, so that a series
+reporting at least once per `L` completes a hold that truly held; a value first read inside the look-back later
+than `T − L` completes its hold late, never early. Gates with no hold read nothing. Staleness is judged at `T` from
+the series' arrivals; inside the seed the facts before the look-back count as arriving at its start (Q-1561). A
+window input in the seed sees the series' facts as the seed reads them.
+**Pinned by.** `tests/gate_seed.rs` `a_seed_reads_twice_the_longest_hold_back_and_counts_from_the_first_reading_inside`,
+`a_value_that_rose_shortly_before_the_watch_completes_its_hold_late_never_early`, `the_look_back_is_at_most_a_day`,
+`a_gate_without_holds_reads_no_history_so_its_boundaries_start_uncrossed`,
+`a_series_joining_an_each_is_seeded_from_its_history_at_the_join`, `a_fact_committed_at_the_look_backs_start_is_read`,
+`the_longest_hold_counts_hold_down`, `a_sets_longest_hold_counts_hold_off`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+
+## Q-1391 — Durable resume state for gates
+Decided by the lead with cond2 step 1, provisional, to the design's default.
+**Scenario.** A consumer's gates must resume exactly after a crash. Per-instance latches cost a record per instance
+on every confirmation, and a bound measured from the cursor refuses the replay of a consumer whose gates have been
+quiet for longer than `replay_max.span`.
+**Decision.** One gate cursor per consumer, a point in id order (the last confirmed transition id, or the frontier
+of the last confirmed resync), plus a checkpoint frontier at or after it and never after an unconfirmed transition.
+Confirmation is cumulative, so the cursor filters exactly as per-instance latches would. Resume replays every
+transition after both; the bound (`replay_max`) is measured from the checkpoint, so a quiet consumer still replays
+exactly. `kvik_model::gate::resume` takes the checkpoint and the gate cursor.
+**Pinned by.** `tests/gate_properties.rs` `a_restart_resumes_every_transition_once_after_dedup_by_id` (the replay
+equals the per-instance latch filter); `tests/gates.rs`
+`the_replay_bound_counts_facts_and_time_from_the_checkpoint_not_the_gate_cursor`,
+`a_frontier_gate_cursor_covers_timer_transitions_due_by_its_instant_only`; `tests/gate_edges.rs`
+`the_replay_bound_runs_from_the_checkpoint_not_from_an_old_gate_cursor`.
+
+## Q-1393 — The clock live gate timers run on
+Open, for the owner.
+**Scenario.** A gate's holds and staleness are timers. On the commit clock a forward step of the host clock
+completes holds and fires staleness at once, and a quiet store fires no timer until its writer's commit clock
+reaches the deadline; on the host clock live and replay can disagree.
+**Options.** (a) The commit clock, as for replay: a timer due at `d` fires once every batch committed before `d` is
+judged and the writer's commit clock has reached `d`, a backward step pausing timers; (b) the host clock live and
+the commit clock on replay, accepting that they can differ.
+**Provisional default.** (a), the commit clock, so live and replay agree (spec §6 Gates, Clock).
+**Pinned by.** none yet: the model judges on the commit clock only; the engine's live timers are cond2's.
+
+## Q-1560 — Facts inside the seed's look-back that were never the live value
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default; amends Q-1390.
+**Scenario.** Level 10, holds 5 s both ways; the live value is 5 (`t` 50, committed at 50); a backfill for `t` 40
+with value 50 commits at 92; the gate is watched at 100. Seeded from the facts committed inside the look-back
+alone, on an empty series, the backfill is the live value and the gate starts crossed, then falls at 105; the same
+gate watched at 90 stays at `Level(0)`. A fact outranked at its `t` (lower `changed_at`) does the same.
+**Decision (provisional).** The seed judges the series' true live state over the look-back: every fact of the series
+committed before the look-back counts as committed at its start, in position order, then the facts committed inside
+it before the start entry. A backfilled or outranked fact is never the live value, and the stand-in of Q-1390 is
+no longer needed. The engine then needs the live fact as of the look-back's start (one read by position), to be
+costed in cond2 step 2. **Fallback** if that read is too dear: count an inside fact only when it is not outranked
+and its `t` is at or after the look-back's start; that stays late, never early, except against future facts.
+**Pinned by.** `tests/gate_seed.rs` `a_backfill_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`an_outranked_fact_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`a_backfill_before_a_late_rise_does_not_start_the_hold_early`,
+`a_bad_fact_inside_the_look_back_leaves_the_earlier_live_value_in_the_seed`,
+`a_future_fact_taking_effect_inside_the_look_back_holds_from_its_t`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+
+## Q-1880 — What the gates core's history reads must return, and what they cost
+Decided by the lead with cond2 step 2's fix round, provisional, to the review's default; moves Q-1560's costing.
+**Scenario.** The core holds one live fact per series (G9's bound), so three things it cannot answer go to
+`History`: the series' state at a watch, the fallback when a bad or valueless fact replaces the live one at its
+`t` (spec §2.3), and the seed's look-back (Q-1390, Q-1560). The rules that matter were only in the tests' double.
+**Decision (provisional).** (1) `series(now, through)` is the state over the log through a position, not at its
+head: live, `through` is the item being applied, so the read sees the batch in flight, the triggering fact and
+earlier facts of the same batch included. (2) Its `last_arrival` counts the commit time of a usable fact even when
+a later fact replaced it at its `t`, and a fact committed ahead of its `t` counts at its `t` unless replaced before
+then: commit times are needed, which a latest-value index does not hold. (3) `at_look_back` is the state as of a
+commit time, every earlier usable fact in effect by then arriving at `from`; whether one still ahead at `from`
+counts there is Q-1882. (4) The fallback runs on the commit path, once per bad fact that lands on the live `t`.
+Costed in cond2 step 4 against the hot log and compacted segments, with the real `History` checked against the
+tests' double over the same generated logs. If `series` through a past position is too dear for replay, step 5
+replays from the checkpoint's held series states and reads only facts ahead.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_bad_fact_replacing_the_live_one_falls_back_to_the_older_value`,
+`the_seed_starts_from_the_live_fact_in_force_at_the_look_back_start`; the core's differential
+(`kvik/src/gates/differential.rs`).
+
+## Q-1881 — How a failed or short history read reaches the gates core
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** The seed's read may not reach the look-back's start (compacted away), and any read may fail (damage,
+I/O). The design seeds over what was read and counts `seeds_shortened`, and abandons a replay whose read fails.
+**Decision (provisional).** `History`'s reads are fallible: a failed read is `CoreError::History`, the call fails,
+and the core is not used again (any `CoreError` part-way through a batch is fatal to it; the caller restores from
+its checkpoint). A watch reads before it changes anything, so a failed read there adds nothing of the gate. A
+short read is not an error: `History` returns what it reached and its caller counts `seeds_shortened`.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_failed_history_read_fails_the_call_and_a_watch_adds_nothing`.
+
+## Q-1882 — Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** A usable fact committed before the look-back's start with `t` beyond it. `at_look_back` may count it
+as an arrival at `from` or not.
+**Decision (provisional).** Either: a seeded instance's state is never read (the start evaluation recomputes it),
+and with no live fact at `from` its holds and crossings stay empty either way, so transitions and states are the
+same. The real `History` takes whichever read is cheaper.
+**Pinned by.** Nothing can: the tests' double's choice is an equivalent mutant.
+
+## Q-1561 — Arrivals inside the seed
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default.
+**Scenario.** A series silent since commit 1 (value 50), `stale_after` 8 s, hold 5 s, watched at 100: inside the
+seed its facts count as arriving at the look-back's start, so the hold completes in the seed; the start is `Stale`
+and the next reading gives `Level(1)` at once. A gate watched at the look-back's start would hold again from that
+reading; one watched all along gives `Level(1)` at once, as the seed does.
+**Decision (provisional).** Keep: inside the seed the facts before the look-back arrive at its start. It agrees with
+a gate watched all along; spec §6 Gates, Transitions says so.
+**Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
+
+## Q-1580 — The routing fields of a watch and an unwatch
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** Routing changes 4 and 5 need field ids after 66. Ids are per entry type,
+but `format.md` A.6 names field 70 as the label item of type 10, and one id meaning two things across types invites
+mistakes. A set gate's members need a value form in the entry codec, which had none.
+**Decision.** 67 gate id, 68 name, 69 selector, 71 input, 72 kind, 73 level, 74 member, 75 holds, 76 dead-band,
+77 stale after; 70 is skipped and stays an unknown critical field of a routing change. A member is a tag byte then
+the value: 1 `f64`, 2 decimal (`i64` units, `u8` scale), 3 named state index `u32`, 4 boolean byte, 5 text of 1 to
+255 bytes. Window inputs (71 = 2) are refused when read until their fold exists.
+**Pinned by.** `log/tests/entries_gates.rs` (every field check, the byte vector of `format.md` A.6),
+`log/tests/batches.rs` round trip.
+
+## Q-1581 — The gate interface as built
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** `api.md` Gates sketched `Transition.flags`, a `Cause` enum and no error for an unknown name or a name
+the grammar refuses.
+**Decision.** A transition's flags are its delivery's (`Delivery.flags`, as for facts and triggers); the cause enum is
+`TransitionCause`; `Consumer::gates()` returns `(GateId, String, Gate)` with the series by id; `GateError::Name` (not
+1 to 64 bytes, or holding `/`) and `GateError::NoSuchGate` (unwatch of a name not in force) are added;
+`GateInstanceState.set_by` is an `Option` (Q-1392). An equal spec is compared after resolving a series name, so a
+watch by name and one by id of the same series are equal. A builder method of another kind (`deadband` on a levels
+gate) has no effect.
+**Pinned by.** `kvik/tests/gates.rs`, `kvik/src/gate.rs` tests, `kvik/src/durable/gates/tests.rs`.
+
+## Q-1582 — Every entry moves a gate's frontier
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** A timer transition's `at` is the last position of the whole log before its instant, but `kvik_model::gate::Entry` could carry only facts, definitions and the consumer's own gates, so the
+model backend could not hand `judge` a funnel change, another consumer's watch or a site-zone entry.
+**Decision.** `gate::Entry::Other { position, commit_time }` carries any other entry; it changes no state.
+`Model::gate_history` maps the whole log so.
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition`,
+`a_timer_after_a_funnel_change_takes_that_entry_as_its_at`.
+
+## Q-1583 — The model backend's gates for now
+Decided by the lead, provisional (settle with conditions step 5).
+**Scenario.** The model backend serves gates from `judge` so that the durable engine has an oracle; some parts of the
+interface have no model counterpart yet.
+**Decision.** A decimal member is compared as the `f64` it denotes; a named-state member on a gate whose series has
+no named states (every `each` gate) is `NotSupportedYet`. The gate cursor is the last confirmed transition, kept in
+the process with the store; after a restart every transition after it comes again flagged `replayed`, with no
+replay bound, and a resync carries each instance's state at the model's now, as it is handed out. A confirmation is
+cumulative across transitions and the model's other deliveries (cond2 step 4). The durable backend refuses window
+inputs and `each` gates with `NotSupportedYet` (until cond2 step 6 for `each`).
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_resync_carries_gate_states`,
+`kvik/src/durable/gates/tests.rs` `an_each_gate_is_refused_not_supported_yet_and_writes_nothing`.
+
+## Q-1810 — The bounds of a set member
+Decided at the review of conditions step 3, provisional.
+**Scenario.** Field 74 took any `u8` decimal scale and any `u32` state index, where every other decimal in the
+format is held to scale 18, a series has at most 65,536 names and `Value::State` is `u16`. Neither could match a
+value, and once stores hold such entries the format cannot be tightened.
+**Decision.** Scale at most 18 and index below 65,536, refused when read (field 74) and the scale at `watch`
+(`GateError::Set`; the index cannot exceed `u16`).
+**Pinned by.** `log/tests/entries_gates.rs` `gate_field_values_are_range_checked`, `kvik/src/gate.rs`
+`a_set_holds_one_to_sixty_four_values_none_absent`.
+
+## Q-1811 — Member order in an equal spec
+Decided at the review of conditions step 3, provisional.
+**Scenario.** A set gate watched again with the same members in another order.
+**Decision.** Not an equal spec: members compare in order, as written, so the second watch is `NameInUse`.
+`api.md` Gates, Naming says so.
+**Pinned by.** By reading (the spec comparison is the entry's equality).
+
+## Q-1812 — A named-state member on the durable backend
+Decided at the review of conditions step 3, provisional.
+**Scenario.** The model backend checks a named-state member against its series' names at `watch`; the durable
+backend wrote the index unchecked, so the two disagreed once durable gates are live.
+**Decision.** Both call one check: an index past the names is `GateError::Set`; a state member on a series without
+named states, every `each` gate included, is `NotSupportedYet` until `each` gates carry state names.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`a_named_state_member_is_checked_against_the_series_names_as_on_the_model`.
+
+## Q-1800 — A fact at position `0:0` in a history given to `judge`
+Decided by the lead at the re-check of cond2 step 1.
+**Scenario.** The seed's inner run starts after `Position::ORIGIN`, so a fact at `0:0` committed inside the
+look-back made `judge` panic; the outer run accepted it. No log holds one (positions start at `0:1`).
+**Decision.** `judge` refuses a fact at the origin as `GateError::Order`, so the seed's invariant holds for every
+history it accepts. A watch or other entry at the origin stays accepted (the tests' early-watch oracle uses one).
+**Pinned by.** `model/tests/gate_seed.rs`
+`a_fact_at_the_origin_position_is_refused_as_out_of_order_not_a_panic_in_the_seed`.
+
+## Q-2000 — The durable gate cursor in memory until the cursor file holds it
+Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
+**Scenario.** Gates are judged live before the cursor file has a gate cursor field or a checkpoint block.
+**Decision (provisional).** The gate cursor and the held snapshot (the core at or before the oldest unconfirmed
+transition, G5) live in the process. A second take in the same run queues the unconfirmed transitions again under
+their ids (flagged `replayed` if handed out before) as its catch-up passes their positions, then the resync with state
+now: the same transitions a replay from the held snapshot gives, without reading the log. The first take after a start
+reseeds the gates in force at the head by the seed rule, emits no start transitions and reports `set_by` `None`
+(Q-1392), counted `gates_reseeded`; nothing is replayed.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`,
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
+`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`; the first take's reseed is
+replaced by Q-2080's replay, pinned by `kvik/tests/gates.rs`
+`a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by`.
+
+## Q-2001 — What the durable backend's gate history reads cost
+Decided by the lead with cond2 step 4, narrowed at its review, provisional; settle with cond2 step 5.
+**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double. The first
+decision scanned the whole log per read, twice per gate at every reseed, under the deliverer lock.
+**Decision (provisional).** A read takes the series' facts at or before `through` through the segment indexes
+(`format.md` A.8; a segment without one is scanned) and judges them by the double's own rules (`Replay`), so the two
+cannot differ; the gate differential checks it end to end. One read per series and position serves a whole core
+call, so a reseed reads each watched series once for all its gates. A read that cannot read every place that may
+hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; bounded in
+time by Q-2295. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
+summaries) is a merge condition on cond2 step 5, which builds it with replay.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`;
+`kvik/src/durable/gates/tests.rs` `a_reseed_reads_a_series_from_the_log_once_for_all_its_gates`.
+
+## Q-2002 — Gate state after an overflow catch-up
+Decided by the lead with cond2 step 4; replaced at its review, provisional.
+**Scenario.** Spec §6 Gates, Resume says the overflow catch-up's resync carries gate states, but §4 Overflow ends a
+catch-up with no resync: condition funnels re-attach by sending each changed state. The first decision re-sent, on
+re-attaching, the transition that set each changed state. That transition was judged before any snapshot the run
+still holds, so G5 cannot hold for it, and after a second take it came again unflagged though confirmed.
+**Decision (provisional).** Transitions judged while a consumer is behind wait in a buffer as large as its queue and
+are queued as the catch-up passes their positions, so a short catch-up loses none and needs no resync. A buffer that
+fills makes the gates quiet: judged, counted `transitions_not_delivered`, not queued. Any resync queued while quiet
+ends it (its states are taken as it is handed out, Q-2003); a catch-up still quiet at its end issues one at the last
+position taken, as a resume does: cause `Resume`, funnel states included, so funnels re-attach by it (§4 Overflow, a
+resync counts as emitting the states it carries). No new resync cause.
+**Pinned by.** `kvik/tests/gates.rs`
+`a_gate_that_overflows_its_queue_counts_what_it_drops_and_ends_its_catch_up_with_a_resync_of_the_present_state` and
+`a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_take_while_quiet` (the model backend
+has no overflow: its transitions are computed when handed out).
+
+## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
+Decided by the lead with cond2 step 4, provisional.
+**Scenario.** A resync is queued at one moment and handed out later; transitions may be judged in between.
+**Decision (provisional).** Its gate states are taken as it is handed out, as the model backend's are. Confirming it
+sets the gate cursor to the frontier at the resync's position: every transition at or below it is queued before the
+resync and none above, so the transitions queued behind it stay unconfirmed.
+**Pinned by.** `kvik/tests/consumer_properties.rs`
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`.
+
+
+## Q-2080 — The durable gate cursor and checkpoint in the cursor file
+Decided by the builder with cond2 step 5, provisional; supersedes Q-2000.
+**Scenario.** A consumer with gates stops or crashes; at the next start it should receive every transition after the
+last one it confirmed, under the same ids, then a resync with state now (spec §6 Gates, Resume).
+**Decision (provisional).** Every cursor block written once the consumer's first watch has been applied holds the gate
+cursor (field 4); a write that carries a checkpoint appends block `0x31` before it in the same write and sync. At the
+first take in a run the engine is restored from the last valid checkpoint (from the empty core at the cursor when the
+file has no gate cursor), fed every record after it from the deliverer's kept log with each batch's commit time, and
+advanced to the commit floor; the transitions after the gate cursor are queued flagged `replayed` as the catch-up passes
+their positions, then the resume's resync carries state now. Replay is refused, and the gates in force are reseeded
+(counted `gates_reseeded`; `transitions_not_replayed` when over `conditions.replay_max`), with no cursor file, a gate
+cursor with no checkpoint (damage), a checkpoint of another generation or past the head, a reset point after it
+(Q-2082), or a failed read. A checkpoint instance naming a gate not in force at its frontier is dropped and a gate in
+force there with no instance is reseeded, both counted `checkpoint_mismatch`. At a start the commit clock is raised to
+every checkpoint's instant and every gate cursor's (G10, Q-1394). Q-2001's effect on replay: the replay itself reads no
+history, but restoring reads each held series' facts ahead of the checkpoint with one history read, and a reseed two
+per gate, each a scan of the log from its start (not changed here).
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`;
+`kvik/tests/gates_durable.rs`, `gate_deliveries_after_crashes_follow_the_rules` among them, and its failure-table rows
+(torn checkpoint, torn cursor block, lost file, failed cursor write, bound, clock stepped back).
+
+## Q-2081 — The checkpoint block as built
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The design laid out a checkpoint record per instance with the series' live fact inside it; the engine
+keeps series apart (several gates may read one) and restores fields the design did not list.
+**Decision (provisional).** Block `0x31` holds instances and series as two lists (`format.md` A.15): an instance adds a
+change gate's reference value and the instant of its last evaluation; a series adds whether its live fact is usable and
+its revision. Values use the checkpoint's own tagged form (none, number, boolean, text), since a core value is not an
+entry value. Facts ahead of the frontier are read again at a restore, as designed.
+**Pinned by.** `log/src/cursor/tests.rs` `checkpoint_vector_matches_format_md_and_round_trips`;
+`log/tests/cursor_checkpoint.rs`.
+
+## Q-2082 — A reset point or lost range after the checkpoint
+Decided by the builder with cond2 step 5, provisional; settle with cond2 step 6.
+**Scenario.** A recovery entry or a lost range lies between a consumer's checkpoint and the head at its take.
+**Decision (provisional).** The take reseeds rather than replays: the replay would judge across positions the reset
+point voids. Cond2 step 6 replaces this with the reseed at the reset point during the replay (design §4.4 step 5).
+Reset points below the checkpoint do not stop a replay: nothing after the checkpoint rests on them.
+**Pinned by.** `kvik/tests/gates_durable.rs`
+`a_power_loss_replays_up_to_its_reset_point_then_reseeds_there` (renamed by Q-2170), and
+`gate_deliveries_after_crashes_follow_the_rules` (a power loss ends the resume with a reset point).
+
+## Q-2083 — Facts counted for the bound; entries of a newer format in a replay
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** `conditions.replay_max.facts` must be checked before reading the replay; a log written by a newer
+minor version may hold ignorable entries the deliverer keeps no record of.
+**Decision (provisional).** Facts after the checkpoint are counted as the positions after it less those of the entries
+the deliverer holds, so an ignorable entry counts as facts (the bound can only be met early). A replay feeds the engine
+the records it holds; an ignorable entry last in a batch before a timer's instant would give that timer an `at` lower
+than live judgement gave it. No binary writes such entries yet.
+**Pinned by.** none yet.
+
+## Q-2084 — `set_by` after a replay of an instance a reseed set
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A reseed sets an instance with no transition, so a resync reports `set_by` none (Q-1392); a checkpoint
+taken then is replayed after a restart.
+**Decision (provisional).** The checkpoint holds the start id the instance would have had, not that a reseed set it, so
+after the replay the resync reports that id until a transition moves the instance. A flag in the instance record would
+keep `None`; not added while no consumer reads `set_by` to act.
+**Superseded by Q-2160.**
+
+## Q-2085 — The model backend's resume
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The public-interface differential compares the durable backend's replay with the model backend's
+after clean restarts.
+**Decision (provisional).** The model backend keeps the whole log, has no checkpoint and applies no bound: at the first
+take after a store restart, every transition after the gate cursor that its judgement holds then comes flagged
+`replayed` (`kvik_model::gate::resume` with the bound not reached). The differential therefore runs the durable
+backend with an unbounded `conditions.replay_max`; the bound is pinned on the durable backend alone.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`.
+
+## Q-2086 — When a cursor write carries a checkpoint
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** Design §4.3 lists the writes that carry a checkpoint and what it holds.
+**Decision (provisional).** A cursor write carries a fresh checkpoint when its content's frontier differs from the one
+last written and either a gate confirmation came since, none was written yet, it is the last write of a clean
+shutdown, or `conditions.checkpoint_interval` has passed; a gates-only consumer whose engine moves is written on that
+interval though its cursor did not move. The content is the held snapshot (the engine at or before the oldest
+transition judged and not confirmed, whether queued, deferred while behind, or dropped while quiet) or, with none, the
+engine now. The held snapshot stays until all of them are confirmed: a consumer always one transition behind keeps an
+old checkpoint, whose replay may outgrow the bound (then reseeded, counted). A confirmed transition writes the cursor
+file at once.
+**Pinned by.** `kvik/tests/gates_durable.rs`, `a_clean_shutdown_writes_a_checkpoint_at_the_frontier` and
+`the_replay_bound_counts_facts_from_the_checkpoint_not_the_cursor` among them.
+
+## Q-2087 — The instant a reseed starts the gates at
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A take reseeds (no cursor file, beyond `conditions.replay_max`, a reset point after the checkpoint) while
+a hold begun before the head's last commit has completed by the commit floor: in the previous run it fired, was
+delivered and was confirmed. Seeded at the head's commit time, the hold completes after the start and fires again, a
+transition with no `replayed` flag ahead of the resync, where the spec sends the resync alone.
+**Decision (provisional).** The reseed's start instant `T` is the commit floor when the deliverer has read through the
+floor's position (the floor's guarantee then holds: nothing later commits below it), else the head's commit time. A
+hold complete by then is in the resync's state, `set_by` none; nothing is sent before the resync.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_lost_cursor_file_reseeds_the_gates`,
+`a_resume_beyond_the_replay_bound_reseeds_without_replaying`.
+
+## Q-2160 — `set_by` of a reseeded instance after a restart
+Decided at review of cond2 step 5 (S1), replacing Q-2084.
+**Scenario.** The cursor file is lost; the take reseeds (resync `NoCursor`, `set_by` none); the consumer confirms; a
+clean stop; the next start replays from the checkpoint that confirmation wrote. Under Q-2084 the resync then named
+the start id, which no delivery in either run carried; a consumer that de-duplicates or audits by `set_by` is misled.
+**Decision.** An instance record's `set_by` gate point sets its third byte, otherwise zero, to 1 when a reseed set the
+instance and no transition has moved it since (`format.md` A.15); a restore keeps the instance reported as `set_by`
+none until a transition moves it. Files written before the flag read it as 0.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_reseeded_gate_keeps_set_by_none_after_a_restart`;
+`log/src/cursor/tests.rs` `a_reseeded_instance_sets_byte_2_of_its_set_by_and_round_trips`; the crash property's check
+that a resync's `set_by` is an id handed out.
+
+## Q-2161 — The crash property's cases and checks
+Decided at review of cond2 step 5 (S2).
+**Scenario.** `gate_deliveries_after_crashes_follow_the_rules` ran a quarter of the configured cases and checked three
+rules, so a transition lost between a checkpoint and the head, or a wrong state in a resync, would pass.
+**Decision.** It runs every configured case and adds two continuity checks needing no log oracle: a new transition
+starts from the state the consumer last learnt for its instance; a resync's `set_by` is none or an id handed out, and
+its state is the one that id set. It fails when fewer than one history in 64 reaches the replay check or fewer than
+one `set_by` check per 4 histories (measured at 1,024 cases: one in 22, and 0.8 a history).
+**Pinned by.** `kvik/tests/gates_durable.rs` `gate_deliveries_after_crashes_follow_the_rules`.
+
+## Q-2162 — Bytes written per confirmed transition by a consumer with many gates
+Decided at review of cond2 step 5 (S4), provisional.
+**Scenario.** A confirmed transition with nothing else outstanding appends the consumer's whole checkpoint and syncs
+(Q-2086). From the A.15 layout a levels instance with no pending hold takes 54 bytes and the series it reads 42
+(a numeric live fact and a last arrival), so a consumer with 1,000 single-series gates appends about 96 KB a confirmed
+transition and writes its 16 MiB file again about every 170.
+**Decision (provisional).** Keep the rule; the bench notes of cond2 step 6 measure bytes as well as syncs. If the
+bytes show, write a checkpoint on a confirmation at most once per `conditions.checkpoint_interval` and rely on replay.
+**Pinned by.** none: a measurement.
+
+## Q-2163 — A checkpoint larger than a block once `Each` lands
+Decided at review of cond2 step 5; bound chosen by the builder with cond2 step 6, provisional.
+**Scenario.** `Each` allows 4,096 gates of up to 256 instances on one consumer; their checkpoint would pass the 16 MiB
+block limit. Today's limit, 4,096 single-series gates, stays under 3 MiB.
+**Decision (provisional).** A consumer holds at most 12,288 `Each` instances across its gates (`MAX_EACH_INSTANCES`);
+a series that would pass it is refused and counted like one beyond a gate's 256 (Q-1143), and joins at the first
+definition entry that finds room, gates taken in id order. With 4,096 single-series gates that is 16,384 instances;
+at every field's widest (255-byte text values, 16 pending holds) an instance with its series takes about 1,009 bytes,
+so the largest checkpoint is about 16.5 MB, under the block. Splitting the checkpoint across blocks was the
+alternative; it changes the format and is not needed at this bound.
+**Pinned by.** `kvik/src/gates/each_tests.rs` (`the_largest_checkpoint_a_consumer_can_hold_fits_one_block`,
+`a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gate_frees_room`, core against `judge`).
+
+## Q-2170 — A reset point or a new generation in the judgement
+Decided by the builder with cond2 step 6, provisional. Supersedes Q-2082.
+**Scenario.** A gate has crossed a boundary with hysteresis on a value since lost (a power loss truncated it, or a
+lost range voids it), and the log now holds a recovery entry or a lost range after the checkpoint. Judged straight
+through, the instance keeps a crossing that rests on facts the log no longer holds.
+**Decision (provisional).** The judgement treats a reset point (a recovery entry at its position; a lost range not
+described by one at its last position, before the next entry and at the commit time before it) and the start of a new
+generation as a reseed entry (`gate::Entry::Reset`): every instance in force is seeded again there by the seed rule,
+as if starting, with no transition; its `set_by` is that start id, carried as none in a resync until the instance moves
+(Q-1392); the series an `Each` holds and refuses are kept, so no instance joins or leaves there. The model engine's
+gate history places these entries from its reset points; the durable replay at a take does the same where it meets
+one after the checkpoint, so it replays the transitions before the reset point rather than reseeding the whole take
+at the head. The consumer forgets ids above the resync's `forget_above` (Q-1140). Counted once per take as
+`gates_reseeded`.
+**Pinned by.** `model/tests/gate_reset.rs` (`after_a_reset_the_judgement_is_that_of_a_gate_started_there` and the
+unit cases); `kvik/src/gates/differential.rs` (resets in the core differential), `kvik/src/gates/each_tests.rs`
+`a_reset_reseeds_every_instance_without_a_transition`; `kvik/tests/gates_each.rs`
+`a_reset_point_after_the_checkpoint_reseeds_where_it_lies_after_replaying_up_to_it`.
+
+## Q-2171 — A new generation on the durable backend
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A store is restored (§8); a consumer's checkpoint is of the previous generation.
+**Decision (provisional).** The durable backend reseeds at the take, at the commit floor (Q-2087), not at the first
+position of the new generation where the model's history places its reseed entry (Q-2170). The two agree on states
+except where a hold or hysteresis spans entries between the generation's start and the take. Restores are not in the
+gate differentials; settle with the restore work if they are added.
+**Pinned by.** `kvik/src/durable/deliver/gate_resume.rs` (another generation is not replayed); no differential.
+
+## Q-2172 — A lost range recorded at run time
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A scrub finds a sealed segment damaged with no copy while the store runs; the engine has already judged
+its facts. Consumers past the range receive a plain resync (§4 Resync).
+**Decision (provisional).** The running engine keeps what it judged; a later replay from a checkpoint before the range
+reseeds there (Q-2170), as the model's history, which lists every lost range among its reset points, does. Until a
+restart the live states may rest on the lost facts. Not in the differentials.
+**Pinned by.** Nothing yet.
+
+## Q-2173 — An `Each` gate's refusals across a restore
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A full `Each` refuses a series; the consumer stops; its checkpoint holds instances only (`format.md`
+A.15, Q-2081).
+**Decision (provisional).** No format change: at restore the refusals are every series the pattern matches at the
+checkpoint's position, by the names in force there, beyond the instances (with the instances, every match: the
+invariant the core keeps). `instances_refused` counts per run: a replay counts again the refusals it judges again.
+**Pinned by.** `kvik/src/gates/differential.rs` (restores with `Each` gates); `kvik/tests/gates_each.rs`
+`each_instances_replay_after_a_restart_from_the_checkpoint`.
+
+## Q-2220 — A resync's confirmation over replayed transitions is written at once
+Decided in the fix round of cond2 step 5.
+**Scenario.** A start replays transitions handed out before a crash and ends with a resync; the consumer confirms the
+resync, which returns, and the process crashes within a second. The confirmation's frontier covered the replayed
+transitions, but only a confirmed transition was written at once: the frontier went on the timed path (at most once
+a second), so the crash lost it and the next start replayed the same transitions again after their confirmation had
+returned. Found by the crash property at its full case count.
+**Decision.** Every gate confirmation, a transition or a resync's frontier, writes the cursor file before `confirm`
+returns, as a latch change does. A resync is confirmed once a resume, so the extra writes are few.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_confirmed_start_transition_does_not_come_again_after_three_crashes`.
+
+## Q-2250 — When a run takes the snapshot that becomes `held`
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A consumer that is behind with nothing outstanding can hold transitions in `deferred`, judged in an
+earlier batch. A snapshot taken at the next batch is after their judgement, and the catch-up then makes it `held`
+under them (G5).
+**Decision (provisional).** A run takes the snapshot that becomes `held` only when `outstanding` and `deferred` are
+both empty: in `gate_batch` and in `ready`. `gate_confirm` takes none; it clears `pre`, and the next `ready` retakes it
+under the same condition. Settle with cond2 step 5, which writes `held` as the checkpoint.
+**Pinned by.** `kvik/tests/gates_snapshot.rs`
+`a_transition_deferred_while_behind_is_delivered_once_after_later_batches_judge_nothing`; the S5 test
+`the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement` still holds.
+**At the step 5 merge.** The condition is written as `held` none: the durable hold sets `held` at every judged
+transition and keeps it while one is outstanding, deferred or dropped (Q-2270), so it is the same condition.
+
+## Q-2251 — Deferred transitions older than a dropped one, after the resync that ended the quiet
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A resync that ends a quiet clears `quiet` while `deferred` may hold transitions above the resync's
+position and older than the ones dropped; they arrive after it with a state it superseded.
+**Decision (provisional).** Keep, as Q-2003 accepts (`set_by` names the newer id). `api.md` is not changed here: a
+transition whose id is below a resync's `set_by` for its instance is superseded. Not probed in this round; settle
+by step 5's merge.
+**At the step 5 merge.** Unchanged: the checkpoint hold (Q-2270) does not move `held` past these transitions,
+and a quiet ended by a resync below a dropped id keeps the checkpoint until a later confirmation covers it.
+
+## Q-2270 — The checkpoint while a quiet catch-up ends with a resync
+Decided when the overflow resync (Q-2002) met the durable checkpoint (Q-2086).
+**Scenario.** A consumer behind fills its buffer, so its gates go quiet; the transition that filled it is dropped,
+then the catch-up ends with a resync of the present state. The consumer confirms every transition queued before
+that resync but not the resync, and the process crashes. Nothing is outstanding or deferred and the run is no
+longer quiet, so without more the checkpoint moves to the core now, after the dropped transition, and the restart
+does not replay it although it is after the gate cursor.
+**Decision.** The highest dropped id is kept (the one that makes the gates quiet included) and holds the checkpoint
+before it until the gate cursor covers it: the confirmed resync's frontier does. Kept rather than a "resync
+pending" flag, since it holds whatever confirms past it.
+**Pinned by.** `kvik/tests/gates_checkpoint.rs`
+`a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_up_resync_is_confirmed`.
+
+## Q-2271 — The bounded gate history read named as a merge condition on cond2 step 5
+Open, for the lead.
+**Scenario.** Q-2001, as narrowed at the step 4 review, makes the bounded read of Q-1880 (from `commit_at(T − 2L)`,
+with the series' state there from the summaries) a merge condition on step 5. Step 5 bounds replay by
+`conditions.replay_max`, but each history read still takes all of a series' facts at or before its position.
+**Default (provisional).** Merge step 5 without it; the bounded read lands with step 6, measured in its bench notes;
+Q-2001 keeps its text until then.
+**Ruling.** The lead: build it with step 6. Built as Q-2295.
+
+## Q-2295 — How the durable gate history read is bounded
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** Q-2001's reads took every fact of a series at or before their position, so a reseed or a watch on a
+series with years of history read all of it. The design's bound (positions from `commit_at(T − 2L)`, the state there
+from the summaries) needs a per-series state at a position that the summaries do not keep.
+**Decision (provisional).** A read takes the series' facts with `t` from whole days before the time asked about,
+through the segment indexes bounded to positions at or below the read's: 1 day (covers the longest look-back), then
+16, then 256, then the whole series. A window answers only where the facts it omits (all with `t` before it) cannot
+change the answer: the series' state needs a usable fact in effect then inside the window and a last arrival not
+in the window (any is above every omitted one); the look-back's start needs a usable fact in effect then; the
+facts since a time need the window's first commit before it (the seed asks for them after the look-back's start,
+whose answer needs that already). A window is
+refused when a fact before it was committed after its first (a backfill it cannot see, found by a position-bounded
+probe that keeps no facts); one with nothing before it is the whole series. So the answers equal the whole series'
+(Q-1880's rules unchanged), and a series reporting at least daily is read for a day, not its history. A series quiet
+for longer than the windows, or with backfills older than them, is still read whole.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`bounded_history_reads_answer_as_the_whole_series_does` (property: months of history, backfills, future and bad
+facts) and `a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history`.
 
 ## Open at v0.2
 
@@ -6217,7 +6776,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1142 | conditions step 3 | Decided by the lead, provisional: ids name the series; for review with the public API |
 | Q-1143 | conditions step 6 | Decided by the lead, provisional: refused and counted, joining when there is room |
 | Q-1144 | conditions step 2 | Decided by the lead, provisional: timers first; the engine is compared with the model on it |
-| Q-1145 | conditions step 3 | Decided by the lead, provisional: boundaries start uncrossed; for review with the public API |
+| Q-1145 | cond2 step 1 | Settled by the owner: (b), seeded from history by the rule of Q-1390 |
 | Q-1146 | conditions step 2 | Decided by the lead, provisional: `Unknown` and `Stale` break holds, crossings kept |
 | Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
 | Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
@@ -6232,6 +6791,38 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2132 | 7.1b | Decided with the fix round of 7.1b step 5: the rig shuts its writer down when dropped; 64 shrink steps |
 | Q-2133 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: order of levers for the ten-year chart |
 | Q-2260 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: the fetch's bound is the hint, not a grant |
+| Q-1390 | cond2 step 1 | Decided by the lead, provisional: look-back `min(2L, 24 h)`, the series' state at its start (Q-1560) |
+| Q-1391 | cond2 step 1 | Decided by the lead, provisional: one gate cursor and a checkpoint; the bound from the checkpoint |
+| Q-1393 | cond2 step 2 | Open, for the owner: the commit clock as the provisional default |
+| Q-1560 | cond2 step 4 | Decided by the lead, provisional: the series' true live state; the read costed in step 4 (Q-1880), else the fallback |
+| Q-1561 | cond2 step 2 | Decided by the lead, provisional: facts before the look-back arrive at its start (kept) |
+| Q-1880 | cond2 step 5 | Decided by the lead, provisional: the four rules as the contract; a log scan per read for now (Q-2001), the bounded read with replay |
+| Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
+| Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
+| Q-2000 | cond2 step 5 | Superseded by Q-2080 |
+| Q-2001 | cond2 step 5 | Decided at review, provisional: one indexed read per series per core call; the bounded read with replay, before step 5 merges |
+| Q-2002 | cond2 step 6 | Decided at review, provisional: buffered while behind; a quiet catch-up ends with a resync |
+| Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
+| Q-2080 | cond2 review | Decided by the builder, provisional: field 4 and block 0x31; replay at the first take |
+| Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
+| Q-2082 | cond2 step 6 | Superseded by Q-2170 (cond2 step 6): the replay reseeds where the reset point lies |
+| Q-2083 | cond2 review | Decided by the builder, provisional: positions less entries; newer-format entries not fed |
+| Q-2084 | cond2 review | Superseded by Q-2160 |
+| Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
+| Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
+| Q-2087 | cond2 review | Decided by the builder, provisional: the commit floor once read through its position |
+| Q-2160 | cond2 review | Decided at review: a reseed flag in the instance's `set_by` |
+| Q-2161 | cond2 review | Decided at review: every case; two continuity checks; floors on checks reached |
+| Q-2162 | cond2 step 6 | Decided at review, provisional: keep the rule; measure bytes in the step 6 bench notes |
+| Q-2163 | cond2 step 6 | Provisional: at most 12,288 `Each` instances per consumer, refused and counted beyond |
+| Q-2170 | cond2 review | Decided by the builder, provisional: a reseed entry; the replay reseeds at the reset point |
+| Q-2171 | cond2 review | Decided by the builder, provisional: reseed at the take; the differentials hold no restore |
+| Q-2172 | cond2 review | Decided by the builder, provisional: the engine keeps what it judged; reseeded at the next replay across it |
+| Q-2173 | cond2 review | Decided by the builder, provisional: recomputed at restore from the names in force |
+| Q-2220 | cond2 review | Decided in the fix round: every gate confirmation written at once |
+| Q-2270 | cond2 review | Decided at merge: the highest dropped id holds the checkpoint until the gate cursor covers it |
+| Q-2271 | cond2 step 6 | Ruled by the lead: built with step 6 (Q-2295) |
+| Q-2295 | cond2 step 6 | Decided by the builder, provisional: event-time windows of 1, 16, 256 days, exact or widened |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -6573,6 +7164,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1403 | "First fact at or after T" for `start: time` | §4 New consumer (decided by the lead, 26 November, to the provisional default): by the receive time of the batch, as the durable backend's commit index; the model takes the last entry received before T. Scenario: facts received a second apart; a start at the second's receive time begins after the first (`starts.rs`; `kvik/tests/api.rs`, both backends) |
 | Q-1450 | A lost consumer taken again before it confirms its `NoCursor` resync | §4 Resync, invariant 25 (settled by the lead, 26 November, to the recommended default): every take before the confirmation sends the `NoCursor` resync again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`; `kvik/tests/consumers.rs`) |
 | Q-2051 | Where the S2 follow-up goes | With the train-6 review fixes (`api.md` `Store::open`, `log/tests/recovery.rs`) |
+| Q-1145 | A gate's state when it starts | §6 Gates, Transitions (ruled by the owner, 2026-11-26: (b), seeded from history) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

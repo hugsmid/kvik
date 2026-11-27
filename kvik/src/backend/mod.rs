@@ -11,6 +11,7 @@
 
 pub(crate) mod convert;
 mod error;
+pub(crate) mod gates;
 pub(crate) mod live;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -31,6 +32,7 @@ use crate::consume::{
 };
 use crate::env::{Clock, Monotonic};
 use crate::error::{Fault, Refusal, Wait};
+use crate::gate::GateInstanceState;
 use crate::health::{
     ClockJump, ClockStats, ConsumerStats, DiskStats, Health, IngestStats, LogStats, LossCause,
     LossKind, LossReport, MarkState, Reason, SeriesStats, Stats,
@@ -195,6 +197,8 @@ struct ConsumerSlot {
     /// Per model funnel, the last condition delivery sequence the model issued before this store session: the model
     /// keeps sequences across restarts, the interface starts them at 1 at every start (spec §4 Order).
     sequence_base: BTreeMap<u32, u64>,
+    /// Gates and their delivery state.
+    gates: gates::GateFeed,
 }
 
 #[derive(Debug)]
@@ -416,6 +420,7 @@ impl Slot {
             c.attached = None;
             c.parts.clear();
             c.awaiting_resync = None;
+            c.gates.reattach();
         }
         self.waiting.clear();
         Ok(self.epoch)
@@ -1011,9 +1016,25 @@ impl Slot {
                        has no routing-cycle check",
             ));
         }
+        // The first take after a store restart: what the judgement holds now is replayed (spec §6 Gates, Resume).
+        let restart = match self.consumers.get(name) {
+            Some(c) if c.attached.is_none() && c.gates.any() && !c.handle => {
+                let history = self.model.gate_history(c.id).map_err(convert::error)?;
+                Some(km::gate::Frontier {
+                    at: history
+                        .last()
+                        .map_or(km::types::Position::ORIGIN, km::gate::Entry::position),
+                    now: self.model.now,
+                })
+            }
+            _ => None,
+        };
         if let Some(c) = self.consumers.get_mut(name) {
             if c.handle {
                 return Err(Error::ConsumerInUse(name.to_string()));
+            }
+            if restart.is_some() {
+                c.gates.restart = restart;
             }
             // Taken again in the same store session: the consumer restarted;
             // it resumes from its durable cursor (spec §6 Restart and
@@ -1025,6 +1046,7 @@ impl Slot {
                 // What was handed out is dropped with the old handle, a resync awaiting confirmation included.
                 c.parts.clear();
                 c.awaiting_resync = None;
+                c.gates.reattach();
             } else if self.model.cursor_lost(id) {
                 // Its cursor file was lost at the start: it starts as a new consumer would (Q-131).
                 self.model
@@ -1058,6 +1080,7 @@ impl Slot {
                 sequence_base: BTreeMap::new(),
                 parts: VecDeque::new(),
                 awaiting_resync: None,
+                gates: gates::GateFeed::default(),
             },
         );
         Ok(())
@@ -1267,6 +1290,14 @@ impl Slot {
     /// being handed out, else, unless a resync awaits confirmation, a
     /// delivery from the model after running due timers and catch-up.
     pub(crate) fn poll_delivery(&mut self, epoch: u64, name: &str) -> Result<Option<Delivery>> {
+        let d = self.next_delivery(epoch, name)?;
+        if let (Some(d), Some(c)) = (&d, self.consumers.get_mut(name)) {
+            c.gates.handed_out(d.id);
+        }
+        Ok(d)
+    }
+
+    fn next_delivery(&mut self, epoch: u64, name: &str) -> Result<Option<Delivery>> {
         let cid = self.bound(epoch, name)?;
         let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
         if let Some(d) = c.parts.pop_front() {
@@ -1284,10 +1315,30 @@ impl Slot {
         self.model
             .catch_up(cid, usize::MAX)
             .map_err(convert::error)?;
-        let mut got = self.model.receive(cid, 1).map_err(convert::error)?;
+        let peeked = match self.consumers[name].gates.peeked.is_some() {
+            true => None,
+            false => self.model.receive(cid, 1).map_err(convert::error)?.pop(),
+        };
         self.forget_observations();
-        let Some(e) = got.pop() else { return Ok(None) };
-        let parts = self.deliveries(name, e);
+        let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
+        let e = c.gates.peeked.take().or(peeked);
+        // Gate transitions interleave with the model's deliveries by position (spec §4 Order, §6 Gates).
+        if let Some(t) = self.next_transition(name)?
+            && e.as_ref().is_none_or(|e| gates::before(&t, e))
+        {
+            self.consumers
+                .get_mut(name)
+                .ok_or(Error::Closed)?
+                .gates
+                .peeked = e;
+            return Ok(Some(self.hand_transition(name, t)));
+        }
+        let Some(e) = e else { return Ok(None) };
+        let gate_states = match &e.kind {
+            km::engine::DeliveryKind::Resync(_) => self.gate_states(name)?,
+            _ => Vec::new(),
+        };
+        let parts = self.deliveries(name, e, gate_states);
         let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
         c.parts.extend(parts);
         let d = c.parts.pop_front();
@@ -1317,7 +1368,12 @@ impl Slot {
     }
 
     /// The deliveries of one model envelope: one, or the parts of a resync.
-    fn deliveries(&self, name: &str, e: km::engine::Envelope) -> Vec<Delivery> {
+    fn deliveries(
+        &self,
+        name: &str,
+        e: km::engine::Envelope,
+        gate_states: Vec<GateInstanceState>,
+    ) -> Vec<Delivery> {
         use km::engine::DeliveryKind as K;
         let mut flags = DeliveryFlags {
             replayed: e.replayed,
@@ -1394,19 +1450,13 @@ impl Slot {
                     .collect();
                 // In the interface's funnel order: a re-routed pattern funnel has a later model id.
                 states.sort_by_key(|f| f.funnel);
-                let chunks: Vec<Vec<FunnelState>> = if states.is_empty() {
-                    vec![Vec::new()]
-                } else {
-                    states
-                        .chunks(RESYNC_PART_FUNNELS)
-                        .map(<[FunnelState]>::to_vec)
-                        .collect()
-                };
-                let n = chunks.len();
-                chunks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(k, funnels)| {
+                let mut funnel_parts = states.chunks(RESYNC_PART_FUNNELS);
+                let mut gate_parts = gate_states.chunks(RESYNC_PART_FUNNELS);
+                let n = funnel_parts.len().max(gate_parts.len()).max(1);
+                (0..n)
+                    .map(|k| {
+                        let funnels = funnel_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
+                        let gates = gate_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
                         let part = u32::try_from(k + 1).unwrap_or(u32::MAX);
                         Delivery {
                             id: DeliveryId::Resync { part },
@@ -1417,6 +1467,7 @@ impl Slot {
                                 part,
                                 last: k + 1 == n,
                                 funnels,
+                                gates,
                             }),
                             flags,
                             delivered_at,
@@ -1427,7 +1478,32 @@ impl Slot {
         }
     }
 
+    /// Confirms `id` and every delivery handed out before it in this attachment, gate transitions and the model's
+    /// deliveries alike (`docs/api.md` `Consumer::confirm`).
     pub(crate) fn confirm(&mut self, epoch: u64, name: &str, id: DeliveryId) -> Result<()> {
+        self.bound(epoch, name)?;
+        let c = self.consumers.get(name).ok_or(Error::Closed)?;
+        if let DeliveryId::Resync { part } = id
+            && c.awaiting_resync != Some(part)
+        {
+            return Ok(());
+        }
+        let Some((transition, other)) = c.gates.confirming(id) else {
+            return self.confirm_one(epoch, name, id);
+        };
+        if let Some(o) = other {
+            self.confirm_one(epoch, name, o)?;
+        }
+        if let Some(t) = transition {
+            self.confirm_one(epoch, name, t)?;
+        }
+        if let Some(c) = self.consumers.get_mut(name) {
+            c.gates.confirmed_through(id);
+        }
+        Ok(())
+    }
+
+    fn confirm_one(&mut self, epoch: u64, name: &str, id: DeliveryId) -> Result<()> {
         let cid = self.bound(epoch, name)?;
         let mid = match id {
             DeliveryId::Fact(p) => km::engine::DeliveryId::Fact(mpos(p)),
@@ -1439,6 +1515,7 @@ impl Slot {
                 sequence: sequence + self.sequence_base(name, funnel.0),
             },
             DeliveryId::GenerationChanged => km::engine::DeliveryId::GenerationChanged,
+            DeliveryId::Transition(t) => return self.confirm_transition(name, &t),
             DeliveryId::Resync { part } => {
                 // Only the last part confirms the resync; an earlier part
                 // does nothing.

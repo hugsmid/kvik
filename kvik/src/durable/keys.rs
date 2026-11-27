@@ -114,6 +114,64 @@ impl LocalFacts for OnLog<'_> {
     }
 }
 
+impl OnLog<'_> {
+    /// The series' facts with `t` in `from..=to` at positions above `above` and at or below `upto`, in position order;
+    /// none when a place that may hold one could not be read.
+    pub(crate) fn within(
+        &mut self,
+        series: u32,
+        from: i64,
+        to: i64,
+        above: Option<kvik_log::writer::Position>,
+        upto: kvik_log::writer::Position,
+    ) -> Option<Vec<FoundFact>> {
+        let wanted = [Wanted {
+            series_id: series,
+            from,
+            to,
+        }];
+        let within = kvik_log::reader::Within {
+            above,
+            upto: Some(upto),
+            ..kvik_log::reader::Within::default()
+        };
+        let (lost, latch) = (self.lost, self.latch);
+        let skipped = |f, a, z| OnLog::skip(lost, latch, f, a, z);
+        let l = self.reader.lookup_within(&wanted, &skipped, within).ok()?;
+        let mut facts = l.facts;
+        facts.sort_by_key(|f| f.position);
+        (l.complete[0] && !l.overflowed).then_some(facts)
+    }
+
+    /// Whether [`OnLog::within`] may find a fact: it keeps none, and says yes when a place could not be read.
+    pub(crate) fn any(
+        &mut self,
+        series: u32,
+        from: i64,
+        to: i64,
+        above: Option<kvik_log::writer::Position>,
+        upto: kvik_log::writer::Position,
+    ) -> bool {
+        let wanted = [Wanted {
+            series_id: series,
+            from,
+            to,
+        }];
+        let within = kvik_log::reader::Within {
+            budget: 1,
+            above,
+            upto: Some(upto),
+            expect: 0,
+        };
+        let (lost, latch) = (self.lost, self.latch);
+        let skipped = |f, a, z| OnLog::skip(lost, latch, f, a, z);
+        match self.reader.lookup_within(&wanted, &skipped, within) {
+            Ok(l) => l.overflowed || !l.complete[0] || !l.facts.is_empty(),
+            Err(_) => true,
+        }
+    }
+}
+
 /// [`LocalFacts`] on a log reader it owns.
 #[derive(Debug)]
 pub(crate) struct LogFacts {

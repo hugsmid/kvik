@@ -47,6 +47,8 @@ enum Due {
     Now,
     /// If a second has passed since the last write.
     Timed,
+    /// At once, the last write before a clean shutdown: it carries a checkpoint if the gates moved.
+    Last,
 }
 
 impl Deliverer {
@@ -75,6 +77,7 @@ impl Deliverer {
             .ok_or(Error::BadConfirm)?
             + 1;
         let done: Vec<Out> = rt.unconfirmed.drain(..n).collect();
+        let gate = done.iter().filter_map(|o| o.gate).next_back();
         // The condition funnels in force, only when a confirmed delivery carries a condition state.
         let funnels: BTreeMap<u32, LogPos> = if done.iter().any(|o| !o.latches.is_empty()) {
             self.view
@@ -116,6 +119,11 @@ impl Deliverer {
             rt.cursor = rt.cursor.max(o.position);
         }
         rt.dirty = true;
+        rt.gate_dirty |= gate.is_some();
+        let gated = gate.is_some();
+        if let Some(g) = gate {
+            self.gate_confirm(name, g);
+        }
         // Only this consumer's own poll can wait on what a confirm frees: room in its queue or the end of a pause.
         self.changed(name);
         if forced {
@@ -127,8 +135,13 @@ impl Deliverer {
             }
             return Ok(r.map(|_| ()));
         }
-        // A latch whose state changed is written at once (Q-132), anything else at most once a second.
-        let due = if latch_changed { Due::Now } else { Due::Timed };
+        // A latch whose state changed, or a gate confirmation (a transition, or a resync's frontier over replayed
+        // ones), is written at once (Q-132, spec §6 Gates, Q-2220), anything else at most once a second.
+        let due = if latch_changed || gated {
+            Due::Now
+        } else {
+            Due::Timed
+        };
         Ok(self.write_cursor(name, due, ctx).map(|_| ()))
     }
 
@@ -137,15 +150,22 @@ impl Deliverer {
         if self.failed {
             return Err(io::Error::other("a cursor file write failed before"));
         }
+        let fresh = self.checkpoint_wanted(name, due == Due::Last, ctx.mono);
         let Some(rt) = self.consumers.get_mut(name) else {
             return Ok(false);
         };
-        if !rt.dirty {
+        if !rt.dirty && !fresh {
             return Ok(true);
         }
         if due == Due::Timed && rt.last_write.is_some_and(|t| ctx.mono - t < SECOND) {
             return Ok(false);
         }
+        let checkpoint = if fresh {
+            self.checkpoint_content(name)
+        } else {
+            None
+        };
+        let rt = self.consumers.get_mut(name).expect("looked up above");
         let funnels: BTreeMap<u32, LogPos> = self
             .view
             .funnels(name)
@@ -161,15 +181,22 @@ impl Deliverer {
                 .copied()
                 .collect(),
             reset: rt.reset,
+            gate: match &rt.gates {
+                Some(run) => Some(super::gate_resume::cursor_out(run.confirmed)),
+                None => rt.gate_saved,
+            },
         };
+        let highest = checkpoint
+            .as_ref()
+            .map_or(state.highest(), |c| c.highest().max(state.highest()));
         // A cursor file never names a position above the last synced mark (`spec.md` §3 Durable mark): a write that
         // would forces a mark sync, and is skipped unless the mark synced reaches it (a writer that has stopped
         // syncs no more).
         if let Some(w) = ctx.watch
-            && state.highest() > w.stats().mark_synced
+            && highest > w.stats().mark_synced
         {
             match w.sync_mark() {
-                Ok(synced) if synced >= state.highest() => {}
+                Ok(synced) if synced >= highest => {}
                 Ok(_) => return Ok(false),
                 Err(f) => {
                     self.failed = true;
@@ -177,13 +204,19 @@ impl Deliverer {
                 }
             }
         }
-        let end = match cursor::append(
+        let rt = self.consumers.get_mut(name).expect("looked up above");
+        let rec = cursor::Record {
+            state: &state,
+            checkpoint: checkpoint.as_ref().or(rt.checkpoint.as_ref()),
+            fresh: checkpoint.is_some(),
+        };
+        let end = match cursor::append_record(
             &*ctx.env.fs,
             ctx.dir,
             self.store_id,
             rt.cursor.generation,
             ctx.wall,
-            &state,
+            rec,
             rt.file_end,
         ) {
             Ok(end) => end,
@@ -193,6 +226,11 @@ impl Deliverer {
             }
         };
         rt.file_end = Some(end);
+        if checkpoint.is_some() {
+            rt.checkpoint = checkpoint;
+            rt.checkpoint_at = Some(ctx.mono);
+            rt.gate_dirty = false;
+        }
         rt.dirty = false;
         rt.last_write = Some(ctx.mono);
         rt.has_cursor = true;
@@ -217,7 +255,7 @@ impl Deliverer {
     pub(crate) fn flush_all(&mut self, ctx: &Ctx<'_>) -> io::Result<()> {
         let names: Vec<String> = self.consumers.keys().cloned().collect();
         for n in names {
-            self.write_cursor(&n, Due::Now, ctx)?;
+            self.write_cursor(&n, Due::Last, ctx)?;
         }
         Ok(())
     }

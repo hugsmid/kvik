@@ -923,6 +923,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
             operator: None,
             emits: Selection::None,
             condition: None,
+            gate: None,
         })))]);
         r.drain();
     }
@@ -939,6 +940,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
         },
         latches: Vec::new(),
         reset: None,
+        gate: None,
     };
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("alarms", 12), None).unwrap();
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("broken", 2), None).unwrap();
@@ -972,6 +974,7 @@ fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
         operator: None,
         emits: Selection::None,
         condition: None,
+        gate: None,
     })))]);
     r.drain();
     r.advance(Duration::from_secs(301));
@@ -1022,6 +1025,7 @@ fn a_routing_change_sealed_above_a_registry_files_through_names_its_consumer() {
         operator: None,
         emits: Selection::None,
         condition: None,
+        gate: None,
     })))]);
     r.drain();
     r.advance(Duration::from_secs(301));

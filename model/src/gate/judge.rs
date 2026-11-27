@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use super::{
-    Cause, ConditionId, Entry, Gate, GateError, GateState, Input, Kind, MAX_INSTANCES, Selector,
-    TimerKind, Transition, TransitionId, pattern_matches,
+    Cause, ConditionId, Entry, Gate, GateError, GateState, Input, Kind, MAX_EACH_INSTANCES,
+    MAX_INSTANCES, Selector, TimerKind, Transition, TransitionId, pattern_matches,
 };
 use crate::summary::{AggValue, Params};
-use crate::types::{Fact, Kind as SeriesKind, Nanos, Position, Quality, SeriesId, Value};
+use crate::types::{DAY, Fact, Kind as SeriesKind, Nanos, Position, Quality, SeriesId, Value};
 
 /// Every transition of a history, and each instance's state at its end.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -16,31 +16,20 @@ pub struct Judgement {
     pub transitions: Vec<Transition>,
     /// Each instance in force at the end: its state and the id of the transition that set it.
     pub states: BTreeMap<(ConditionId, SeriesId), (GateState, TransitionId)>,
-    /// Series an `Each` could not take beyond [`MAX_INSTANCES`], counted once each time one starts to
-    /// match while the gate is full (Q-1143).
+    /// Series an `Each` could not take beyond [`MAX_INSTANCES`] or [`MAX_EACH_INSTANCES`], counted once each time
+    /// one starts to match while the gate or the consumer is full (Q-1143, Q-2163).
     pub instances_refused: u64,
 }
 
 /// Judges every gate the history watches, firing timers due at or before `until` after its last entry.
 /// Timers due at or before an entry's commit time fire before it (Q-1144).
 pub fn judge(history: &[Entry], until: Nanos) -> Result<Judgement, GateError> {
-    let mut j = Judge::default();
-    let mut last: Option<(Position, Nanos)> = None;
-    for e in history {
-        if let Some((p, c)) = last
-            && (e.position() <= p || e.commit_time() < c)
-        {
-            return Err(GateError::Order(e.position()));
-        }
-        if let Some((p, _)) = last {
-            j.run_timers(e.commit_time(), p);
-        }
-        j.apply(e)?;
-        last = Some((e.position(), e.commit_time()));
-    }
-    if let Some((p, c)) = last {
-        j.run_timers(until.max(c), p);
-    }
+    let mut j = Judge {
+        history,
+        seeding: true,
+        ..Judge::default()
+    };
+    j.run(history, until, None)?;
     j.out.transitions.sort_by_key(|t| t.id);
     for w in j.gates.values() {
         for (s, i) in &w.instances {
@@ -107,13 +96,101 @@ struct Watched {
 }
 
 #[derive(Default)]
-struct Judge {
+struct Judge<'a> {
     series: BTreeMap<SeriesId, SeriesData>,
     gates: BTreeMap<ConditionId, Watched>,
     out: Judgement,
+    /// The whole history and the index of the entry being applied, read by the seed.
+    history: &'a [Entry],
+    index: usize,
+    seeding: bool,
 }
 
-impl Judge {
+impl Judge<'_> {
+    /// Applies `entries` after the entry at `last`, if any, already applied.
+    fn run(
+        &mut self,
+        entries: &[Entry],
+        until: Nanos,
+        mut last: Option<(Position, Nanos)>,
+    ) -> Result<(), GateError> {
+        for (index, e) in entries.iter().enumerate() {
+            // A fact at the origin too: the seed's inner run starts after it (Q-1800).
+            if matches!(e, Entry::Fact { fact, .. } if fact.position == Position::ORIGIN)
+                || last.is_some_and(|(p, c)| e.position() <= p || e.commit_time() < c)
+            {
+                return Err(GateError::Order(e.position()));
+            }
+            if let Some((p, _)) = last {
+                self.run_timers(e.commit_time(), p);
+            }
+            self.index = index;
+            self.apply(e)?;
+            last = Some((e.position(), e.commit_time()));
+        }
+        if let Some((p, c)) = last {
+            self.run_timers(until.max(c), p);
+        }
+        Ok(())
+    }
+
+    /// An instance starting at `now` judged, emitting nothing, as the same gate watched at the look-back's
+    /// start `now − min(2L, 24 h)`, `L` the gate's longest hold (Q-1145 (b), Q-1390, Q-1560): every fact
+    /// of the series committed before the look-back counts as committed at its start, then those committed
+    /// inside it before the entry being applied.
+    fn seed(&self, id: ConditionId, s: SeriesId, now: Nanos) -> Option<Instance> {
+        let w = self.gates.get(&id)?;
+        let longest = longest_hold(&w.gate.kind);
+        if !self.seeding || longest == 0 {
+            return None;
+        }
+        let from = now.saturating_sub(longest.saturating_mul(2).min(DAY));
+        let mut inner = Judge::default();
+        let sd = self.data(s);
+        inner.series.insert(
+            s,
+            SeriesData {
+                names: sd.names.clone(),
+                params: sd.params,
+                ..SeriesData::default()
+            },
+        );
+        let mut inside = Vec::new();
+        for e in &self.history[..self.index] {
+            if let Entry::Fact { commit_time, fact } = e
+                && fact.series == s
+            {
+                if *commit_time >= from {
+                    inside.push(e.clone());
+                } else {
+                    // No gate is watched yet, so this only builds the series' state at `from`.
+                    inner
+                        .apply(&Entry::Fact {
+                            commit_time: from,
+                            fact: fact.clone(),
+                        })
+                        .expect("a fact never fails to apply");
+                }
+            }
+        }
+        let gate = Gate {
+            selector: Selector::Series(s),
+            ..w.gate.clone()
+        };
+        inner
+            .apply(&Entry::Watch {
+                position: Position::ORIGIN,
+                commit_time: from,
+                id,
+                gate,
+            })
+            .expect("the gate was validated when watched");
+        inner
+            .run(&inside, now, Some((Position::ORIGIN, from)))
+            .expect("history entries are in order");
+        inner.gates.remove(&id)?.instances.remove(&s)
+    }
+
     fn apply(&mut self, e: &Entry) -> Result<(), GateError> {
         let (at, now) = (e.position(), e.commit_time());
         match e {
@@ -177,6 +254,8 @@ impl Judge {
             Entry::Unwatch { id, .. } => {
                 self.gates.remove(id).ok_or(GateError::Id(*id))?;
             }
+            Entry::Reset { .. } => self.reseed(now, at),
+            Entry::Other { .. } => {}
         }
         Ok(())
     }
@@ -228,39 +307,87 @@ impl Judge {
             });
         }
         for s in wanted {
+            let consumer_full = matches!(self.gates[&id].gate.selector, Selector::Each(_))
+                && self.each_instances() >= MAX_EACH_INSTANCES;
             let w = self.gates.get_mut(&id).expect("watched");
             if w.instances.contains_key(&s) {
                 continue;
             }
-            if w.instances.len() >= MAX_INSTANCES {
+            if w.instances.len() >= MAX_INSTANCES || consumer_full {
                 if w.refused.insert(s) {
                     self.out.instances_refused += 1;
                 }
                 continue;
             }
             w.refused.remove(&s);
-            let n = match &w.gate.kind {
-                Kind::Levels(ls) => ls.len(),
-                Kind::Set { .. } => 1,
-                Kind::Change { .. } => 0,
-            };
-            w.instances.insert(
-                s,
+            let instance = self.started(id, s, now, at);
+            self.gates
+                .get_mut(&id)
+                .expect("watched")
+                .instances
+                .insert(s, instance);
+            self.evaluate_start(id, s, now, at, cause.clone());
+        }
+    }
+
+    /// Instances of every `Each` gate in force.
+    fn each_instances(&self) -> usize {
+        self.gates
+            .values()
+            .filter(|w| matches!(w.gate.selector, Selector::Each(_)))
+            .map(|w| w.instances.len())
+            .sum()
+    }
+
+    /// Every instance in force seeded again at the entry at `at`, `now`, as a start there with no transition: its
+    /// `set_by` the start id it would have had (carried as none, Q-1392); the gate's series set is kept.
+    fn reseed(&mut self, now: Nanos, at: Position) {
+        let keys: Vec<(ConditionId, SeriesId)> = self
+            .gates
+            .values()
+            .flat_map(|w| w.instances.keys().map(|s| (w.id, *s)))
+            .collect();
+        for (id, s) in keys {
+            let instance = self.started(id, s, now, at);
+            self.gates
+                .get_mut(&id)
+                .expect("watched")
+                .instances
+                .insert(s, instance);
+            let before = self.out.transitions.len();
+            self.evaluate(id, s, now, at, None, Cause::Entry { position: at });
+            self.out.transitions.truncate(before);
+        }
+    }
+
+    /// An instance starting at the entry at `at`, `now`: seeded, or with its boundaries uncrossed.
+    fn started(&self, id: ConditionId, s: SeriesId, now: Nanos, at: Position) -> Instance {
+        let start = TransitionId {
+            at,
+            due: None,
+            condition: id,
+            series: s,
+        };
+        match self.seed(id, s, now) {
+            Some(seeded) => Instance {
+                set_by: start,
+                ..seeded
+            },
+            None => {
+                let n = match &self.gates[&id].gate.kind {
+                    Kind::Levels(ls) => ls.len(),
+                    Kind::Set { .. } => 1,
+                    Kind::Change { .. } => 0,
+                };
                 Instance {
                     on: vec![false; n],
                     pending: vec![None; n],
                     reference: None,
                     reported: GateState::Unknown,
-                    set_by: TransitionId {
-                        at,
-                        due: None,
-                        condition: id,
-                        series: s,
-                    },
+                    set_by: start,
                     last_eval: now,
-                },
-            );
-            self.evaluate_start(id, s, now, at, cause.clone());
+                }
+            }
         }
     }
 
@@ -416,6 +543,21 @@ fn step(kind: &Kind, i: &mut Instance, v: &Value, now: Nanos) -> GateState {
             }
             GateState::Value(i.reference.clone().expect("reference set"))
         }
+    }
+}
+
+/// The longest hold of any boundary of the gate, either way.
+fn longest_hold(kind: &Kind) -> Nanos {
+    match kind {
+        Kind::Levels(ls) => ls
+            .iter()
+            .map(|l| l.hold_up.max(l.hold_down))
+            .max()
+            .unwrap_or(0),
+        Kind::Set {
+            hold_on, hold_off, ..
+        } => (*hold_on).max(*hold_off),
+        Kind::Change { .. } => 0,
     }
 }
 

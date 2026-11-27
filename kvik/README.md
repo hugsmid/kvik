@@ -124,7 +124,17 @@ Model backend:
 
 - **`ReaderState.stamp`** is always the zero stamp: the model has no resets. The durable backend gives the mark's.
 
+- **Gates** are judged by `kvik_model::gate::judge` over the log: a decimal set member is compared as its `f64`, a
+  named-state member on a gate whose series has no named states (every `each` gate) is `NotSupportedYet`, and after
+  a restart every transition after the last confirmed one comes again flagged `replayed`, with no replay bound
+  (Q-1583).
+
 Durable backend, besides windowed operators in funnels:
+
+- **Gates** are judged live on the commit clock; `each` gates and window inputs are refused `NotSupportedYet`. The
+  cursor file holds the gate cursor and a checkpoint; a start replays the transitions after the gate cursor, flagged
+  `replayed`, and reseeds instead beyond `conditions.replay_max`, without a cursor file or after a reset point
+  (Q-1583, Q-2080, Q-2082).
 
 - **Every start kind:** a new consumer starts after the position before `start` with no resync; one whose cursor
   file was unreadable at the start (a missing file of a consumer never routed starts it as new on the durable
