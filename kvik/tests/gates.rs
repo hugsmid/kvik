@@ -137,59 +137,141 @@ fn a_consumer_holds_at_most_4096_gates() {
     );
 }
 
-/// The deliveries of one script of watches, readings and clock steps, as comparable lines: the backends' positions
-/// differ, so each is shown as the number of readings emitted at or before it.
-fn script(backend: Backend, name: &str) -> Vec<String> {
+#[derive(Clone, Copy)]
+enum Op {
+    Emit(f64),
+    Watch,
+    Advance(u64),
+    /// Steps the host's wall clock alone, by seconds either way.
+    Jump(i64),
+    Drain,
+}
+
+/// The transitions one script of watches, readings and clock steps delivers, as comparable lines: the backends'
+/// positions differ, so each is shown as the number of readings emitted at or before it.
+fn script(backend: Backend, name: &str, ops: &[Op]) -> Vec<String> {
     let (s, clock) = store_on(backend, name);
     let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
-    let mut emitted = Vec::new();
+    let mut emitted: Vec<kvik::Position> = Vec::new();
     let mut out = Vec::new();
-    let drain = |c: &mut Consumer, emitted: &[kvik::Position], out: &mut Vec<String>| {
-        let at = |p: kvik::Position| emitted.iter().filter(|e| **e <= p).count();
-        while let Some(d) = c.try_next().unwrap() {
-            if let kvik::DeliveryKind::Transition(t) = &d.kind {
-                out.push(format!(
-                    "{} @{} due={:?} {:?}->{:?} {:?} r={}",
-                    t.name,
-                    at(t.id.at),
-                    t.id.due.map(|d| d.0 - common::start().0),
-                    t.from,
-                    t.to,
-                    t.value,
-                    d.flags.replayed
-                ));
+    for op in ops {
+        match *op {
+            Op::Emit(v) => {
+                let a = block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(v))]))
+                    .unwrap();
+                if let Some(kvik::Outcome::Recorded { position, .. }) = a.outcomes.first() {
+                    emitted.push(*position);
+                }
             }
-            block_on(c.confirm(d.id)).unwrap();
+            Op::Watch => {
+                block_on(c.watch("humidity", humidity(id))).unwrap();
+            }
+            Op::Advance(secs) => clock.advance(Duration::from_secs(secs)),
+            Op::Jump(secs) => clock.jump_wall(kvik::Span::from_secs(secs)),
+            Op::Drain => {
+                let at = |p: kvik::Position| emitted.iter().filter(|e| **e <= p).count();
+                let mut got = Vec::new();
+                while let Some(d) = c.try_next().unwrap() {
+                    if let kvik::DeliveryKind::Transition(t) = &d.kind {
+                        got.push(format!(
+                            "{} @{} due={:?} {:?}->{:?} {:?} r={}",
+                            t.name,
+                            at(t.id.at),
+                            t.id.due.map(|d| (d.0 - common::start().0) / 1_000_000_000),
+                            t.from,
+                            t.to,
+                            t.value,
+                            d.flags.replayed
+                        ));
+                    }
+                    block_on(c.confirm(d.id)).unwrap();
+                }
+                out.push(got.join("; "));
+            }
         }
-    };
-    let emit = |v: f64, emitted: &mut Vec<kvik::Position>| {
-        let a = block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(v))])).unwrap();
-        if let Some(kvik::Outcome::Recorded { position, .. }) = a.outcomes.first() {
-            emitted.push(*position);
-        }
-    };
-    emit(50.0, &mut emitted);
-    block_on(c.watch("humidity", humidity(id))).unwrap();
-    drain(&mut c, &emitted, &mut out);
-    clock.advance(Duration::from_secs(10));
-    emit(75.0, &mut emitted);
-    drain(&mut c, &emitted, &mut out);
-    // The hold completes on the commit clock, then staleness 600 s after the last arrival.
-    clock.advance(Duration::from_secs(130));
-    drain(&mut c, &emitted, &mut out);
-    clock.advance(Duration::from_secs(600));
-    drain(&mut c, &emitted, &mut out);
-    emit(90.0, &mut emitted);
-    drain(&mut c, &emitted, &mut out);
+    }
     block_on(s.shutdown()).unwrap();
     out
 }
 
+fn on_both(name: &str, ops: &[Op]) -> Vec<String> {
+    let model = script(Backend::Model, &format!("{name}-model"), ops);
+    let durable = script(Backend::Durable, &format!("{name}-durable"), ops);
+    assert_eq!(durable, model);
+    model
+}
+
 #[test]
 fn the_durable_backend_delivers_the_transitions_the_model_backend_does() {
-    let model = script(Backend::Model, "gates-api-model");
-    let durable = script(Backend::Durable, "gates-api-durable");
-    assert_eq!(model.len(), 4, "{model:#?}");
-    assert_eq!(durable, model);
+    use Op::*;
+    let out = on_both(
+        "gates-api-both",
+        &[
+            Emit(50.0),
+            Watch,
+            Drain,
+            Advance(10),
+            Emit(75.0),
+            Drain,
+            Advance(130),
+            Drain,
+            Advance(600),
+            Drain,
+            Emit(90.0),
+            Drain,
+        ],
+    );
+    assert!(
+        out[2].contains("->Some(Level(1))") && out[3].contains("->Some(Stale)"),
+        "{out:#?}"
+    );
+}
+
+#[test]
+fn a_forward_clock_step_completes_a_hold_and_fires_staleness_at_once() {
+    use Op::*;
+    let out = on_both(
+        "gates-api-forward",
+        &[Emit(50.0), Watch, Emit(75.0), Drain, Jump(86_400), Drain],
+    );
+    let stepped = &out[1];
+    assert!(
+        stepped.contains("->Some(Level(1))") && stepped.contains("->Some(Stale)"),
+        "{stepped}"
+    );
+}
+
+/// The model backend's commit times follow the wall clock back, which its judgement refuses, so this one is checked
+/// against what `judge` gives on the durable log: every commit at or after the last, the hold due 120 s after it,
+/// and the reading after the step older in event time than the live one.
+#[test]
+fn a_backward_clock_step_pauses_timers_until_the_clock_catches_up() {
+    use Op::*;
+    let out = script(
+        Backend::Durable,
+        "gates-api-backward",
+        &[
+            Emit(50.0),
+            Watch,
+            Emit(75.0),
+            Drain,
+            Jump(-3_600),
+            Advance(130),
+            Drain,
+            Emit(80.0),
+            Drain,
+            Jump(3_600),
+            Drain,
+        ],
+    );
+    assert_eq!(
+        out,
+        [
+            "humidity @1 due=None None->Some(Level(0)) Some(F64(50.0)) r=false",
+            "",
+            "",
+            "humidity @3 due=Some(120) Some(Level(0))->Some(Level(1)) Some(F64(75.0)) r=false",
+        ]
+    );
 }

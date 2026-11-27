@@ -131,9 +131,9 @@ Model backend:
 
 Durable backend, besides windowed operators in funnels:
 
-- **Gates:** `Consumer::watch` validates the gate, returns the id of an equal gate in force, and otherwise refuses
-  `ConsumerError::NotSupportedYet` until the engine that judges gates is built; window inputs are refused the same
-  way (Q-1583).
+- **Gates** are judged live on the commit clock; `each` gates and window inputs are refused `NotSupportedYet`, and the
+  gate cursor is kept in memory only, so after a restart every start reseeds its gates: nothing is replayed and the
+  resync's `set_by` is `None` (Q-1583, Q-2000).
 
 - **Every start kind:** a new consumer starts after the position before `start` with no resync; one whose cursor
   file was missing or unreadable at the start is first sent a resync of the added cause `ResyncCause::NoCursor`

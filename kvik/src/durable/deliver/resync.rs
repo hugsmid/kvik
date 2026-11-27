@@ -84,7 +84,6 @@ impl Deliverer {
             });
         }
         let unchecked = self.incomplete.get();
-        let (gates, gate_frontier) = self.gate_resync(name);
         let Some(rt) = self.consumers.get_mut(name) else {
             return;
         };
@@ -93,8 +92,8 @@ impl Deliverer {
             forget_above,
             position,
             funnels: states,
-            gates,
-            gate_frontier,
+            gates: Vec::new(),
+            gate_frontier: None,
             reset,
             unchecked,
         });
@@ -143,11 +142,6 @@ impl Deliverer {
                     break;
                 };
                 self.gate_flush(name, Some(p), true);
-                let reset_states = if self.resets.contains_key(&p) {
-                    Some(self.gate_resync(name))
-                } else {
-                    None
-                };
                 let rt = self.consumers.get_mut(name).expect("looked up above");
                 if rt.queue.len() >= self.capacity {
                     paused = true;
@@ -165,14 +159,13 @@ impl Deliverer {
                             *position = (*position).max(p);
                         }
                         _ => {
-                            let (gates, gate_frontier) = reset_states.unwrap_or_default();
                             rt.queue.push_back(Pend::Resync {
                                 cause: ResyncCause::ResetPoint,
                                 forget_above: Some(fa),
                                 position: p,
                                 funnels: Vec::new(),
-                                gates,
-                                gate_frontier,
+                                gates: Vec::new(),
+                                gate_frontier: None,
                                 reset: true,
                                 unchecked: false,
                             });
@@ -285,13 +278,23 @@ impl Deliverer {
         }
         self.tick(ctx);
         self.catch_up(name, ctx);
-        let Some(p) = self
+        let Some(mut p) = self
             .consumers
             .get_mut(name)
             .and_then(|rt| rt.queue.pop_front())
         else {
             return Ok(None);
         };
+        // Gate states are those now, as the resync is handed out (spec §6 Gates, Resume).
+        if let Pend::Resync {
+            gates,
+            gate_frontier,
+            position,
+            ..
+        } = &mut p
+        {
+            (*gates, *gate_frontier) = self.gate_resync(name, *position);
+        }
         let parts = self.deliveries(name, p, ctx);
         let rt = self.consumers.get_mut(name).expect("bound above");
         rt.parts.extend(parts);

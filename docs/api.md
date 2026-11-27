@@ -426,8 +426,11 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 
 ### Gates
 In-store conditions on one stream (spec §6 Gates). The model backend serves them from its judgement
-(`kvik_model::gate`); the durable backend validates a watch and refuses it `NotSupportedYet` until its engine is
-built (Q-1140, Q-1583).
+(`kvik_model::gate`); the durable backend judges them in the writer's process, one engine per consumer taken in
+the run, and refuses `each` gates and window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Until the cursor
+file holds the gate cursor, the durable backend keeps it in memory: a second take in the same run receives the
+unconfirmed transitions again under their ids, but after a restart every start reseeds, with no replay and `set_by`
+`None` (Q-2000).
 ```rust
 let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity), [
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),
@@ -738,7 +741,10 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
 //               window */, unchecked /* deliveries flagged `unchecked` */, evaluations_unchecked /* condition
 //               evaluations without every fact they rest on, delivered or not */, regions_unread /* damaged regions a
-//               consumer's read of the log met beyond those the open passed over */ }   (zero on the model backend)
+//               consumer's read of the log met beyond those the open passed over */, transitions_not_delivered
+//               /* gate transitions judged during a catch-up and not delivered */, gates_reseeded /* starts whose gates
+//               were rebuilt from history */, gate_errors /* gate judgements rebuilt after a failed read */ }
+//               (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }
@@ -809,7 +815,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
   `evaluations_unknown`, the evaluations skipped during a restore for lack of local detail (spec §6 Conditions), and
-  per condition funnel `transitions_not_delivered` while its consumer caught up (spec §4 Overflow), and restore
+  per condition funnel `transitions_not_delivered` while its consumer caught up (spec §4 Overflow), the gate counts
+of `DeliveryStats`, and restore
   progress (files and bytes remaining), which is not a health condition (spec §8 Restore). Health reasons added by
   their roadmap items (the enums are non-exhaustive): `restore_failed` (naming the file), the set-aside range of each
   restore record, a tzdata change with both versions and the days rebuilt, a series whose interval zone the tzdata

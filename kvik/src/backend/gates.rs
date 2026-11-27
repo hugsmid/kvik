@@ -28,6 +28,9 @@ pub(super) struct GateFeed {
     confirmed: Option<km::gate::TransitionId>,
     /// A model delivery taken to compare its position with the next transition's.
     pub(super) peeked: Option<km::engine::Envelope>,
+    /// Every delivery handed out in this attachment and not confirmed, in order: a confirmation is cumulative
+    /// across transitions and the model's deliveries.
+    order: Vec<DeliveryId>,
 }
 
 impl GateFeed {
@@ -35,6 +38,32 @@ impl GateFeed {
     pub(super) fn reattach(&mut self) {
         self.handed = self.confirmed;
         self.peeked = None;
+        self.order.clear();
+    }
+
+    pub(super) fn handed_out(&mut self, id: DeliveryId) {
+        self.order.push(id);
+    }
+
+    /// For a confirmation of `id`: the last transition and the last other delivery handed out up to it; `None`
+    /// when `id` was not handed out.
+    pub(super) fn confirming(
+        &self,
+        id: DeliveryId,
+    ) -> Option<(Option<DeliveryId>, Option<DeliveryId>)> {
+        let i = self.order.iter().rposition(|x| *x == id)?;
+        let prefix = &self.order[..=i];
+        let is_t = |x: &&DeliveryId| matches!(x, DeliveryId::Transition(_));
+        Some((
+            prefix.iter().rev().find(is_t).copied(),
+            prefix.iter().rev().find(|x| !is_t(x)).copied(),
+        ))
+    }
+
+    pub(super) fn confirmed_through(&mut self, id: DeliveryId) {
+        if let Some(i) = self.order.iter().rposition(|x| *x == id) {
+            self.order.drain(..=i);
+        }
     }
 
     pub(super) fn any(&self) -> bool {

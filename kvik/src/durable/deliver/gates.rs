@@ -50,6 +50,8 @@ pub(super) struct GateRun {
     reseeded: BTreeMap<Key, TransitionId>,
     /// The highest id handed out: one at or below it comes again flagged `replayed`.
     seen: Option<TransitionId>,
+    /// Every gate watched in this run, by id: a transition queued before an unwatch keeps its name.
+    names: BTreeMap<u32, String>,
     /// A core call failed: the core was rebuilt by a reseed (Q-1881).
     pub(super) failed: bool,
 }
@@ -68,6 +70,7 @@ impl GateRun {
             last: BTreeMap::new(),
             reseeded: BTreeMap::new(),
             seen: None,
+            names: BTreeMap::new(),
             failed: false,
         }
     }
@@ -108,11 +111,10 @@ pub(super) fn transition_delivery(
     t: &MTransition,
 ) -> crate::gate::Transition {
     let gate_name = d
-        .view
         .consumers
         .get(name)
-        .and_then(|r| r.gates.get(&t.id.condition.0))
-        .map(|g| g.spec.name.clone())
+        .and_then(|rt| rt.gates.as_ref()?.names.get(&t.id.condition.0))
+        .cloned()
         .unwrap_or_default();
     transition_out(
         t,
@@ -187,6 +189,13 @@ impl Deliverer {
         }
         let mut run = GateRun::new(core);
         run.failed = r.is_err();
+        if let Some(routes) = self.view.consumers.get(name) {
+            run.names = routes
+                .gates
+                .iter()
+                .map(|(id, g)| (*id, g.spec.name.clone()))
+                .collect();
+        }
         run.reseeded = run
             .core
             .states()
@@ -219,6 +228,10 @@ impl Deliverer {
                 .collect();
             back.extend(run.deferred.drain(..));
             run.deferred = back;
+            // Queued again, they take back the snapshot held for them (G5).
+            if let Some(h) = run.held.take() {
+                run.pre = Some(h);
+            }
             run.emitted.clear();
             return;
         }
@@ -253,6 +266,16 @@ impl Deliverer {
             && rt.gates.is_none()
         {
             rt.gates = Some(GateRun::new(Core::new()));
+        }
+        if let Feed::Routing(r) = feed
+            && let (RouteOp::Watch, Some(g)) = (r.op, &r.gate)
+            && let Some(spec) = &g.spec
+            && let Some(run) = self
+                .consumers
+                .get_mut(&r.consumer)
+                .and_then(|rt| rt.gates.as_mut())
+        {
+            run.names.insert(g.id, spec.name.clone());
         }
         let names = self.gate_names();
         for name in names {
@@ -359,6 +382,7 @@ impl Deliverer {
                 fresh.emitted = run.emitted;
                 fresh.last = run.last;
                 fresh.seen = run.seen;
+                fresh.names.extend(run.names);
                 fresh.outstanding = run.outstanding;
                 fresh.held = run.held;
                 fresh.confirmed = run.confirmed;
@@ -455,14 +479,22 @@ impl Deliverer {
         }
     }
 
-    /// Each instance's state now for a resync of `name`, with the frontier it was built at; the states count as
-    /// sent.
-    pub(super) fn gate_resync(&mut self, name: &str) -> (Vec<GateInstanceState>, Option<Frontier>) {
+    /// Each instance's state now for a resync of `name` at `position`, with the gate cursor its confirmation sets:
+    /// the resync's place in delivery order, since every transition at or below its position is queued before it
+    /// and none above. The states count as sent.
+    pub(super) fn gate_resync(
+        &mut self,
+        name: &str,
+        position: LogPos,
+    ) -> (Vec<GateInstanceState>, Option<Frontier>) {
         let Some(run) = self.consumers.get(name).and_then(|rt| rt.gates.as_ref()) else {
             return (Vec::new(), None);
         };
         let states = run.states(self);
-        let frontier = run.core.frontier();
+        let frontier = Frontier {
+            at: core_pos(position),
+            now: run.core.frontier().now,
+        };
         let rt = self.consumers.get_mut(name).expect("looked at above");
         let run = rt.gates.as_mut().expect("looked at above");
         run.emitted = run

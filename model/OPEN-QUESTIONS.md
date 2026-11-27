@@ -206,6 +206,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
 | Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
 | Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
+| Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: the transitions that set the changed states, not a resync (decided by the lead, provisional) |
+| Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5394,11 +5398,12 @@ interface have no model counterpart yet.
 **Decision.** A decimal member is compared as the `f64` it denotes; a named-state member on a gate whose series has
 no named states (every `each` gate) is `NotSupportedYet`. The gate cursor is the last confirmed transition, kept in
 the process with the store; after a restart every transition after it comes again flagged `replayed`, with no
-replay bound, and a resync carries each instance's state at the model's now. The durable backend refuses window
-inputs and, until conditions step 4, every watch, with `NotSupportedYet`.
+replay bound, and a resync carries each instance's state at the model's now, as it is handed out. A confirmation is
+cumulative across transitions and the model's other deliveries (cond2 step 4). The durable backend refuses window
+inputs and `each` gates with `NotSupportedYet` (until cond2 step 6 for `each`).
 **Pinned by.** `kvik/src/backend/gates/tests.rs`
 `unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_resync_carries_gate_states`,
-`kvik/tests/gates.rs` `the_durable_backend_validates_a_watch_and_refuses_not_supported_yet`.
+`kvik/src/durable/gates/tests.rs` `an_each_gate_is_refused_not_supported_yet_and_writes_nothing`.
 
 ## Q-1810 — The bounds of a set member
 Decided at the review of conditions step 3, provisional.
@@ -5434,6 +5439,49 @@ look-back made `judge` panic; the outer run accepted it. No log holds one (posit
 history it accepts. A watch or other entry at the origin stays accepted (the tests' early-watch oracle uses one).
 **Pinned by.** `model/tests/gate_seed.rs`
 `a_fact_at_the_origin_position_is_refused_as_out_of_order_not_a_panic_in_the_seed`.
+
+## Q-2000 — The durable gate cursor in memory until the cursor file holds it
+Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
+**Scenario.** Gates are judged live before the cursor file has a gate cursor field or a checkpoint block.
+**Decision (provisional).** The gate cursor and the held snapshot (the core at or before the oldest unconfirmed
+transition, G5) live in the process. A second take in the same run queues the unconfirmed transitions again under
+their ids (flagged `replayed` if handed out before) as its catch-up passes their positions, then the resync with state
+now: the same transitions a replay from the held snapshot gives, without reading the log. The first take after a start
+reseeds the gates in force at the head by the seed rule, emits no start transitions and reports `set_by` `None`
+(Q-1392), counted `gates_reseeded`; nothing is replayed.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`,
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
+`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`.
+
+## Q-2001 — What the durable backend's gate history reads cost
+Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
+**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double.
+**Decision (provisional).** Each read scans the log from its start to `through` and judges the series' facts by the
+double's own rules (`Replay`), so the two cannot differ; the gate differential checks it end to end. Cost: one log
+scan per read; reads happen at a watch with holds (two), at a reseed (two per gate) and when a bad fact replaces the
+live one (one). Fine for the tests' logs; a store of 30 days needs the bounded read of Q-1880 (from
+`commit_at(T − 2L)`, with the series' state there from the summaries), which cond2 step 5 builds with replay.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`.
+
+## Q-2002 — Gate state after an overflow catch-up
+Decided by the lead with cond2 step 4, provisional.
+**Scenario.** Spec §6 Gates, Resume says the overflow catch-up's resync carries gate states, but §4 Overflow ends a
+catch-up with no resync: condition funnels re-attach by sending each changed state.
+**Decision (provisional).** Transitions judged while a consumer is behind wait in a buffer as large as its queue and
+are queued as the catch-up passes their positions, so a short catch-up loses none. A buffer that fills makes the
+gates quiet: judged, counted `transitions_not_delivered`, not queued. On re-attaching, before any live delivery, each
+instance whose state differs from the last it was sent receives the transition that set its present state (a real id
+from the judgement), in id order. No new resync cause.
+**Pinned by.** none yet: the model backend has no overflow (its transitions are computed when handed out).
+
+## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
+Decided by the lead with cond2 step 4, provisional.
+**Scenario.** A resync is queued at one moment and handed out later; transitions may be judged in between.
+**Decision (provisional).** Its gate states are taken as it is handed out, as the model backend's are. Confirming it
+sets the gate cursor to the frontier at the resync's position: every transition at or below it is queued before the
+resync and none above, so the transitions queued behind it stay unconfirmed.
+**Pinned by.** `kvik/tests/consumer_properties.rs`
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`.
 
 ## Open at v0.2
 
@@ -5662,9 +5710,13 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1393 | cond2 step 2 | Open, for the owner: the commit clock as the provisional default |
 | Q-1560 | cond2 step 4 | Decided by the lead, provisional: the series' true live state; the read costed in step 4 (Q-1880), else the fallback |
 | Q-1561 | cond2 step 2 | Decided by the lead, provisional: facts before the look-back arrive at its start (kept) |
-| Q-1880 | cond2 step 4 | Decided by the lead, provisional: the four rules as the contract; costed in step 4 against the hot log and compacted segments |
+| Q-1880 | cond2 step 5 | Decided by the lead, provisional: the four rules as the contract; a log scan per read for now (Q-2001), the bounded read with replay |
 | Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
 | Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
+| Q-2000 | cond2 step 5 | Decided by the lead, provisional: gate cursor in memory; every start reseeds |
+| Q-2001 | cond2 step 5 | Decided by the lead, provisional: a log scan per read; the bounded read with replay |
+| Q-2002 | cond2 step 6 | Decided by the lead, provisional: buffered while behind; changed states re-sent on re-attaching |
+| Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

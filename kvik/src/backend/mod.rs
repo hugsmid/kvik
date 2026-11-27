@@ -1189,6 +1189,14 @@ impl Slot {
     /// being handed out, else, unless a resync awaits confirmation, a
     /// delivery from the model after running due timers and catch-up.
     pub(crate) fn poll_delivery(&mut self, epoch: u64, name: &str) -> Result<Option<Delivery>> {
+        let d = self.next_delivery(epoch, name)?;
+        if let (Some(d), Some(c)) = (&d, self.consumers.get_mut(name)) {
+            c.gates.handed_out(d.id);
+        }
+        Ok(d)
+    }
+
+    fn next_delivery(&mut self, epoch: u64, name: &str) -> Result<Option<Delivery>> {
         let cid = self.bound(epoch, name)?;
         let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
         if let Some(d) = c.parts.pop_front() {
@@ -1375,7 +1383,32 @@ impl Slot {
         }
     }
 
+    /// Confirms `id` and every delivery handed out before it in this attachment, gate transitions and the model's
+    /// deliveries alike (`docs/api.md` `Consumer::confirm`).
     pub(crate) fn confirm(&mut self, epoch: u64, name: &str, id: DeliveryId) -> Result<()> {
+        self.bound(epoch, name)?;
+        let c = self.consumers.get(name).ok_or(Error::Closed)?;
+        if let DeliveryId::Resync { part } = id
+            && c.awaiting_resync != Some(part)
+        {
+            return Ok(());
+        }
+        let Some((transition, other)) = c.gates.confirming(id) else {
+            return self.confirm_one(epoch, name, id);
+        };
+        if let Some(o) = other {
+            self.confirm_one(epoch, name, o)?;
+        }
+        if let Some(t) = transition {
+            self.confirm_one(epoch, name, t)?;
+        }
+        if let Some(c) = self.consumers.get_mut(name) {
+            c.gates.confirmed_through(id);
+        }
+        Ok(())
+    }
+
+    fn confirm_one(&mut self, epoch: u64, name: &str, id: DeliveryId) -> Result<()> {
         let cid = self.bound(epoch, name)?;
         let mid = match id {
             DeliveryId::Fact(p) => km::engine::DeliveryId::Fact(mpos(p)),
