@@ -702,7 +702,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 
 ### Gates (in-store conditions)
 
-A **gate** is a condition a consumer registers on one stream (`api.md` Gates, a proposal); the store judges it once
+A **gate** is a condition a consumer registers on one stream (`api.md` Gates); the store judges it once
 per reading and delivers a transition only when its state changes. Specified, and judged by the reference model's
 `gate` module, which defines it until a backend delivers gates (Q-1140); the condition funnels above keep their
 rules, identities and resume.
