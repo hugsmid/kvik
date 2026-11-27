@@ -65,8 +65,11 @@ impl Writer {
                 provisional = fast::facts_of(&self.fast, &plan.items, clock.wall)
                     .map(|f| (f, log.watch().durable()));
                 let items = std::mem::take(&mut plan.items);
-                marked = tree::dirty::keys_of(&items);
-                self.dirty.begin(&marked);
+                // Design tree-memory section 11: with the tree off nothing is marked.
+                if self.tree.is_some() {
+                    marked = tree::dirty::keys_of(&items);
+                    self.dirty.begin(&marked);
+                }
                 #[cfg(test)]
                 pause::at(&self.dir, pause::Point::BeforeOffer);
                 if wait {

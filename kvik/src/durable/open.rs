@@ -206,7 +206,7 @@ impl Writer {
             }
         };
         let dirty = Arc::new(tree::Dirty::default());
-        let tree_job = start_fault.is_none().then(|| {
+        let tree_job = (config.tree.enabled && start_fault.is_none()).then(|| {
             let ds = writer.directory_start();
             let job = Arc::new(tree::Job::new(tree::job::Parts {
                 dir: dir.clone(),

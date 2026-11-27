@@ -23,7 +23,9 @@ impl Writer {
                 Decided::Done(out) => return Ok(out),
                 Decided::Entry(entry, out) => (entry, out),
             };
-            if let Some(id) = tree::dirty::node_changing(&d.registry, &entry) {
+            if self.tree.is_some()
+                && let Some(id) = tree::dirty::node_changing(&d.registry, &entry)
+            {
                 self.dirty.rebuild(id);
             }
             let r = {
@@ -49,7 +51,9 @@ impl Writer {
     /// for with the lock held.
     pub(super) fn commit_entry_held(&self, d: &mut Decider, entry: Entry) -> Result<LogAck, Error> {
         self.writable()?;
-        if let Some(id) = tree::dirty::node_changing(&d.registry, &entry) {
+        if self.tree.is_some()
+            && let Some(id) = tree::dirty::node_changing(&d.registry, &entry)
+        {
             self.dirty.rebuild(id);
         }
         let pending = {

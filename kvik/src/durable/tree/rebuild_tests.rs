@@ -313,3 +313,87 @@ fn a_floor_close_over_a_merged_day_equals_the_model_with_rollups() {
     assert!(vis.keys().any(|k| k.1 == 4), "the day's roll-up is rebuilt");
     assert_model(&st, &vis);
 }
+
+/// The visible nodes `live` and `rebuilt` both cover, which must be equal, `as_of` included (T3).
+fn assert_t3(live: &(Root, BTreeMap<Key, Seen>), rebuilt: &(Root, BTreeMap<Key, Seen>)) {
+    let both = |m: &BTreeMap<Key, Seen>| -> BTreeMap<Key, Seen> {
+        m.iter()
+            .filter(|&(&(_, l, s), _)| {
+                let w = rebuilt.0.levels.iter().find(|x| x.id == l).unwrap().width;
+                set::covered(&rebuilt.0, l, s, s + w) && set::covered(&live.0, l, s, s + w)
+            })
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
+    assert_eq!(live.0.checkpoint, rebuilt.0.checkpoint);
+    assert!(!both(&live.1).is_empty());
+    assert_eq!(both(&live.1), both(&rebuilt.1), "T3: as_of included");
+}
+
+/// The same store backfilled from no tree, to full cover of the quarter-hour level.
+fn rebuilt(st: &mut Store) -> (Root, BTreeMap<Key, Seen>) {
+    let fresh = st.fs.snapshot();
+    remove_tree(&fresh, &st.dir);
+    st.fs = fresh;
+    st.reopen();
+    st.w.reader().unwrap();
+    step_until(st, "the rebuild covers the quarter-hour level", |r| {
+        set::covered(r, 2, i64::MIN / 2, i64::MAX / 2)
+    });
+    st.stop();
+    tree_state(&st.fs, &st.dir)
+}
+
+#[test]
+fn a_store_written_with_the_tree_on_then_off_then_on_ends_equal_to_a_rebuild() {
+    let mut st = Store::new("on-off-on");
+    history(&mut st);
+    st.stop();
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    st.clock.advance(Duration::from_secs(600));
+    st.reopen_with(false);
+    st.emit(Intent::Normal, &[(7_000, Some(5.0)), (5, Some(6.0))]);
+    st.emit(Intent::Revise, &[(7_300 - 61, Some(-8.0)), (6_000, None)]);
+    st.stop();
+    assert_eq!(
+        tree_state(&st.fs, &st.dir).0.seq,
+        first.seq,
+        "no root while off"
+    );
+    st.reopen();
+    st.emit(Intent::Normal, &[(2, Some(1.25))]);
+    st.stop();
+    let live = tree_state(&st.fs, &st.dir);
+    assert!(live.0.checkpoint > first.checkpoint);
+    assert_t1(&st.params(), st.id.0, &st.current, &live.1);
+    assert_model(&st, &live.1);
+    let rebuilt = rebuilt(&mut st);
+    assert_model(&st, &rebuilt.1);
+    assert_t3(&live, &rebuilt);
+}
+
+#[test]
+fn turning_the_tree_on_with_its_root_behind_past_stretch_max_discards_it_and_backfills() {
+    let mut st = Store::new("far-behind");
+    history(&mut st);
+    st.stop();
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    st.reopen_with(false);
+    for k in 0..6u64 {
+        st.emit(Intent::Normal, &[(4_000 - k * 7, Some(k as f64))]);
+    }
+    st.stop();
+    super::job::STRETCH_MAX_AT_OPEN.set(3);
+    st.reopen();
+    super::job::STRETCH_MAX_AT_OPEN.set(super::read::STRETCH_MAX);
+    st.w.reader().unwrap();
+    step_until(&st, "the tree is discarded", |r| r.floor > first.floor);
+    step_until(&st, "the backfill covers the quarter-hour level", |r| {
+        set::covered(r, 2, i64::MIN / 2, i64::MAX / 2)
+    });
+    st.stop();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(root.floor > first.floor, "the old tree was discarded");
+    assert_t1(&st.params(), st.id.0, &st.current, &vis);
+    assert_model(&st, &vis);
+}

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use kvik::env::{Env, ManualClock, StdFs};
 use kvik::{
     Kind, Reader, ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues,
-    Store, StoreConfig, Timestamp, Value, ValueType,
+    Store, StoreConfig, Timestamp, TreeConfig, Value, ValueType,
 };
 
 const NS: i64 = 1_000_000_000;
@@ -136,6 +136,7 @@ fn config(dir: &Path, clock: &ManualClock) -> StoreConfig {
     env.clock = Arc::new(clock.clone());
     let mut c = StoreConfig::new(dir.to_string_lossy().into_owned(), "Etc/UTC")
         .create_if_missing(true)
+        .tree(TreeConfig::default().enabled(true))
         .env(env);
     c.log.min_sync_interval = Duration::ZERO;
     c

@@ -6545,6 +6545,26 @@ for longer than the windows, or with backfills older than them, is still read wh
 `bounded_history_reads_answer_as_the_whole_series_does` (property: months of history, backfills, future and bad
 facts) and `a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history`.
 
+## Q-2370 — The summary tree off by default while its memory is unbounded
+Decided by the builder with the tree switch, provisional; settle with the step that bounds the tree's memory.
+**Scenario.** The tree's checkpoint and chart reads can hold memory that grows with a long backlog; a release must
+not carry that by default.
+**Decision (provisional).** `tree.enabled` (default off, documented as experimental). Off: no checkpoint job, no
+dirty marking on the commit path, nothing written under `tree/`; readers are unchanged and use a root an earlier run
+left only while its stretch is within `STRETCH_MAX`, so charts over old data take facts. The default turns on with
+the step that bounds the tree's memory. Tests: `with_the_tree_off_the_dirty_set_stays_empty_and_nothing_is_written_under_tree`,
+`charts_equal_the_fact_path_throughout_a_store_written_with_the_tree_on_then_off_then_on`,
+`a_store_written_with_the_tree_on_then_off_then_on_ends_equal_to_a_rebuild`.
+
+## Q-2371 — Turning the tree on with its root far behind
+Decided by the builder with the tree switch, provisional; settle with the step that bounds the tree's memory.
+**Scenario.** A store run with the tree off for long has a root whose K is far below the mark; continuing it would
+read the whole log since K into the dirty set at the start.
+**Decision (provisional).** A start whose root's K is more than `STRETCH_MAX` positions below the synced mark
+discards the tree as for a loss (Q-1429) and, as for a store with no root (Q-2181), marks nothing from the log: the
+discarded root covers nothing and the backfill rebuilds it from facts. Test:
+`turning_the_tree_on_with_its_root_behind_past_stretch_max_discards_it_and_backfills`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -6823,6 +6843,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2270 | cond2 review | Decided at merge: the highest dropped id holds the checkpoint until the gate cursor covers it |
 | Q-2271 | cond2 step 6 | Ruled by the lead: built with step 6 (Q-2295) |
 | Q-2295 | cond2 step 6 | Decided by the builder, provisional: event-time windows of 1, 16, 256 days, exact or widened |
+| Q-2370 | tree switch | Decided by the builder, provisional: `tree.enabled` default off, experimental, until the tree's memory is bounded |
+| Q-2371 | tree switch | Decided by the builder, provisional: a root behind by more than `STRETCH_MAX` is discarded at the start and backfilled |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

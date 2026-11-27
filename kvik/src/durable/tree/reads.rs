@@ -15,7 +15,7 @@ use kvik_tree::set::{Policy, merge, next_root, plan};
 use kvik_tree::write::{DIR, Identity, Opening, TreeFiles, part_name, root_name};
 use proptest::prelude::*;
 
-use super::tests::{open, wait};
+use super::tests::{open, open_with, wait};
 use crate::durable::reader::DurableReader;
 use crate::durable::windows::nodes::NODES_USED;
 use crate::durable::{Writer, buckets_of, windows};
@@ -172,9 +172,14 @@ impl Rig {
 
     /// A clean shutdown with the reader open, so that it checkpoints, then a start.
     fn checkpoint(&mut self) {
+        self.restart(true);
+    }
+
+    /// A clean shutdown with the reader open, then a start with the tree on or off.
+    fn restart(&mut self, tree: bool) {
         self.w.reader().unwrap();
         self.w.shutdown().unwrap();
-        self.w = open(&self.fs, &self.clock, &self.dir);
+        self.w = open_with(&self.fs, &self.clock, &self.dir, tree);
     }
 
     fn reader(&self) -> Arc<DurableReader> {
@@ -521,6 +526,36 @@ fn a_reader_whose_cut_moves_takes_readings_since_its_last_read_as_dirty() {
         .collect();
     rig.emit(Intent::Normal, &late);
     assert_t7(&rig, &ranges(rig.now()));
+}
+
+#[test]
+fn charts_equal_the_fact_path_throughout_a_store_written_with_the_tree_on_then_off_then_on() {
+    let mut rig = Rig::new("on-off-on");
+    let first: Vec<(i64, u8)> = (0..1_500i64)
+        .map(|k| (k * 89 * S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    assert!(assert_t7(&rig, &ranges(rig.now())) > 0);
+    rig.restart(false);
+    assert!(rig.w.tree.is_none());
+    let late: Vec<(i64, u8)> = (0..40i64)
+        .map(|k| (2 * HOUR + k * 1_777 * S, 200))
+        .collect();
+    rig.emit(Intent::Normal, &late);
+    rig.emit(Intent::Revise, &[(first[7].0, 9), (first[300].0, 240)]);
+    assert!(
+        assert_t7(&rig, &ranges(rig.now())) > 0,
+        "the old tree still serves"
+    );
+    rig.restart(false);
+    rig.advance(5 * MIN);
+    rig.emit(Intent::Normal, &[(MIN, 4), (3 * HOUR + 11 * S, 17)]);
+    assert_t7(&rig, &ranges(rig.now()));
+    rig.restart(true);
+    assert_t7(&rig, &ranges(rig.now()));
+    rig.emit(Intent::Revise, &[(late[3].0 + 5 * MIN, 31)]);
+    rig.checkpoint();
+    assert!(assert_t7(&rig, &ranges(rig.now())) > 0);
 }
 
 #[test]

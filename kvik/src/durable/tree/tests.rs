@@ -11,7 +11,7 @@ use kvik_tree::set::{Key, Seen, visible};
 use kvik_tree::write::{DIR, folded_levels, part_name, read_file, root_name};
 use kvik_tree::{LEVELS, Node, Value as TreeValue, fold};
 
-use crate::config::StoreConfig;
+use crate::config::{StoreConfig, TreeConfig};
 use crate::durable::completion::Emitted;
 use crate::durable::{Writer, lock, windows};
 use crate::env::{Env, ManualClock, MemFs};
@@ -30,11 +30,16 @@ pub(super) struct Store {
 }
 
 pub(super) fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
+    open_with(fs, clock, dir, true)
+}
+
+pub(super) fn open_with(fs: &MemFs, clock: &ManualClock, dir: &Path, tree: bool) -> Arc<Writer> {
     let mut env = Env::test(clock.clone());
     env.fs = Arc::new(fs.clone());
     env.background_timers = false;
     let config = StoreConfig::new(dir, "Etc/UTC")
         .create_if_missing(true)
+        .tree(TreeConfig::default().enabled(tree))
         .env(env);
     crate::durable::LOG_SKEW.set(Some(skew()));
     let w = Writer::open(&config);
@@ -66,10 +71,14 @@ pub(super) fn wait(e: Emitted) {
 
 impl Store {
     pub(super) fn new(name: &str) -> Self {
+        Store::new_with(name, true)
+    }
+
+    pub(super) fn new_with(name: &str, tree: bool) -> Self {
         let fs = MemFs::new();
         let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
         let dir = PathBuf::from(format!("tree-unit/{name}"));
-        let w = open(&fs, &clock, &dir);
+        let w = open_with(&fs, &clock, &dir, tree);
         let spec = SeriesSpec::new(
             "a/b/c",
             Kind::Gauge {
@@ -90,7 +99,11 @@ impl Store {
     }
 
     pub(super) fn reopen(&mut self) {
-        self.w = open(&self.fs, &self.clock, &self.dir);
+        self.reopen_with(true);
+    }
+
+    pub(super) fn reopen_with(&mut self, tree: bool) {
+        self.w = open_with(&self.fs, &self.clock, &self.dir, tree);
     }
 
     /// Emits readings `(seconds before now, value)`, `None` as bad quality.
@@ -643,4 +656,31 @@ fn a_node_changing_entry_committed_under_the_decision_lock_marks_its_series() {
     .unwrap();
     assert!(st.w.dirty.take().1.contains(&st.id.0));
     st.w.shutdown().unwrap();
+}
+
+#[test]
+fn with_the_tree_off_the_dirty_set_stays_empty_and_nothing_is_written_under_tree() {
+    let mut st = Store::new_with("off", false);
+    assert!(st.w.tree.is_none());
+    for round in 0..40u64 {
+        history(&mut st);
+        st.emit(Intent::Revise, &[(7_300 - round * 61, Some(round as f64))]);
+        st.clock.advance(Duration::from_secs(97));
+    }
+    let id = st.id;
+    st.w.retire(id, st.clock.wall()).unwrap();
+    let t_r = st.clock.wall().0;
+    st.w.commit_entry_held(
+        &mut lock(&st.w.decider),
+        kvik_log::entries::Entry::Retirement { id: id.0, t_r },
+    )
+    .unwrap();
+    st.w.reader().unwrap();
+    assert_eq!(st.w.dirty.len(), 0);
+    assert!(
+        st.w.dirty.take().1.is_empty(),
+        "no series marked for rebuild"
+    );
+    st.stop();
+    assert_eq!(st.fs.read_dir(&st.dir.join(DIR)).unwrap(), Vec::new());
 }

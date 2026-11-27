@@ -275,7 +275,7 @@ pub(crate) struct Writer {
     fast: Arc<fast::Fast>,
     /// The summary tree's dirty set, marked before each call is offered (design 7.1b section 5).
     dirty: Arc<tree::Dirty>,
-    /// The summary tree's checkpoint job; `None` when the start left the store read-only.
+    /// The summary tree's checkpoint job; `None` with `tree.enabled` off or when the start left the store read-only.
     tree: Option<Arc<tree::Job>>,
     /// Whether `watch` writes its entry; off until gates are judged live ([`gates::LIVE`]).
     gates_live: AtomicBool,
