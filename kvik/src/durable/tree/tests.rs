@@ -600,3 +600,35 @@ fn a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree(
         "an interval step starts it"
     );
 }
+
+#[test]
+fn a_call_whose_outcome_is_unknown_keeps_its_pairs_marked() {
+    let st = Store::new("unknown");
+    assert_eq!(st.w.dirty.len(), 0);
+    st.fs.fail_syncs(true);
+    let r = Reading::new(st.id, st.clock.wall(), Value::F64(1.0));
+    if let Ok(Emitted::Queued(mut q)) = st.w.emit(&[r], Intent::Normal, true) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let out = loop {
+            if let Poll::Ready(r) = q.poll(&mut cx) {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(out.is_err(), "the sync failed");
+    }
+    assert_eq!(st.w.dirty.len(), 1);
+}
+
+#[test]
+fn a_node_changing_entry_committed_under_the_decision_lock_marks_its_series() {
+    let st = Store::new("held");
+    let t_r = st.clock.wall().0;
+    st.w.commit_entry_held(
+        &mut lock(&st.w.decider),
+        kvik_log::entries::Entry::Retirement { id: st.id.0, t_r },
+    )
+    .unwrap();
+    assert!(st.w.dirty.take().1.contains(&st.id.0));
+    st.w.shutdown().unwrap();
+}
