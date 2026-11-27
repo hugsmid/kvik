@@ -112,6 +112,9 @@ impl Deliverer {
         if lost || again.is_some() {
             rt.latches.clear();
             rt.forget = Some(point);
+            // Nothing is read from the log until the resync is confirmed, as the model's `awaiting` (Q-1450): a fact
+            // committed meanwhile is caught up after it, replayed.
+            rt.paused = true;
             self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
             return Ok(Ok(()));
         }

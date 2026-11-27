@@ -5249,7 +5249,9 @@ until the `NoCursor` resync is confirmed the consumer stays lost, and every take
 and the durable `take`, together, so the differential still agrees). **Settled by the lead, 26 November, to the
 recommended default; built with roadmap 5.3 step 1:** every take before the confirmation sends the `NoCursor` resync
 again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`;
-`kvik/tests/consumers.rs`).
+`kvik/tests/consumers.rs`). Until then neither backend reads the log for it, so a fact committed meanwhile follows the
+confirmation as replayed (`kvik/tests/consumer_properties.rs`
+`a_fact_after_a_retake_with_no_cursor_unconfirmed_is_flagged_as_the_model_flags_it`).
 
 ## Q-1400 — Restore records in the saved-point check
 
