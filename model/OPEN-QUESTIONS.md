@@ -207,7 +207,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
 | Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
 | Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (decided by the lead, provisional; settle with cond2 step 5) |
-| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided at review, provisional; settle with cond2 step 5) |
 | Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: a resync, cause `Resume` (decided at review, provisional) |
 | Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
@@ -5455,14 +5455,18 @@ reseeds the gates in force at the head by the seed rule, emits no start transiti
 `every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor`.
 
 ## Q-2001 — What the durable backend's gate history reads cost
-Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
-**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double.
-**Decision (provisional).** Each read scans the log from its start to `through` and judges the series' facts by the
-double's own rules (`Replay`), so the two cannot differ; the gate differential checks it end to end. Cost: one log
-scan per read; reads happen at a watch with holds (two), at a reseed (two per gate) and when a bad fact replaces the
-live one (one). Fine for the tests' logs; a store of 30 days needs the bounded read of Q-1880 (from
-`commit_at(T − 2L)`, with the series' state there from the summaries), which cond2 step 5 builds with replay.
-**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`.
+Decided by the lead with cond2 step 4, narrowed at its review, provisional; settle with cond2 step 5.
+**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double. The first
+decision scanned the whole log per read, twice per gate at every reseed, under the deliverer lock.
+**Decision (provisional).** A read takes the series' facts at or before `through` through the segment indexes
+(`format.md` A.8; a segment without one is scanned) and judges them by the double's own rules (`Replay`), so the two
+cannot differ; the gate differential checks it end to end. One read per series and position serves a whole core
+call, so a reseed reads each watched series once for all its gates. A read that cannot read every place that may
+hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; still
+unbounded in time. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
+summaries) is a merge condition on cond2 step 5, which builds it with replay.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`;
+`kvik/src/durable/gates/tests.rs` `a_reseed_reads_a_series_from_the_log_once_for_all_its_gates`.
 
 ## Q-2002 — Gate state after an overflow catch-up
 Decided by the lead with cond2 step 4; replaced at its review, provisional.
@@ -5721,7 +5725,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
 | Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
 | Q-2000 | cond2 step 5 | Decided by the lead, provisional: gate cursor in memory; every start reseeds |
-| Q-2001 | cond2 step 5 | Decided by the lead, provisional: a log scan per read; the bounded read with replay |
+| Q-2001 | cond2 step 5 | Decided at review, provisional: one indexed read per series per core call; the bounded read with replay, before step 5 merges |
 | Q-2002 | cond2 step 6 | Decided at review, provisional: buffered while behind; a quiet catch-up ends with a resync |
 | Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
 

@@ -165,8 +165,8 @@ impl Deliverer {
         self.gate_reads.get()
     }
 
-    fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
-        LogHistory { d: self, ctx }
+    fn history(&self) -> LogHistory<'_> {
+        LogHistory::new(self)
     }
 
     /// The gates in force for `name`, as the core judges them.
@@ -185,16 +185,10 @@ impl Deliverer {
 
     /// A core for `name` with its gates in force started at `at`, committed at `commit`, by the seed rule (cond2
     /// design §3.3, reseed).
-    fn reseeded(
-        &mut self,
-        name: &str,
-        at: LogPos,
-        commit: Nanos,
-        ctx: &Ctx<'_>,
-    ) -> Option<GateRun> {
+    fn reseeded(&mut self, name: &str, at: LogPos, commit: Nanos) -> Option<GateRun> {
         let gates = self.gates_in_force(name);
         let mut core = Core::new();
-        let r = core.reseed(&gates, core_pos(at), commit, &self.history(ctx));
+        let r = core.reseed(&gates, core_pos(at), commit, &self.history());
         if r.is_err() {
             self.stats.gate_errors += 1;
             core = Core::new();
@@ -221,7 +215,7 @@ impl Deliverer {
     /// At a take (`docs/api.md` `Store::consumer`): the first in this run reseeds the consumer's gates in force
     /// (no gate cursor is written yet, so every start does, cond2 step 4); a later one queues its unconfirmed
     /// transitions again under their ids as the catch-up from its cursor passes them (design §4.4 step 4).
-    pub(super) fn gate_take(&mut self, name: &str, again: bool, ctx: &Ctx<'_>) {
+    pub(super) fn gate_take(&mut self, name: &str, again: bool) {
         let has = self
             .consumers
             .get(name)
@@ -252,7 +246,7 @@ impl Deliverer {
             .get(name)
             .is_some_and(|r| !r.gates.is_empty());
         if in_force && !has {
-            let run = self.reseeded(name, self.head, self.last_commit_time, ctx);
+            let run = self.reseeded(name, self.head, self.last_commit_time);
             if let Some(rt) = self.consumers.get_mut(name) {
                 rt.gates = run;
             }
@@ -267,7 +261,6 @@ impl Deliverer {
         commit: Nanos,
         feed: &Feed<'_>,
         names: &mut Vec<String>,
-        ctx: &Ctx<'_>,
     ) {
         if let Feed::Routing(r) = feed
             && r.op == RouteOp::Watch
@@ -323,7 +316,7 @@ impl Deliverer {
             };
             #[cfg(test)]
             let fail = self.gate_fail_at == Some(p);
-            self.gate_call(name, (p, commit), ctx, |core, h| {
+            self.gate_call(name, (p, commit), |core, h| {
                 #[cfg(test)]
                 if fail {
                     return Err(crate::gates::CoreError::Id(ConditionId(u32::MAX)));
@@ -361,7 +354,7 @@ impl Deliverer {
         let names = self.gate_names();
         for name in names {
             let at = (self.head, self.last_commit_time);
-            self.gate_call(&name, at, ctx, |core, _| Ok(core.advance(f)));
+            self.gate_call(&name, at, |core, _| Ok(core.advance(f)));
         }
     }
 
@@ -399,7 +392,6 @@ impl Deliverer {
         &mut self,
         name: &str,
         at: (LogPos, Nanos),
-        ctx: &Ctx<'_>,
         f: impl FnOnce(
             &mut Core,
             &dyn crate::gates::History,
@@ -409,7 +401,7 @@ impl Deliverer {
             return;
         };
         run.ready();
-        let r = f(&mut run.core, &self.history(ctx));
+        let r = f(&mut run.core, &self.history());
         match r {
             Ok(ts) => {
                 if let Some(rt) = self.consumers.get_mut(name) {
@@ -421,7 +413,7 @@ impl Deliverer {
             }
             Err(_) => {
                 self.stats.gate_errors += 1;
-                let mut fresh = self.reseeded(name, at.0, at.1, ctx).expect("a run");
+                let mut fresh = self.reseeded(name, at.0, at.1).expect("a run");
                 fresh.seen = run.seen;
                 fresh.names.extend(run.names);
                 fresh.outstanding = run.outstanding;

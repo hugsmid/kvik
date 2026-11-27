@@ -138,7 +138,7 @@ impl Deliverer {
         }
         rt.handle = true;
         rt.attached = true;
-        self.gate_take(name, retake, ctx);
+        self.gate_take(name, retake);
         let rt = self.consumers.get_mut(name).expect("inserted above");
         let Some(point) = point.or(again) else {
             return Ok(Ok(()));

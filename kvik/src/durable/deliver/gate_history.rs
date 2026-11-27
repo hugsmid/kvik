@@ -1,12 +1,17 @@
-//! The gates core's history reads on the durable backend (Q-1880): the series' facts at or before a position,
+//! The gates core's history reads on the durable backend (Q-1880, Q-2001): the series' facts at or before a position,
 //! read from the log, judged by the same rules as the tests' double ([`Replay`]).
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use kvik_log::writer::Position as LogPos;
 use kvik_model::types::{Nanos, Position, SeriesId};
 
-use super::{Ctx, Deliverer, next};
+use super::Deliverer;
 use crate::durable::gates::core_value;
 use crate::durable::index::quality_out;
+use crate::durable::keys::{LocalFacts, OnLog};
 use crate::gates::{FactItem, History, HistoryError, Replay, SeriesState};
 
 pub(super) fn log_pos(p: Position) -> LogPos {
@@ -32,28 +37,52 @@ pub(super) fn fact_item(row: &kvik_log::facts::FactRow, d: &Deliverer) -> FactIt
     }
 }
 
-/// [`History`] over the deliverer's log. Each read scans the log from its start to `through` (Q-2001).
+/// [`History`] over the deliverer's log: a series' facts read through the segment indexes (`format.md` A.8), once
+/// per series and position for the core call it serves, so a reseed reads each series once for all its gates
+/// (Q-2001).
 pub(super) struct LogHistory<'a> {
-    pub(super) d: &'a Deliverer,
-    pub(super) ctx: &'a Ctx<'a>,
+    d: &'a Deliverer,
+    read: RefCell<HashMap<(SeriesId, Position), Rc<Replay>>>,
 }
 
-impl LogHistory<'_> {
-    fn replay(&self, series: SeriesId, through: Position) -> Result<Replay, HistoryError> {
+impl<'a> LogHistory<'a> {
+    pub(super) fn new(d: &'a Deliverer) -> Self {
+        LogHistory {
+            d,
+            read: RefCell::default(),
+        }
+    }
+
+    fn replay(&self, series: SeriesId, through: Position) -> Result<Rc<Replay>, HistoryError> {
+        if let Some(r) = self.read.borrow().get(&(series, through)) {
+            return Ok(r.clone());
+        }
         #[cfg(test)]
         self.d.gate_reads.set(self.d.gate_reads.get() + 1);
-        let facts = self
-            .d
-            .facts_between(LogPos::default(), next(log_pos(through)), self.ctx)
-            .ok_or_else(|| HistoryError("the log could not be read".into()))?;
+        let unreadable = || HistoryError("the log could not be read".into());
+        self.d.slow.set(self.d.slow.get() + 1);
+        let mut reader = self.d.local().ok_or_else(unreadable)?;
+        let facts = OnLog {
+            reader: &mut reader,
+            lost: &self.d.damaged,
+            latch: &self.d.latch,
+        }
+        .between(series.0, i64::MIN, i64::MAX)
+        .ok_or_else(unreadable)?;
+        drop(reader);
+        let through = log_pos(through);
         let mut r = Replay::default();
-        for (stored, _, _) in facts.iter().filter(|(s, _, _)| s.row.series_id == series.0) {
+        for f in facts.iter().filter(|f| f.position <= through) {
             r.push(
-                stored.received_at,
-                core_pos(stored.position),
-                fact_item(&stored.row, self.d),
+                f.received_at,
+                core_pos(f.position),
+                fact_item(&f.row, self.d),
             );
         }
+        let r = Rc::new(r);
+        self.read
+            .borrow_mut()
+            .insert((series, core_pos(through)), r.clone());
         Ok(r)
     }
 }

@@ -329,14 +329,13 @@ impl Deliverer {
                     commit,
                     &gates::Feed::Fact(f, fact_outranked),
                     &mut gate_names,
-                    ctx,
                 ),
                 (None, Some(r)) => {
-                    self.gate_item(p, commit, &gates::Feed::Routing(r), &mut gate_names, ctx);
+                    self.gate_item(p, commit, &gates::Feed::Routing(r), &mut gate_names);
                     gating = self.gating();
                 }
                 (None, None) if gating => {
-                    self.gate_item(p, commit, &gates::Feed::Other, &mut gate_names, ctx)
+                    self.gate_item(p, commit, &gates::Feed::Other, &mut gate_names)
                 }
                 _ => {}
             }
