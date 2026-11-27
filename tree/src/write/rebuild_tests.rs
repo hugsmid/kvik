@@ -324,6 +324,38 @@ proptest! {
 }
 
 #[test]
+fn t8_holds_when_a_repair_follows_a_start_that_refused_a_newer_root() {
+    use Act::Checkpoint as C;
+    let h = 3_600_000_000_000;
+    run(&[
+        Op::Act(C),
+        Op::Facts(vec![
+            (0, 71 * h, None),
+            (0, 72 * h + 19 * S, None),
+            (0, 47 * h, None),
+        ]),
+        Op::Facts(vec![(0, 96 * h + 19 * S, None), (0, -h, Some(0.0))]),
+        Op::Sync,
+        Op::Act(C),
+        Op::Facts(vec![
+            (0, 120 * h + 19 * S, None),
+            (0, 24 * h + 19 * S, None),
+            (0, 72 * h + 19 * S, None),
+            (0, 96 * h + 19 * S, None),
+            (0, 48 * h + 19 * S, None),
+            (0, -h, None),
+        ]),
+        Op::Sync,
+        Op::Stopped {
+            at: 28,
+            stop: Stop::Partial(10_612_798_949_906_852_736),
+            act: C,
+        },
+        Op::Damage(0),
+    ]);
+}
+
+#[test]
 fn merges_write_rollups_that_equal_a_rebuild_and_late_facts_recompute_them() {
     let mut w = World::new();
     let facts: Vec<(u64, i64, Option<f64>)> = (0..200)

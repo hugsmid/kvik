@@ -217,3 +217,40 @@ fn a_backfill_reaches_full_cover_and_equals_the_live_tree_after_merges_and_a_kil
     assert!(both(&live).keys().any(|k| k.1 == 4));
 }
 
+#[test]
+fn a_damaged_part_of_a_merged_day_is_rebuilt_when_late_data_arrives() {
+    let mut st = Store::new("late-damage");
+    history(&mut st);
+    let d0 = day_of(&st);
+    st.w.reader().unwrap();
+    step_until(&st, "the first day's roll-ups are written", |r| {
+        set::covered(r, 4, d0, d0 + DAY)
+    });
+    let late = (st.clock.wall().0 - (d0 + 13 * 3_600_000_000_000)) / 1_000_000_000;
+    let late = u64::try_from(late).unwrap();
+    st.stop();
+    let (root, _) = tree_state(&st.fs, &st.dir);
+    let bad = *root
+        .parts
+        .iter()
+        .find(|p| p.period_start <= d0 && d0 < p.period_start + p.period_len as i64)
+        .unwrap();
+    let path = st
+        .dir
+        .join(DIR)
+        .join(part_name(root.header.generation, bad.file_id));
+    st.fs
+        .poke(&path, (bad.byte_len / 2) as usize, &[0xff, 0x00, 0xff]);
+    st.reopen();
+    st.w.reader().unwrap();
+    st.emit(Intent::Normal, &[(late, Some(42.0))]);
+    let k0 = root.checkpoint;
+    step_until(
+        &st,
+        "the damaged part is replaced after a checkpoint",
+        |r| r.checkpoint > k0 && !r.parts.iter().any(|x| x.file_id == bad.file_id),
+    );
+    st.stop();
+    let (_, vis) = tree_state(&st.fs, &st.dir);
+    assert_model(&st, &vis);
+}
