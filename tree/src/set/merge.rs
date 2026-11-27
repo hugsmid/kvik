@@ -60,7 +60,8 @@ pub enum MergeError {
 /// `plan.rollups` every roll-up recomputed from its children (invariant T2) where the finest cover level is
 /// covered. The output takes the inputs' highest `seq`, so a live part outside the plan whose `seq` lies between
 /// the inputs' is refused (Q-1554). Output `file_id`s count up from the root's `next_file_id`; `template` gives the rest of
-/// the A.1 header. `params` gives a series' parameters, `None` for one that stores no roll-ups.
+/// the A.1 header. `params` gives a series' parameters; a roll-up merge refuses a series with a cover-level entry
+/// in the periods and no parameters (Q-1821).
 pub fn merge<F>(
     root: &Root,
     parts: &[Part],
@@ -193,6 +194,16 @@ where
             .iter()
             .any(|&(s, l)| s <= start && start.saturating_add(w) <= s.saturating_add(l as i64))
     };
+    let covers = cover_levels(&root.levels);
+    if let Some(&(s, _, _)) = kept.keys().find(|&&(s, level, start)| {
+        covers
+            .iter()
+            .find(|l| l.id == level)
+            .is_some_and(|l| inside(start, l.width))
+            && params(s).is_none()
+    }) {
+        return Err(MergeError::NoParams(s));
+    }
     let parents: Vec<Level> = pairs.iter().map(|p| p.0).collect();
     kept.retain(|&(_, level, start), _| {
         parents
@@ -210,7 +221,9 @@ where
         for &(parent, child) in &pairs {
             let mut groups: BTreeMap<i64, Vec<&Entry>> = BTreeMap::new();
             for (_, e) in kept.range((s, child.id, i64::MIN)..=(s, child.id, i64::MAX)) {
-                let x = e.start - e.start.rem_euclid(parent.width);
+                let Some(x) = e.start.checked_sub(e.start.rem_euclid(parent.width)) else {
+                    continue;
+                };
                 groups.entry(x).or_default().push(e);
             }
             let mut made: Vec<(Key, Entry)> = Vec::new();
@@ -277,7 +290,9 @@ pub fn part_ref(p: &Part, bytes: &[u8]) -> PartRef {
     let file_crc32c = u32::from_le_bytes(bytes[crc_at..crc_at + 4].try_into().expect("4 bytes"));
     let spans = p.runs.iter().flat_map(|r| {
         let w = width(&p.levels, r.level).unwrap_or(0);
-        r.entries.iter().map(move |e| (e.start, e.start + w))
+        r.entries
+            .iter()
+            .map(move |e| (e.start, e.start.saturating_add(w)))
     });
     let (least_start, greatest_end) = spans
         .fold(None, |acc: Option<(i64, i64)>, (s, e)| {
@@ -301,7 +316,8 @@ pub fn part_ref(p: &Part, bytes: &[u8]) -> PartRef {
 
 /// The root that publishes a merge: the outputs live, the inputs retired at `now`, `seq` one higher; with roll-ups,
 /// each roll-up level covered over the periods where the finest cover level is; finer levels than [`QUARTER`] no
-/// longer covered before `plan.minute_from`.
+/// longer covered before `plan.minute_from`, for every period: minute entries of parts outside the plan before the
+/// cut are no longer visible.
 pub fn next_root(root: &Root, plan: &Plan, outputs: &[PartRef], now: i64) -> Root {
     let mut r = root.clone();
     r.seq = root.seq + 1;
