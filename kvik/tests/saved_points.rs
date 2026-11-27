@@ -413,7 +413,7 @@ impl Rig {
                 // Q-1630: a reset point with nothing to forget at the consumer's start may be on one side only.
                 let vacuous = |d: &Delivery| {
                     matches!(&d.kind, DeliveryKind::Resync(r)
-                        if r.cause == ResyncCause::ResetPoint && r.forget_above.is_some_and(|fa| fa >= want))
+                        if r.cause == ResyncCause::ResetPoint && r.forget_above == Some(want))
                 };
                 got.0.retain(|d| !vacuous(d));
                 got.1.retain(|d| !vacuous(d));
