@@ -193,6 +193,25 @@ impl Writer {
                 });
             }
         };
+        let dirty = Arc::new(tree::Dirty::default());
+        let tree_job = start_fault.is_none().then(|| {
+            let ds = writer.directory_start();
+            let job = Arc::new(tree::Job::new(tree::job::Parts {
+                dir: dir.clone(),
+                env: env.clone(),
+                clocks: clocks.clone(),
+                latch: latch.clone(),
+                recorded: recorded.to_vec(),
+                id: kvik_tree::write::Identity {
+                    generation: ds.generation,
+                    reset: ds.stamp.unwrap_or_default(),
+                    store_id: descriptor.store_id,
+                },
+                dirty: dirty.clone(),
+            }));
+            hook.tree(job.clone());
+            job
+        });
         let log =
             Log::start_with(writer, clock, Some(derived::options(&hook))).map_err(|source| {
                 OpenError::Io {
@@ -261,6 +280,8 @@ impl Writer {
             scan: Mutex::new(scan),
             bucket_warning: config.log.bucket_warning(),
             fast: Arc::default(),
+            dirty,
+            tree: tree_job,
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`

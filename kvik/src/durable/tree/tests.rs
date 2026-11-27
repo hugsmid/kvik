@@ -1,0 +1,300 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use kvik_log::fs::{FaultOp, Fs};
+use kvik_tree::part::Part;
+use kvik_tree::root::Root;
+use kvik_tree::set::{Key, Seen, visible};
+use kvik_tree::write::{DIR, folded_levels, part_name, read_file, root_name};
+use kvik_tree::{LEVELS, Node, Value as TreeValue, fold};
+
+use crate::config::StoreConfig;
+use crate::durable::completion::Emitted;
+use crate::durable::{Writer, lock, windows};
+use crate::env::{Env, ManualClock, MemFs};
+use crate::health::{Health, Reason};
+use crate::series::{Kind, ParameterChange, RetentionClass, SeriesSpec, ValueType};
+use crate::types::{Intent, Quality, Reading, SeriesId, Value};
+
+struct Store {
+    fs: MemFs,
+    clock: ManualClock,
+    dir: PathBuf,
+    w: Arc<Writer>,
+    id: SeriesId,
+    /// The current readings: `t` to value, `None` for bad quality.
+    current: BTreeMap<i64, Option<f64>>,
+}
+
+fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(fs.clone());
+    env.background_timers = false;
+    let config = StoreConfig::new(dir, "Etc/UTC")
+        .create_if_missing(true)
+        .env(env);
+    Writer::open(&config).unwrap()
+}
+
+fn wait(e: Emitted) {
+    if let Emitted::Queued(mut q) = e {
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(r) = q.poll(&mut cx) {
+                q.finish(r).unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Store {
+    fn new(name: &str) -> Self {
+        let fs = MemFs::new();
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let dir = PathBuf::from(format!("tree-unit/{name}"));
+        let w = open(&fs, &clock, &dir);
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        )
+        .expected_interval(Duration::from_secs(5));
+        let id = w.define(&spec).unwrap();
+        Store {
+            fs,
+            clock,
+            dir,
+            w,
+            id,
+            current: BTreeMap::new(),
+        }
+    }
+
+    fn reopen(&mut self) {
+        self.w = open(&self.fs, &self.clock, &self.dir);
+    }
+
+    /// Emits readings `(seconds before now, value)`, `None` as bad quality.
+    fn emit(&mut self, intent: Intent, readings: &[(u64, Option<f64>)]) {
+        let now = self.clock.wall();
+        let rs: Vec<Reading> = readings
+            .iter()
+            .map(|&(ago, v)| {
+                let mut r = Reading::new(
+                    self.id,
+                    crate::time::Timestamp(now.0 - ago as i64 * 1_000_000_000),
+                    Value::F64(v.unwrap_or(0.0)),
+                );
+                if v.is_none() {
+                    r.quality = Quality::Bad;
+                }
+                r
+            })
+            .collect();
+        wait(self.w.emit(&rs, intent, true).unwrap());
+        for (r, &(_, v)) in rs.iter().zip(readings) {
+            self.current.insert(r.t.0, v);
+        }
+    }
+
+    fn params(&self) -> kvik_tree::Params {
+        let d = lock(&self.w.decider);
+        let s = d.registry.get(self.id.0).unwrap();
+        crate::fold::node_params(&windows::params(&s.def))
+    }
+}
+
+/// The newest root on disk, and the visible state of the parts it lists.
+fn tree_state(fs: &MemFs, dir: &Path) -> (Root, BTreeMap<Key, Seen>) {
+    let tree = dir.join(DIR);
+    let newest = fs
+        .read_dir(&tree)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.name.starts_with("root-"))
+        .map(|e| e.name)
+        .max()
+        .expect("a root");
+    let root = Root::decode(&read_file(fs, &tree.join(newest)).unwrap()).unwrap();
+    let parts: Vec<Part> = root
+        .parts
+        .iter()
+        .map(|r| {
+            let path = tree.join(part_name(root.header.generation, r.file_id));
+            Part::decode(&read_file(fs, &path).unwrap()).unwrap()
+        })
+        .collect();
+    let vis = visible(&root, &parts).unwrap();
+    (root, vis)
+}
+
+/// T1 against the readings the test emitted: every non-empty span of the folded levels, and nothing else.
+fn assert_t1(
+    p: &kvik_tree::Params,
+    series: u32,
+    current: &BTreeMap<i64, Option<f64>>,
+    vis: &BTreeMap<Key, Seen>,
+) {
+    let mut want: BTreeMap<(u8, i64), Node> = BTreeMap::new();
+    for l in folded_levels(&LEVELS) {
+        let mut spans: Vec<i64> = current.keys().map(|t| t - t.rem_euclid(l.width)).collect();
+        spans.dedup();
+        for s in spans {
+            let readings: Vec<(i64, TreeValue)> = current
+                .range(s..s + l.width)
+                .filter_map(|(&t, v)| v.map(|v| (t, TreeValue::F64(v))))
+                .collect();
+            let n = fold(p, s, s + l.width, &readings);
+            if !n.is_empty() {
+                want.insert((l.id, s), n);
+            }
+        }
+    }
+    let got: BTreeMap<(u8, i64), Node> = vis
+        .iter()
+        .filter(|((s, _, _), _)| *s == u64::from(series))
+        .map(|(&(_, l, start), seen)| ((l, start), seen.node.clone().expect("a node")))
+        .collect();
+    assert_eq!(got, want);
+}
+
+fn history(st: &mut Store) {
+    let normal: Vec<(u64, Option<f64>)> = (0..120u64)
+        .map(|k| (7_300 - k * 61, (k % 9 != 4).then_some(k as f64 / 4.0)))
+        .collect();
+    st.emit(Intent::Normal, &normal);
+    st.emit(
+        Intent::Revise,
+        &[
+            (7_300 - 61, Some(99.0)),
+            (7_300 - 4 * 61, Some(1.5)),
+            (7_300 - 5 * 61, None),
+        ],
+    );
+    st.emit(Intent::Normal, &[(6_000, Some(-3.0)), (30, Some(2.0))]);
+}
+
+#[test]
+fn a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark() {
+    let mut st = Store::new("shutdown");
+    history(&mut st);
+    let p = st.params();
+    st.w.shutdown().unwrap();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(root.checkpoint.sequence > 0);
+    assert_eq!(root.floor, 0);
+    assert!(
+        vis.values()
+            .all(|s| s.as_of.sequence > 0 && s.as_of <= root.checkpoint)
+    );
+    assert_t1(&p, st.id.0, &st.current, &vis);
+    assert!(vis.keys().any(|k| k.1 == 1) && vis.keys().any(|k| k.1 == 2));
+}
+
+#[test]
+fn a_restart_continues_the_root_and_late_readings_recompute_their_quarter_hours() {
+    let mut st = Store::new("restart");
+    history(&mut st);
+    let p = st.params();
+    st.w.shutdown().unwrap();
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    st.clock.advance(Duration::from_secs(600));
+    st.reopen();
+    st.emit(Intent::Normal, &[(7_000, Some(5.0)), (5, Some(6.0))]);
+    st.emit(Intent::Revise, &[(6_600, Some(7.0))]);
+    st.w.shutdown().unwrap();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(root.seq > first.seq && root.checkpoint > first.checkpoint);
+    assert_t1(&p, st.id.0, &st.current, &vis);
+}
+
+/// Another process finds the files after this one stopped without a checkpoint: its start refills the dirty set from
+/// the log above K (`dirty_from_log`).
+#[test]
+fn a_start_after_a_stop_refills_the_dirty_set_from_the_log_above_k() {
+    let mut st = Store::new("stopped");
+    history(&mut st);
+    let p = st.params();
+    st.w.shutdown().unwrap();
+    st.reopen();
+    st.emit(Intent::Normal, &[(7_100, Some(8.0)), (3, Some(9.0))]);
+    st.emit(Intent::Revise, &[(30, Some(10.0))]);
+    let copy = st.fs.snapshot();
+    st.w.shutdown().unwrap();
+    let w = open(&copy, &st.clock, &st.dir);
+    w.shutdown().unwrap();
+    let (_, vis) = tree_state(&copy, &st.dir);
+    assert_t1(&p, st.id.0, &st.current, &vis);
+}
+
+#[test]
+fn a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_not() {
+    let mut st = Store::new("floors");
+    history(&mut st);
+    let id = st.id;
+    let change = ParameterChange {
+        retention: Some(RetentionClass::Diagnostic {
+            period: Duration::from_secs(86_400 * 40),
+        }),
+        ..ParameterChange::default()
+    };
+    st.w.set_parameters(id, &change).unwrap();
+    st.w.shutdown().unwrap();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(
+        root.floors.is_empty(),
+        "a retention class changes no node (Q-1428)"
+    );
+    assert!(!vis.is_empty());
+    st.reopen();
+    let t_r = st.clock.wall();
+    st.w.retire(id, t_r).unwrap();
+    st.w.shutdown().unwrap();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert_eq!(root.floors.len(), 1);
+    assert!(root.floors[0].rebuilding && root.floors[0].series == u64::from(id.0));
+    assert!(
+        vis.is_empty(),
+        "the series is not served until it is rebuilt"
+    );
+}
+
+#[test]
+fn failing_tree_writes_degrade_health_with_tree_behind_and_never_stop_ingest() {
+    let mut st = Store::new("behind");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    for _ in 0..64 {
+        st.fs
+            .fail_nth(FaultOp::Create, "/tree/", 0, std::io::ErrorKind::Other);
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let behind = loop {
+        st.clock.advance(Duration::from_secs(16 * 60));
+        let reasons = match st.w.health() {
+            Health::Degraded { reasons } => reasons,
+            _ => Vec::new(),
+        };
+        if let Some(r) = reasons
+            .into_iter()
+            .find(|r| matches!(r, Reason::TreeBehind { .. }))
+        {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "no tree_behind");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        behind.to_string().starts_with("summary tree behind: "),
+        "{behind}"
+    );
+    st.emit(Intent::Normal, &[(5, Some(2.0))]);
+    assert!(st.fs.read(&st.dir.join(DIR).join(root_name(1))).is_none());
+    st.w.shutdown().unwrap();
+}

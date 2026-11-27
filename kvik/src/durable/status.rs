@@ -99,6 +99,9 @@ impl Writer {
                 regions,
             });
         }
+        if let Some(cause) = self.tree.as_ref().and_then(|t| t.behind()) {
+            reasons.push(Reason::TreeBehind { cause });
+        }
         match (self.fault(), reasons.is_empty()) {
             (Some(f), _) => Health::ReadOnly {
                 cause: fault_out(&f),

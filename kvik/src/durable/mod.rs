@@ -44,6 +44,7 @@ mod seed;
 mod start;
 mod status;
 mod summary;
+mod tree;
 mod windows;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -266,6 +267,10 @@ pub(crate) struct Writer {
     bucket_warning: Option<String>,
     /// The provisional streams' ring (spec §4 Provisional streams).
     fast: Arc<fast::Fast>,
+    /// The summary tree's dirty set, marked before each call is offered (design 7.1b section 5).
+    dirty: Arc<tree::Dirty>,
+    /// The summary tree's checkpoint job; `None` when the start left the store read-only.
+    tree: Option<Arc<tree::Job>>,
 }
 
 impl Drop for Writer {

@@ -322,13 +322,15 @@ impl TreeFiles {
 
     /// Writes one checkpoint (section 5 steps 4 and 5): a delta part per UTC day the entries fall in, then the root
     /// that lists them at `k`; then removes old roots and the retired parts whose time has come. `entries` are per
-    /// `(series, level)` in ascending start. On an error the temporary files are removed and the root stays as it
+    /// `(series, level)` in ascending start; each series of `rebuilding` gains an open floor, so the tree stops
+    /// serving it until a rebuild closes it. On an error the temporary files are removed and the root stays as it
     /// was, unless the new root was already renamed, when it becomes the root (a reader may hold it).
     pub fn checkpoint(
         &mut self,
         k: Position,
         synced: Position,
         entries: BTreeMap<(u64, u8), Vec<Entry>>,
+        rebuilding: &BTreeSet<u64>,
         wall: i64,
         now: Duration,
     ) -> Result<(), WriteError> {
@@ -382,6 +384,18 @@ impl TreeFiles {
             .collect();
         let mut next = self.root.clone();
         next.checkpoint = k;
+        for &series in rebuilding {
+            if let Err(i) = next.floors.binary_search_by_key(&series, |f| f.series) {
+                next.floors.insert(
+                    i,
+                    root::Floor {
+                        series,
+                        seq,
+                        rebuilding: true,
+                    },
+                );
+            }
+        }
         self.publish(next, parts, wall, now)
     }
 

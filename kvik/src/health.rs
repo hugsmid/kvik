@@ -127,6 +127,12 @@ pub enum Reason {
         /// since by a consumer's read of the log that no loss this process reports stands for (Q-929).
         regions: u64,
     },
+    /// The summary tree's checkpoints are failing or overdue: reads stay correct, and slow down as they take more
+    /// from facts (design 7.1b section 5).
+    TreeBehind {
+        /// Why: the last failed job's error, or how long no checkpoint has succeeded.
+        cause: String,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -171,6 +177,7 @@ impl fmt::Display for Reason {
                 "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries and \
                  {evaluations} evaluations unchecked, {regions} damaged regions not recorded as lost"
             ),
+            Reason::TreeBehind { cause } => write!(f, "summary tree behind: {cause}"),
         }
     }
 }

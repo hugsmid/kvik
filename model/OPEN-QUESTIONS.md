@@ -5320,6 +5320,57 @@ that keeps an entry; the planner's runs and whole-period merges take such siblin
 **Pinned by.** `tests/plan.rs` `a_merge_must_take_the_overlapping_siblings_of_its_output_seq`,
 `the_planner_takes_a_delta_run_with_its_same_seq_siblings`.
 
+## Q-1428 — Which registry entries change a series' nodes
+Settled with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs` `node_changing`).
+**Scenario.** A registry entry committed beside facts can change nodes already stored; the series must then not be
+served from the tree until rebuilt. The design's default was everything but labels, aliases and routing.
+**Decision.** By entry type: a definition of an id already defined; a parameter change carrying the expected
+interval, the staleness limit, the wrap or the reset ceiling; a retirement. No node changes for aliases, routing,
+zone and tzdata entries (no calendar node is stored, Q-1425), recovery entries (their losses take the global floor,
+Q-1429), scale raises (decimal series store no level), or parameter changes of recording, lateness, retention or
+excess precision. Such a series gets an open floor in the next root; 71b-4's rebuild closes it.
+**Pinned by.** `durable::tree::tests` `a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_not`.
+
+## Q-1830 — K and the dirty set without a race
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs`), provisional.
+**Scenario.** Acknowledgements reach the commit hook out of order across threads, so a set filled at acknowledgement
+can miss a fact at or below a K the job has already taken.
+**Decision (provisional).** A call marks its pairs before its facts are offered; K is the durable position of a cut
+taken before the set is read; a pair is cleared only when no call that marked it is unsettled and the highest last
+position of those settled is at or below K. A call whose outcome is unknown keeps its pairs until a restart.
+**Pinned by.** `durable::tree::dirty::tests`, `durable::tree::tests` `a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark`.
+
+## Q-1831 — One delta part per UTC day
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs`), provisional.
+**Scenario.** The design writes one delta part a checkpoint; a part has one period, and the planner merges deltas of
+one UTC day; late data dirties quarter-hours of other days.
+**Decision (provisional).** A checkpoint writes one delta part per UTC day its entries fall in, all with the root's
+`seq`; usually one, two around midnight.
+**Pinned by.** `tree/src/write/tests.rs` (histories cross midnight).
+
+## Q-1832 — Definitions met by `dirty_from_log`
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/stretch.rs`), provisional.
+**Scenario.** The pass over `(K, P]` does not know the registry at K, so it cannot tell a new series' definition from a
+redefinition (Q-1428).
+**Decision (provisional).** Every definition in the stretch marks its series for rebuild. A series defined in the
+last interval before a stop is served from facts until its rebuild (71b-4), which is cheap; the commit path, which
+has the registry, marks only redefinitions.
+
+## Q-1833 — Empty markers for every empty span of a dirty quarter-hour
+Decided with roadmap 7.1b step 3 (`tree/src/write/nodes.rs`), provisional.
+**Scenario.** The job does not read the visible state, so it cannot tell whether an empty span hides an older entry.
+**Decision (provisional).** Every empty span of a folded level inside a dirty quarter-hour is written as an empty
+marker (about 4 bytes each, at most 16 a quarter-hour); a merge that takes every live part of its period drops them.
+The extension of a stored node by later readings (section 5 step 3) is left for a later step: the job always folds
+the span's current facts, which gives the same node.
+
+## Q-1834 — The tree's coverage before backfill
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs` `covered_all`), provisional.
+**Scenario.** With no root, `covered` must be true only where every fact has gone through the dirty set.
+**Decision (provisional).** A start with no valid root covers every span of the folded levels when the registry holds
+no series (no fact can exist), and nothing otherwise until backfill (71b-4). A tree whose first checkpoint never
+landed therefore waits for backfill; reads take facts meanwhile.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

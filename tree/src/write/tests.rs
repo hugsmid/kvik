@@ -134,7 +134,7 @@ impl World {
         }
         let (wall, now) = (self.wall, self.now);
         let files = self.files.as_mut().expect("started");
-        files.checkpoint(k, self.synced, entries, wall, now)?;
+        files.checkpoint(k, self.synced, entries, &BTreeSet::new(), wall, now)?;
         self.dirty.retain(|_, p| *p > k);
         Ok(())
     }
@@ -446,6 +446,7 @@ fn a_checkpoint_above_the_synced_mark_is_refused_and_writes_nothing() {
         pos(1),
         Position::default(),
         BTreeMap::new(),
+        &BTreeSet::new(),
         0,
         Duration::ZERO,
     );
@@ -464,6 +465,7 @@ fn a_checkpoint_below_the_roots_is_refused() {
         Position::default(),
         pos(1),
         BTreeMap::new(),
+        &BTreeSet::new(),
         0,
         Duration::ZERO,
     );

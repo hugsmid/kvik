@@ -93,6 +93,13 @@ pub trait SealHook: Send + Sync {
     fn status(&self) -> Option<StatusContent> {
         None
     }
+
+    /// The store's own derived files, stepped after the log's on `kvik-maint` (the summary tree's checkpoints), with
+    /// the mark synced through `synced`; `stopping` at a clean shutdown. Returns how long until it is due again.
+    fn step(&self, synced: Position, now: Duration, stopping: bool) -> Option<Duration> {
+        let _ = (synced, now, stopping);
+        None
+    }
 }
 
 /// What the derived files are written with ([`super::Log::start_with`]).
@@ -636,6 +643,9 @@ impl Directories {
         if let Some(d) = self.status(synced, now, wall) {
             soon(d);
         }
+        if let Some(d) = self.call(|h| h.step(synced, now, false)) {
+            soon(d);
+        }
         wait
     }
 
@@ -658,6 +668,7 @@ impl Directories {
             {
                 self.write_series(synced, now, wall);
             }
+            self.call(|h| h.step(synced, now, true));
         }
     }
 
