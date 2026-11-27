@@ -5397,6 +5397,20 @@ that keeps an entry; the planner's runs and whole-period merges take such siblin
 **Pinned by.** `tests/plan.rs` `a_merge_must_take_the_overlapping_siblings_of_its_output_seq`,
 `the_planner_takes_a_delta_run_with_its_same_seq_siblings`.
 
+## Q-2050 — The cause a start records for a batch whose content does not decode
+Raised by the re-check of the train-6 review follow-up (S2); decided, provisional.
+**Scenario.** A checksum-valid batch in an unsealed segment, below the durable mark, whose content does not decode. A
+start records its positions as a lost range with cause corruption; `format.md` A.2 names cause 4 (invalid content),
+as the loss finder does while the store is open.
+**Decision (provisional).** A start is to record cause 4, in a later log item; until then `api.md` names no cause.
+**Pinned by.** `log/tests/recovery.rs`
+`a_checksum_valid_batch_whose_content_does_not_decode_is_a_recorded_loss_and_the_start_succeeds` (the loss and the
+start; not the cause).
+
+## Q-2051 — Where the S2 follow-up goes
+Raised with Q-2050; settled. The four follow-up edits and their test go with the train-6 review fixes, not into the
+next docs item.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5956,6 +5970,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1201 | Records held for a consumer not taken in this run | `api.md` Memory (ruled by the owner, 2026-11-26: none held) |
 | Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
 | Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
+| Q-2051 | Where the S2 follow-up goes | With the train-6 review fixes (`api.md` `Store::open`, `log/tests/recovery.rs`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
