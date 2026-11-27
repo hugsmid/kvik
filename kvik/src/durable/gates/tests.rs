@@ -577,6 +577,32 @@ fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
     assert_eq!(gates, 4);
 }
 
+/// Q-2001: a history of facts every 20 days, 320 days in all, reaches the 256-day window and its whole-history
+/// fall-back; the bounded reads answer as the whole series does at each look-back.
+#[test]
+fn bounded_history_reads_over_a_history_past_the_256_day_window_answer_as_the_whole_series_does() {
+    let (w, _config, clock) = open_clocked("gates-bounded-history-long");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    for v in 0..16u8 {
+        clock.advance(Duration::from_secs(20 * DAY_SECS as u64));
+        emit(&w, &clock, s, f64::from(v % 3));
+    }
+    let now = clock.wall().0;
+    for days in [1, 30, 255, 256, 257, 300] {
+        let from = now - days * DAY_SECS * 1_000_000_000;
+        let differs = w
+            .hub()
+            .unwrap()
+            .run(move |d, _| d.gate_history_differs(kvik_model::types::SeriesId(s.0), now, from));
+        assert!(
+            differs.is_none(),
+            "{days} days: {}",
+            differs.unwrap_or_default()
+        );
+    }
+}
+
 const DAY_SECS: i64 = 86_400;
 
 proptest::proptest! {

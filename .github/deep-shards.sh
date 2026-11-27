@@ -100,6 +100,7 @@ kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
 kvik-gates-core kvik  lib         gates::differential::
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
 kvik-gates      kvik  lib         backend::gates::tests::the_model_backend_delivers_what_judge_computes_from_its_log
+kvik-gates-history kvik lib      durable::gates::tests::bounded_history_reads_
 '
 
 cd "$(dirname "$0")/.."
