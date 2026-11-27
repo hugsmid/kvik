@@ -47,20 +47,29 @@ impl Tier {
         }
     }
 
-    /// The period of this tier holding `t`, as `(start, length)`.
-    pub fn period(self, t: i64) -> (i64, u64) {
+    /// The period of this tier holding `t`, as `(start, length)`; `None` when its start is before the least
+    /// instant.
+    pub fn period(self, t: i64) -> Option<(i64, u64)> {
         let (len, origin) = match self {
             Tier::Day => (DAY, 0),
             _ => (self.len(), MONDAY),
         };
-        let start = t - (t - origin).rem_euclid(len);
-        (start, len as u64)
+        let rem = (i128::from(t) - i128::from(origin)).rem_euclid(i128::from(len)) as i64;
+        Some((t.checked_sub(rem)?, len as u64))
     }
 
     fn of(start: i64, len: u64) -> Option<Tier> {
         Tier::ALL
             .into_iter()
-            .find(|t| t.len() as u64 == len && t.period(start).0 == start)
+            .find(|t| t.len() as u64 == len && t.period(start).is_some_and(|p| p.0 == start))
+    }
+
+    fn due(self, start: i64, policy: &Policy) -> i64 {
+        let wait = match self {
+            Tier::Day => policy.late_window,
+            _ => SETTLE,
+        };
+        start.saturating_add(self.len()).saturating_add(wait)
     }
 }
 
@@ -106,7 +115,7 @@ fn tier(r: &PartRef) -> Option<Tier> {
 }
 
 fn day(r: &PartRef) -> Option<i64> {
-    let d = Tier::Day.period(r.period_start);
+    let d = Tier::Day.period(r.period_start)?;
     inside(r, d.0, d.1).then_some(d.0)
 }
 
@@ -121,15 +130,19 @@ fn merged(root: &Root, d: i64) -> bool {
         .filter(|(p, _)| DAY % p.width == 0)
         .all(|(p, _)| {
             (0..DAY / p.width)
-                .map(|i| d + i * p.width)
-                .filter(|&x| covered(root, base.id, x, x + p.width))
-                .all(|x| covered(root, p.id, x, x + p.width))
+                .filter_map(|i| {
+                    let x = d.checked_add(i * p.width)?;
+                    Some((x, x.checked_add(p.width)?))
+                })
+                .filter(|&(x, e)| covered(root, base.id, x, e))
+                .all(|(x, e)| covered(root, p.id, x, e))
         })
 }
 
 /// The merges due under `root` at `now`, in order, each input in at most one (section 5 Merges): a part whose
-/// period crosses a day boundary and is no merged period is split by day (Q-1553); a merged period overlaid by
-/// more than four parts is merged again; a day past its late window and not merged gets its day part; eight
+/// period crosses a day boundary and is no merged period is split by day (Q-1553); a merged period past its late
+/// window or settling time and overlaid by more than four parts is merged again; a day past its late window and
+/// not merged gets its day part, whatever its parts' class (Q-1820); eight
 /// deltas of a day, or two once the oldest is two hours old, merge into one; weeks, 13 and 52 weeks merge two
 /// weeks after they end.
 pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
@@ -156,11 +169,16 @@ pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
             continue;
         }
         let periods = if r.least_start < r.greatest_end {
+            let Some((mut d, _)) = Tier::Day.period(r.least_start) else {
+                continue;
+            };
             let mut v = Vec::new();
-            let mut d = Tier::Day.period(r.least_start).0;
             while d < r.greatest_end {
                 v.push((d, DAY as u64));
-                d += DAY;
+                let Some(next) = d.checked_add(DAY) else {
+                    break;
+                };
+                d = next;
             }
             v
         } else {
@@ -173,8 +191,8 @@ pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
     }
 
     for m in &root.parts {
-        let Some(_) = tier(m) else { continue };
-        if used.contains(&m.file_id) {
+        let Some(t) = tier(m) else { continue };
+        if used.contains(&m.file_id) || now < t.due(m.period_start, policy) {
             continue;
         }
         let over = root
@@ -198,12 +216,12 @@ pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
     let days: BTreeSet<i64> = root
         .parts
         .iter()
-        .filter(|r| !used.contains(&r.file_id) && tier(r).is_none())
+        .filter(|r| !used.contains(&r.file_id))
         .filter_map(day)
         .collect();
     for d in days {
         let span = (d, DAY as u64);
-        if !merged(root, d) && now >= d.saturating_add(DAY).saturating_add(policy.late_window) {
+        if !merged(root, d) && now >= Tier::Day.due(d, policy) {
             if let Some(inputs) = whole(root, &used, d, DAY as u64) {
                 take(&mut plans, &mut used, inputs, vec![span], true);
             }
@@ -219,11 +237,11 @@ pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
             .parts
             .iter()
             .filter(|r| !used.contains(&r.file_id) && tier(r).is_none_or(|x| x < t))
-            .map(|r| t.period(r.period_start).0)
+            .filter_map(|r| t.period(r.period_start).map(|p| p.0))
             .collect();
         for p in periods {
             let len = t.len() as u64;
-            if now < p.saturating_add(t.len()).saturating_add(SETTLE) {
+            if now < t.due(p, policy) {
                 continue;
             }
             let Some(inputs) = whole(root, &used, p, len) else {
@@ -234,8 +252,7 @@ pub fn plan(root: &Root, now: i64, policy: &Policy) -> Vec<Plan> {
                 .iter()
                 .filter(|r| inputs.contains(&r.file_id))
                 .collect();
-            let days_merged = parts.iter().filter_map(|r| day(r)).all(|d| merged(root, d));
-            if parts.len() >= 2 && days_merged && parts.iter().all(|r| tier(r) != Some(t)) {
+            if parts.len() >= 2 && parts.iter().all(|r| tier(r) != Some(t)) {
                 take(&mut plans, &mut used, inputs, vec![(p, len)], true);
             }
         }
@@ -299,11 +316,11 @@ mod tests {
     fn weeks_start_on_monday_and_each_period_lies_inside_the_next() {
         let monday_2026_01_05 = 1_767_571_200_000_000_000;
         assert_eq!(
-            Tier::Week.period(monday_2026_01_05 + DAY).0,
-            monday_2026_01_05
+            Tier::Week.period(monday_2026_01_05 + DAY),
+            Some((monday_2026_01_05, WEEK as u64))
         );
-        let (s52, l52) = Tier::Weeks52.period(monday_2026_01_05);
-        let (s13, _) = Tier::Weeks13.period(monday_2026_01_05);
+        let (s52, l52) = Tier::Weeks52.period(monday_2026_01_05).unwrap();
+        let (s13, _) = Tier::Weeks13.period(monday_2026_01_05).unwrap();
         assert!(s52 <= s13 && s13 < s52 + l52 as i64);
         assert_eq!(QUARTER * 96, DAY);
     }
