@@ -17,6 +17,8 @@ use super::{
     segments, temp_dir,
 };
 
+type Segments = Vec<(u32, Vec<TestBatch>)>;
+
 fn put_all(dir: &std::path::Path, segs: &[(u32, Vec<TestBatch>)]) -> Vec<Candidate> {
     segs.iter()
         .enumerate()
@@ -159,20 +161,22 @@ fn each_step_declares_at_most_one_piece_of_device_work() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A segment of `n` batches of `per` facts each from `item(batch, k)`.
+/// Segments of about 3 MB at most, `n` batches in all of `per` facts each from `item(batch, k)`.
 fn shape(n: u64, per: u64, item: impl Fn(u64, u64) -> Item) -> Vec<(u32, Vec<TestBatch>)> {
-    vec![(
-        0,
-        (0..n)
-            .map(|b| {
-                batch(
-                    1 + b * per,
-                    400 * DAY,
-                    (0..per).map(|k| item(b, k)).collect(),
-                )
-            })
-            .collect(),
-    )]
+    let batches: Vec<TestBatch> = (0..n)
+        .map(|b| {
+            batch(
+                1 + b * per,
+                400 * DAY,
+                (0..per).map(|k| item(b, k)).collect(),
+            )
+        })
+        .collect();
+    let per_segment = (3_000_000 / (per * 300)).max(1) as usize;
+    batches
+        .chunks(per_segment)
+        .map(|c| (0, c.to_vec()))
+        .collect()
 }
 
 fn peak_of(tag: &str, segs: &[(u32, Vec<TestBatch>)]) -> u64 {
@@ -198,7 +202,7 @@ fn peak_of(tag: &str, segs: &[(u32, Vec<TestBatch>)]) -> u64 {
 
 #[test]
 fn peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes() {
-    let shapes: [(&str, Vec<(u32, Vec<TestBatch>)>); 4] = [
+    let shapes: [(&str, Segments); 4] = [
         (
             "many-series",
             shape(200, 1_000, |b, k| {

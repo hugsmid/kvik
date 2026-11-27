@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kvik_chunk::file::{
     CanonicalCheck, CanonicalError, Class, CompactedFile, Directory, Fact, FileError, Identity,
-    IndexEntry, Layout, Position, Reach, ReadAt, SeriesInfo,
+    IndexEntry, Input, Layout, Position, Reach, ReadAt, SeriesInfo,
 };
 use kvik_log::fs::{FsFile, OpenMode};
 use sha2::{Digest, Sha256};
@@ -33,6 +33,8 @@ pub(super) struct Expect {
     pub(super) anchors: Anchors,
     pub(super) sums: BTreeMap<u32, u128>,
     pub(super) entries: u128,
+    /// The inputs every description names.
+    pub(super) names: Vec<Input>,
 }
 
 /// An output as written, before it is read back.
@@ -69,6 +71,59 @@ pub(crate) enum VerifyError {
     /// A row is out of place (step 3).
     #[error("misplaced: {0}")]
     Placement(&'static str),
+    /// Its description names other inputs, run or run size than the run's (§3.5 rebuild rule).
+    #[error("description disagrees with the run: {0}")]
+    Description(&'static str),
+}
+
+/// A bit for each position of the inputs' ranges, so a position held by two outputs is found (step 3).
+struct Held {
+    spans: Vec<(Position, Position, usize)>,
+    bits: Vec<u64>,
+}
+
+/// The most positions the bits cover; inputs whose ranges are unknown or wider are checked by counts and digests.
+const MAX_HELD: u64 = 1 << 28;
+
+impl Held {
+    fn new(ranges: &[(Position, Position)]) -> Option<Self> {
+        let mut r = ranges.to_vec();
+        r.sort();
+        let mut spans: Vec<(Position, Position, usize)> = Vec::new();
+        let mut total = 0u64;
+        for (a, z) in r {
+            match spans.last_mut() {
+                Some(s) if s.0.0 == a.0 && a.1 <= s.1.1.saturating_add(1) => s.1 = s.1.max(z),
+                _ => spans.push((a, z, 0)),
+            }
+        }
+        for s in &mut spans {
+            s.2 = usize::try_from(total).ok()?;
+            total = total.checked_add(s.1.1.checked_sub(s.0.1)?.checked_add(1)?)?;
+            if total > MAX_HELD {
+                return None;
+            }
+        }
+        Some(Self {
+            spans,
+            bits: vec![0; usize::try_from(total.div_ceil(64)).ok()?],
+        })
+    }
+
+    fn hold(&mut self, p: Position) -> Result<(), VerifyError> {
+        let s = self
+            .spans
+            .iter()
+            .find(|s| s.0 <= p && p <= s.1)
+            .ok_or(VerifyError::Placement("a position outside the inputs"))?;
+        let i = s.2 + (p.1 - s.0.1) as usize;
+        let (w, b) = (i / 64, 1u64 << (i % 64));
+        if self.bits[w] & b != 0 {
+            return Err(VerifyError::Placement("a position held twice"));
+        }
+        self.bits[w] |= b;
+        Ok(())
+    }
 }
 
 /// An output read back by offset.
@@ -183,6 +238,7 @@ enum Phase {
 /// The verification of a run's outputs, stepped.
 pub(super) struct Check {
     files: Vec<Written>,
+    held: Option<Held>,
     j: usize,
     phase: Phase,
     sums: BTreeMap<u32, u128>,
@@ -193,9 +249,11 @@ pub(super) struct Check {
 }
 
 impl Check {
-    pub(super) fn new(files: Vec<Written>) -> Self {
+    /// Checks `files`, the outputs of a run over inputs with these position ranges.
+    pub(super) fn new(files: Vec<Written>, ranges: &[(Position, Position)]) -> Self {
         Self {
             files,
+            held: Held::new(ranges),
             j: 0,
             phase: Phase::Open,
             sums: BTreeMap::new(),
@@ -214,10 +272,16 @@ impl Check {
     /// Bytes it holds: its sums and counts by series, the open file's index and a block of each of two files.
     pub(super) fn held(&self) -> u64 {
         let index = match &self.phase {
-            Phase::Content { order, .. } => order.len() as u64 * 96,
+            Phase::Content { order, .. } => {
+                (order.len() * std::mem::size_of::<IndexEntry>()) as u64
+            }
             _ => 0,
         };
-        64 * self.sums.len() as u64 + index + 2 * PIECE as u64
+        let bits = self
+            .held
+            .as_ref()
+            .map_or(0, |h| 8 * h.bits.len() + 32 * h.spans.len());
+        40 * self.sums.len() as u64 + index + bits as u64 + 2 * PIECE as u64
     }
 
     /// The size of the next step's device call.
@@ -246,6 +310,16 @@ impl Check {
             Phase::Open => {
                 let src = Src::open(input, &w)?;
                 let file = CompactedFile::open(src.clone(), &w.id, Some(&w.layout))?;
+                let d = file.description();
+                if d.inputs != expect.names {
+                    return Err(VerifyError::Description("inputs"));
+                }
+                if d.run_id != input.first_file_id {
+                    return Err(VerifyError::Description("run id"));
+                }
+                if d.run_count as usize != self.files.len() {
+                    return Err(VerifyError::Description("run count"));
+                }
                 let mut named: BTreeMap<u32, SeriesInfo> = BTreeMap::new();
                 for e in file.index()? {
                     named
@@ -296,6 +370,9 @@ impl Check {
                         )
                         .map_err(|_| VerifyError::Checksum(None))?;
                         self.entries = self.entries.wrapping_add(d);
+                        if let Some(h) = &mut self.held {
+                            h.hold(row.position)?;
+                        }
                         self.positions += 1;
                     }
                     if !file.ignored().is_empty() {
@@ -326,9 +403,10 @@ impl Check {
                     if !within(f.t) {
                         return Err(VerifyError::Placement("a row outside its file's period"));
                     }
-                    if e.set_aside() != input.set_aside.holds(p)
-                        || (e.set_aside() && w.class != Class::Revision)
-                    {
+                    if let Some(h) = &mut self.held {
+                        h.hold(p)?;
+                    }
+                    if e.set_aside() != input.set_aside.holds(p) {
                         return Err(VerifyError::Placement("a set-aside row in the wrong chunk"));
                     }
                     if !e.set_aside() && w.class == Class::Revision {

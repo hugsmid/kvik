@@ -30,6 +30,11 @@ use super::{
 const MAX_OPEN: usize = 16;
 /// Bytes written to an output between its syncs (compaction design §4).
 const SYNC_EVERY: u64 = 1 << 20;
+/// What a writer's block being built may hold beyond its sink.
+const BLOCK_RESERVE: u64 = 64 << 10;
+/// The least a group may hold, so a census near the cap does not split every series; a cap of 0 makes every series
+/// its own pass, split as finely as it goes.
+const MIN_GROUP: u64 = 1 << 20;
 /// The compression context and other fixed costs, counted whole (compaction design §4 Memory).
 const FIXED: u64 = 2 << 20;
 const DAY: i64 = 86_400_000_000_000;
@@ -90,10 +95,12 @@ struct Census {
 
 impl Census {
     fn held(&self) -> u64 {
-        (self.batches.len() * 72
-            + self.bytes.len() * 160
-            + self.days.len() * 40
-            + self.dups.len() * 64
+        (self.batches.len() * 48
+            + self.expect.sums.len() * 24
+            + self.expect.anchors.facts.len() * 16
+            + self.bytes.len() * 32
+            + self.days.len() * 16
+            + self.dups.len() * 32
             + self.defs.values().map(|d| d.len() * 192).sum::<usize>()) as u64
     }
 }
@@ -163,7 +170,7 @@ struct Plan {
 impl Plan {
     fn held(&self) -> u64 {
         (self.batches.len() * 48
-            + self.order.len() * 48
+            + self.order.len() * 16
             + self
                 .metas
                 .values()
@@ -204,6 +211,8 @@ struct Rows {
     rows: Vec<PRow>,
     collected: bool,
     opened: bool,
+    /// What `rows` costs, kept as they are taken.
+    bytes: u64,
     next: usize,
 }
 
@@ -245,7 +254,9 @@ impl<'a> RunTask<'a> {
                 let (first, last) = c
                     .seal
                     .as_ref()
-                    .map_or((0, u64::MAX), |(_, t)| (t.first_sequence, t.last_sequence));
+                    .map(|(_, t)| (t.first_sequence, t.last_sequence))
+                    .or(c.range)
+                    .unwrap_or((0, u64::MAX));
                 (
                     (c.generation, first),
                     (c.generation, last),
@@ -289,14 +300,7 @@ impl<'a> RunTask<'a> {
     fn held(&self) -> u64 {
         let segment = match &self.stage {
             Stage::Census { segment, .. } => segment.as_ref().map_or(0, Segment::held),
-            Stage::Pass { rows, .. } => {
-                rows.segment.as_ref().map_or(0, Segment::held)
-                    + rows
-                        .rows
-                        .iter()
-                        .map(|r| row_cost(r.fact.text.capacity()))
-                        .sum::<u64>()
-            }
+            Stage::Pass { rows, .. } => rows.segment.as_ref().map_or(0, Segment::held) + rows.bytes,
             Stage::Verify(c) => c.held(),
             Stage::Done => 0,
         };
@@ -447,10 +451,11 @@ impl<'a> RunTask<'a> {
                 .len()
                 > 1
         });
-        let budget = self
-            .cap
-            .saturating_sub(FIXED + 2 * c.held() + 2 * (MAX_OPEN as u64) * 4 * PIECE as u64)
-            / 2;
+        let reserved = FIXED + c.held() + 2 * MAX_OPEN as u64 * (PIECE as u64 + BLOCK_RESERVE);
+        let budget = match self.cap {
+            0 => 0,
+            cap => (cap.saturating_sub(reserved) / 2).max(MIN_GROUP),
+        };
         let mut groups: Vec<Group> = Vec::new();
         let mut size = 0u64;
         for (i, (_, s)) in named.iter().enumerate() {
@@ -546,6 +551,8 @@ impl<'a> RunTask<'a> {
             names: names.into_iter().collect(),
             renamed,
         });
+        self.census.bytes = BTreeMap::new();
+        self.census.days = BTreeSet::new();
         Ok(())
     }
 
@@ -571,7 +578,12 @@ impl<'a> RunTask<'a> {
         let Some(pass) = plan.passes.get(*k).copied() else {
             self.input.fs.sync_dir(&self.input.dir.join(DATA_DIR))?;
             let written = std::mem::take(&mut self.written);
-            self.stage = Stage::Verify(Box::new(Check::new(written)));
+            let ranges: Vec<(Position, Position)> =
+                self.census.ranges.iter().map(|r| (r.0, r.1)).collect();
+            self.census.expect.names = plan.names.clone();
+            self.census.batches = BTreeMap::new();
+            self.stage = Stage::Verify(Box::new(Check::new(written, &ranges)));
+            self.plan = None;
             return Ok(None);
         };
         let (window, group) = (
@@ -602,16 +614,18 @@ impl<'a> RunTask<'a> {
                     rows.segment = None;
                     rows.seg += 1;
                 }
-                Event::Batch(d) => collect(
-                    plan,
-                    self.input.weeks_merged,
-                    &window,
-                    &group,
-                    first_of_window,
-                    d,
-                    &mut rows.rows,
-                    &mut self.entries,
-                ),
+                Event::Batch(d) => {
+                    rows.bytes += collect(
+                        plan,
+                        self.input.weeks_merged,
+                        &window,
+                        &group,
+                        first_of_window,
+                        d,
+                        &mut rows.rows,
+                        &mut self.entries,
+                    )
+                }
             }
             return Ok(None);
         }
@@ -657,10 +671,10 @@ impl<'a> RunTask<'a> {
         if let Some(o) = self.open.iter_mut().find(|o| o.w.is_some()) {
             let (pi, class) = plan.files[o.file];
             let mut w = o.w.take().expect("checked");
-            if class == CURRENT {
-                if let Some(e) = self.entries.remove(&pi) {
-                    w.entries(&e)?;
-                }
+            if class == CURRENT
+                && let Some(e) = self.entries.remove(&pi)
+            {
+                w.entries(&e)?;
             }
             let (sink, done) = w.finish()?;
             o.tail = sink;
@@ -852,7 +866,8 @@ fn collect(
     d: Decoded,
     rows: &mut Vec<PRow>,
     entries: &mut BTreeMap<usize, Vec<(Position, Entry)>>,
-) {
+) -> u64 {
+    let before = rows.len();
     let mut seq = d.content.first_sequence;
     for item in d.content.items {
         let p = (d.commit.generation, seq);
@@ -876,15 +891,19 @@ fn collect(
                 }
             }
             Item::Entry(e) if first => {
-                if let Some(pi) = plan.period_of(d.commit.commit_time, weeks) {
-                    if window.contains(&pi) {
-                        entries.entry(pi).or_default().push((p, *e));
-                    }
+                if let Some(pi) = plan.period_of(d.commit.commit_time, weeks)
+                    && window.contains(&pi)
+                {
+                    entries.entry(pi).or_default().push((p, *e));
                 }
             }
             Item::Entry(_) => {}
         }
     }
+    rows[before..]
+        .iter()
+        .map(|r| row_cost(r.fact.text.capacity()))
+        .sum()
 }
 
 /// Ranks the pass's rows into classes (§3.1 Class), keeps a position met twice once, counts them into the files'

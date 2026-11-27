@@ -72,7 +72,8 @@ pub(super) fn verified_or_removed(
     written: &[Written],
 ) -> Result<Vec<Output>, RunError> {
     let expect = expect(taken)?;
-    let mut check = Check::new(written.to_vec());
+    let ranges: Vec<(Position, Position)> = taken.ranges.iter().map(|r| (r.0, r.1)).collect();
+    let mut check = Check::new(written.to_vec(), &ranges);
     let infos = |s: u32, g: Position| {
         let (name, reach) = info(input, &taken.definitions, s, g);
         kvik_chunk::file::SeriesInfo { name, reach }
@@ -95,6 +96,7 @@ pub(super) fn verified_or_removed(
 fn expect(taken: &Inputs) -> Result<Expect, RunError> {
     let mut e = Expect {
         anchors: taken.anchors.clone(),
+        names: taken.names.clone(),
         ..Expect::default()
     };
     for (&p, row) in &taken.rows {
@@ -350,10 +352,25 @@ type Entries = Vec<(Position, Entry)>;
 /// A key: series and `t`.
 type Key = (u32, i64);
 
+/// Writes one file per period and class under its `.tmp` name; on any error every file it created is removed (§3.5).
 pub(super) fn write(
     input: &RunInput<'_>,
     taken: &Inputs,
     parts: BTreeMap<(i64, i64), Part>,
+) -> Result<Vec<Written>, RunError> {
+    let mut created = Vec::new();
+    write_files(input, taken, parts, &mut created).inspect_err(|_| {
+        for p in &created {
+            let _ = input.fs.remove_file(p);
+        }
+    })
+}
+
+fn write_files(
+    input: &RunInput<'_>,
+    taken: &Inputs,
+    parts: BTreeMap<(i64, i64), Part>,
+    created: &mut Vec<std::path::PathBuf>,
 ) -> Result<Vec<Written>, RunError> {
     let mut files: Vec<(i64, i64, Class, Vec<SeriesRows>, Entries)> = Vec::new();
     for ((start, len), part) in parts {
@@ -455,6 +472,7 @@ pub(super) fn write(
             _ => {}
         }
         let f = input.fs.open(&path, OpenMode::CreateNew)?;
+        created.push(path.clone());
         f.write_at(&bytes, 0)?;
         f.sync_all()?;
         out.push(Written {

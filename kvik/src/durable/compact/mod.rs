@@ -56,11 +56,23 @@ pub(crate) enum Cause {
     PeriodOutOfRange,
 }
 
+impl Cause {
+    /// Whether no repair, returning cold path or newer binary ends the stall: a period leaving `i64` (Q-1520) and
+    /// commit times decreasing inside one segment (Q-1521).
+    pub(crate) fn permanent(self) -> bool {
+        matches!(self, Cause::PeriodOutOfRange | Cause::CommitTimeDecreases)
+    }
+
+    fn health(self) -> &'static str {
+        if self.permanent() { " (permanent)" } else { "" }
+    }
+}
+
 /// Why a run produced no verified outputs; the inputs are untouched in every case.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RunError {
     /// Compaction stalls at a segment.
-    #[error("compaction stalled at segment {}/{}: {:?}", .0.generation, .0.file_id, .0.cause)]
+    #[error("compaction stalled at segment {}/{}: {:?}{}", .0.generation, .0.file_id, .0.cause, .0.cause.health())]
     Stalled(Stall),
     /// A position met twice in the inputs with differing content (§3.1, as §8 Restore step 3).
     #[error("position {0:?} met twice with differing content")]

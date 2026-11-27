@@ -29,6 +29,7 @@ fn cand(file_id: u64, first: u64, last: u64, len: u64, listed: bool) -> Candidat
         path: PathBuf::new(),
         seal: Some((len, trailer)),
         listed,
+        range: None,
     }
 }
 
@@ -170,5 +171,105 @@ fn without_a_manifest_no_candidate_is_listed() {
     let cs = candidates(&StdFs, &dir, &STORE).unwrap();
     assert_eq!(cs.len(), 1);
     assert!(!cs[0].listed);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A manifest listing generation-0 segments as `(file_id, first, last)`.
+fn write_manifest(dir: &std::path::Path, listed: &[(u64, u64, u64)]) {
+    let descs = listed
+        .iter()
+        .map(|&(file_id, first, last)| FileDescription {
+            kind: 1,
+            class: FileClass::None,
+            generation: 0,
+            file_id,
+            range: Some(((0, first), (0, last))),
+            hash: [0; 32],
+            inputs: Vec::new(),
+        })
+        .collect();
+    let mut m = encode_initial(STORE, 0);
+    m.extend(Record::new(2, 0, 0, Body::Sealed(descs)).encode().unwrap());
+    StdFs
+        .open(&dir.join(MANIFEST), OpenMode::CreateNew)
+        .unwrap()
+        .write_at(&m, 0)
+        .unwrap();
+}
+
+/// Segments 1, 2 and 3 of generation 0, one position each at sequences 1, 2 and 3, all listed.
+fn listed_three(dir: &std::path::Path) {
+    for f in 1..=3u64 {
+        let b = segment_bytes(0, f, &[batch(f, DAY, vec![reading(1, 5, Value::F64(1))])]);
+        put_segment(dir, 0, f, &b);
+    }
+    write_manifest(dir, &[(1, 1, 1), (2, 2, 2), (3, 3, 3)]);
+}
+
+#[test]
+fn a_listed_segment_missing_from_log_stops_the_run_before_it_and_stalls_once_reached() {
+    let dir = temp_dir("missing");
+    listed_three(&dir);
+    std::fs::remove_file(dir.join(LOG_DIR).join("00000000-0000000000000002.kvl")).unwrap();
+    let cs = candidates(&StdFs, &dir, &STORE).unwrap();
+    assert_eq!(ids(&plan(&cs, &BTreeMap::new(), 1000)), vec![1]);
+    assert!(
+        matches!(
+            plan(&cs, &BTreeMap::from([(0, 1)]), 1000),
+            Plan::Stalled(Stall {
+                file_id: 2,
+                cause: Cause::Unreadable(_),
+                ..
+            })
+        ),
+        "{cs:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_listed_segment_at_or_below_c_g_without_a_trailer_is_passed_by_its_manifest_range() {
+    let dir = temp_dir("lost-trailer");
+    listed_three(&dir);
+    let one = dir.join(LOG_DIR).join("00000000-0000000000000001.kvl");
+    let len = std::fs::metadata(&one).unwrap().len();
+    std::fs::write(&one, vec![0u8; len as usize]).unwrap();
+    let cs = candidates(&StdFs, &dir, &STORE).unwrap();
+    assert_eq!(ids(&plan(&cs, &BTreeMap::from([(0, 1)]), 1000)), vec![2, 3]);
+    std::fs::remove_file(&one).unwrap();
+    let cs = candidates(&StdFs, &dir, &STORE).unwrap();
+    assert_eq!(ids(&plan(&cs, &BTreeMap::from([(0, 1)]), 1000)), vec![2, 3]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_description_range_in_another_generation_does_not_pass_a_segment_without_a_trailer() {
+    let dir = temp_dir("other-generation");
+    let desc = FileDescription {
+        kind: 1,
+        class: FileClass::None,
+        generation: 0,
+        file_id: 1,
+        range: Some(((1, 1), (1, 1))),
+        hash: [0; 32],
+        inputs: Vec::new(),
+    };
+    let mut m = encode_initial(STORE, 0);
+    m.extend(
+        Record::new(2, 0, 0, Body::Sealed(vec![desc]))
+            .encode()
+            .unwrap(),
+    );
+    StdFs
+        .open(&dir.join(MANIFEST), OpenMode::CreateNew)
+        .unwrap()
+        .write_at(&m, 0)
+        .unwrap();
+    let cs = candidates(&StdFs, &dir, &STORE).unwrap();
+    assert_eq!(cs[0].range, None);
+    assert!(matches!(
+        plan(&cs, &BTreeMap::from([(0, 1)]), 1000),
+        Plan::Stalled(Stall { file_id: 1, .. })
+    ));
     std::fs::remove_dir_all(&dir).unwrap();
 }
