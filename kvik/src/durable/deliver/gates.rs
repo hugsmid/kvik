@@ -252,9 +252,16 @@ impl Deliverer {
         }
     }
 
-    /// One item of a batch committed at `commit`, at `p`, for every consumer judging gates; a consumer's first
-    /// watch starts its run.
-    pub(super) fn gate_item(&mut self, p: LogPos, commit: Nanos, feed: &Feed<'_>, ctx: &Ctx<'_>) {
+    /// One item of a batch committed at `commit`, at `p`, for every consumer judging gates (`names`, kept by the
+    /// caller for the batch and renewed here at a routing entry); a consumer's first watch starts its run.
+    pub(super) fn gate_item(
+        &mut self,
+        p: LogPos,
+        commit: Nanos,
+        feed: &Feed<'_>,
+        names: &mut Vec<String>,
+        ctx: &Ctx<'_>,
+    ) {
         if let Feed::Routing(r) = feed
             && r.op == RouteOp::Watch
             && let Some(rt) = self.consumers.get_mut(&r.consumer)
@@ -273,14 +280,22 @@ impl Deliverer {
         {
             run.names.insert(g.id, spec.name.clone());
         }
-        let names = self.gate_names();
-        for name in names {
+        if let Feed::Routing(_) = feed {
+            *names = self.gate_names();
+        }
+        for name in names.iter() {
+            let reads = |s| {
+                self.consumers
+                    .get(name)
+                    .and_then(|rt| rt.gates.as_ref())
+                    .is_some_and(|run| run.core.reads(s))
+            };
             let body = match feed {
-                Feed::Fact(f, outranked) => Body::Fact {
+                Feed::Fact(f, outranked) if reads(f.series) => Body::Fact {
                     fact: f.clone(),
                     outranked: *outranked,
                 },
-                Feed::Routing(r) if r.consumer == name => match (r.op, &r.gate) {
+                Feed::Routing(r) if r.consumer == *name => match (r.op, &r.gate) {
                     (RouteOp::Watch, Some(g)) => match &g.spec {
                         Some(spec) => Body::Watch {
                             id: ConditionId(g.id),
@@ -301,7 +316,7 @@ impl Deliverer {
             };
             #[cfg(test)]
             let fail = self.gate_fail_at == Some(p);
-            self.gate_call(&name, (p, commit), ctx, |core, h| {
+            self.gate_call(name, (p, commit), ctx, |core, h| {
                 #[cfg(test)]
                 if fail {
                     return Err(crate::gates::CoreError::Id(ConditionId(u32::MAX)));
@@ -362,7 +377,7 @@ impl Deliverer {
             .any(|rt| rt.attached && rt.gates.is_some())
     }
 
-    fn gate_names(&self) -> Vec<String> {
+    pub(super) fn gate_names(&self) -> Vec<String> {
         self.consumers
             .iter()
             .filter(|(_, rt)| rt.attached && rt.gates.is_some())
