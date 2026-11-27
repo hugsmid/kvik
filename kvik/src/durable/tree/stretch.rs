@@ -8,9 +8,8 @@ use kvik_log::content::Item;
 use kvik_log::entries::Entry;
 use kvik_log::reader::{LogReader, ReadEvent, ReaderError};
 use kvik_log::writer::Position as LogPos;
-use kvik_tree::set::QUARTER;
 
-use super::dirty::Key;
+use super::dirty::{Key, quarter_of};
 use crate::env::Env;
 
 /// What a stretch of the log dirties.
@@ -38,9 +37,10 @@ impl Stretch {
             }
             match item {
                 Item::Fact(r) => {
-                    let k = (r.series_id, r.t - r.t.rem_euclid(QUARTER));
-                    let e = self.keys.entry(k).or_default();
-                    *e = (*e).max(at);
+                    if let Some(q) = quarter_of(r.t) {
+                        let e = self.keys.entry((r.series_id, q)).or_default();
+                        *e = (*e).max(at);
+                    }
                 }
                 Item::Entry(e) => {
                     if let Some(id) = changes_nodes(e) {
@@ -106,6 +106,7 @@ const PART: usize = 1 << 14;
 #[cfg(test)]
 mod tests {
     use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
+    use kvik_tree::set::QUARTER;
 
     use super::*;
 
@@ -139,7 +140,12 @@ mod tests {
     #[test]
     fn take_leaves_out_facts_whose_quarter_hour_does_not_fit() {
         let mut s = Stretch::default();
-        s.take(p(1), &[fact(i64::MIN + 1), fact(i64::MAX), fact(0)], p(0), p(9));
+        s.take(
+            p(1),
+            &[fact(i64::MIN + 1), fact(i64::MAX), fact(0)],
+            p(0),
+            p(9),
+        );
         assert_eq!(s.keys.into_keys().collect::<Vec<_>>(), [(1, 0)]);
     }
 }
