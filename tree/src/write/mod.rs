@@ -222,6 +222,7 @@ impl TreeFiles {
                     .all(|p| parts.get(&part_name(id.generation, p.file_id)) == Some(&p.byte_len))
         };
         let mut kept: Vec<Root> = Vec::new();
+        let mut refused: Vec<&String> = Vec::new();
         for (_, name) in &roots {
             if kept.len() == 2 {
                 break;
@@ -231,7 +232,17 @@ impl TreeFiles {
                 .and_then(|b| Root::decode(&b).ok());
             match r {
                 Some(r) if valid(&r) => kept.push(r),
-                _ => report.refused += 1,
+                _ => {
+                    report.refused += 1;
+                    refused.push(name);
+                }
+            }
+        }
+        // A refused root is never valid again for this store, and one newer than the kept roots would otherwise
+        // outlive two publishes.
+        for name in refused {
+            if fs.remove_file(&dir.join(name)).is_ok() {
+                report.removed += 1;
             }
         }
         let mut it = kept.into_iter();

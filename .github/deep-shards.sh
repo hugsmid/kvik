@@ -75,6 +75,7 @@ tree-properties tree properties
 tree-fuzz-inputs tree fuzz_inputs
 tree-refusals   tree refusals
 tree-set        tree set
+tree-write      tree  lib         write::tests::t1_t5_t6_t8_
 backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys

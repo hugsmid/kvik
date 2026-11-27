@@ -392,8 +392,6 @@ fn run(ops: &[Op]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
-
     #[test]
     fn t1_t5_t6_t8_hold_over_histories_with_a_stop_at_any_write_step(ops in prop::collection::vec(op(), 1..30)) {
         run(&ops);
@@ -552,6 +550,23 @@ fn a_start_falls_back_to_the_previous_root_when_the_newest_is_damaged_or_names_a
     assert!(w.files.as_ref().unwrap().root().seq < k);
     w.renamed.clear();
     w.check();
+}
+
+#[test]
+fn a_start_removes_a_refused_root_newer_than_the_one_it_continues() {
+    let mut w = World::new();
+    w.append(&[(0, 0, Some(1.0))]);
+    w.sync();
+    w.checkpoint().unwrap();
+    w.append(&[(0, 60 * S, Some(2.0))]);
+    w.sync();
+    w.checkpoint().unwrap();
+    let dir = w.dir.join(DIR);
+    w.fs.poke(&dir.join(root_name(2)), 40, &[0xff; 4]);
+    w.stop();
+    w.start();
+    assert_eq!(w.files.as_ref().unwrap().root().seq, 1);
+    assert!(w.fs.read(&dir.join(root_name(2))).is_none());
 }
 
 #[test]
