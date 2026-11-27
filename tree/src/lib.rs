@@ -35,6 +35,7 @@ pub mod part;
 pub mod root;
 pub mod set;
 mod window;
+pub mod write;
 
 pub use bytes::{DecodeError, NotStorable, decode, encode, form};
 pub use exact::{Exact, exact, exact_ns};
