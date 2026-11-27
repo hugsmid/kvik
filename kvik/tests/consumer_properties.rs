@@ -422,12 +422,10 @@ fn deliveries_follow_the_model_over_restarts() {
                     smalls.fetch_add(1, Ordering::Relaxed);
                 }
                 let lose = |name: &str| {
-                    // A consumer never routed has no cursor file yet on either backend's terms.
-                    if let Some(path) =
-                        w.path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
-                    {
-                        w.fs.poke(&path, 0, &[0; 16]);
-                    }
+                    let path = w
+                        .path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
+                        .expect("a consumer is given its cursor file at the take");
+                    w.fs.poke(&path, 0, &[0; 16]);
                 };
                 let d = run(w.open(), &|| w.open(), &lose, &w.clock, &history);
                 prop_assert_eq!(m, d);

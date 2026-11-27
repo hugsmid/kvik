@@ -75,10 +75,11 @@ impl Model {
         self.vol.as_mut().expect("up").consumers[i].started = lost.then_some(p);
         // Never ahead of the synced mark (invariant 26).
         self.disk.cover(p);
-        let written = p.min(self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last));
+        let reach = self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last);
         // A lost cursor is written by the confirmation of its `NoCursor` resync; until then every start finds it lost.
-        if !lost {
-            self.disk.cursors.insert(id, written);
+        // A start the synced mark cannot reach writes none, as the durable backend (§4, Q-1621).
+        if !lost && p <= reach {
+            self.disk.cursors.insert(id, p);
         }
         self.disk.registered.insert(id);
         self.disk.latches.retain(|(c, _), _| *c != id);

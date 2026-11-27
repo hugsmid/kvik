@@ -286,8 +286,11 @@ fn a_lost_consumer_taken_again_before_confirming_is_sent_no_cursor_again() {
 
 #[test]
 fn a_start_the_synced_mark_cannot_reach_writes_no_cursor() {
-    let (mut m, s) = model(Selection::All);
+    let (mut m, s) = model(Selection::Series(Default::default()));
     facts(&mut m, s, 0, 1.0);
+    m.disk.cursors.remove(&C);
+    m.disk.synced_mark = None;
+    m.disk.mark = None;
     m.start_consumer(C, Start::Now).unwrap();
     assert!(
         !m.disk.cursors.contains_key(&C),

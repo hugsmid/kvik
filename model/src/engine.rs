@@ -1326,7 +1326,7 @@ pub struct Disk {
     /// Set by fault injection: consumers whose cursor file is missing or
     /// unreadable, until a recovery entry names them (§3 Recovery rule 3).
     pub lost_cursors: BTreeSet<ConsumerId>,
-    /// Consumers registered at run time (`Model::start_consumer`), as the registry file names them.
+    /// Consumers registered at run time (`Model::start_consumer`), as the model's stand-in for an unreadable cursor file naming them.
     pub registered: BTreeSet<ConsumerId>,
     /// Every recovery entry written, by position, as the registry file and
     /// each tree checkpoint keep them (§2.1, §11 Health): a `possible_loss`
