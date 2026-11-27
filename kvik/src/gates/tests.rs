@@ -270,17 +270,15 @@ fn window_gates_are_refused_as_not_supported_yet() {
         }),
         ..hold_up(0)
     };
-    for (id, g) in [(1, window)] {
-        let item = Item {
-            position: Position::new(0, id),
-            body: Body::Watch {
-                id: ConditionId(id as u32),
-                gate: g,
-            },
-        };
-        let err = Core::new().apply_batch(0, &[item], &Replay::default());
-        assert_eq!(err, Err(CoreError::NotSupported(ConditionId(id as u32))));
-    }
+    let item = Item {
+        position: Position::new(0, 1),
+        body: Body::Watch {
+            id: ConditionId(1),
+            gate: window,
+        },
+    };
+    let err = Core::new().apply_batch(0, &[item], &Replay::default());
+    assert_eq!(err, Err(CoreError::NotSupported(ConditionId(1))));
 }
 
 #[test]
