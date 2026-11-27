@@ -202,42 +202,30 @@ fn trace() -> Trace {
     Trace { steps, data }
 }
 
-/// The most calls a step makes in each stage, and the steps that break the bar outside verification.
-fn tally(t: &Trace) -> (BTreeMap<&'static str, usize>, Vec<String>) {
-    let mut most: BTreeMap<&str, usize> = BTreeMap::new();
+/// The steps that make more than one device call, or more bytes than they declared.
+fn over(t: &Trace) -> Vec<String> {
     let mut bad = Vec::new();
     for (i, (stage, declared, calls)) in t.steps.iter().enumerate() {
-        let m = most.entry(stage).or_default();
-        *m = (*m).max(calls.len());
         let bytes: u64 = calls.iter().map(Call::bytes).sum();
         let ok = match declared {
             Next::Device(n) => calls.len() <= 1 && bytes <= *n,
             _ => calls.is_empty(),
         };
-        if !ok && *stage != "verify" && bad.len() < 12 {
+        if !ok && bad.len() < 12 {
             bad.push(format!("step {i} {stage} {declared:?}: {calls:?}"));
         }
     }
-    (most, bad)
+    bad
 }
 
+/// Q-1990: a verification step whose read would be a second call, or larger than declared, stops and is taken
+/// again in the next step, which declares that read.
 #[test]
-fn each_step_of_the_census_and_passes_makes_at_most_one_device_call_of_at_most_its_declared_bytes()
-{
-    let (most, bad) = tally(&trace());
-    assert!(
-        bad.is_empty(),
-        "most calls a step: {most:?}\n{}",
-        bad.join("\n")
-    );
-}
-
-/// Q-1990: verification still makes up to three calls in a step (an output's open, header and tail; a window
-/// crossed by the reader and the comparing sink together; a revision block and the current file's).
-#[test]
-fn each_verification_step_makes_at_most_three_device_calls() {
-    let (most, _) = tally(&trace());
-    assert!(most["verify"] <= 3, "most calls a step: {most:?}");
+fn each_step_makes_at_most_one_device_call_of_at_most_its_declared_bytes() {
+    let t = trace();
+    let bad = over(&t);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(t.steps.iter().any(|s| s.0 == "verify" && !s.2.is_empty()));
 }
 
 #[test]

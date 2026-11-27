@@ -536,4 +536,77 @@ mod tests {
         check_canonical(&own, &id, &info).unwrap();
         check_canonical(&canonical, &id, &info).unwrap();
     }
+
+    /// A source each of whose reads fails once with `WouldBlock` before it succeeds.
+    #[derive(Clone)]
+    struct Shy<'a>(
+        &'a [u8],
+        &'a std::cell::RefCell<std::collections::HashSet<(u64, usize)>>,
+    );
+
+    impl ReadAt for Shy<'_> {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            if self.1.borrow_mut().insert((offset, len)) {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.0.read_at(offset, len)
+        }
+    }
+
+    /// The check over `Shy`, each step that waits taken again; the verdict and how many steps waited.
+    fn shy_check(bytes: &[u8], id: &Identity) -> (Result<(), String>, usize) {
+        let seen = std::cell::RefCell::default();
+        let info = |_| SeriesInfo {
+            name: Some("s".into()),
+            reach: Reach::Point,
+        };
+        let mut c = loop {
+            match CanonicalCheck::new(Shy(bytes, &seen), id, info) {
+                Err(CanonicalError::File(FileError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                r => break r.map_err(|e| e.to_string()),
+            }
+        };
+        let mut waited = 0;
+        let verdict = loop {
+            let Ok(check) = c.as_mut() else {
+                break c.map(|_| ()).map_err(|e| e.clone());
+            };
+            match check.step() {
+                Ok(true) => break Ok(()),
+                Ok(false) => {}
+                Err(CanonicalError::File(FileError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    waited += 1
+                }
+                Err(e) => break Err(e.to_string()),
+            }
+        };
+        (verdict, waited)
+    }
+
+    #[test]
+    fn a_check_whose_reads_each_wait_once_reaches_the_verdict_of_one_that_never_waits() {
+        let (canonical, id) = aside_then_ninths(Vec::new());
+        let (bodies, _) = plain_xor_bodies(&canonical, &id);
+        let (own, _) = aside_then_ninths(bodies);
+        let mut damaged = own.clone();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 1;
+        let info = |_| SeriesInfo {
+            name: Some("s".into()),
+            reach: Reach::Point,
+        };
+        for bytes in [&canonical, &own, &damaged] {
+            let plain = check_canonical(bytes, &id, &info).map_err(|e| e.to_string());
+            let (shy, waited) = shy_check(bytes, &id);
+            assert_eq!(shy, plain);
+            assert!(waited > 60, "{waited} steps waited");
+        }
+        assert!(check_canonical(&damaged, &id, &info).is_err());
+    }
 }
