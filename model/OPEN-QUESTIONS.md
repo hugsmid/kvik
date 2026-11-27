@@ -199,6 +199,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1581 | `api.md` Gates | The gate interface as built: `Transition` without flags, `TransitionCause`, `gates()`, two more `GateError`s (decided by the lead, provisional; settle with conditions step 4) |
 | Q-1582 | §6 Gates; Q-1140 | Entries other than facts, definitions and the consumer's own gates move the judgement's frontier (decided by the lead, provisional; settle with conditions step 4) |
 | Q-1583 | `api.md` Gates; crate README | What the model backend's gates do not do yet (decided by the lead, provisional; settle with conditions step 5) |
+| Q-1810 | `format.md` A.6; Q-1580 | The bounds of a set member: decimal scale and state index (decided at review, provisional) |
+| Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
+| Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5354,6 +5357,32 @@ inputs and, until conditions step 4, every watch, with `NotSupportedYet`.
 **Pinned by.** `kvik/src/backend/gates/tests.rs`
 `unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_resync_carries_gate_states`,
 `kvik/tests/gates.rs` `the_durable_backend_validates_a_watch_and_refuses_not_supported_yet`.
+
+## Q-1810 — The bounds of a set member
+Decided at the review of conditions step 3, provisional.
+**Scenario.** Field 74 took any `u8` decimal scale and any `u32` state index, where every other decimal in the
+format is held to scale 18, a series has at most 65,536 names and `Value::State` is `u16`. Neither could match a
+value, and once stores hold such entries the format cannot be tightened.
+**Decision.** Scale at most 18 and index below 65,536, refused when read (field 74) and the scale at `watch`
+(`GateError::Set`; the index cannot exceed `u16`).
+**Pinned by.** `log/tests/entries_gates.rs` `gate_field_values_are_range_checked`, `kvik/src/gate.rs`
+`a_set_holds_one_to_sixty_four_values_none_absent`.
+
+## Q-1811 — Member order in an equal spec
+Decided at the review of conditions step 3, provisional.
+**Scenario.** A set gate watched again with the same members in another order.
+**Decision.** Not an equal spec: members compare in order, as written, so the second watch is `NameInUse`.
+`api.md` Gates, Naming says so.
+**Pinned by.** By reading (the spec comparison is the entry's equality).
+
+## Q-1812 — A named-state member on the durable backend
+Decided at the review of conditions step 3, provisional.
+**Scenario.** The model backend checks a named-state member against its series' names at `watch`; the durable
+backend wrote the index unchecked, so the two disagreed once durable gates are live.
+**Decision.** Both call one check: an index past the names is `GateError::Set`; a state member on a series without
+named states, every `each` gate included, is `NotSupportedYet` until `each` gates carry state names.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`a_named_state_member_is_checked_against_the_series_names_as_on_the_model`.
 
 ## Open at v0.2
 
