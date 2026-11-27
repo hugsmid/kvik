@@ -12,6 +12,7 @@ use kvik_log::entries::{
 use super::registry::Registry;
 use super::routing::View;
 use super::{Writer, lock};
+use crate::backend::gates::state_member;
 use crate::backend::{Error, convert};
 use crate::gate::{
     Gate, GateError, GateId, GateKind, Input, Level, MAX_GATES_PER_CONSUMER, MAX_GATES_PER_STORE,
@@ -25,21 +26,20 @@ pub(crate) const LIVE: bool = false;
 
 /// The gate as its watch entry carries it, its series resolved now (`docs/api.md` Gates, Inputs).
 pub(crate) fn entry_spec(registry: &Registry, name: &str, gate: &Gate) -> Result<GateSpec, Error> {
-    let selector = match (&gate.each, &gate.input.series) {
-        (Some(p), None) => GateSelector::Each(p.clone()),
+    let (selector, series) = match (&gate.each, &gate.input.series) {
+        (Some(p), None) => (GateSelector::Each(p.clone()), None),
         (None, Some(SeriesKey::Id(id))) => {
-            registry
+            let s = registry
                 .get(id.0)
                 .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
-            GateSelector::One(id.0)
+            (GateSelector::One(id.0), Some(s))
         }
-        (None, Some(SeriesKey::Name(n))) => GateSelector::One(
-            registry
+        (None, Some(SeriesKey::Name(n))) => {
+            let s = registry
                 .resolve(n)
-                .ok_or_else(|| Error::UnknownSeries(n.clone()))?
-                .def
-                .id,
-        ),
+                .ok_or_else(|| Error::UnknownSeries(n.clone()))?;
+            (GateSelector::One(s.def.id), Some(s))
+        }
         _ => return Err(Error::Gate(GateError::Selector)),
     };
     if gate.input.window.is_some() {
@@ -75,7 +75,10 @@ pub(crate) fn entry_spec(registry: &Registry, name: &str, gate: &Gate) -> Result
                             units: *units,
                             scale: *scale,
                         },
-                        Value::State(i) => GateValue::State(u32::from(*i)),
+                        Value::State(i) => {
+                            state_member(*i, series.map(|s| &s.spec))?;
+                            GateValue::State(u32::from(*i))
+                        }
                         Value::Bool(b) => GateValue::Bool(*b),
                         Value::Text(t) => GateValue::Text(t.clone()),
                         Value::Absent => return Err(Error::Gate(GateError::Set)),

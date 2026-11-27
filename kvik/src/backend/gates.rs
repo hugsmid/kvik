@@ -356,23 +356,22 @@ fn member(v: &Value, spec: Option<&crate::series::SeriesSpec>) -> Result<km::typ
         Value::Decimal { units, scale } => V::Num(*units as f64 / 10f64.powi(i32::from(*scale))),
         Value::Bool(b) => V::Bool(*b),
         Value::Text(t) => V::Str(t.clone()),
-        Value::State(i) => match spec.map(|s| &s.kind) {
-            Some(Kind::State {
-                values: StateValues::Named(names),
-            }) => V::Str(
-                names
-                    .get(usize::from(*i))
-                    .ok_or(Error::Gate(GateError::Set))?
-                    .clone(),
-            ),
-            _ => {
-                return Err(Error::NotSupportedYet(
-                    "a named-state member on a gate whose series has no named states (each gates included)",
-                ));
-            }
-        },
+        Value::State(i) => V::Str(state_member(*i, spec)?.clone()),
         Value::Absent => return Err(Error::Gate(GateError::Set)),
     })
+}
+
+/// The name a named-state member stands for, on the one series of its gate (`spec`; `None` for `each`), as both
+/// backends check it at `watch` (Q-1812).
+pub(crate) fn state_member(i: u16, spec: Option<&crate::series::SeriesSpec>) -> Result<&String> {
+    match spec.map(|s| &s.kind) {
+        Some(Kind::State {
+            values: StateValues::Named(names),
+        }) => names.get(usize::from(i)).ok_or(Error::Gate(GateError::Set)),
+        _ => Err(Error::NotSupportedYet(
+            "a named-state member on a gate whose series has no named states (each gates included)",
+        )),
+    }
 }
 
 #[cfg(test)]

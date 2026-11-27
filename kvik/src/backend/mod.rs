@@ -11,7 +11,7 @@
 
 pub(crate) mod convert;
 mod error;
-mod gates;
+pub(crate) mod gates;
 pub(crate) mod live;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
