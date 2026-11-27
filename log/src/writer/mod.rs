@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod commit_clock;
 mod directories;
 mod gather;
 mod generation;
@@ -57,6 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+pub use commit_clock::CommitClock;
 pub use directories::{
     Directories, DirectoryOptions, DirectoryStart, DirectoryStats, GROUPS_PER_STEP,
     REUSED_PER_STEP, STATUS_INTERVAL, SealHook, SeriesEntries, StatusContent, TRAILERS_PER_STEP,
@@ -591,6 +593,8 @@ pub struct LogWriter {
     next_file_id: u64,
     last_sequence: u64,
     last_commit_time: i64,
+    /// Shared with the deliverer's floor (spec §6 Gates, Clock).
+    commit_clock: Arc<CommitClock>,
     max_series_id: u32,
     intervals: HashMap<u32, IntervalLength>,
     /// The sync-rate budget (spec §3 Group commit, Q-980).
@@ -729,6 +733,13 @@ impl LogWriter {
             next_file_id: r.next_file_id,
             last_sequence: r.last_sequence,
             last_commit_time: r.last_commit_time,
+            commit_clock: Arc::new(CommitClock::new(
+                r.last_commit_time,
+                Position {
+                    generation,
+                    sequence: r.last_sequence,
+                },
+            )),
             max_series_id: r.max_series_id,
             intervals: r.intervals,
             budget: Budget::default(),
@@ -757,6 +768,11 @@ impl LogWriter {
     /// What the start found and did (`spec.md` §3 Recovery).
     pub fn start_report(&self) -> &StartReport {
         &self.report
+    }
+
+    /// The commit clock, for the floor of live gate timers (spec §6 Gates, Clock).
+    pub fn commit_clock(&self) -> Arc<CommitClock> {
+        self.commit_clock.clone()
     }
 
     /// The generation this writer assigns positions in (`spec.md` §8 Generations).
@@ -1334,12 +1350,23 @@ impl LogWriter {
     ) -> Option<Vec<Done>> {
         let mut items = Vec::with_capacity(calls.iter().map(Call::len).sum());
         let counts = gather::gather(&mut calls, &mut items);
+        let first = Position {
+            generation: self.generation,
+            sequence: self.last_sequence + 1,
+        };
         let mut content = BatchContent {
-            first_sequence: self.last_sequence + 1,
-            received_at: wall.max(self.last_commit_time),
+            first_sequence: first.sequence,
+            received_at: self
+                .commit_clock
+                .begin(wall.max(self.last_commit_time), first),
             items,
         };
         let done = self.commit_content(&mut calls, counts, &mut content, now, back);
+        self.commit_clock
+            .end((self.last_sequence >= first.sequence).then_some(Position {
+                generation: self.generation,
+                sequence: self.last_sequence,
+            }));
         self.batch = content.items;
         self.batch_calls = calls;
         done

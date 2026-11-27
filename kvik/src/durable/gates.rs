@@ -1,6 +1,6 @@
 //! Gates on the durable backend (spec §6 Gates): `watch` and `unwatch` are routing changes 4 and 5 (`format.md`
-//! A.6) and the routing view keeps the gates in force. Nothing judges them yet, so `watch` writes its entry only
-//! when [`LIVE`] (or a test) allows it, and refuses `NotSupportedYet` otherwise.
+//! A.6) and the routing view keeps the gates in force; the deliverer judges them (`deliver::gates`). `watch`
+//! writes its entry only when [`LIVE`] (or a test) allows it, and refuses `NotSupportedYet` otherwise.
 
 use std::sync::atomic::Ordering;
 
@@ -8,6 +8,8 @@ use kvik_log::entries::{
     GateKind as EntryKind, GateLevel, GateSelector, GateSpec, GateValue, RouteGate, RouteOp,
     Routing,
 };
+
+use kvik_model as km;
 
 use super::registry::Registry;
 use super::routing::View;
@@ -18,11 +20,11 @@ use crate::gate::{
     Gate, GateError, GateId, GateKind, Input, Level, MAX_GATES_PER_CONSUMER, MAX_GATES_PER_STORE,
     check_name,
 };
-use crate::series::SeriesKey;
+use crate::series::{SeriesKey, StateValues};
 use crate::types::{SeriesId, Value};
 
-/// Whether durable gates are judged; turned on with the live engine (Q-1583).
-pub(crate) const LIVE: bool = false;
+/// Whether durable gates are judged (Q-1583).
+pub(crate) const LIVE: bool = true;
 
 /// The gate as its watch entry carries it, its series resolved now (`docs/api.md` Gates, Inputs).
 pub(crate) fn entry_spec(registry: &Registry, name: &str, gate: &Gate) -> Result<GateSpec, Error> {
@@ -42,6 +44,11 @@ pub(crate) fn entry_spec(registry: &Registry, name: &str, gate: &Gate) -> Result
         }
         _ => return Err(Error::Gate(GateError::Selector)),
     };
+    if gate.each.is_some() {
+        return Err(Error::NotSupportedYet(
+            "an each gate on the durable backend (Q-1583)",
+        ));
+    }
     if gate.input.window.is_some() {
         return Err(Error::NotSupportedYet(
             "a window input to a gate on the durable backend (no incremental window fold yet)",
@@ -165,6 +172,87 @@ pub(crate) fn gate_out(spec: &GateSpec) -> Gate {
     g
 }
 
+fn named(spec: Option<&crate::series::SeriesSpec>, i: u32) -> km::types::Value {
+    let name = match spec.map(|s| &s.kind) {
+        Some(crate::series::Kind::State {
+            values: StateValues::Named(names),
+        }) => usize::try_from(i).ok().and_then(|i| names.get(i)).cloned(),
+        _ => None,
+    };
+    // An index past the names cannot reach here: `watch` and the writer check it (Q-1812).
+    km::types::Value::Str(name.unwrap_or_else(|| format!("#{i}")))
+}
+
+/// A stored value as the gates core reads it: named states by name, as the model has them.
+pub(crate) fn core_value(
+    v: &kvik_log::facts::Value,
+    spec: Option<&crate::series::SeriesSpec>,
+) -> km::types::Value {
+    use kvik_log::facts::Value as L;
+    match v {
+        L::F64(bits) => km::types::Value::Num(f64::from_bits(*bits)),
+        L::Decimal { units, scale } => {
+            km::types::Value::Num(*units as f64 / 10f64.powi(i32::from(*scale)))
+        }
+        L::State(i) => named(spec, u32::from(*i)),
+        L::Bool(b) => km::types::Value::Bool(*b),
+        L::Text(t) => km::types::Value::Str(t.clone()),
+        L::Absent { .. } => km::types::Value::Absent,
+    }
+}
+
+/// The gate a watch entry carries, as the gates core judges it.
+pub(crate) fn core_gate(spec: &GateSpec, registry: &Registry) -> km::gate::Gate {
+    let series = match &spec.selector {
+        GateSelector::One(id) => registry.get(*id).map(|s| &s.spec),
+        GateSelector::Each(_) => None,
+    };
+    let kind = match &spec.kind {
+        EntryKind::Levels(ls) => km::gate::Kind::Levels(
+            ls.iter()
+                .map(|l| km::gate::Level {
+                    at: l.at,
+                    clear: l.clear,
+                    hold_up: l.hold_up,
+                    hold_down: l.hold_down,
+                })
+                .collect(),
+        ),
+        EntryKind::Set {
+            members,
+            hold_on,
+            hold_off,
+        } => km::gate::Kind::Set {
+            members: members
+                .iter()
+                .map(|m| match m {
+                    GateValue::F64(x) => km::types::Value::Num(*x),
+                    GateValue::Decimal { units, scale } => {
+                        km::types::Value::Num(*units as f64 / 10f64.powi(i32::from(*scale)))
+                    }
+                    GateValue::State(i) => named(series, *i),
+                    GateValue::Bool(b) => km::types::Value::Bool(*b),
+                    GateValue::Text(t) => km::types::Value::Str(t.clone()),
+                })
+                .collect(),
+            hold_on: *hold_on,
+            hold_off: *hold_off,
+        },
+        EntryKind::Change { deadband } => km::gate::Kind::Change {
+            deadband: *deadband,
+        },
+    };
+    km::gate::Gate {
+        selector: match &spec.selector {
+            GateSelector::One(id) => km::gate::Selector::Series(km::types::SeriesId(*id)),
+            GateSelector::Each(p) => km::gate::Selector::Each(p.clone()),
+        },
+        input: km::gate::Input::Value,
+        kind,
+        stale_after: spec.stale_after,
+    }
+}
+
 /// The id of one more gate on `consumer`, within the limits (`docs/api.md` Gates, Limits).
 fn admit(view: &View, consumer: &str) -> Result<u32, Error> {
     let routes = view.consumers.get(consumer);
@@ -184,6 +272,12 @@ impl Writer {
     #[cfg(test)]
     pub(crate) fn allow_gates(&self) {
         self.gates_live.store(true, Ordering::SeqCst);
+    }
+
+    /// Turns gates off, as before they were judged.
+    #[cfg(test)]
+    pub(crate) fn forbid_gates(&self) {
+        self.gates_live.store(false, Ordering::SeqCst);
     }
 
     /// Watches a gate: routing change 4, at its position. An equal spec under the name is the gate in force and

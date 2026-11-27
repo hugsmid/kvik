@@ -8,12 +8,17 @@ use super::*;
 use crate::config::{LogConfig, StoreConfig};
 use crate::consume::{Select, Start};
 use crate::env::{Env, ManualClock, MemFs};
-use crate::gate::Input;
+use crate::gate::{GateState, Input};
 use crate::series::{Kind, SeriesSpec, StateValues, ValueType};
 
 fn open(name: &str) -> (Arc<Writer>, StoreConfig) {
+    let (w, c, _) = open_clocked(name);
+    (w, c)
+}
+
+fn open_clocked(name: &str) -> (Arc<Writer>, StoreConfig, ManualClock) {
     let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
-    let mut env = Env::test(clock);
+    let mut env = Env::test(clock.clone());
     env.fs = Arc::new(MemFs::new());
     env.background_timers = false;
     let config = StoreConfig::new(PathBuf::from(format!("durable-unit/{name}")), "UTC")
@@ -23,7 +28,7 @@ fn open(name: &str) -> (Arc<Writer>, StoreConfig) {
             segment_size: 16 << 20,
             ..LogConfig::default()
         });
-    (Writer::open(&config).unwrap(), config)
+    (Writer::open(&config).unwrap(), config, clock)
 }
 
 fn gauge(w: &Writer, name: &str) -> SeriesId {
@@ -55,10 +60,11 @@ fn head(w: &Writer) -> crate::types::Position {
 }
 
 #[test]
-fn watch_validates_and_refuses_not_supported_yet_until_gates_are_live() {
+fn watch_validates_first_and_refuses_not_supported_yet_with_gates_off() {
     let (w, _) = open("gates-not-live");
     let s = gauge(&w, "hall/air/humidity");
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.forbid_gates();
     let before = head(&w);
     assert!(matches!(
         w.watch("c", "humidity", &humidity(s)),
@@ -83,6 +89,19 @@ fn watch_validates_and_refuses_not_supported_yet_until_gates_are_live() {
     ));
     assert_eq!(head(&w), before, "nothing is written");
     assert!(w.gates("c").unwrap().is_empty());
+}
+
+#[test]
+fn an_each_gate_is_refused_not_supported_yet_and_writes_nothing() {
+    let (w, _) = open("gates-each");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    let before = head(&w);
+    let pump = Gate::set(Input::value_each(), [Value::F64(0.0)]).each("plant/*/code");
+    assert!(matches!(
+        w.watch("c", "pump", &pump),
+        Err(Error::NotSupportedYet(_))
+    ));
+    assert_eq!(head(&w), before);
 }
 
 #[test]
@@ -134,10 +153,9 @@ fn unwatch_frees_the_name_and_gate_ids_are_never_reused() {
         Err(Error::Gate(GateError::NoSuchGate))
     ));
     assert_eq!(w.watch("c", "humidity", &humidity(s)).unwrap(), GateId(1));
-    let pump = Gate::set(Input::value_each(), [Value::F64(0.0)])
+    let pump = Gate::set(Input::value(s), [Value::F64(0.0)])
         .hold_on(Duration::from_secs(5))
-        .hold_off(Duration::from_secs(9))
-        .each("plant/*/code");
+        .hold_off(Duration::from_secs(9));
     assert_eq!(w.watch("c", "pump", &pump).unwrap(), GateId(2));
     let moved = Gate::change(Input::value(s)).deadband(0.5);
     assert_eq!(w.watch("c", "moved", &moved).unwrap(), GateId(3));
@@ -252,4 +270,119 @@ fn the_gate_limits_admit_the_last_gate_and_refuse_one_more() {
     full[0] = n - 1;
     assert_eq!(admit(&view_with(&full), "c16").unwrap(), 1);
     assert_eq!(admit(&view_with(&[]), "new").unwrap(), 1);
+}
+
+fn emit(w: &Arc<Writer>, clock: &ManualClock, s: SeriesId, v: f64) {
+    let r = crate::types::Reading::new(s, clock.wall(), Value::F64(v));
+    match w.emit(&[r], crate::types::Intent::Normal, true) {
+        Ok(crate::durable::Emitted::Ready(_)) => {}
+        Ok(crate::durable::Emitted::Queued(mut q)) => {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            loop {
+                if let std::task::Poll::Ready(r) = q.poll(&mut cx) {
+                    q.finish(r).unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
+fn transitions(w: &Writer, confirm: bool) -> Vec<crate::gate::Transition> {
+    let mut out = Vec::new();
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        if confirm {
+            w.confirm("c", d.id).unwrap();
+        }
+        if let crate::consume::DeliveryKind::Transition(t) = d.kind {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn states(ts: &[crate::gate::Transition]) -> Vec<Option<crate::gate::GateState>> {
+    ts.iter().map(|t| t.to.clone()).collect()
+}
+
+fn cursor(
+    w: &Writer,
+) -> (
+    Option<super::super::deliver::GatePoint>,
+    Option<crate::gates::Frontier>,
+    usize,
+) {
+    w.hub().unwrap().run(|d, _| d.gate_cursor("c")).unwrap()
+}
+
+#[test]
+fn a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot() {
+    let (w, _, clock) = open_clocked("gates-confirm");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    emit(&w, &clock, s, 50.0);
+    w.watch(
+        "c",
+        "humidity",
+        &Gate::change(Input::value(s)).deadband(5.0),
+    )
+    .unwrap();
+    clock.advance(Duration::from_secs(1));
+    emit(&w, &clock, s, 60.0);
+    let ts = transitions(&w, false);
+    assert_eq!(ts.len(), 2);
+    let (confirmed, held, outstanding) = cursor(&w);
+    assert_eq!((confirmed, outstanding), (None, 2));
+    // G5: held before the oldest outstanding transition was judged.
+    let held = held.expect("a held snapshot while transitions are outstanding");
+    assert!(held.at.sequence < ts[0].id.at.sequence);
+    w.confirm("c", crate::consume::DeliveryId::Transition(ts[0].id))
+        .unwrap();
+    let (confirmed, held, outstanding) = cursor(&w);
+    assert_eq!(outstanding, 1);
+    assert!(held.is_some());
+    assert!(matches!(
+        confirmed,
+        Some(super::super::deliver::GatePoint::Transition(id)) if id.at.sequence == ts[0].id.at.sequence
+    ));
+    w.confirm("c", crate::consume::DeliveryId::Transition(ts[1].id))
+        .unwrap();
+    let (_, held, outstanding) = cursor(&w);
+    assert_eq!((held, outstanding), (None, 0));
+}
+
+#[test]
+fn no_timer_fires_while_a_batch_assigned_below_the_floor_is_not_yet_judged() {
+    let (w, _, clock) = open_clocked("gates-race");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.watch("c", "humidity", &humidity(s)).unwrap();
+    emit(&w, &clock, s, 75.0);
+    assert_eq!(
+        states(&transitions(&w, true)),
+        [Some(GateState::Unknown), Some(GateState::Level(0))]
+    );
+    // A batch is in flight at the floor's position, past the head: the hold due at +120 s must wait for it.
+    let hub = w.hub().unwrap().clone();
+    let in_flight = hub.run(|d, _| {
+        let h = d.head();
+        kvik_log::writer::Position {
+            generation: h.generation,
+            sequence: h.sequence + 1,
+        }
+    });
+    let due = clock.wall().0 + 200 * 1_000_000_000;
+    hub.run(|d, _| d.hold_floor(Some((due, in_flight))));
+    assert!(
+        transitions(&w, true).is_empty(),
+        "nothing before the batch in flight is judged"
+    );
+    // It commits below the hold's due instant and breaks the hold.
+    clock.advance(Duration::from_secs(100));
+    emit(&w, &clock, s, 50.0);
+    hub.run(|d, _| d.hold_floor(None));
+    clock.advance(Duration::from_secs(100));
+    assert!(transitions(&w, true).is_empty(), "the hold never completed");
 }

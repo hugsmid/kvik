@@ -20,6 +20,8 @@
 
 mod confirm;
 mod funnels;
+mod gate_history;
+mod gates;
 mod held;
 mod hub;
 mod intake;
@@ -28,6 +30,8 @@ mod resync;
 mod seeded;
 mod take;
 
+#[cfg(test)]
+pub(crate) use gates::GatePoint;
 pub(crate) use hub::Hub;
 
 use std::cell::{Cell, RefCell};
@@ -182,11 +186,19 @@ enum Pend {
         position: LogPos,
         unchecked: bool,
     },
+    /// A gate transition (spec §6 Gates).
+    Transition {
+        t: Box<kvik_model::gate::Transition>,
+        replayed: bool,
+    },
     Resync {
         cause: ResyncCause,
         forget_above: Option<LogPos>,
         position: LogPos,
         funnels: Vec<FState>,
+        /// Each gate instance's state, and the frontier the core was at.
+        gates: Vec<crate::gate::GateInstanceState>,
+        gate_frontier: Option<crate::gates::Frontier>,
         /// It is, or ends with, a reset point: its confirmation records its id in the cursor file (field 3).
         reset: bool,
         unchecked: bool,
@@ -204,6 +216,8 @@ struct Out {
     forced: bool,
     /// A reset point's resync.
     reset: bool,
+    /// The gate cursor its confirmation sets.
+    gate: Option<gates::GatePoint>,
 }
 
 /// A consumer as this process runs it.
@@ -233,6 +247,8 @@ struct Rt {
     paused: bool,
     /// The `forget_above` of a `NoCursor` resync not yet confirmed: a second take in this run sends it again.
     forget: Option<LogPos>,
+    /// Its gates, from its first watch applied in this run or its take with gates in force.
+    gates: Option<gates::GateRun>,
     runners: BTreeMap<u32, Runner>,
     /// A void changed the funnels in force: the runners are synced at the next evaluation.
     stale_runners: bool,
@@ -298,6 +314,13 @@ pub(crate) struct Deliverer {
     seeded: Option<LogPos>,
     view: View,
     head: LogPos,
+    /// The commit time of the batch at `head`.
+    last_commit_time: i64,
+    /// The last commit floor gate timers fired under.
+    gate_floor: Option<i64>,
+    /// A floor the tests set in place of the commit clock's.
+    #[cfg(test)]
+    floor_hold: Option<(i64, LogPos)>,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
     resets: BTreeMap<LogPos, LogPos>,
     /// Per consumer named in a recovery entry (field 47: its cursor file was missing or unreadable), the lowest
@@ -439,6 +462,10 @@ impl Deliverer {
             seeded: None,
             view: View::default(),
             head: LogPos::default(),
+            last_commit_time: i64::MIN,
+            gate_floor: None,
+            #[cfg(test)]
+            floor_hold: None,
             resets: BTreeMap::new(),
             lost: BTreeMap::new(),
             consumers: BTreeMap::new(),

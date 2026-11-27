@@ -18,6 +18,13 @@ pub(crate) struct Snapshot {
     pub(super) frontier: Frontier,
 }
 
+impl Snapshot {
+    /// The frontier it was taken at.
+    pub fn frontier(&self) -> Frontier {
+        self.frontier
+    }
+}
+
 impl Core {
     /// The core's state now.
     pub fn snapshot(&self) -> Snapshot {

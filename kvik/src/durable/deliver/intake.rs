@@ -38,6 +38,7 @@ impl Deliverer {
         }
         self.take_pending(ctx);
         self.forget_latched();
+        self.gate_timers(ctx);
     }
 
     /// Takes in the ranges the scanning readers of the process found lost since the last call: one the reader had read
@@ -211,6 +212,11 @@ impl Deliverer {
             }
         }
         let mut fed: Vec<u32> = Vec::new();
+        let commit = b.content.received_at;
+        let mut gating = !self.loading && self.gating();
+        if gating {
+            self.gate_batch(commit, ctx);
+        }
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();
         // The consumers with more to take after the batch; an entry may change what any of them takes.
@@ -221,6 +227,18 @@ impl Deliverer {
                 sequence,
             };
             sequence += item.sequences();
+            let core_fact = match &item {
+                Item::Fact(row) if gating => Some(gate_history::fact_item(row, self)),
+                _ => None,
+            };
+            let gate_route = match &item {
+                Item::Entry(e) if !self.loading => match &**e {
+                    Entry::Routing(r) if r.gate.is_some() => Some(r.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut fact_outranked = false;
             match item {
                 Item::Fact(row) => {
                     let key = (row.series_id, row.t);
@@ -239,6 +257,7 @@ impl Deliverer {
                         None => (false, false),
                     };
                     self.unchecked += u64::from(unchecked);
+                    fact_outranked = outranked;
                     let rec = Arc::new(FactRec {
                         stored: Stored {
                             position: p,
@@ -298,8 +317,20 @@ impl Deliverer {
                     }
                 }
             }
+            match (core_fact, &gate_route) {
+                (Some(f), _) => {
+                    self.gate_item(p, commit, &gates::Feed::Fact(f, fact_outranked), ctx)
+                }
+                (None, Some(r)) => {
+                    self.gate_item(p, commit, &gates::Feed::Routing(r), ctx);
+                    gating = self.gating();
+                }
+                (None, None) if gating => self.gate_item(p, commit, &gates::Feed::Other, ctx),
+                _ => {}
+            }
         }
         self.head = self.head.max(b.last);
+        self.last_commit_time = self.last_commit_time.max(commit);
         if !self.loading {
             for (name, _) in names.iter().zip(&more).filter(|(_, m)| **m) {
                 self.changed(name);

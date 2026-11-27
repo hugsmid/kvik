@@ -265,6 +265,32 @@ impl Core {
         Ok(())
     }
 
+    /// Starts `gates` at `at`, `now` by the seed rule without their start transitions (spec §6 Gates, Transitions;
+    /// reseed): each instance's `set_by` is the start id it would have had. Every read comes first, so a failed
+    /// one changes nothing.
+    pub fn reseed(
+        &mut self,
+        gates: &[(ConditionId, Gate)],
+        at: Position,
+        now: Nanos,
+        history: &dyn History,
+    ) -> Result<(), CoreError> {
+        let mut next = self.clone();
+        next.frontier.at = next.frontier.at.max(at);
+        next.frontier.now = next.frontier.now.max(now);
+        let mut dropped = Vec::new();
+        for (id, gate) in gates {
+            next.watch(*id, gate, at, now, history, &mut dropped)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// The earliest timer due.
+    pub fn next_due(&self) -> Option<Nanos> {
+        self.timers.first_key_value().map(|(k, _)| k.0)
+    }
+
     /// Removes a gate with its instance, timer and, when no other gate reads it, its series.
     fn unwatch(&mut self, id: ConditionId) -> Result<(), CoreError> {
         self.defs.remove(&id).ok_or(CoreError::Id(id))?;

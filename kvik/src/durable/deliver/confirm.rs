@@ -75,6 +75,7 @@ impl Deliverer {
             .ok_or(Error::BadConfirm)?
             + 1;
         let done: Vec<Out> = rt.unconfirmed.drain(..n).collect();
+        let gate = done.iter().filter_map(|o| o.gate).next_back();
         // The condition funnels in force, only when a confirmed delivery carries a condition state.
         let funnels: BTreeMap<u32, LogPos> = if done.iter().any(|o| !o.latches.is_empty()) {
             self.view
@@ -116,6 +117,9 @@ impl Deliverer {
             rt.cursor = rt.cursor.max(o.position);
         }
         rt.dirty = true;
+        if let Some(g) = gate {
+            self.gate_confirm(name, g);
+        }
         // Only this consumer's own poll can wait on what a confirm frees: room in its queue or the end of a pause.
         self.changed(name);
         if forced {

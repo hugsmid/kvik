@@ -197,6 +197,7 @@ struct Shared {
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
+    commit_clock: Arc<super::CommitClock>,
     /// The writer's held batch entries and calls as the last acknowledgements were delivered, and just after.
     #[cfg(test)]
     held: Mutex<Option<(usize, usize)>>,
@@ -341,6 +342,7 @@ impl Log {
             stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
+            commit_clock: writer.commit_clock(),
             clock,
             #[cfg(test)]
             held: Mutex::new(None),

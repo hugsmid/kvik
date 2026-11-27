@@ -1,6 +1,6 @@
 //! Gates through the public interface (spec §6 Gates, `docs/api.md` Gates): ids, an equal spec writing nothing,
-//! every `GateError` a call returns, the per-consumer limit, and the durable backend refusing until its engine
-//! exists.
+//! every `GateError` a call returns, the per-consumer limit, and the durable backend delivering as the model backend
+//! does.
 
 mod common;
 
@@ -137,20 +137,59 @@ fn a_consumer_holds_at_most_4096_gates() {
     );
 }
 
+/// The deliveries of one script of watches, readings and clock steps, as comparable lines: the backends' positions
+/// differ, so each is shown as the number of readings emitted at or before it.
+fn script(backend: Backend, name: &str) -> Vec<String> {
+    let (s, clock) = store_on(backend, name);
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut emitted = Vec::new();
+    let mut out = Vec::new();
+    let drain = |c: &mut Consumer, emitted: &[kvik::Position], out: &mut Vec<String>| {
+        let at = |p: kvik::Position| emitted.iter().filter(|e| **e <= p).count();
+        while let Some(d) = c.try_next().unwrap() {
+            if let kvik::DeliveryKind::Transition(t) = &d.kind {
+                out.push(format!(
+                    "{} @{} due={:?} {:?}->{:?} {:?} r={}",
+                    t.name,
+                    at(t.id.at),
+                    t.id.due.map(|d| d.0 - common::start().0),
+                    t.from,
+                    t.to,
+                    t.value,
+                    d.flags.replayed
+                ));
+            }
+            block_on(c.confirm(d.id)).unwrap();
+        }
+    };
+    let emit = |v: f64, emitted: &mut Vec<kvik::Position>| {
+        let a = block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(v))])).unwrap();
+        if let Some(kvik::Outcome::Recorded { position, .. }) = a.outcomes.first() {
+            emitted.push(*position);
+        }
+    };
+    emit(50.0, &mut emitted);
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    drain(&mut c, &emitted, &mut out);
+    clock.advance(Duration::from_secs(10));
+    emit(75.0, &mut emitted);
+    drain(&mut c, &emitted, &mut out);
+    // The hold completes on the commit clock, then staleness 600 s after the last arrival.
+    clock.advance(Duration::from_secs(130));
+    drain(&mut c, &emitted, &mut out);
+    clock.advance(Duration::from_secs(600));
+    drain(&mut c, &emitted, &mut out);
+    emit(90.0, &mut emitted);
+    drain(&mut c, &emitted, &mut out);
+    block_on(s.shutdown()).unwrap();
+    out
+}
+
 #[test]
-fn the_durable_backend_validates_a_watch_and_refuses_not_supported_yet() {
-    let (_s, c, id) = rig("gates-api-durable", Backend::Durable);
-    assert!(matches!(
-        block_on(c.watch("humidity", humidity(id))),
-        Err(ConsumerError::NotSupportedYet { .. })
-    ));
-    assert_eq!(
-        gate_err(block_on(c.watch("l", Gate::levels(Input::value(id), [])))),
-        GateError::Levels
-    );
-    assert!(c.gates().unwrap().is_empty());
-    assert!(matches!(
-        block_on(c.unwatch("humidity")),
-        Err(ConsumerError::Gate(GateError::NoSuchGate))
-    ));
+fn the_durable_backend_delivers_the_transitions_the_model_backend_does() {
+    let model = script(Backend::Model, "gates-api-model");
+    let durable = script(Backend::Durable, "gates-api-durable");
+    assert_eq!(model.len(), 4, "{model:#?}");
+    assert_eq!(durable, model);
 }

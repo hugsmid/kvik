@@ -479,6 +479,12 @@ pub struct DeliveryStats {
     pub evaluations_unchecked: u64,
     /// Damaged regions a consumer's read of the log passed over that the store's start had not (Q-750).
     pub regions_unread: u64,
+    /// Gate transitions judged while their consumer caught up and not delivered (spec §4 Overflow; Q-1396).
+    pub transitions_not_delivered: u64,
+    /// Starts whose gates were rebuilt from history rather than replayed (spec §6 Gates, Resume; Q-1392).
+    pub gates_reseeded: u64,
+    /// Gate judgements that failed (a history read) and were rebuilt by a reseed (Q-1881).
+    pub gate_errors: u64,
 }
 
 /// Per-series statistics.

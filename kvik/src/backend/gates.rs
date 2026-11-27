@@ -12,7 +12,7 @@ use crate::gate::{
     Gate, GateError, GateId, GateInstanceState, GateKind, GateState, MAX_GATES_PER_CONSUMER,
     MAX_GATES_PER_STORE, TimerKind, Transition, TransitionCause, TransitionId, check_name,
 };
-use crate::series::{Kind, SeriesKey, StateValues};
+use crate::series::{Kind, SeriesKey, SeriesSpec, StateValues};
 use crate::types::Value;
 
 /// One consumer's gate delivery state, kept across store restarts in this process.
@@ -43,7 +43,7 @@ impl GateFeed {
 }
 
 /// The interface's id of a model transition id.
-pub(super) fn id_out(id: &km::gate::TransitionId) -> TransitionId {
+pub(crate) fn id_out(id: &km::gate::TransitionId) -> TransitionId {
     TransitionId {
         at: pos(id.at),
         due: id.due.map(ts),
@@ -282,37 +282,7 @@ impl Slot {
             .get(&t.id.condition.0)
             .map(|(n, _)| n.clone())
             .unwrap_or_default();
-        let id = id_out(&t.id);
-        let spec = self.specs.get(&sid(t.id.series));
-        let cause = match t.cause.clone() {
-            km::gate::Cause::Fact { position, t } => TransitionCause::Fact {
-                position: pos(position),
-                t: ts(t),
-            },
-            km::gate::Cause::Timer { due, kind } => TransitionCause::Timer {
-                due: ts(due),
-                kind: match kind {
-                    km::gate::TimerKind::Hold => TimerKind::Hold,
-                    km::gate::TimerKind::Stale => TimerKind::Stale,
-                    km::gate::TimerKind::Mature => TimerKind::Mature,
-                    km::gate::TimerKind::Window => TimerKind::Window,
-                },
-            },
-            km::gate::Cause::Entry { position } => TransitionCause::Entry {
-                position: pos(position),
-            },
-        };
-        Transition {
-            id,
-            name: gate_name,
-            series: id.series,
-            from: t.from.as_ref().map(|s| self.state_out(s, t.id.series)),
-            to: t.to.as_ref().map(|s| self.state_out(s, t.id.series)),
-            cause,
-            value: t.value.as_ref().map(|v| value_out(v, spec)),
-            event_time: t.event_time.map(ts),
-            now: ts(t.now),
-        }
+        transition_out(t, gate_name, self.specs.get(&sid(t.id.series)))
     }
 
     /// Confirms transitions through `id` (cumulative); one not handed out in this attachment is refused.
@@ -327,15 +297,56 @@ impl Slot {
     }
 
     fn state_out(&self, s: &km::gate::GateState, series: km::types::SeriesId) -> GateState {
-        match s {
-            km::gate::GateState::Unknown => GateState::Unknown,
-            km::gate::GateState::Stale => GateState::Stale,
-            km::gate::GateState::Level(n) => GateState::Level(*n),
-            km::gate::GateState::Match(b) => GateState::Match(*b),
-            km::gate::GateState::Value(v) => {
-                GateState::Value(value_out(v, self.specs.get(&sid(series))))
-            }
-        }
+        state_out(s, self.specs.get(&sid(series)))
+    }
+}
+
+/// A model gate state as the interface shows it, given its series' definition.
+pub(crate) fn state_out(s: &km::gate::GateState, spec: Option<&SeriesSpec>) -> GateState {
+    match s {
+        km::gate::GateState::Unknown => GateState::Unknown,
+        km::gate::GateState::Stale => GateState::Stale,
+        km::gate::GateState::Level(n) => GateState::Level(*n),
+        km::gate::GateState::Match(b) => GateState::Match(*b),
+        km::gate::GateState::Value(v) => GateState::Value(value_out(v, spec)),
+    }
+}
+
+/// A model transition as the interface shows it, under its gate's name and given its series' definition.
+pub(crate) fn transition_out(
+    t: &km::gate::Transition,
+    name: String,
+    spec: Option<&SeriesSpec>,
+) -> Transition {
+    let id = id_out(&t.id);
+    let cause = match t.cause.clone() {
+        km::gate::Cause::Fact { position, t } => TransitionCause::Fact {
+            position: pos(position),
+            t: ts(t),
+        },
+        km::gate::Cause::Timer { due, kind } => TransitionCause::Timer {
+            due: ts(due),
+            kind: match kind {
+                km::gate::TimerKind::Hold => TimerKind::Hold,
+                km::gate::TimerKind::Stale => TimerKind::Stale,
+                km::gate::TimerKind::Mature => TimerKind::Mature,
+                km::gate::TimerKind::Window => TimerKind::Window,
+            },
+        },
+        km::gate::Cause::Entry { position } => TransitionCause::Entry {
+            position: pos(position),
+        },
+    };
+    Transition {
+        id,
+        name,
+        series: id.series,
+        from: t.from.as_ref().map(|s| state_out(s, spec)),
+        to: t.to.as_ref().map(|s| state_out(s, spec)),
+        cause,
+        value: t.value.as_ref().map(|v| value_out(v, spec)),
+        event_time: t.event_time.map(ts),
+        now: ts(t.now),
     }
 }
 

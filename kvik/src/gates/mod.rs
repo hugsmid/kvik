@@ -3,7 +3,6 @@
 //! the same log. No clock and no files: facts it cannot hold are read through [`History`].
 
 mod engine;
-#[cfg(test)]
 mod replay;
 mod rules;
 mod seed;
@@ -16,9 +15,9 @@ mod tests;
 
 use std::collections::BTreeMap;
 
-pub(crate) use engine::Core;
-#[cfg(test)]
+pub(crate) use engine::{Core, Frontier};
 pub(crate) use replay::Replay;
+pub(crate) use snapshot::Snapshot;
 
 use kvik_model::gate::ConditionId;
 use kvik_model::types::{Nanos, Position, Quality, SeriesId, Value};

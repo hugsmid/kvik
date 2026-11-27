@@ -35,6 +35,11 @@ impl Watch {
         i.progress
     }
 
+    /// The writer's commit clock.
+    pub fn commit_clock(&self) -> Arc<super::super::CommitClock> {
+        self.shared.commit_clock.clone()
+    }
+
     /// Whether the writer thread has ended.
     pub fn stopped(&self) -> bool {
         lock(&self.shared.info).stopped

@@ -151,8 +151,9 @@ impl Hub {
             .name("kvik-deliver".into())
             .spawn(move || {
                 let mut seen = 0;
+                let mut wait = Duration::from_secs(1);
                 loop {
-                    seen = watch.wait_progress(seen, Duration::from_secs(1));
+                    seen = watch.wait_progress(seen, wait);
                     if watch.stopped() || hub.closed.load(Ordering::SeqCst) {
                         break;
                     }
@@ -165,13 +166,15 @@ impl Hub {
                     if due {
                         hub.ticked();
                     }
-                    let r = hub.run(|d, c| {
+                    let (r, next) = hub.run(|d, c| {
                         d.pump(c);
                         if due {
                             d.tick(c);
                         }
-                        d.flush_due(c)
+                        (d.flush_due(c), d.gate_wait())
                     });
+                    // A gate timer due before the next second wakes the thread for it (spec §6 Gates, Clock).
+                    wait = next.filter(|_| timers).unwrap_or(Duration::from_secs(1));
                     if let Err(e) = r {
                         hub.failed(&e);
                     }
