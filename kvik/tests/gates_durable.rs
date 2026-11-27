@@ -13,7 +13,7 @@ use common::world::{World, gauge, ready, resync};
 use kvik::{
     ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Funnel, Gate, GateId, GateState,
     Health, Input, Level, Reading, ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store,
-    TransitionId, Value,
+    TransitionId, Value, WriteError,
 };
 use kvik_log::fs::FaultOp;
 use proptest::prelude::*;
@@ -591,9 +591,34 @@ impl Track {
     }
 }
 
-/// Drains and confirms through the `n`th delivery (or the last), recording the confirmation's outcome.
-fn drain(c: &mut Consumer, n: usize, track: &mut Track) -> Result<(), TestCaseError> {
-    let got = ready(c);
+/// Drains and confirms through the `n`th delivery (or the last), recording the confirmation's outcome. With
+/// `stopping`, the process is stopping (`MemFs::crash_after` is armed): any cursor write, the `kvik-deliver` thread's
+/// included, may meet the stop and leave the store read-only, so `try_next` may fail (Q-2290); what came before is
+/// still checked, and nothing is confirmed, so every transition it gave must come again.
+fn drain(
+    c: &mut Consumer,
+    n: usize,
+    track: &mut Track,
+    stopping: bool,
+) -> Result<(), TestCaseError> {
+    let mut got = Vec::new();
+    loop {
+        match c.try_next() {
+            Ok(Some(d)) => got.push(d),
+            Ok(None) => break,
+            Err(e) if stopping => {
+                track.take(&got)?;
+                prop_assert!(
+                    matches!(e, ConsumerError::Write(WriteError::ReadOnly(_))),
+                    "a stopping process fails a poll only read-only: {e:?}"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                prop_assert!(false, "a poll failed outside a stop: {e:?}");
+            }
+        }
+    }
     track.take(&got)?;
     if let Some(i) = (n < got.len()).then_some(n).or(got.len().checked_sub(1)) {
         let upto = track.run.len()
@@ -731,7 +756,7 @@ fn crash_history(name: &str, history: &[Op]) -> Result<(), TestCaseError> {
                 let (name, g) = gate_of(*k, id);
                 let _ = block_on(c.watch(&name, g));
             }
-            Op::Drain(n) => drain(&mut c, *n, &mut track)?,
+            Op::Drain(n) => drain(&mut c, *n, &mut track, false)?,
             Op::Restart => {
                 drop(c);
                 block_on(s.shutdown()).unwrap();
@@ -747,7 +772,7 @@ fn crash_history(name: &str, history: &[Op]) -> Result<(), TestCaseError> {
             } => {
                 w.fs.crash_after(usize::from(*ops));
                 let _ = block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(90.0))]));
-                let _ = drain(&mut c, usize::from(*n), &mut track);
+                drain(&mut c, usize::from(*n), &mut track, true)?;
                 w.stop(s, vec![c], power.then_some(Some(*seed)));
                 s = w.open();
                 c = resume(&s, &mut track)?;
@@ -768,4 +793,40 @@ static REPLAYS_CHECKED: AtomicU64 = AtomicU64::new(0);
 fn next_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Q-2290: the `kvik-deliver` thread's cursor write may meet the stop in the first crash's window before the drain
+/// polls, which then fails read-only.
+#[test]
+fn a_poll_failing_read_only_inside_a_crash_window_is_tolerated() {
+    crash_history(
+        "gates-crashes-2",
+        &[
+            Op::Advance(98),
+            Op::Watch(2),
+            Op::Crash {
+                ops: 4,
+                n: 5,
+                power: false,
+                seed: 15654120068666427350,
+            },
+            Op::Emit(250),
+            Op::Drain(1),
+            Op::Crash {
+                ops: 6,
+                n: 1,
+                power: false,
+                seed: 8938501873652612491,
+            },
+            Op::Drain(5),
+            Op::Emit(14),
+            Op::Crash {
+                ops: 3,
+                n: 2,
+                power: false,
+                seed: 875064321013420437,
+            },
+        ],
+    )
+    .unwrap();
 }
