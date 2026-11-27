@@ -386,3 +386,20 @@ fn no_timer_fires_while_a_batch_assigned_below_the_floor_is_not_yet_judged() {
     clock.advance(Duration::from_secs(100));
     assert!(transitions(&w, true).is_empty(), "the hold never completed");
 }
+
+#[test]
+fn a_pump_on_a_store_without_gates_leaves_the_commit_clock_at_the_last_batch() {
+    let (w, _, clock) = open_clocked("gates-none-clock");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    emit(&w, &clock, s, 50.0);
+    let committed = |w: &Writer| {
+        w.hub()
+            .unwrap()
+            .run(|_, c| c.watch.map(|x| x.commit_clock().floor(i64::MIN).0))
+    };
+    let before = committed(&w);
+    clock.advance(Duration::from_secs(100));
+    assert!(transitions(&w, true).is_empty());
+    assert_eq!(committed(&w), before);
+}
