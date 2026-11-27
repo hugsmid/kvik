@@ -136,7 +136,8 @@ Entry:
 
 An entry starts on a multiple of its level's width (UTC-aligned) and ends a width later. `len` 0 without `stale` is an
 **empty marker**: the node is now empty, hiding an older part's entry. `len` 0 with `stale` is a stale entry with no
-node. A node with no readings is never stored in full (it is an empty marker). All nodes of one series have one form.
+node. A node with no readings is never stored in full (it is an empty marker). All nodes of one series, at every
+level, have one form.
 
 ## T.10 Directory (`0x61`) and directory root (`0x62`)
 Each body is `count: u32`, `record_size: u16`, two reserved bytes, then `count` records.
@@ -153,7 +154,7 @@ Body (104 bytes, then the level table):
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 8 | `seq`: the root sequence the part was written for; among the parts a root lists, the higher `seq` overlays |
+| 0 | 8 | `seq`: for a delta or rebuilt part that of the first root to list it, for a merged part the highest of its inputs (Q-1540); among a root's parts the higher `seq` overlays |
 | 8 | 1 | `class`: 0 delta (a checkpoint), 1 merged, 2 rebuilt; any other value is critical |
 | 9 | 1 | reserved |
 | 10 | 2 | level count |
@@ -181,15 +182,22 @@ invalid, of another kind, of another major version or with non-zero flags, `base
 marker, or a trailer offset that does not lead to a trailer block ending at it; a block header or body checksum that
 fails, a body above 16 MiB or past the trailer, non-zero block flags, reserved bytes or padding; a block of an unknown
 type (a version refusal) or out of the order of T.8; a field past the end of its body, a `uv` not in its shortest form
-or above 64 bits; a record size other than 16 (above it a version refusal), arrays that do not fill the body; an empty
+or above 64 bits; a record size other than the one given (16 for levels, 48 and 32 for directory and directory
+root records; above it a version refusal), arrays that do not fill the body; an empty
 level table, a zero or non-ascending id, a width not a positive whole number of minutes; an unknown class (a version
 refusal); an empty period or one ending beyond `i64`; `file_crc32c` wrong; a nodes block with no entries, a level not
 in the table, a first `gap` not 0, a start or end beyond `i64` or not on its level's width, an unknown entry flag (a
 version refusal), an `as_of` beyond `u32` generations or `u64` sequences, a `base_pos` not the least `as_of` of its
 run; node bytes that fail T.6 (an unknown form is a version refusal), whose span is not the entry's, or with no
-readings; nodes of one series of different forms; runs or entries out of order or overlapping; an entry outside the
+readings; nodes of one series of different forms, at any levels; runs or entries out of order or overlapping; an entry outside the
 period; blocks not split as T.8 says; a directory, directory root or trailer summary that does not match the nodes.
 Every check has a named vector in `tree/tests/refusals.rs`.
+
+The checks come in two tiers. A **whole-file** decode (the scrub, a merge's inputs, tests) makes every check above. A
+**block read** (a reader that takes the trailer, the directory and single nodes blocks of a large part) makes the
+checks of the header, the tail and trailer, the directory records it reads and each block it reads, framing and
+entries; it cannot check the split, the directory against the nodes, a run's `base_pos` against blocks it has not
+read, or `file_crc32c`, and relies on the writer writing only canonical files (T.8).
 
 ## T.12 Tree root (`kind = 19`)
 `<dir>/tree/root-<seq:16 hex>.kvr`: an A.1 header (kind 19, `file_id` equal to `seq`, flags, `base_sequence` and
@@ -209,7 +217,8 @@ reserved bytes zero) and exactly one block (`0x64`, not skippable) that ends the
 | 86 | 2 | reserved |
 
 - **Level** (16): as T.11.
-- **Part** (80), ascending `file_id`, each `seq` distinct: 0 `file_id: u64`; 8 `seq: u64`; 16 `class: u8`;
+- **Part** (80), ascending `file_id`; no two parts of one `seq` overlap in both period and series range
+  (Q-1540): 0 `file_id: u64`; 8 `seq: u64`; 16 `class: u8`;
   17 reserved (3); 20 `file_crc32c: u32`; 24 period start `i64`; 32 period length `u64`; 40 least start; 48 greatest
   end; 56 least series; 64 greatest series; 72 the file's length `u64`. The fields repeat the part's trailer.
 - **Covered** (24), ascending level then start: 0 `level: u8`; 1 reserved (7); 8 `from: i64`; 16 `to: i64`. A range
@@ -220,8 +229,8 @@ reserved bytes zero) and exactly one block (`0x64`, not skippable) that ends the
 - **Retired** (16), ascending `file_id`, none also live: 0 `file_id: u64`; 8 `retired_at: i64` on the commit clock.
 
 **Checks.** As T.11 for the header, the block, the integers, record sizes, arrays, the level table, classes and
-periods; and a root refuses a header `file_id` other than `seq`, anything after its block, parts out of order or
-sharing a `seq`, a part or retired `file_id` at or above `next_file_id`, a covered range that breaks the rule above or
+periods; and a root refuses a header `file_id` other than `seq`, anything after its block, parts out of order, two
+parts of one `seq` whose periods (half-open) and series ranges (inclusive) both overlap, a part or retired `file_id` at or above `next_file_id`, a covered range that breaks the rule above or
 names a level not in the table, floors out of order or with an unknown flag (a version refusal), retired files out of
 order or also live.
 

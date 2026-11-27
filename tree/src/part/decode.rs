@@ -2,10 +2,13 @@ use kvik_log::crc::crc32c;
 use kvik_log::writer::Position;
 
 use super::encode::{base_of, layout};
-use super::{Class, END_MARKER, Entry, KIND, KNOWN, Part, Run, TRAILER_FIXED, block_type};
+use super::{
+    Class, DIRECTORY_RECORD, DIRECTORY_ROOT_RECORD, END_MARKER, Entry, KIND, KNOWN, Part, Run,
+    TRAILER_FIXED, block_type,
+};
 use crate::bytes::DecodeError;
 use crate::frame::{
-    Cursor, FileError, LEVEL_RECORD, Refusal, block, expect_type, fail, header, header_len,
+    Block, Cursor, FileError, LEVEL_RECORD, Refusal, block, expect_type, fail, header, header_len,
 };
 use crate::level::{Level, MINUTE};
 use crate::node::Kind;
@@ -63,10 +66,16 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Part, FileError> {
                         r.entries.extend(n.entries);
                     }
                     last => {
-                        if last.is_some_and(|r| (r.series, r.level) >= (n.series, n.level)) {
+                        if last
+                            .as_ref()
+                            .is_some_and(|r| (r.series, r.level) >= (n.series, n.level))
+                        {
                             return fail(b.at, Refusal::Order);
                         }
-                        kind = None;
+                        // T.9: one form per series, across its levels.
+                        if last.is_none_or(|r| r.series != n.series) {
+                            kind = None;
+                        }
                         kind_matches(&mut kind, &n.entries, b.at)?;
                         if let Some(r) = runs.last() {
                             check_bases(r, &bases)?;
@@ -82,9 +91,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Part, FileError> {
                 bases.push((b.at, n.base));
             }
             block_type::DIRECTORY if root_at.is_none() => {
+                array_record_size(&b, DIRECTORY_RECORD)?;
                 directory_at.get_or_insert(b.at);
             }
-            block_type::DIRECTORY_ROOT if root_at.is_none() => root_at = Some(b.at),
+            block_type::DIRECTORY_ROOT if root_at.is_none() => {
+                array_record_size(&b, DIRECTORY_ROOT_RECORD)?;
+                root_at = Some(b.at);
+            }
             _ => expect_type(&b, 0, KNOWN)?,
         }
         at = b.next;
@@ -224,6 +237,15 @@ fn trailer(body: &[u8], base: u64) -> Result<Trailer, FileError> {
         file_crc,
         levels,
     })
+}
+
+/// The `record_size` of a directory or directory root body (T.10), read before the body is compared with a
+/// re-encoding so that a newer writer's larger records take a version refusal (Q-1462).
+fn array_record_size(b: &Block<'_>, v1: usize) -> Result<(), FileError> {
+    let mut c = Cursor::new(b.body, b.at + 16);
+    c.u32()?;
+    let at = c.at();
+    record_size(c.u16()? as usize, v1, at)
 }
 
 /// A record size: below `v1` is damage, above it a newer version's records (`format.md` A.3).

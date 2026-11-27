@@ -96,7 +96,7 @@ pub struct Run {
 pub struct Part {
     /// The A.1 header: kind 6, the tree's own `file_id`.
     pub header: FileHeader,
-    /// The root sequence the part was written for; a higher one overlays.
+    /// The first listing root's `seq`, or for a merged part its inputs' highest (Q-1540); a higher one overlays.
     pub seq: u64,
     /// Why it was written.
     pub class: Class,
@@ -119,7 +119,7 @@ impl Part {
         let again = decode::decode(&bytes)?;
         if again != *self {
             return Err(EncodeError::Shape(
-                "runs not one per series and level, or an empty run",
+                "a part that does not decode to itself (runs not one per series and level, or empty)",
             ));
         }
         Ok(bytes)
