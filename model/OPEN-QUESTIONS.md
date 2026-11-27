@@ -5285,6 +5285,13 @@ ignored while open). In the same histories, a consumer started at a point below 
 range's reset point by the durable backend and none by the model. **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
 kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
 until then the history property stops restarting and comparing deliveries once an entry is lost.
+Traced at the end of the ignored history: the consumer start synced both marks to the fact, so the second power loss
+loses nothing on the model, which then writes no recovery entry (last position 3, the fact); the history's power loss
+zeroes the fact's bytes on the durable backend anyway, which grows the recorded loss over them (§3 Recovery rule 2)
+and writes an entry at 4. §3 Recovery rule 3 has a start on another boot write an entry unless it adopts one, and the
+last kept batch is a fact, so the model is the backend at fault on the last position; the history also cuts a batch
+the mark was synced past, which no power loss does. Both are to be ruled, with a fault on each backend that loses the
+same bytes, before step 5 compares whole histories.
 
 ## Q-1621 — A start whose position the synced mark cannot reach
 
@@ -5324,6 +5331,14 @@ returns those events again, so dropping the round's collector lost facts for eve
 **Decision.** The round finishes as not whole, so every session is told `Lagged`; its collector is never carried
 over, since a carried collector grows without bound while the fault lasts. A round that took nothing is dropped.
 **Pinned by.** `kvik/src/durable/read/live/lags.rs` `a_round_failing_after_taking_events_lags_the_tail_it_took_them_for`.
+
+## Q-2010 — A saved point judged after it answered unknown
+
+§7 Readers, Reset stamp and saved points. A point answers unknown while no kept entry carries the mark's stamp; a
+later recovery writes an entry that carries the new stamp, after which the same point answers void above, a position
+higher than unknown's nothing. **Decided by the lead, 27 November:** allowed; unknown already told the holder to
+start again as if it kept no position, so "never rises" holds only until a point answers unknown
+(`kvik/tests/saved_points.rs`, the history property).
 
 ## Open at v0.2
 
@@ -5540,7 +5555,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
 | Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
 | Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
-| Q-1631 | 5.3 step 5 | Open: a lost recovery entry, then a power loss or a consumer below it; the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-1631 | 5.3 step 5, before it compares whole histories | Open: the model is wrong on the last position (no recovery entry on another boot after a lost entry, against §3 Recovery rule 3), and the history cuts a batch the mark was synced past; until ruled the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-2010 | 5.3 step 2 | Decided by the lead: a point that answered unknown may later answer void above |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |

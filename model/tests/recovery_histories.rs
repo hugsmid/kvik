@@ -872,8 +872,21 @@ impl RWorld {
                 seen.losses.insert(key, (l.first, l.last));
             }
         }
+        // A loss folded into a lower identity stays listed as one it absorbed (§8 Acknowledging a loss, Q-1108).
+        let absorbed: BTreeSet<_> = losses
+            .iter()
+            .flat_map(|l| {
+                l.absorbed
+                    .iter()
+                    .map(move |i| (*i, l.kind == LossKind::PossibleLoss))
+            })
+            .collect();
         for key in seen.losses.keys().filter(|_| self.checks.inv27) {
-            prop_assert!(keys.contains(key), "loss {:?} no longer listed", key);
+            prop_assert!(
+                keys.contains(key) || absorbed.contains(key),
+                "loss {:?} no longer listed",
+                key
+            );
         }
         seen.possible = seen.possible.max(
             losses
@@ -973,6 +986,39 @@ proptest! {
     ) {
         run_recovery(&ops, &mut Seen::default(), Checks { reuse: true, ..NONE })?;
     }
+}
+
+#[test]
+fn recovery_history_a_recorded_loss_folded_into_a_lower_one_stays_listed_as_absorbed() {
+    let t = || ROp::Take { c: 0, n: 4 };
+    let ops = [
+        ROp::PowerLoss(0),
+        t(),
+        ROp::PowerLoss(0),
+        ROp::Define,
+        ROp::Ingest(1, None),
+        ROp::Merge,
+        ROp::PowerLoss(0),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::LoseMark(false),
+        ROp::CorruptSealed(0),
+        t(),
+        ROp::Corrupt(5),
+        t(),
+        ROp::Corrupt(2),
+        ROp::LoseMark(false),
+        ROp::Ingest(1, None),
+        ROp::Corrupt(2),
+        t(),
+    ];
+    let checks = Checks {
+        inv27: true,
+        ..NONE
+    };
+    run_recovery(&ops, &mut Seen::default(), checks).unwrap();
 }
 
 #[test]
