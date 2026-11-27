@@ -1,9 +1,9 @@
 //! The dirty set (design 7.1b section 5 Commit path): the `(series, quarter-hour)` pairs whose nodes a checkpoint
 //! must bring up to its K, and the series whose nodes a registry entry changed.
 //!
-//! A call's pairs are marked before its facts are offered to the log, so every fact at or below a position the
-//! checkpoint takes as K after taking the set had its pair marked first. A pair stays while a call that marked it is
-//! unsettled or its last acknowledged position is above the K of the checkpoint that cleared it.
+//! A call's pairs are marked before its facts are offered to the log, and a checkpoint takes K first and the set
+//! after (Q-1830), so the set it takes holds the pair of every fact at or below K. A pair stays while a call that
+//! marked it is unsettled or its last acknowledged position is above the K of the checkpoint that cleared it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -44,12 +44,19 @@ struct State {
 #[derive(Debug, Default)]
 pub(crate) struct Dirty(Mutex<State>);
 
+/// The start of `t`'s quarter-hour when the whole quarter-hour fits in an `i64`. One that does not is outside every
+/// covered range (`covered_all` rounds inwards), so T1 never asks the tree for it and it is never marked.
+pub(crate) fn quarter_of(t: i64) -> Option<i64> {
+    let q = t.checked_sub(t.rem_euclid(QUARTER))?;
+    q.checked_add(QUARTER).map(|_| q)
+}
+
 /// The pairs of a call's facts, each once.
 pub(crate) fn keys_of(items: &[Item]) -> Vec<Key> {
     let mut v: Vec<Key> = items
         .iter()
         .filter_map(|i| match i {
-            Item::Fact(r) => Some((r.series_id, r.t - r.t.rem_euclid(QUARTER))),
+            Item::Fact(r) => quarter_of(r.t).map(|q| (r.series_id, q)),
             Item::Entry(_) => None,
         })
         .collect();
@@ -223,5 +230,17 @@ mod tests {
             row(2, -1),
         ];
         assert_eq!(keys_of(&items), [(1, QUARTER), (2, -QUARTER), (2, 0)]);
+    }
+
+    #[test]
+    fn quarter_of_refuses_the_quarter_hours_that_do_not_fit() {
+        assert_eq!(quarter_of(i64::MIN), None);
+        assert_eq!(quarter_of(i64::MIN + 1), None);
+        assert_eq!(quarter_of(i64::MAX), None);
+        let last = i64::MAX - i64::MAX.rem_euclid(QUARTER) - QUARTER;
+        assert_eq!(quarter_of(last + QUARTER - 1), Some(last));
+        let first = i64::MIN + (QUARTER - i64::MIN.rem_euclid(QUARTER)) % QUARTER;
+        assert_eq!(quarter_of(first), Some(first));
+        assert_eq!(quarter_of(-1), Some(-QUARTER));
     }
 }

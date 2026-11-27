@@ -5379,6 +5379,8 @@ does (the registry file is written from the deliverer's index without reading th
 **Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
 leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
 that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it.
+A first step that comes at a clean shutdown with no reader open does not start the tree either, since the start's
+pass reads the log (`a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree`).
 
 ## Q-1951 — One reader for the tree's checkpoints and the process's reads
 Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
@@ -5386,6 +5388,61 @@ Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
 start opened it only to learn whether the store held a series.
 **Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
 if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
+
+## Q-1952 — A fan-out session answers a race with an older value
+Recorded with roadmap 7.1b step 3, open; for a fix of the live fan-out (`kvik/src/durable/read/live/fanout.rs`).
+**Scenario.** The property `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive`
+found a history (pinned, ignored, as `a_race_between_two_rounds_of_one_series_delivers_the_later_value`) in which a
+session polled only when rung answers a `Latest` read with the value at sequence 6 where every-round sessions and the
+model give the one at sequence 11. It fails the same way on public main.
+**Recommended default.** Treat as a delivery bug: a later value of a series in the round that races the session's turn
+must reach it. Fix with the fan-out, then remove the `ignore`.
+
+## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
+Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
+with 71b-4.
+**Scenario.** The mark is synced every `log.mark_sync` (1 s by default), so for up to a second after each commit the
+durable position, and with it a cut's K, is above the synced mark, and the tree refuses a root naming it. A store
+taking a commit a second or more never took an interval checkpoint.
+**Decision (provisional).** After taking its cut, an interval checkpoint whose K is above the synced mark has the log
+sync the mark through K (`Watch::sync_mark`) and checkpoints with what it returns: at most one extra mark sync an
+interval, 96 a day. A clean shutdown keeps the mark its own sync left. Alternative not taken: answer "not yet", ask
+for a sync as the derived files do, and retry within a second.
+Test: `an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds`.
+
+## Q-2181 — K of a tree started on a store with facts and no root
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `start`), provisional; settle with 71b-4.
+**Scenario.** A store with facts and no tree starts an empty root that covers nothing, with K at the origin; the
+start's pass from the origin read the whole log and, by Q-1832, floored every series defined in it.
+**Decision (provisional).** When the start continues no root and the store is not fresh, it makes no pass: nothing is
+covered, so nothing below the mark needs marking. The first checkpoint takes K from its cut and writes a root with no
+part and no floor; 71b-4's backfill covers the store from facts. Test:
+`a_store_with_facts_and_no_tree_starts_without_marking_its_log`.
+
+## Q-2182 — A loss found while running
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional; settle with 71b-4.
+**Scenario.** A loss found this run below the root's K discards the tree (Q-1429). The comparison is with the
+manifest's lost ranges as they were at opening, so the same loss discarded the tree again at every later checkpoint
+that left a part.
+**Decision (provisional).** The job remembers the ranges of the losses each discard answered, and discards again only
+for a loss outside them. Test: `a_loss_found_while_running_discards_the_tree_once`.
+
+## Q-2183 — A checkpoint with nothing to write
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional.
+**Scenario.** An idle store published a root every interval: a file, a file sync and a directory sync, 96 times a
+day.
+**Decision (provisional).** With no dirty pair, no series to floor, no discard and K equal to the root's, the step
+removes the retired parts that are due and counts as a checkpoint without publishing. When only K moved, a root with
+no part is published, so the stretch stays short. Test: `an_idle_store_writes_no_root_at_its_intervals`.
+
+## Q-2184 — How ingest latency is measured for the commit path's dirty set
+Decided with the fix round of roadmap 7.1b step 3, provisional.
+**Scenario.** The commit path gained, per call and under the decision lock, the call's sorted keys and a hash insert
+per pair, and a second lock at the acknowledgement; no bench drove `emit`.
+**Decision (provisional).** `kvik/benches/emit.rs` measures each call from `emit` to its acknowledgement at a home
+rate (one reading a call, 45 calls a second) and at saturation (batches of 100 back to back), and
+`scripts/bench-emit-ab.sh` runs it on a base revision and the head, alternating. The result is in
+`docs/measurements/tree-71b-3-ingest-latency.md`.
 
 ## Q-2070 — The stretch limit counted in log positions
 Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.

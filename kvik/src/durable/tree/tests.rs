@@ -310,6 +310,72 @@ fn a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_no
 }
 
 #[test]
+fn an_interval_checkpoint_opens_the_stores_reader_and_writes_a_root() {
+    let mut st = Store::new("interval");
+    st.emit(Intent::Normal, &[(10, Some(1.0)), (5, Some(2.0))]);
+    assert!(lock(&st.w.reader).is_none());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        st.clock.advance(Duration::from_secs(16 * 60));
+        let tree = st.dir.join(DIR);
+        let rooted = st
+            .fs
+            .read_dir(&tree)
+            .is_ok_and(|es| es.iter().any(|e| e.name.ends_with(".kvt")));
+        if rooted && st.w.tree.as_ref().unwrap().behind().is_none() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no interval checkpoint");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        lock(&st.w.reader).is_some(),
+        "the job opened the store's reader"
+    );
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn a_shutdown_step_that_takes_no_checkpoint_does_not_count_as_one() {
+    let mut st = Store::new("skipped");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.shutdown().unwrap();
+    assert!(lock(&st.w.reader).is_none());
+    let job = st.w.tree.clone().unwrap();
+    let far = Duration::from_secs(1 << 30);
+    job.step(kvik_log::writer::Position::default(), far, true);
+    let behind = job
+        .behind()
+        .expect("tree_behind after intervals without a checkpoint");
+    assert!(behind.starts_with("no checkpoint for "), "{behind}");
+    drop(st);
+    job.step(kvik_log::writer::Position::default(), far, false);
+    assert_eq!(
+        job.behind().as_deref(),
+        Some("tree reader: none"),
+        "an interval step with no store to read fails"
+    );
+}
+
+#[test]
+fn a_store_with_series_and_no_tree_starts_a_tree_that_covers_nothing() {
+    let mut st = Store::new("untreed");
+    history(&mut st);
+    st.stop();
+    let tree = st.dir.join(DIR);
+    for e in st.fs.read_dir(&tree).unwrap() {
+        st.fs.remove_file(&tree.join(&e.name)).unwrap();
+    }
+    st.reopen();
+    st.stop();
+    let (root, _) = tree_state(&st.fs, &st.dir);
+    assert!(
+        root.covered.is_empty(),
+        "not fresh: covered until backfill (Q-1834, Q-1951)"
+    );
+}
+
+#[test]
 fn failing_tree_writes_degrade_health_with_tree_behind_and_never_stop_ingest() {
     let mut st = Store::new("behind");
     st.emit(Intent::Normal, &[(10, Some(1.0))]);
@@ -339,5 +405,230 @@ fn failing_tree_writes_degrade_health_with_tree_behind_and_never_stop_ingest() {
     );
     st.emit(Intent::Normal, &[(5, Some(2.0))]);
     assert!(st.fs.read(&st.dir.join(DIR).join(root_name(1))).is_none());
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds() {
+    let mut st = Store::new("unsynced");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    let r = st.w.reader().unwrap();
+    st.clock.advance(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(300));
+    st.emit(Intent::Normal, &[(1, Some(2.0))]);
+    let synced = st.w.log().as_ref().unwrap().stats().mark_synced;
+    let v = r.snapshot().unwrap();
+    assert!(
+        v.cut().durable > synced,
+        "the commit is above the synced mark"
+    );
+    let _ = r.end(v);
+    let job = st.w.tree.clone().unwrap();
+    job.step(synced, Duration::from_secs(1 << 30), false);
+    assert_eq!(job.behind(), None);
+    st.w.shutdown().unwrap();
+}
+
+fn emit_at(st: &Store, t: i64) {
+    let r = Reading::new(st.id, crate::time::Timestamp(t), Value::F64(1.0));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        st.w.emit(&[r], Intent::Normal, true).map(wait)
+    }));
+    assert!(out.is_ok(), "emit panicked at {t}");
+}
+
+#[test]
+fn a_reading_at_the_least_instants_is_taken_and_checkpointed() {
+    let st = Store::new("least");
+    emit_at(&st, i64::MIN + 1);
+    emit_at(&st, i64::MIN);
+    st.stop();
+}
+
+#[test]
+fn a_reading_at_the_greatest_instant_is_taken_and_checkpointed() {
+    let st = Store::new("greatest");
+    emit_at(&st, i64::MAX);
+    emit_at(&st, i64::MAX - QUARTER_NS);
+    st.stop();
+}
+
+const QUARTER_NS: i64 = kvik_tree::set::QUARTER;
+
+fn step_at(st: &Store, hours: u64) {
+    let job = st.w.tree.clone().unwrap();
+    job.step(
+        kvik_log::writer::Position::default(),
+        Duration::from_secs((1 << 30) + hours * 3_600),
+        false,
+    );
+    assert_eq!(job.behind(), None);
+}
+
+fn found_loss(st: &Store, first: u64, last: u64) {
+    use crate::health::{LossCause, LossKind, LossReport, MarkState};
+    use crate::types::Position;
+    let g = st.w.log().as_ref().unwrap().stats().durable.generation;
+    let report = LossReport {
+        identity: Position::new(g, first),
+        kind: LossKind::DataLost,
+        cause: LossCause::Corruption,
+        first: Some(Position::new(g, first)),
+        last: Some(Position::new(g, last)),
+        file_id: Some(1),
+        bytes: 1,
+        readable_commit_blocks: 0,
+        mark_state: MarkState::Readable,
+        boot_id: None,
+        commit_time_before: None,
+        commit_time_after: None,
+        cursors_missing: Vec::new(),
+        recorded: false,
+        acknowledged: false,
+        absorbed: Vec::new(),
+    };
+    let at = |sequence| kvik_log::writer::Position {
+        generation: g,
+        sequence,
+    };
+    st.w.latch.note(&[crate::durable::loss::Find {
+        report,
+        file_id: 1,
+        span: (0, 1),
+        closed: (at(first), at(last)),
+    }]);
+}
+
+#[test]
+fn a_loss_found_while_running_discards_the_tree_once() {
+    let mut st = Store::new("loss-once");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.reader().unwrap();
+    step_at(&st, 0);
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    assert!(!first.parts.is_empty());
+    found_loss(&st, 1, 1);
+    st.emit(Intent::Normal, &[(5, Some(2.0))]);
+    step_at(&st, 1);
+    let (discarded, _) = tree_state(&st.fs, &st.dir);
+    assert!(discarded.floor > first.seq, "the loss raised the floor");
+    st.emit(Intent::Normal, &[(4, Some(3.0))]);
+    step_at(&st, 2);
+    let (next, _) = tree_state(&st.fs, &st.dir);
+    assert!(next.seq > discarded.seq);
+    assert_eq!(
+        next.floor, discarded.floor,
+        "the same loss discards nothing again"
+    );
+    assert!(!next.parts.is_empty());
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn a_store_with_facts_and_no_tree_starts_without_marking_its_log() {
+    let mut st = Store::new("no-pass");
+    for _ in 0..3 {
+        st.emit(Intent::Normal, &[(10, Some(1.0)), (5, Some(2.0))]);
+        st.clock.advance(Duration::from_secs(86_400));
+    }
+    st.stop();
+    let tree = st.dir.join(DIR);
+    for e in st.fs.read_dir(&tree).unwrap() {
+        st.fs.remove_file(&tree.join(&e.name)).unwrap();
+    }
+    st.reopen();
+    st.stop();
+    let (root, _) = tree_state(&st.fs, &st.dir);
+    assert!(root.checkpoint.sequence > 0, "K moved to the cut");
+    assert!(root.parts.is_empty(), "{} parts", root.parts.len());
+    assert!(root.floors.is_empty(), "{} floors", root.floors.len());
+}
+
+#[test]
+fn an_idle_store_writes_no_root_at_its_intervals() {
+    let mut st = Store::new("idle");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.reader().unwrap();
+    step_at(&st, 0);
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    for h in 1..4 {
+        step_at(&st, h);
+    }
+    let (last, _) = tree_state(&st.fs, &st.dir);
+    assert_eq!(last.seq, first.seq);
+    st.emit(Intent::Normal, &[(5, Some(2.0))]);
+    step_at(&st, 4);
+    assert!(tree_state(&st.fs, &st.dir).0.seq > first.seq);
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree() {
+    let fs = MemFs::new();
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock);
+    env.fs = Arc::new(fs.clone());
+    let dir = PathBuf::from("tree-unit/no-start");
+    let job = super::Job::new(super::job::Parts {
+        dir: dir.clone(),
+        env,
+        latch: Arc::default(),
+        recorded: Vec::new(),
+        id: kvik_tree::write::Identity {
+            generation: 1,
+            reset: Default::default(),
+            store_id: [0; 16],
+        },
+        fresh: false,
+        dirty: Arc::default(),
+    });
+    job.readers(Box::new(|_| Ok(None)));
+    fs.create_dir_all(&dir.join(DIR)).unwrap();
+    drop(
+        fs.open(
+            &dir.join(DIR).join("x.tmp"),
+            kvik_log::fs::OpenMode::CreateNew,
+        )
+        .unwrap(),
+    );
+    assert_eq!(job.step(Default::default(), Duration::ZERO, true), None);
+    assert!(fs.read(&dir.join(DIR).join("x.tmp")).is_some());
+    assert_eq!(job.behind(), None);
+    job.step(Default::default(), Duration::ZERO, false);
+    assert!(
+        fs.read(&dir.join(DIR).join("x.tmp")).is_none(),
+        "an interval step starts it"
+    );
+}
+
+#[test]
+fn a_call_whose_outcome_is_unknown_keeps_its_pairs_marked() {
+    let st = Store::new("unknown");
+    assert_eq!(st.w.dirty.len(), 0);
+    st.fs.fail_syncs(true);
+    let r = Reading::new(st.id, st.clock.wall(), Value::F64(1.0));
+    if let Ok(Emitted::Queued(mut q)) = st.w.emit(&[r], Intent::Normal, true) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let out = loop {
+            if let Poll::Ready(r) = q.poll(&mut cx) {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(out.is_err(), "the sync failed");
+    }
+    assert_eq!(st.w.dirty.len(), 1);
+}
+
+#[test]
+fn a_node_changing_entry_committed_under_the_decision_lock_marks_its_series() {
+    let st = Store::new("held");
+    let t_r = st.clock.wall().0;
+    st.w.commit_entry_held(
+        &mut lock(&st.w.decider),
+        kvik_log::entries::Entry::Retirement { id: st.id.0, t_r },
+    )
+    .unwrap();
+    assert!(st.w.dirty.take().1.contains(&st.id.0));
     st.w.shutdown().unwrap();
 }

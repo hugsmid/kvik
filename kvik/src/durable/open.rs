@@ -219,6 +219,9 @@ impl Writer {
                     source,
                 }
             })?;
+        if let Some(job) = &tree_job {
+            job.marks(log.watch());
+        }
         let watch_log = log.watch();
         hook.fold.follow(move || watch_log.mark_synced());
         let counters = Arc::new(Mutex::new(counters));
