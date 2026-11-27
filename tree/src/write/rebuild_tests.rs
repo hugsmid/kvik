@@ -349,6 +349,28 @@ fn t1_holds_when_a_series_rebuild_resumed_after_a_kill_finds_a_node_now_empty() 
 }
 
 #[test]
+fn a_one_period_floor_close_raises_the_floor_to_its_own_root_seq() {
+    let mut w = World::new();
+    w.append(&[(0, 600 * S, Some(1.0))]);
+    w.sync();
+    w.checkpoint_with(&BTreeSet::from([0])).unwrap();
+    for _ in 0..3 {
+        w.checkpoint().unwrap();
+    }
+    close_floors(&mut w).unwrap();
+    let root = w.files.as_ref().unwrap().root();
+    assert_eq!(root.parts.len(), 1, "one period rebuilt");
+    assert_eq!(
+        root.floors,
+        vec![root::Floor {
+            series: 0,
+            seq: root.seq,
+            rebuilding: false,
+        }]
+    );
+}
+
+#[test]
 fn t8_holds_when_a_repair_follows_a_start_that_refused_a_newer_root() {
     use Act::Checkpoint as C;
     let h = 3_600_000_000_000;
