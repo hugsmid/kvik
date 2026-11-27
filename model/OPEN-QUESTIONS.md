@@ -199,6 +199,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1535 | compaction design §3.1, §4; `format-compacted.md` B.1 | Count passes ahead of write passes (provisional) |
 | Q-1536 | compaction design §4 Memory | Index entries and a window's entries counted, not spilled (provisional) |
 | Q-1537 | compaction design §4 Memory | A series too large for one pass taken a range of `t` at a time (provisional) |
+| Q-1850 | `format.md` A.14 `0x21`; compaction design §2, §3.4; Q-792 | Publish record field 3, the layout, and records without it (provisional) |
+| Q-1851 | compaction design §3.5; `spec.md` §7 Manifest step 2 | The rebuild's verdict on outputs no valid record names (provisional) |
+| Q-1852 | compaction design §3.4, §3.5 | A merge's counts after a rebuild restates a retirement without its layout (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5305,6 +5308,24 @@ Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
 **Scenario.** Series go to passes in name order, in groups whose rows fit half of what the cap leaves; a full segment of one series does not fit one group.
 **Decision (provisional).** A series larger than a group is split into up to 64 ranges of `t` of equal width between its least and greatest `t`, taken in order by successive passes, with its writers' series left open between them; its set-aside facts go with the first range. A range holds whole keys, so ranking is unchanged. When a series is renamed in the inputs, every series is one group, since each file then orders its series by its own names (Q-1412). Reason: equal widths fit readings at a steady rate; a series whose rows bunch in a narrow range of `t`, or a rename, can still pass the cap, which 6.2c's benchmarks are to show or rule out.
 **Pinned by.** `kvik/src/durable/compact/tests/task.rs` `peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes` (one series, 350,000 facts).
+
+## Q-1850 — Publish record field 3, the layout, and records without it
+Decided with roadmap 6.3e, provisional. To be settled by the owner with Q-792.
+**Scenario.** The compaction design adds a repeated field 3 to the publish record: one layout per published compacted file, in the order of field 1, so that the catalogue checks counts and finds C(g) without opening files (§3.4). Q-792 asks the owner to accept it as an addition inside version 1. Publish records written before it (by tests, and by a rebuild restating a file whose layout it cannot read) have none.
+**Decision (provisional).** Field 3 is laid out as `format.md` A.14 now states (`kvik_files::layout::CompactedLayout`) and is decoded strictly. A record carries a layout for every published compacted file or for none. The catalogue's rule covers the files that have a layout; a file without one is outside rules 1, 3 and 4 and is counted only as naming its inputs (rule 2, C(g)). The writer judges only new records with layouts. Reason: no released version wrote a publish record, so a record without field 3 comes only from tests or a restatement; refusing it would refuse every manifest the 6.3a tests write.
+**Pinned by.** `files/tests/records.rs` `a_publish_record_refuses_layouts_that_are_not_one_per_compacted_file_in_order`; `files/src/layout.rs` tests; `files/tests/compaction_rule.rs`.
+
+## Q-1851 — The rebuild's verdict on outputs no valid record names
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5 discards an output no valid record names only when nothing names any file of its run, its inputs are local and pass their checksums, and the run's files fail against them; otherwise it is live if it verifies or an input is not at hand, and kept and held where neither can be said. The rebuild's verifier judged one output at a time and an output was either published or discarded.
+**Decision (provisional).** The rebuild groups the outputs no valid record names into runs by shared inputs (a log segment is the input of one run, rule 1; a compacted file of one merge) and asks the verifier once per run, with the run's local files and inputs; it answers holds, fails or cannot say (`kvik_files::rebuild::Verdict`). A run one of whose files shares an input with a file a valid record names (published, retired or as an input) is never discarded: a failure counts as cannot say. Cannot say with every input at hand puts the file in `RebuildPlan::held`: it stays on disk, unlisted, and is not removed by the start's clean-up. With an input not at hand the file is published without a verdict, as before. Reason: a run's files are published by one record, so a sibling a valid record names proves that record existed; and an output alone cannot be checked for counts against inputs it shares with its siblings.
+**Pinned by.** `files/tests/unnamed_outputs.rs`; `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1852 — A merge's counts after a rebuild restates a retirement without its layout
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** A run's publish record is corrupt and a later merge, whose record is valid, retired the run's files. The rebuild restates the retirement from the merge record, which carries no layout of a retired file, so rule 3 cannot compare the merge's counts with its inputs'.
+**Decision (provisional).** The rule is undecided, naming the inputs; the catalogue holds runs, merges, removals and releases until a copy of the corrupt record is supplied (§3.4). C(g) still follows the retired files' inputs. *Alternative:* read the retired files' layouts from the files where they are still local. Reason: the hold is what §3.4 prescribes for an undecidable check, and merges, which make the case reachable, are roadmap 6.2c.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_corrupt_record_rebuilt_at_any_epoch_keeps_the_rule_and_c_g`.
 
 ## Open at v0.2
 

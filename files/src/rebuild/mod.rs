@@ -26,6 +26,7 @@ use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 use crate::catalogue::{Catalogue, CatalogueError};
 use crate::desc::{FileDescription, FileRef, kind};
 use crate::image::{CorruptSpan, Image};
+use crate::layout::CompactedLayout;
 use crate::record::{Body, EncodeError, Publish, Rebuild, Record, record_type};
 
 mod copies;
@@ -59,12 +60,25 @@ pub struct LocalFile {
     pub place: Place,
     /// Whether it passed its own checksums and its plaintext hash. A file that did not is not a valid local file.
     pub verified: bool,
+    /// A compacted file's layout, read from its own description and trailer, for a restated publish record.
+    pub layout: Option<CompactedLayout>,
 }
 
-/// The §7 procedure: whether `output` holds exactly the facts of `inputs` (roadmap 6.2 implements it).
+/// What the §7 procedure says of a set of outputs against their inputs (compaction design §3.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The outputs hold exactly the positions of their inputs.
+    Holds,
+    /// The outputs fail a check of compaction design §3.2 against their inputs.
+    Fails,
+    /// Neither can be said: the outputs found are not the whole run, or a check could not run.
+    CannotSay,
+}
+
+/// The §7 procedure, judging the files of one run found locally against that run's inputs (compaction design §3.5).
 pub trait Verifier {
-    /// Whether `output` verifies against `inputs`.
-    fn verify(&self, output: &LocalFile, inputs: &[&LocalFile]) -> bool;
+    /// What `outputs`, the files of one run no valid record names, are against `inputs`.
+    fn verify(&self, outputs: &[&LocalFile], inputs: &[&LocalFile]) -> Verdict;
 }
 
 /// A range of positions the scan of the log finds missing (between the batches of a segment, between segments, or
@@ -137,6 +151,9 @@ pub struct RebuildPlan {
     /// Outputs no valid record names that do not verify against their inputs: discarded, as an unlisted output is
     /// (`spec.md` §9 row 10), once the rebuilt manifest is synced and nothing holds removals.
     pub discard: Vec<FileRef>,
+    /// Outputs no valid record names that can be neither published nor discarded (compaction design §3.5): kept,
+    /// unlisted, holding runs, merges, removals and releases until the record or the file is supplied.
+    pub held: Vec<FileRef>,
     /// Files under `quarantine/`: never live.
     pub quarantined: Vec<FileRef>,
     /// Compacted files a corrupt record retired, named only as an input, that neither a valid record nor a local
@@ -181,6 +198,41 @@ pub enum RebuildError {
     /// No epoch is left above the manifest's and the leases'.
     #[error("no manifest epoch is left")]
     EpochsExhausted,
+}
+
+/// The candidates grouped into runs: outputs that share an input, transitively. A log segment is the input of one
+/// run (compaction design §3.4 rule 1) and a compacted file of one merge, so the files of a run share their inputs.
+fn runs(candidates: &[(FileRef, &LocalFile)]) -> Vec<Vec<FileRef>> {
+    let mut groups: Vec<(BTreeSet<FileRef>, Vec<FileRef>)> = Vec::new();
+    for (r, f) in candidates {
+        let mut inputs: BTreeSet<FileRef> = f.description.inputs.iter().copied().collect();
+        let mut members = vec![*r];
+        let (joined, rest): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .partition(|(i, _)| !i.is_disjoint(&inputs));
+        for (i, m) in joined {
+            inputs.extend(i);
+            members.extend(m);
+        }
+        members.sort();
+        groups = rest;
+        groups.push((inputs, members));
+    }
+    groups.into_iter().map(|(_, m)| m).collect()
+}
+
+/// The layouts of a restated publish record: every published compacted file's, from the file, or none when one is
+/// not known.
+fn restated_layouts(
+    published: &[FileDescription],
+    local: &BTreeMap<FileRef, &LocalFile>,
+) -> Vec<CompactedLayout> {
+    published
+        .iter()
+        .filter(|d| d.kind == kind::COMPACTED)
+        .map(|d| local.get(&d.file_ref()).and_then(|l| l.layout.clone()))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// How far above the highest id seen each `file_id` floor is (`format.md` A.14, rebuild record field 5).
@@ -274,6 +326,50 @@ pub fn plan(
         .filter(|(r, _)| r.kind == kind::COMPACTED && old.file(**r).is_none() && !gone.contains(*r))
         .map(|(r, f)| (*r, *f))
         .collect();
+    // Files a valid record names, published, retired or as an input, with their inputs: a sibling among them makes
+    // its run's other outputs never discarded (compaction design §3.5).
+    let named: Vec<FileDescription> = old
+        .files()
+        .map(|e| e.description.clone())
+        .chain(gone.iter().filter_map(&describe))
+        .collect();
+    let mut verdicts: BTreeMap<FileRef, Verdict> = BTreeMap::new();
+    for run in runs(&candidates) {
+        let files: Vec<&LocalFile> = run.iter().map(|r| local[r]).collect();
+        let inputs_of: BTreeSet<FileRef> = files
+            .iter()
+            .flat_map(|f| f.description.inputs.iter().copied())
+            .collect();
+        let sibling_named = named
+            .iter()
+            .any(|d| d.inputs.iter().any(|i| inputs_of.contains(i)));
+        let all_at_hand = files.iter().all(|f| {
+            f.description
+                .inputs
+                .iter()
+                .filter(|i| {
+                    i.kind == kind::LOG_SEGMENT || live.contains(i) || old.file(**i).is_none()
+                })
+                .all(|i| local.contains_key(i))
+        });
+        let inputs: Vec<&LocalFile> = inputs_of
+            .iter()
+            .filter_map(|i| local.get(i).copied())
+            .collect();
+        let v = if all_at_hand {
+            verifier.verify(&files, &inputs)
+        } else {
+            Verdict::CannotSay
+        };
+        let v = match v {
+            Verdict::Fails if sibling_named => Verdict::CannotSay,
+            v => v,
+        };
+        for r in run {
+            verdicts.insert(r, v);
+        }
+    }
+    let mut held = Vec::new();
     for (r, f) in candidates {
         let r = &r;
         let live_inputs: Vec<FileRef> = f
@@ -298,13 +394,12 @@ pub fn plan(
                 i.kind == kind::LOG_SEGMENT || live_inputs.contains(i) || old.file(**i).is_none()
             })
             .all(|i| local.contains_key(i));
-        let inputs: Vec<&LocalFile> = f
-            .description
-            .inputs
-            .iter()
-            .filter_map(|i| local.get(i).copied())
-            .collect();
-        if !at_hand || verifier.verify(f, &inputs) {
+        let verdict = verdicts[r];
+        if verdict == Verdict::CannotSay && at_hand {
+            held.push(*r);
+            continue;
+        }
+        if !at_hand || verdict == Verdict::Holds {
             published.push(f.description.clone());
             live.insert(*r);
             for i in live_inputs {
@@ -494,6 +589,7 @@ pub fn plan(
             generation,
             input.written_at,
             Body::Publish(Publish {
+                layouts: restated_layouts(&published, &local),
                 published,
                 retired: retired.into_values().collect(),
             }),
@@ -523,6 +619,7 @@ pub fn plan(
         catalogue,
         locations,
         discard,
+        held,
         quarantined,
         invalid,
         undescribed,

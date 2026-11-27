@@ -71,6 +71,7 @@ proptest! {
 
 fn publish() -> Body {
     Body::Publish(Publish {
+        layouts: Vec::new(),
         published: vec![compacted(
             5,
             FileClass::Current,
@@ -89,15 +90,18 @@ fn the_checks_of_each_record_type() {
     assert!(!ok(Body::Publish(Publish::default())));
     let d = compacted(5, FileClass::Current, (1, 20), &[seg_ref(1)]);
     assert!(!ok(Body::Publish(Publish {
+        layouts: Vec::new(),
         published: vec![d.clone(), d.clone()],
         retired: vec![]
     })));
     assert!(!ok(Body::Publish(Publish {
+        layouts: Vec::new(),
         published: vec![d.clone()],
         retired: vec![d.clone()]
     })));
     let e = compacted(4, FileClass::Current, (1, 20), &[seg_ref(1)]);
     assert!(!ok(Body::Publish(Publish {
+        layouts: Vec::new(),
         published: vec![d.clone(), e.clone()],
         retired: vec![]
     })));
@@ -633,4 +637,32 @@ fn a_rejected_record_gives_the_same_error_with_its_fields_kept_at_most_twice() {
     };
     assert_eq!(ack(2), Err(RecordError::Invalid("field 2 twice")));
     assert_eq!(ack(5), ack(2));
+}
+
+#[test]
+fn a_publish_record_refuses_layouts_that_are_not_one_per_compacted_file_in_order() {
+    let a = compacted(100, FileClass::Current, (1, 10), &[seg_ref(1)]);
+    let b = compacted(101, FileClass::Current, (11, 20), &[seg_ref(1)]);
+    let body = |layouts: Vec<_>| {
+        Record::new(
+            2,
+            0,
+            T0,
+            Body::Publish(Publish {
+                published: vec![a.clone(), b.clone()],
+                retired: Vec::new(),
+                layouts,
+            }),
+        )
+    };
+    assert!(body(vec![layout_of(&a), layout_of(&b)]).encode().is_ok());
+    assert!(body(vec![layout_of(&a)]).encode().is_err());
+    assert!(body(vec![layout_of(&b), layout_of(&a)]).encode().is_err());
+    let mut other_generation = layout_of(&b);
+    other_generation.positions = vec![(1, 10)];
+    assert!(
+        body(vec![layout_of(&a), other_generation])
+            .encode()
+            .is_err()
+    );
 }

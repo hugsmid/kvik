@@ -651,6 +651,7 @@ fn q282_a_record_naming_a_file_retired_before_its_upload_does_not_wait_for_it() 
     upload_support::lock(&h.app())
         .append(
             Body::Publish(kvik_files::record::Publish {
+                layouts: Vec::new(),
                 published: vec![new.clone()],
                 retired: vec![old.clone()],
             }),

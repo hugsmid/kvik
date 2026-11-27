@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use kvik_log::fs::{Fs, FsFile, OpenMode};
 
 use crate::catalogue::{Catalogue, CatalogueError};
+use crate::compaction::{Breach, Judgement, judge, publish_shape};
 use crate::image::{Image, ReadError, read};
 use crate::record::{Acknowledgement, Body, EncodeError, Record};
 use crate::{MANIFEST, MANIFEST_NEW};
@@ -143,6 +144,12 @@ pub enum AppendError {
     /// A rebuild acknowledgement while the rebuild is provisional (`api.md` `WriteError::NotFinal`).
     #[error("the manifest rebuild is provisional")]
     NotFinal,
+    /// A publish record that would break the catalogue's rule for compacted files (compaction design §3.4).
+    #[error(transparent)]
+    Breach(#[from] Breach),
+    /// A new publish record while the catalogue's rule is undecided or broken (compaction design §3.4 hold).
+    #[error("compaction is held: the catalogue's rule is not decided")]
+    CompactionHeld,
 }
 
 /// Why a rebuild acknowledgement was refused.
@@ -176,6 +183,8 @@ pub struct Appender {
     /// The corrupt records of a provisional rebuild not yet answered for in this run.
     pending: Vec<Gap>,
     dropped_tail: u64,
+    /// The catalogue's rule as last judged: at open, and after each publish, sealed-segment or carried record.
+    compaction: Judgement,
 }
 
 pub(crate) fn read_file(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
@@ -296,6 +305,7 @@ impl Appender {
             next_epoch,
             synced: image.last_epoch(),
             generation: image.records.last().map_or(0, |p| p.record.generation),
+            compaction: judge(&catalogue),
             catalogue,
             faulted: false,
             rebuild,
@@ -320,6 +330,19 @@ impl Appender {
             return Err(AppendError::NotFinal);
         }
         self.catalogue.check(&r)?;
+        if let (Body::Publish(p), None) = (&r.body, r.old_epoch)
+            && !p.layouts.is_empty()
+        {
+            if self.compaction.holds_compaction() {
+                return Err(AppendError::CompactionHeld);
+            }
+            publish_shape(p)?;
+            let mut after = self.catalogue.clone();
+            after.apply(&r)?;
+            if let Judgement::Broken(b) = judge(&after) {
+                return Err(b.into());
+            }
+        }
         let bytes = r.encode()?;
         let next = self
             .next_epoch
@@ -335,6 +358,9 @@ impl Appender {
         }
         self.end += bytes.len() as u64;
         self.catalogue.apply(&r)?;
+        if matches!(r.body, Body::Publish(_) | Body::Sealed(_)) || r.old_epoch.is_some() {
+            self.compaction = judge(&self.catalogue);
+        }
         self.synced = r.epoch;
         self.next_epoch = next;
         Ok(r.epoch)
@@ -400,6 +426,12 @@ impl Appender {
             written_at,
         )?;
         Ok(true)
+    }
+
+    /// The catalogue's rule for compacted files as last judged; anything but [`Judgement::Holds`] holds runs,
+    /// merges, removals and releases (compaction design §3.4).
+    pub fn compaction(&self) -> &Judgement {
+        &self.compaction
     }
 
     /// The fold of every record, those appended in this run included.

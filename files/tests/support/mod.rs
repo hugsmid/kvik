@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use kvik_files::catalogue::Tier;
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
-use kvik_files::rebuild::{FoundLoss, LocalFile, Place, Verifier};
+use kvik_files::layout::CompactedLayout;
+use kvik_files::rebuild::{FoundLoss, LocalFile, Place, Verdict, Verifier};
 use kvik_files::record::{AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record};
 use kvik_files::restore::{RestoreRecord, RestoredFile};
 use kvik_files::tier::{CopyVerified, DeepCopy, tier_of};
@@ -134,6 +135,7 @@ pub fn local(d: &FileDescription, place: Place) -> LocalFile {
         description: d.clone(),
         place,
         verified: true,
+        layout: None,
     }
 }
 
@@ -144,15 +146,17 @@ pub struct FakeVerifier {
 }
 
 impl Verifier for FakeVerifier {
-    fn verify(&self, output: &LocalFile, inputs: &[&LocalFile]) -> bool {
+    fn verify(&self, outputs: &[&LocalFile], inputs: &[&LocalFile]) -> Verdict {
         let given: BTreeSet<FileRef> = inputs.iter().map(|i| i.description.file_ref()).collect();
-        !self.bad.contains(&output.description.file_ref())
-            && output
-                .description
-                .inputs
-                .iter()
-                .filter(|i| i.kind == kind::COMPACTED)
-                .all(|i| given.contains(i))
+        let ok = outputs.iter().all(|o| {
+            !self.bad.contains(&o.description.file_ref())
+                && o.description
+                    .inputs
+                    .iter()
+                    .filter(|i| i.kind == kind::COMPACTED)
+                    .all(|i| given.contains(i))
+        });
+        if ok { Verdict::Holds } else { Verdict::Fails }
     }
 }
 
@@ -354,6 +358,34 @@ pub fn lost_range() -> impl Strategy<Value = LostRange> {
         )
 }
 
+/// A layout consistent with a compacted file's description: its range's generations, a fact per position.
+pub fn layout_of(d: &FileDescription) -> CompactedLayout {
+    let ((g0, s0), (g1, s1)) = d.range.expect("a compacted file has a range");
+    let positions = if g0 == g1 {
+        vec![(g0, s1 - s0 + 1)]
+    } else {
+        vec![(g0, 1), (g1, s1.max(1))]
+    };
+    CompactedLayout {
+        file_id: d.file_id,
+        level: 0,
+        period_start: 0,
+        period_len: 86_400_000_000_000,
+        run_id: d.file_id,
+        run_count: 1,
+        min_t: 0,
+        max_reach: 0,
+        first_commit_time: 1,
+        last_commit_time: 2,
+        fact_count: positions.iter().map(|p| p.1).sum(),
+        positions,
+        has_entries: false,
+        has_set_aside: false,
+        complete: true,
+        name_range: None,
+    }
+}
+
 pub fn body() -> impl Strategy<Value = Body> {
     prop_oneof![
         Just(Body::Empty),
@@ -371,6 +403,7 @@ pub fn body() -> impl Strategy<Value = Body> {
                     Body::Empty
                 } else {
                     Body::Publish(Publish {
+                        layouts: Vec::new(),
                         published: p,
                         retired: r,
                     })
@@ -462,7 +495,20 @@ pub fn record() -> impl Strategy<Value = Record> {
         any::<u32>(),
         any::<i64>(),
         proptest::option::of(any::<u64>()),
-        body(),
+        body()
+            .prop_flat_map(|b| (Just(b), any::<bool>()))
+            .prop_map(|(b, laid)| match b {
+                Body::Publish(mut p) if laid => {
+                    p.layouts = p
+                        .published
+                        .iter()
+                        .filter(|d| d.kind == kind::COMPACTED)
+                        .map(layout_of)
+                        .collect();
+                    Body::Publish(p)
+                }
+                b => b,
+            }),
         proptest::collection::btree_map(
             0x8000u16..=0xFFFF,
             proptest::collection::vec(any::<u8>(), 0..12),
@@ -627,6 +673,7 @@ pub fn play(steps: &[Step]) -> History {
                     &mut epoch,
                     &mut gap,
                     Body::Publish(Publish {
+                        layouts: Vec::new(),
                         published: outs.clone(),
                         retired: Vec::new(),
                     }),
@@ -654,6 +701,7 @@ pub fn play(steps: &[Step]) -> History {
                     &mut epoch,
                     &mut gap,
                     Body::Publish(Publish {
+                        layouts: Vec::new(),
                         published: vec![out.clone()],
                         retired: current.clone(),
                     }),

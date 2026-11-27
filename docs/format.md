@@ -728,7 +728,18 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   One record publishes and retires atomically: a compaction of log segments publishes its outputs and retires
   nothing (log segments are never retired by compaction, `spec.md` §7), a compaction of compacted files publishes its
   outputs and retires its compacted inputs. No epoch lists a compacted file live together with a compacted file it
-  names as an input (invariant 14 as the records show it).
+  names as an input (invariant 14 as the records show it). Repeated field 3, a layout, one per published compacted
+  file in the order of field 1, or none in a record written without it (provisional, Q-792, Q-1850): 0 kind `u8`
+  (2); 1 level `u8`; 2 flags `u8` (bit 0 entries, bit 1 set-aside chunks, bit 2 `complete`, bit 3 name range; other
+  bits refused); 3 reserved `u8`; 4 run count `u32`; 8 `file_id` `u64`; 16 period start `i64`; 24 period length
+  `i64`; 32 run id `u64`; 40 `min_t` `i64`; 48 `max_reach` `i64`; 56 first commit time `i64`; 64 last commit time
+  `i64`; 72 `fact_count` `u64`; 80 generation count `u32`; 84 reserved `u32`; 88 per generation 12 bytes, generation
+  `u32` and positions held `u64`; then, with bit 3, the first and the last series name, each a `u16` length and UTF-8
+  bytes. Checks: the length exactly that; reserved bytes 0; level at most 4; a positive period inside `i64`; a run
+  count of at least 1; generations strictly ascending, each count at least 1, the counts summing to at least
+  `fact_count`; commit times ordered; names ordered; the first and last generation those of the file description's
+  range; `file_id` that of the matching field 1. It repeats the file's own description and trailer
+  (`format-compacted.md` B.1), so a rebuild restates it from the file.
 - Sealed log segment (`0x22`): repeated field 1, a sealed log segment's description (kind 1), in strictly ascending
   order of id, at least one. It is appended after the seal, never before: from the description the sealer hands over
   once the `.kvl` name and the directory are synced (A.9 Plaintext hash), and a seal does not wait for it; one lost

@@ -221,6 +221,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     m.append(Body::Sealed(vec![s1]), T0).unwrap();
     m.append(
         Body::Publish(Publish {
+            layouts: Vec::new(),
             published: vec![a.clone(), b.clone()],
             retired: vec![],
         }),
@@ -233,6 +234,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     let e = m
         .append(
             Body::Publish(Publish {
+                layouts: Vec::new(),
                 published: vec![c.clone()],
                 retired: vec![],
             }),
@@ -249,6 +251,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     assert!(
         m.append(
             Body::Publish(Publish {
+                layouts: Vec::new(),
                 published: vec![],
                 retired: vec![a2],
             }),
@@ -260,6 +263,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     // The merge, then publishing `a` again, is refused.
     m.append(
         Body::Publish(Publish {
+            layouts: Vec::new(),
             published: vec![c],
             retired: vec![a.clone()],
         }),
@@ -269,6 +273,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     assert!(
         m.append(
             Body::Publish(Publish {
+                layouts: Vec::new(),
                 published: vec![a],
                 retired: vec![],
             }),

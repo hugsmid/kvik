@@ -11,6 +11,7 @@ use kvik_log::mark::ResetStamp;
 
 use crate::desc::{FileDescription, kind};
 use crate::fields::{self, position_bytes, position_of, u32_of, u64_of};
+use crate::layout::CompactedLayout;
 
 /// Record types (`format.md` A.14).
 pub mod record_type {
@@ -51,6 +52,9 @@ pub struct Publish {
     pub published: Vec<FileDescription>,
     /// Field 2, repeated: the files retired, in ascending order of kind and id.
     pub retired: Vec<FileDescription>,
+    /// Field 3, repeated: the layout of each published compacted file, in the order of field 1; none in a record
+    /// written before field 3 (Q-1850).
+    pub layouts: Vec<CompactedLayout>,
 }
 
 /// One loss an acknowledgement names: its identity and its range as reported then.
@@ -232,6 +236,7 @@ impl Record {
                 check_publish(p).map_err(EncodeError::Invalid)?;
                 list.extend(p.published.iter().map(|d| (1, d.encode())));
                 list.extend(p.retired.iter().map(|d| (2, d.encode())));
+                list.extend(p.layouts.iter().map(|l| (3, l.encode())));
             }
             Body::Sealed(s) => {
                 check_sealed(s).map_err(EncodeError::Invalid)?;
@@ -355,7 +360,7 @@ impl Record {
         // does not repeat is kept at most twice, as a second one is already rejected. So a rejected record costs one
         // pass over its fields and keeps few of them (Q-651).
         let (defined, repeated): (&[u16], &[u16]) = match t {
-            record_type::PUBLISH => (&[1, 2], &[1, 2]),
+            record_type::PUBLISH => (&[1, 2, 3], &[1, 2, 3]),
             record_type::SEALED => (&[1], &[1]),
             record_type::LOST_RANGE => (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], &[]),
             record_type::ACKNOWLEDGEMENT => (&[1, 2], &[1]),
@@ -398,6 +403,11 @@ impl Record {
             record_type::PUBLISH => {
                 let mut p = Publish::default();
                 for (id, v) in &own {
+                    if *id == 3 {
+                        p.layouts
+                            .push(CompactedLayout::decode(v).map_err(RecordError::Invalid)?);
+                        continue;
+                    }
                     let d = FileDescription::decode(v).map_err(RecordError::Invalid)?;
                     if *id == 1 {
                         p.published.push(d);
@@ -628,6 +638,27 @@ fn check_publish(p: &Publish) -> Result<(), &'static str> {
         .any(|d| p.retired.iter().any(|r| r.file_ref() == d.file_ref()))
     {
         return Err("a file both published and retired");
+    }
+    if !p.layouts.is_empty() {
+        let compacted = p
+            .published
+            .iter()
+            .filter(|d| d.kind == crate::desc::kind::COMPACTED);
+        if compacted.clone().count() != p.layouts.len()
+            || compacted.zip(&p.layouts).any(|(d, l)| {
+                d.file_ref() != l.file_ref()
+                    || d.range.map(|(a, b)| (a.0, b.0))
+                        != l.positions
+                            .first()
+                            .zip(l.positions.last())
+                            .map(|(a, b)| (a.0, b.0))
+            })
+        {
+            return Err("layouts not one per published compacted file in order");
+        }
+        for l in &p.layouts {
+            l.check()?;
+        }
     }
     Ok(())
 }
