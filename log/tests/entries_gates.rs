@@ -419,6 +419,13 @@ fn gate_field_values_are_range_checked() {
     let m = |k: usize| members((0..k).map(|i| vec![3, i as u8, 0, 0, 0]).collect());
     assert!(decode_one(5, m(64)).is_ok());
     bad(m(65), 74);
+    // Q-1810: a decimal's scale at most 18, a state index below 65,536.
+    let dec = |scale: u8| [vec![2], i64b(1), vec![scale]].concat();
+    assert!(decode_one(5, members(vec![dec(18)])).is_ok());
+    bad(members(vec![dec(19)]), 74);
+    let state = |i: u32| [vec![3], i.to_le_bytes().to_vec()].concat();
+    assert!(decode_one(5, members(vec![state(65_535)])).is_ok());
+    bad(members(vec![state(65_536)]), 74);
     bad(replace(watch_set(), 75, [i64b(-1), i64b(0)].concat()), 75);
     bad(replace(watch_set(), 75, [i64b(0), i64b(-1)].concat()), 75);
     bad(replace(watch_set(), 75, i64b(0)), 75);

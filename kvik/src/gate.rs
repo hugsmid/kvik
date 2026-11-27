@@ -536,6 +536,9 @@ mod tests {
         assert_eq!(set(vec![Value::Absent]), Err(GateError::Set));
         assert_eq!(set(vec![Value::F64(f64::NAN)]), Err(GateError::Set));
         assert_eq!(set(vec![Value::Text(String::new())]), Err(GateError::Set));
+        let dec = |scale| vec![Value::Decimal { units: 1, scale }];
+        assert_eq!(set(dec(18)), Ok(()));
+        assert_eq!(set(dec(19)), Err(GateError::Set));
         assert_eq!(set(vec![Value::Text("a".repeat(256))]), Err(GateError::Set));
         assert_eq!(set(vec![Value::Text("a".repeat(255))]), Ok(()));
         assert_eq!(

@@ -48,7 +48,8 @@ enum Op {
     Unwatch(usize),
 }
 
-/// Gates over series 0 with holds, staleness and hysteresis, so that timers and entry causes both occur.
+/// Gates over series 0 with holds, staleness and hysteresis, so that timers and entry causes both occur; gate 3
+/// is an `each` gate over both series.
 fn gate(k: usize, s: SeriesId) -> Gate {
     match k {
         0 => Gate::levels(
@@ -66,9 +67,13 @@ fn gate(k: usize, s: SeriesId) -> Gate {
         1 => Gate::set(Input::value(s), [Value::F64(0.0), Value::F64(100.0)])
             .hold_on(Duration::from_secs(15))
             .hold_off(Duration::from_secs(5)),
-        _ => Gate::change(Input::value(s))
+        2 => Gate::change(Input::value(s))
             .deadband(10.0)
             .stale_after(Duration::from_secs(45)),
+        _ => Gate::change(Input::value_each())
+            .deadband(10.0)
+            .stale_after(Duration::from_secs(60))
+            .each("hall/air/*"),
     }
 }
 
@@ -77,8 +82,8 @@ fn op() -> impl Strategy<Value = Op> {
         5 => (0usize..2, 1u64..40, prop_oneof![Just(0.0), Just(100.0), 0f64..100.0])
             .prop_map(|(series, dt, v)| Op::Emit { series, dt, v }),
         2 => (1u64..60).prop_map(|dt| Op::Tick { dt }),
-        2 => (0usize..3).prop_map(Op::Watch),
-        1 => (0usize..3).prop_map(Op::Unwatch),
+        2 => (0usize..4).prop_map(Op::Watch),
+        1 => (0usize..4).prop_map(Op::Unwatch),
     ]
 }
 
@@ -327,16 +332,29 @@ fn unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_res
         .env(Env::test(rig.clock.clone()));
     let store = block_on(Store::open(config)).unwrap();
     let mut c = block_on(store.consumer("c", Start::Now, Select::None)).unwrap();
+    // Not yet handed out in this attachment.
+    assert!(matches!(
+        block_on(c.confirm(pending[0].id)),
+        Err(crate::ConsumerError::BadConfirm)
+    ));
     let mut again = Vec::new();
     let mut gates = Vec::new();
+    let mut order = Vec::new();
     while let Some(d) = c.try_next().unwrap() {
         match &d.kind {
             DeliveryKind::Transition(_) => again.push(d.clone()),
             DeliveryKind::Resync(p) => gates.extend(p.gates.clone()),
             _ => {}
         }
+        order.push(d.kind.clone());
         block_on(c.confirm(d.id)).unwrap();
     }
+    // Design section 2, Exact resume: replayed transitions, then the resync.
+    let at = |f: fn(&DeliveryKind) -> bool| order.iter().position(f).unwrap();
+    assert!(
+        at(|k| matches!(k, DeliveryKind::Transition(_)))
+            < at(|k| matches!(k, DeliveryKind::Resync(_)))
+    );
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].id, pending[0].id);
     assert!(again[0].flags.replayed);
@@ -346,4 +364,31 @@ fn unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_res
         Some(again[0].id),
         gates[0].set_by.map(DeliveryId::Transition)
     );
+}
+
+#[test]
+fn an_each_gate_starts_an_instance_per_series_one_more_when_a_series_joins_and_ends_one_when_it_leaves()
+ {
+    let mut rig = Rig::new("each");
+    let [a, b] = rig.series;
+    rig.apply(&Op::Watch(3));
+    let first: Vec<_> = rig
+        .delivered()
+        .iter()
+        .map(|t| (t.0.series, t.1.clone()))
+        .collect();
+    assert_eq!(first, vec![(a, None), (b, None)]);
+    rig.clock.advance(Duration::from_secs(1));
+    let c = block_on(rig.store.define_series(gauge("hall/air/third"))).unwrap();
+    rig.drain();
+    let joined = rig.delivered()[2..].to_vec();
+    assert_eq!(joined.len(), 1);
+    assert_eq!((joined[0].0.series, joined[0].1.clone()), (c, None));
+    rig.clock.advance(Duration::from_secs(1));
+    block_on(rig.store.retire(c, rig.clock.wall())).unwrap();
+    rig.drain();
+    let left = rig.delivered()[3..].to_vec();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!((left[0].0.series, left[0].2.clone()), (c, None));
+    assert_eq!(rig.delivered(), rig.judged());
 }

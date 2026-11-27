@@ -9,7 +9,7 @@ use crate::config::{LogConfig, StoreConfig};
 use crate::consume::{Select, Start};
 use crate::env::{Env, ManualClock, MemFs};
 use crate::gate::Input;
-use crate::series::{Kind, SeriesSpec, ValueType};
+use crate::series::{Kind, SeriesSpec, StateValues, ValueType};
 
 fn open(name: &str) -> (Arc<Writer>, StoreConfig) {
     let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
@@ -134,15 +134,58 @@ fn unwatch_frees_the_name_and_gate_ids_are_never_reused() {
         Err(Error::Gate(GateError::NoSuchGate))
     ));
     assert_eq!(w.watch("c", "humidity", &humidity(s)).unwrap(), GateId(1));
-    let pump = Gate::set(Input::value_each(), [Value::F64(0.0)]).each("plant/*/code");
+    let pump = Gate::set(Input::value_each(), [Value::F64(0.0)])
+        .hold_on(Duration::from_secs(5))
+        .hold_off(Duration::from_secs(9))
+        .each("plant/*/code");
     assert_eq!(w.watch("c", "pump", &pump).unwrap(), GateId(2));
+    let moved = Gate::change(Input::value(s)).deadband(0.5);
+    assert_eq!(w.watch("c", "moved", &moved).unwrap(), GateId(3));
     w.unwatch("c", "humidity").unwrap();
-    assert_eq!(w.gates("c").unwrap().len(), 1);
-    assert_eq!(w.watch("c", "humidity", &humidity(s)).unwrap(), GateId(3));
+    assert_eq!(
+        w.gates("c").unwrap(),
+        vec![
+            (GateId(2), "pump".to_string(), pump),
+            (GateId(3), "moved".to_string(), moved),
+        ]
+    );
+    assert_eq!(w.watch("c", "humidity", &humidity(s)).unwrap(), GateId(4));
     assert!(matches!(
         w.unwatch("c", "missing"),
         Err(Error::Gate(GateError::NoSuchGate))
     ));
+}
+
+#[test]
+fn a_named_state_member_is_checked_against_the_series_names_as_on_the_model() {
+    let (w, _) = open("gates-state");
+    let spec = SeriesSpec::new(
+        "plant/pump/code",
+        Kind::State {
+            values: StateValues::Named(vec!["off".into(), "on".into(), "fault".into()]),
+        },
+        "",
+    );
+    let p = w.define(&spec).unwrap();
+    let g = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.allow_gates();
+    let set = |series: SeriesId, i| Gate::set(Input::value(series), [Value::State(i)]);
+    assert_eq!(w.watch("c", "fault", &set(p, 2)).unwrap(), GateId(1));
+    assert!(matches!(
+        w.watch("c", "past", &set(p, 3)),
+        Err(Error::Gate(GateError::Set))
+    ));
+    assert!(matches!(
+        w.watch("c", "gauge", &set(g, 0)),
+        Err(Error::NotSupportedYet(_))
+    ));
+    let each = Gate::set(Input::value_each(), [Value::State(0)]).each("plant/*/code");
+    assert!(matches!(
+        w.watch("c", "each", &each),
+        Err(Error::NotSupportedYet(_))
+    ));
+    assert_eq!(w.gates("c").unwrap().len(), 1);
 }
 
 #[test]
