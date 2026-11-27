@@ -976,6 +976,39 @@ proptest! {
 }
 
 #[test]
+fn recovery_history_a_recorded_loss_folded_into_a_lower_one_stays_listed_as_absorbed() {
+    let t = || ROp::Take { c: 0, n: 4 };
+    let ops = [
+        ROp::PowerLoss(0),
+        t(),
+        ROp::PowerLoss(0),
+        ROp::Define,
+        ROp::Ingest(1, None),
+        ROp::Merge,
+        ROp::PowerLoss(0),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::LoseMark(false),
+        ROp::CorruptSealed(0),
+        t(),
+        ROp::Corrupt(5),
+        t(),
+        ROp::Corrupt(2),
+        ROp::LoseMark(false),
+        ROp::Ingest(1, None),
+        ROp::Corrupt(2),
+        t(),
+    ];
+    let checks = Checks {
+        inv27: true,
+        ..NONE
+    };
+    run_recovery(&ops, &mut Seen::default(), checks).unwrap();
+}
+
+#[test]
 fn recovery_history_a_compacted_object_lost_while_read_only_waits_for_the_lost_object_rule() {
     let ops = [
         ROp::PowerLoss(0),
