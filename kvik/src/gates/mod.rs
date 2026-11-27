@@ -2,6 +2,7 @@
 //! incrementally, batch by batch on the commit clock, giving what `kvik_model::gate::judge` gives over
 //! the same log. No clock and no files: facts it cannot hold are read through [`History`].
 
+mod checkpoint;
 mod engine;
 mod replay;
 mod rules;
@@ -15,6 +16,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 
+pub(crate) use checkpoint::{id_in, id_out};
 pub(crate) use engine::{Core, Frontier};
 pub(crate) use replay::Replay;
 pub(crate) use snapshot::Snapshot;

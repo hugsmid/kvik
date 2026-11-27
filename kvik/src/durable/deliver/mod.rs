@@ -21,6 +21,8 @@
 mod confirm;
 mod funnels;
 mod gate_history;
+mod gate_resume;
+pub(crate) use gate_resume::GateConfig;
 mod gates;
 mod held;
 mod hub;
@@ -263,6 +265,15 @@ struct Rt {
     file_end: Option<u64>,
     dirty: bool,
     last_write: Option<i64>,
+    /// The gate cursor the cursor file holds (field 4), for a consumer whose gates are not judged in this run.
+    gate_saved: Option<kvik_log::cursor::GateCursor>,
+    /// The last valid gate checkpoint the cursor file holds: replayed from at the first take, carried into a file
+    /// written again (`format.md` A.15).
+    checkpoint: Option<kvik_log::cursor::Checkpoint>,
+    /// When the last checkpoint was written, on the monotonic clock.
+    checkpoint_at: Option<i64>,
+    /// The gate cursor moved since the last checkpoint was written (cond2 design §4.3).
+    gate_dirty: bool,
 }
 
 /// See the module documentation.
@@ -318,6 +329,8 @@ pub(crate) struct Deliverer {
     last_commit_time: i64,
     /// The last commit floor gate timers fired under.
     gate_floor: Option<i64>,
+    /// `conditions.replay_max` and `conditions.checkpoint_interval`, in nanoseconds and facts (spec §6 Gates, Resume).
+    gate_config: gate_resume::GateConfig,
     /// A floor the tests set in place of the commit clock's.
     #[cfg(test)]
     floor_hold: Option<(i64, LogPos)>,
@@ -464,6 +477,7 @@ impl Deliverer {
             head: LogPos::default(),
             last_commit_time: i64::MIN,
             gate_floor: None,
+            gate_config: gate_resume::GateConfig::default(),
             #[cfg(test)]
             floor_hold: None,
             resets: BTreeMap::new(),
@@ -572,6 +586,8 @@ impl Deliverer {
                     rt.cursor = f.state.position;
                     rt.latches = f.state.latches.iter().map(|l| (l.funnel, *l)).collect();
                     rt.reset = f.state.reset;
+                    rt.gate_saved = f.state.gate;
+                    rt.checkpoint = f.checkpoint;
                     rt.file_end = Some(f.end);
                     rt.behind = Some(next(f.state.position));
                     rt.resume = Some(d.head);

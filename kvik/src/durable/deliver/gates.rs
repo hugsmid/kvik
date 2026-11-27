@@ -1,6 +1,6 @@
 //! Gates in the deliverer (spec §6 Gates; cond2 design §4): one [`GateRun`] per consumer taken in this run, fed every
-//! item of every batch taken, with timers fired under the writer's commit floor. Confirmations move the gate cursor
-//! in memory only: until the cursor file holds it (cond2 step 5) every start reseeds (`docs/api.md` Gates).
+//! item of every batch taken, with timers fired under the writer's commit floor. The cursor file holds the gate cursor
+//! and a checkpoint; the first take in a run replays from them ([`super::gate_resume`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -29,35 +29,41 @@ pub(crate) enum GatePoint {
 /// One consumer's gates as this process judges them (cond2 design §3.1).
 #[derive(Debug)]
 pub(super) struct GateRun {
-    core: Core,
+    pub(super) core: Core,
     /// Queued or handed out and not confirmed, in id order.
-    outstanding: VecDeque<MTransition>,
-    /// The core at or before the judgement of the oldest outstanding transition (G5); the checkpoint of step 5.
-    held: Option<Snapshot>,
-    /// Taken before the first judgement after `outstanding` emptied; becomes `held` with the next transition.
-    pre: Option<Snapshot>,
-    /// Not written to the cursor file yet (cond2 step 5).
-    confirmed: Option<GatePoint>,
+    pub(super) outstanding: VecDeque<MTransition>,
+    /// The core at or before the judgement of the oldest transition judged and not confirmed, queued, deferred or
+    /// dropped (G5): the checkpoint while there is one.
+    pub(super) held: Option<Snapshot>,
+    /// Taken while nothing is unconfirmed, before a judgement; becomes `held` at the next transition judged.
+    pub(super) pre: Option<Snapshot>,
+    /// The gate cursor.
+    pub(super) confirmed: Option<GatePoint>,
     /// Judged while the consumer is behind; queued as its catch-up passes their positions, `true` if replayed.
-    deferred: VecDeque<(MTransition, bool)>,
+    pub(super) deferred: VecDeque<(MTransition, bool)>,
     /// `deferred` was full: judging, queuing nothing, until the catch-up ends (design §4.3 Overflow).
     quiet: bool,
+    /// The highest transition dropped while quiet and not yet covered by the gate cursor: the checkpoint stays before
+    /// it (Q-1396).
+    dropped: Option<TransitionId>,
     /// Per instance, the state last queued or carried by a resync.
     emitted: BTreeMap<Key, GateState>,
     /// Per instance, the transition that set its state now.
-    last: BTreeMap<Key, MTransition>,
+    pub(super) last: BTreeMap<Key, MTransition>,
     /// Instances a reseed set and nothing has moved since: their `set_by` is none (Q-1392).
-    reseeded: BTreeMap<Key, TransitionId>,
+    pub(super) reseeded: BTreeMap<Key, TransitionId>,
     /// The highest id handed out: one at or below it comes again flagged `replayed`.
     seen: Option<TransitionId>,
+    /// The frontier a replay at this run's first take reached: every transition at or before it is `replayed`.
+    pub(super) restart: Option<Frontier>,
     /// Every gate watched in this run, by id: a transition queued before an unwatch keeps its name.
-    names: BTreeMap<u32, String>,
+    pub(super) names: BTreeMap<u32, String>,
     /// A core call failed: the core was rebuilt by a reseed (Q-1881).
     pub(super) failed: bool,
 }
 
 impl GateRun {
-    fn new(core: Core) -> Self {
+    pub(super) fn new(core: Core) -> Self {
         GateRun {
             pre: Some(core.snapshot()),
             core,
@@ -66,21 +72,42 @@ impl GateRun {
             confirmed: None,
             deferred: VecDeque::new(),
             quiet: false,
+            dropped: None,
             emitted: BTreeMap::new(),
             last: BTreeMap::new(),
             reseeded: BTreeMap::new(),
             seen: None,
+            restart: None,
             names: BTreeMap::new(),
             failed: false,
         }
     }
 
-    /// Before a judgement that may emit: the snapshot `held` takes when the first transition after an empty
-    /// `outstanding` is queued.
+    /// Before a judgement that may emit: the snapshot `held` takes at the next transition judged.
     fn ready(&mut self) {
-        if self.outstanding.is_empty() && self.pre.is_none() {
+        if self.held.is_none() && self.pre.is_none() {
             self.pre = Some(self.core.snapshot());
         }
+    }
+
+    /// A transition was judged: the checkpoint stays at or before it until it is confirmed.
+    pub(super) fn hold(&mut self) {
+        if self.held.is_none() {
+            self.held = self.pre.take();
+        }
+    }
+
+    /// Nothing judged is unconfirmed.
+    pub(super) fn settled(&self) -> bool {
+        self.outstanding.is_empty()
+            && self.deferred.is_empty()
+            && !self.quiet
+            && self.dropped.is_none()
+    }
+
+    /// Whether `id` comes again flagged `replayed`: handed out before, or replayed at this run's first take.
+    pub(super) fn again(&self, id: &TransitionId) -> bool {
+        self.seen.is_some_and(|s| *id <= s) || self.restart.is_some_and(|f| !after(id, f))
     }
 
     fn note(&mut self, t: &MTransition) {
@@ -145,7 +172,7 @@ impl Deliverer {
     /// The floor live gate timers fire under (Q-1393, provisional: the commit clock; spec §6 Gates, Clock): an
     /// instant no later batch commits below, with the position every batch committing below it is at or below.
     /// The monotonic alternative replaces this function alone.
-    fn floor(&self, ctx: &Ctx<'_>) -> Option<(Nanos, LogPos)> {
+    pub(super) fn floor(&self, ctx: &Ctx<'_>) -> Option<(Nanos, LogPos)> {
         #[cfg(test)]
         if let Some(f) = self.floor_hold {
             return Some(f);
@@ -159,12 +186,12 @@ impl Deliverer {
         self.floor_hold = f;
     }
 
-    fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
+    pub(super) fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
         LogHistory { d: self, ctx }
     }
 
     /// The gates in force for `name`, as the core judges them.
-    fn gates_in_force(&self, name: &str) -> Vec<(ConditionId, kvik_model::gate::Gate)> {
+    pub(super) fn gates_in_force(&self, name: &str) -> Vec<(ConditionId, kvik_model::gate::Gate)> {
         self.view
             .consumers
             .get(name)
@@ -178,7 +205,7 @@ impl Deliverer {
     }
 
     /// A core for `name` with its gates in force started at the head by the seed rule (cond2 design §3.3, reseed).
-    fn reseeded(&mut self, name: &str, ctx: &Ctx<'_>) -> Option<GateRun> {
+    pub(super) fn reseeded(&mut self, name: &str, ctx: &Ctx<'_>) -> Option<GateRun> {
         let gates = self.gates_in_force(name);
         let mut core = Core::new();
         let at = core_pos(self.head);
@@ -217,21 +244,16 @@ impl Deliverer {
         if again && has {
             let rt = self.consumers.get_mut(name).expect("taken");
             let run = rt.gates.as_mut().expect("looked at above");
-            let seen = run.seen;
-            let mut back: VecDeque<(MTransition, bool)> = run
-                .outstanding
-                .drain(..)
+            let outstanding: Vec<MTransition> = run.outstanding.drain(..).collect();
+            let mut back: VecDeque<(MTransition, bool)> = outstanding
+                .into_iter()
                 .map(|t| {
-                    let r = seen.is_some_and(|s| t.id <= s);
+                    let r = run.again(&t.id);
                     (t, r)
                 })
                 .collect();
             back.extend(run.deferred.drain(..));
             run.deferred = back;
-            // Queued again, they take back the snapshot held for them (G5).
-            if let Some(h) = run.held.take() {
-                run.pre = Some(h);
-            }
             run.emitted.clear();
             return;
         }
@@ -240,8 +262,13 @@ impl Deliverer {
             .consumers
             .get(name)
             .is_some_and(|r| !r.gates.is_empty());
-        if in_force && !has {
-            let run = self.reseeded(name, ctx);
+        // Gates held at the stop, or watched and unwatched since the checkpoint, still replay.
+        let saved = self
+            .consumers
+            .get(name)
+            .is_some_and(|rt| rt.gate_saved.is_some() || rt.checkpoint.is_some());
+        if (in_force || saved) && !has {
+            let run = self.gate_resume(name, ctx);
             if let Some(rt) = self.consumers.get_mut(name) {
                 rt.gates = run;
             }
@@ -261,11 +288,25 @@ impl Deliverer {
     pub(super) fn gate_item(&mut self, p: LogPos, commit: Nanos, feed: &Feed<'_>, ctx: &Ctx<'_>) {
         if let Feed::Routing(r) = feed
             && r.op == RouteOp::Watch
-            && let Some(rt) = self.consumers.get_mut(&r.consumer)
-            && rt.attached
-            && rt.gates.is_none()
+            && self
+                .consumers
+                .get(&r.consumer)
+                .is_some_and(|rt| rt.attached && rt.gates.is_none())
         {
-            rt.gates = Some(GateRun::new(Core::new()));
+            // An empty core just before the watch: the resume point until a checkpoint is written (design §4.4).
+            let empty = Snapshot::empty(Frontier {
+                at: core_pos(super::before(p)),
+                now: commit,
+            });
+            let core =
+                Core::restore(empty, BTreeMap::new(), &self.history(ctx)).unwrap_or_default();
+            let rt = self
+                .consumers
+                .get_mut(&r.consumer)
+                .expect("looked up above");
+            rt.gates = Some(GateRun::new(core));
+            // The first cursor write after the first watch carries the gate cursor and a checkpoint.
+            rt.dirty = true;
         }
         if let Feed::Routing(r) = feed
             && let (RouteOp::Watch, Some(g)) = (r.op, &r.gate)
@@ -387,6 +428,8 @@ impl Deliverer {
                 fresh.held = run.held;
                 fresh.confirmed = run.confirmed;
                 fresh.deferred = run.deferred;
+                fresh.dropped = run.dropped;
+                fresh.restart = run.restart;
                 fresh.quiet = true;
                 fresh.failed = true;
                 if let Some(rt) = self.consumers.get_mut(name) {
@@ -404,8 +447,10 @@ impl Deliverer {
             return;
         };
         let Some(run) = rt.gates.as_mut() else { return };
+        run.hold();
         run.note(&t);
         if run.quiet {
+            run.dropped = run.dropped.max(Some(t.id));
             self.stats.transitions_not_delivered += 1;
             return;
         }
@@ -539,8 +584,11 @@ impl Deliverer {
                 }
             }
         }
+        if run.dropped.is_some_and(|d| covers(&point, &d)) {
+            run.dropped = None;
+        }
         run.confirmed = Some(point);
-        if run.outstanding.is_empty() {
+        if run.settled() {
             run.held = None;
             run.pre = None;
         }
@@ -566,10 +614,16 @@ pub(super) fn after(id: &TransitionId, f: Frontier) -> bool {
     id.at > f.at || id.due.is_some_and(|d| d > f.now)
 }
 
-fn push_outstanding(run: &mut GateRun, t: MTransition) {
-    if run.outstanding.is_empty() {
-        run.held = run.pre.take();
+/// Whether the gate point `g` covers `id`: `id` is at or before it.
+pub(super) fn covers(g: &GatePoint, id: &TransitionId) -> bool {
+    match g {
+        GatePoint::Transition(t) => id <= t,
+        GatePoint::Frontier(f) => !after(id, *f),
     }
+}
+
+fn push_outstanding(run: &mut GateRun, t: MTransition) {
+    run.hold();
     debug_assert!(
         run.held.as_ref().is_none_or(|h| after(&t.id, h.frontier())),
         "G5: the held snapshot is after an outstanding transition"

@@ -918,9 +918,25 @@ impl Slot {
                        has no routing-cycle check",
             ));
         }
+        // The first take after a store restart: what the judgement holds now is replayed (spec §6 Gates, Resume).
+        let restart = match self.consumers.get(name) {
+            Some(c) if c.attached.is_none() && c.gates.any() && !c.handle => {
+                let history = self.model.gate_history(c.id).map_err(convert::error)?;
+                Some(km::gate::Frontier {
+                    at: history
+                        .last()
+                        .map_or(km::types::Position::ORIGIN, km::gate::Entry::position),
+                    now: self.model.now,
+                })
+            }
+            _ => None,
+        };
         if let Some(c) = self.consumers.get_mut(name) {
             if c.handle {
                 return Err(Error::ConsumerInUse(name.to_string()));
+            }
+            if restart.is_some() {
+                c.gates.restart = restart;
             }
             // Taken again in the same store session: the consumer restarted;
             // it resumes from its durable cursor (spec §6 Restart and

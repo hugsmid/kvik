@@ -88,8 +88,7 @@ fn gate_kind() -> impl Strategy<Value = GateKind> {
     ]
 }
 
-/// Histories with gates: no restarts, which reseed gates on the durable backend until its cursor file holds the gate
-/// cursor (Q-1583).
+/// Histories with gates, clean restarts among them.
 fn gate_steps() -> impl Strategy<Value = Vec<Step>> {
     let step = prop_oneof![
         10 => (0usize..4, any::<u8>()).prop_map(|(i, v)| Step::Emit(i, v)),
@@ -101,6 +100,7 @@ fn gate_steps() -> impl Strategy<Value = Vec<Step>> {
         1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unwatch(c, n)),
         5 => (0usize..2, 0usize..8).prop_map(|(c, n)| Step::Drain(c, n)),
         1 => (0usize..2).prop_map(Step::Retake),
+        1 => Just(Step::Restart),
         1 => Just(Step::Define),
     ];
     prop::collection::vec(step, 1..40)
@@ -514,12 +514,14 @@ fn deliveries_follow_the_model_over_restarts() {
 }
 
 /// Gates through the public interface: the durable backend's transitions, their order among the other deliveries,
-/// the states in every resync and a second take in a run give what the model backend gives from `judge`. Without
-/// restarts (`gate_steps`), every configured case: a history opens two stores.
+/// the states in every resync, a second take in a run and the replay after each clean restart (G6, G7: what the
+/// model backend gives from `judge`, every transition after the gate cursor again, `replayed`), every configured
+/// case: a history opens two stores.
 #[test]
-fn gate_deliveries_follow_the_model_without_restarts() {
+fn gate_deliveries_follow_the_model_over_restarts() {
     let watched = AtomicU64::new(0);
     let transitions = AtomicU64::new(0);
+    let replayed = AtomicU64::new(0);
     TestRunner::new(ProptestConfig {
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -531,6 +533,11 @@ fn gate_deliveries_follow_the_model_without_restarts() {
         }
         let n = m.iter().filter(|l| l.contains(": transition ")).count();
         transitions.fetch_add(n as u64, Ordering::Relaxed);
+        let r = m
+            .iter()
+            .filter(|l| l.contains(": transition ") && l.ends_with("r=true"))
+            .count();
+        replayed.fetch_add(r as u64, Ordering::Relaxed);
         prop_assert_eq!(m, d);
         Ok(())
     })
@@ -539,6 +546,10 @@ fn gate_deliveries_follow_the_model_without_restarts() {
     assert!(
         transitions.into_inner() > 0,
         "some history delivers transitions"
+    );
+    assert!(
+        replayed.into_inner() > 0,
+        "some history replays transitions"
     );
 }
 
@@ -553,10 +564,47 @@ fn gate_history_on_both(history: &[Step]) -> (Vec<String>, Vec<String>) {
         .backend(Backend::Model)
         .env(env);
     let model = block_on(Store::open(m_config.clone())).unwrap();
-    let m = run(model, &|| unreachable!("no restarts"), &m_clock, history);
-    let w = World::quiet(&format!("gates-differential-{}", next_id()));
-    let d = run(w.open(), &|| unreachable!("no restarts"), &w.clock, history);
+    let m = run(
+        model,
+        &|| block_on(Store::open(m_config.clone())).unwrap(),
+        &m_clock,
+        history,
+    );
+    let mut w = World::quiet(&format!("gates-differential-{}", next_id()));
+    // The model backend replays without bound.
+    w.conditions = Some(
+        kvik::ConditionsConfig::default()
+            .replay_max(kvik::ReplayMax::new(Duration::from_secs(1 << 30), u64::MAX)),
+    );
+    let d = run(w.open(), &|| w.open(), &w.clock, history);
     (m, d)
+}
+
+#[test]
+fn an_unconfirmed_start_transition_is_replayed_after_a_restart_not_reseeded() {
+    let (m, d) = gate_history_on_both(&[Step::Watch(0, GateKind::Levels(0)), Step::Restart]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn a_transition_replayed_after_its_gate_was_unwatched_keeps_the_gate_name() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(1, GateKind::Change(0)),
+        Step::Watch(1, GateKind::Levels(0)),
+        Step::Unwatch(1, 0),
+        Step::Restart,
+    ]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn a_consumer_whose_gates_were_all_unwatched_still_replays_after_a_restart() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(0, GateKind::Set(0)),
+        Step::Unwatch(0, 0),
+        Step::Restart,
+    ]);
+    assert_eq!(m, d);
 }
 
 #[test]

@@ -26,6 +26,8 @@ pub(super) struct GateFeed {
     seen: Option<km::gate::TransitionId>,
     /// The gate cursor: every transition at or before it is confirmed.
     confirmed: Option<km::gate::TransitionId>,
+    /// What the judgement held at the first take after the last store restart: replayed (spec §6 Gates, Resume).
+    pub(super) restart: Option<km::gate::Frontier>,
     /// A model delivery taken to compare its position with the next transition's.
     pub(super) peeked: Option<km::engine::Envelope>,
     /// Every delivery handed out in this attachment and not confirmed, in order: a confirmation is cumulative
@@ -286,7 +288,8 @@ impl Slot {
     /// Hands out a transition.
     pub(super) fn hand_transition(&mut self, name: &str, t: km::gate::Transition) -> Delivery {
         let c = self.consumers.get_mut(name).expect("a bound consumer");
-        let replayed = c.gates.seen.is_some_and(|s| t.id <= s);
+        let replayed = c.gates.seen.is_some_and(|s| t.id <= s)
+            || c.gates.restart.is_some_and(|f| f.covers(&t.id));
         c.gates.handed = Some(t.id);
         c.gates.seen = c.gates.seen.max(Some(t.id));
         let transition = self.transition_out(name, &t);

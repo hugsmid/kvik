@@ -206,10 +206,17 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
 | Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
 | Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
-| Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (superseded by Q-2080) |
 | Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided by the lead, provisional; settle with cond2 step 5) |
 | Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: the transitions that set the changed states, not a resync (decided by the lead, provisional) |
 | Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
+| Q-2080 | §6 Gates, Resume; `format.md` A.15; Q-2000 | The durable gate cursor and checkpoint in the cursor file, replayed at the first take (decided by the builder, provisional) |
+| Q-2081 | `format.md` A.15; Q-1391 | The checkpoint block as built: series apart from instances, every field the core restores (decided by the builder, provisional) |
+| Q-2082 | §6 Gates, Resume; §4 Resync | A reset point or lost range after the checkpoint reseeds, until cond2 step 6 (decided by the builder, provisional) |
+| Q-2083 | §6 Gates, Resume | Facts counted for `replay_max` without reading them; entries of a newer format in a replay (decided by the builder, provisional) |
+| Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (decided by the builder, provisional) |
+| Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
+| Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5449,7 +5456,7 @@ their ids (flagged `replayed` if handed out before) as its catch-up passes their
 now: the same transitions a replay from the held snapshot gives, without reading the log. The first take after a start
 reseeds the gates in force at the head by the seed rule, emits no start transitions and reports `set_by` `None`
 (Q-1392), counted `gates_reseeded`; nothing is replayed.
-**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`,
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`,
 `a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
 `a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`.
 
@@ -5461,7 +5468,7 @@ double's own rules (`Replay`), so the two cannot differ; the gate differential c
 scan per read; reads happen at a watch with holds (two), at a reseed (two per gate) and when a bad fact replaces the
 live one (one). Fine for the tests' logs; a store of 30 days needs the bounded read of Q-1880 (from
 `commit_at(T − 2L)`, with the series' state there from the summaries), which cond2 step 5 builds with replay.
-**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`.
 
 ## Q-2002 — Gate state after an overflow catch-up
 Decided by the lead with cond2 step 4, provisional.
@@ -5482,6 +5489,89 @@ sets the gate cursor to the frontier at the resync's position: every transition 
 resync and none above, so the transitions queued behind it stay unconfirmed.
 **Pinned by.** `kvik/tests/consumer_properties.rs`
 `a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`.
+
+
+## Q-2080 — The durable gate cursor and checkpoint in the cursor file
+Decided by the builder with cond2 step 5, provisional; supersedes Q-2000.
+**Scenario.** A consumer with gates stops or crashes; at the next start it should receive every transition after the
+last one it confirmed, under the same ids, then a resync with state now (spec §6 Gates, Resume).
+**Decision (provisional).** Every cursor block written once the consumer's first watch has been applied holds the gate
+cursor (field 4); a write that carries a checkpoint appends block `0x31` before it in the same write and sync. At the
+first take in a run the engine is restored from the last valid checkpoint (from the empty core at the cursor when the
+file has no gate cursor), fed every record after it from the deliverer's kept log with each batch's commit time, and
+advanced to the commit floor; the transitions after the gate cursor are queued flagged `replayed` as the catch-up passes
+their positions, then the resume's resync carries state now. Replay is refused, and the gates in force are reseeded
+(counted `gates_reseeded`; `transitions_not_replayed` when over `conditions.replay_max`), with no cursor file, a gate
+cursor with no checkpoint (damage), a checkpoint of another generation or past the head, a reset point after it
+(Q-2082), or a failed read. A checkpoint instance naming a gate not in force at its frontier is dropped and a gate in
+force there with no instance is reseeded, both counted `checkpoint_mismatch`. At a start the commit clock is raised to
+every checkpoint's instant and every gate cursor's (G10, Q-1394). Q-2001's effect on replay: the replay itself reads no
+history, but restoring reads each held series' facts ahead of the checkpoint with one history read, and a reseed two
+per gate, each a scan of the log from its start (not changed here).
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`;
+`kvik/tests/gates_durable.rs`, `gate_deliveries_after_crashes_follow_the_rules` among them.
+
+## Q-2081 — The checkpoint block as built
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The design laid out a checkpoint record per instance with the series' live fact inside it; the engine
+keeps series apart (several gates may read one) and restores fields the design did not list.
+**Decision (provisional).** Block `0x31` holds instances and series as two lists (`format.md` A.15): an instance adds a
+change gate's reference value and the instant of its last evaluation; a series adds whether its live fact is usable and
+its revision. Values use the checkpoint's own tagged form (none, number, boolean, text), since a core value is not an
+entry value. Facts ahead of the frontier are read again at a restore, as designed.
+**Pinned by.** `log/src/cursor/tests.rs` `checkpoint_vector_matches_format_md_and_round_trips`;
+`log/tests/cursor_checkpoint.rs`.
+
+## Q-2082 — A reset point or lost range after the checkpoint
+Decided by the builder with cond2 step 5, provisional; settle with cond2 step 6.
+**Scenario.** A recovery entry or a lost range lies between a consumer's checkpoint and the head at its take.
+**Decision (provisional).** The take reseeds rather than replays: the replay would judge across positions the reset
+point voids. Cond2 step 6 replaces this with the reseed at the reset point during the replay (design §4.4 step 5).
+Reset points below the checkpoint do not stop a replay: nothing after the checkpoint rests on them.
+**Pinned by.** `kvik/tests/gates_durable.rs` `gate_deliveries_after_crashes_follow_the_rules` (a power loss ends
+the resume with a reset point).
+
+## Q-2083 — Facts counted for the bound; entries of a newer format in a replay
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** `conditions.replay_max.facts` must be checked before reading the replay; a log written by a newer
+minor version may hold ignorable entries the deliverer keeps no record of.
+**Decision (provisional).** Facts after the checkpoint are counted as the positions after it less those of the entries
+the deliverer holds, so an ignorable entry counts as facts (the bound can only be met early). A replay feeds the engine
+the records it holds; an ignorable entry last in a batch before a timer's instant would give that timer an `at` lower
+than live judgement gave it. No binary writes such entries yet.
+**Pinned by.** none yet.
+
+## Q-2084 — `set_by` after a replay of an instance a reseed set
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A reseed sets an instance with no transition, so a resync reports `set_by` none (Q-1392); a checkpoint
+taken then is replayed after a restart.
+**Decision (provisional).** The checkpoint holds the start id the instance would have had, not that a reseed set it, so
+after the replay the resync reports that id until a transition moves the instance. A flag in the instance record would
+keep `None`; not added while no consumer reads `set_by` to act.
+**Pinned by.** none yet.
+
+## Q-2085 — The model backend's resume
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The public-interface differential compares the durable backend's replay with the model backend's
+after clean restarts.
+**Decision (provisional).** The model backend keeps the whole log, has no checkpoint and applies no bound: at the first
+take after a store restart, every transition after the gate cursor that its judgement holds then comes flagged
+`replayed` (`kvik_model::gate::resume` with the bound not reached). The differential therefore runs the durable
+backend with an unbounded `conditions.replay_max`; the bound is pinned on the durable backend alone.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`.
+
+## Q-2086 — When a cursor write carries a checkpoint
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** Design §4.3 lists the writes that carry a checkpoint and what it holds.
+**Decision (provisional).** A cursor write carries a fresh checkpoint when its content's frontier differs from the one
+last written and either a gate confirmation came since, none was written yet, it is the last write of a clean
+shutdown, or `conditions.checkpoint_interval` has passed; a gates-only consumer whose engine moves is written on that
+interval though its cursor did not move. The content is the held snapshot (the engine at or before the oldest
+transition judged and not confirmed, whether queued, deferred while behind, or dropped while quiet) or, with none, the
+engine now. The held snapshot stays until all of them are confirmed: a consumer always one transition behind keeps an
+old checkpoint, whose replay may outgrow the bound (then reseeded, counted). A confirmed transition writes the cursor
+file at once.
+**Pinned by.** `kvik/tests/gates_durable.rs`.
 
 ## Open at v0.2
 
@@ -5713,10 +5803,17 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1880 | cond2 step 5 | Decided by the lead, provisional: the four rules as the contract; a log scan per read for now (Q-2001), the bounded read with replay |
 | Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
 | Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
-| Q-2000 | cond2 step 5 | Decided by the lead, provisional: gate cursor in memory; every start reseeds |
+| Q-2000 | cond2 step 5 | Superseded by Q-2080 |
 | Q-2001 | cond2 step 5 | Decided by the lead, provisional: a log scan per read; the bounded read with replay |
 | Q-2002 | cond2 step 6 | Decided by the lead, provisional: buffered while behind; changed states re-sent on re-attaching |
 | Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
+| Q-2080 | cond2 review | Decided by the builder, provisional: field 4 and block 0x31; replay at the first take |
+| Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
+| Q-2082 | cond2 step 6 | Decided by the builder, provisional: reseed when a reset point follows the checkpoint |
+| Q-2083 | cond2 review | Decided by the builder, provisional: positions less entries; newer-format entries not fed |
+| Q-2084 | cond2 review | Decided by the builder, provisional: the start id it would have had |
+| Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
+| Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

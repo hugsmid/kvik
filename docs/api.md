@@ -80,6 +80,8 @@ The keys roadmap section 4 needs; all may change between opens.
 | `limits.disk_critical` | `u64` bytes | 512 MiB | |
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
 | `limits.window_memory` | `u64` bytes | 512 MiB (`WINDOW_MEMORY_DESKTOP`) | ≥ 4 KiB. The recent windows' bytes in all (spec §5.1, Q-751): half for the writer's decision windows and revised-key index, half for the deliverer's windows. Within it each series holds 15 minutes of facts, at most 1,024, and beyond it the oldest keys are read from the log instead (spec §2.4, slow path); decisions do not change. 64 MiB (`WINDOW_MEMORY_MINIMAL`) suits the minimal class. See Memory below |
+| `conditions.replay_max` | `ReplayMax { span: Duration, facts: u64 }` | 24 h, 1,000,000 | span > 0. spec §6 Gates, Resume: a resume replays gate transitions only while the commit clock is within `span` of the consumer's checkpoint and at most `facts` facts follow it; beyond it the gates are rebuilt from history and the resume counted (`transitions_not_replayed`). Durable backend only (Q-2085) |
+| `conditions.checkpoint_interval` | `Duration` | 60 s | > 0. The longest a consumer's gate checkpoint lags its engine while the engine moves and nothing else writes one (Q-1395, Q-2086) |
 
 **Memory** (roadmap 11.0). A store's memory does not grow with the facts it holds while its consumers confirm what
 they are sent. Bounded by configuration:
@@ -427,10 +429,11 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 ### Gates
 In-store conditions on one stream (spec §6 Gates). The model backend serves them from its judgement
 (`kvik_model::gate`); the durable backend judges them in the writer's process, one engine per consumer taken in
-the run, and refuses `each` gates and window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Until the cursor
-file holds the gate cursor, the durable backend keeps it in memory: a second take in the same run receives the
-unconfirmed transitions again under their ids, but after a restart every start reseeds, with no replay and `set_by`
-`None` (Q-2000).
+the run, and refuses `each` gates and window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Its cursor file holds
+the gate cursor and a checkpoint (`format.md` A.15): a second take in the same run, and the first take after a stop or
+a crash, receive the unconfirmed transitions again under their ids, flagged `replayed`; beyond `conditions.replay_max`,
+without a cursor file, or across a reset point the gates are rebuilt from history (`set_by` `None`), counted
+`gates_reseeded` (Q-2080, Q-2082). The model backend replays without bound (Q-2085).
 ```rust
 let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity), [
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),
@@ -743,7 +746,9 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //               evaluations without every fact they rest on, delivered or not */, regions_unread /* damaged regions a
 //               consumer's read of the log met beyond those the open passed over */, transitions_not_delivered
 //               /* gate transitions judged during a catch-up and not delivered */, gates_reseeded /* starts whose gates
-//               were rebuilt from history */, gate_errors /* gate judgements rebuilt after a failed read */ }
+//               were rebuilt from history */, transitions_not_replayed /* resumes beyond `conditions.replay_max` */,
+//               checkpoint_mismatch /* checkpoint instances dropped or gates reseeded at a resume */, gate_errors
+//               /* gate judgements rebuilt after a failed read */ }
 //               (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,

@@ -485,6 +485,14 @@ impl Index {
         self.commit_at(at).unwrap_or_default()
     }
 
+    /// The commit time of the batch holding `p`, if it is kept.
+    pub(crate) fn commit_time_of(&self, p: LogPos) -> Option<i64> {
+        self.commits
+            .range(std::ops::Bound::Included(&p), std::ops::Bound::Unbounded)
+            .next()
+            .map(|(_, t)| *t)
+    }
+
     /// [`Index::position_at`] among the batches taken, `None` when none qualifies.
     pub(crate) fn commit_at(&self, at: i64) -> Option<LogPos> {
         self.commits

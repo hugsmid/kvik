@@ -106,7 +106,7 @@ impl Deliverer {
     }
 
     /// The routes and registry as of the position before `at`, built from the entries before it.
-    fn view_before(&self, at: LogPos) -> View {
+    pub(super) fn view_before(&self, at: LogPos) -> View {
         let mut v = View::default();
         for (p, e) in self.entries.range(..at) {
             v.apply(*p, e);

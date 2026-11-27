@@ -45,6 +45,8 @@ pub struct StoreConfig {
     pub limits: Limits,
     /// Tier configuration.
     pub tiers: TierConfig,
+    /// Gates' resume (spec §6 Gates, Resume).
+    pub conditions: ConditionsConfig,
     /// Clock, file system, boot identity, tzdata and entropy.
     pub env: Env,
 }
@@ -95,6 +97,12 @@ impl StoreConfig {
         self
     }
 
+    /// Sets the gates' resume configuration.
+    pub fn conditions(mut self, conditions: ConditionsConfig) -> Self {
+        self.conditions = conditions;
+        self
+    }
+
     /// Checks every key against its limits (`docs/api.md` Configuration).
     pub(crate) fn validate(&self) -> Result<(), OpenError> {
         let bad = |key, reason: &str| {
@@ -129,7 +137,81 @@ impl StoreConfig {
         if self.limits.window_memory < 4 << 10 {
             return bad("limits.window_memory", "at least 4 KiB");
         }
+        let c = &self.conditions;
+        if c.replay_max.span.is_zero() || i64::try_from(c.replay_max.span.as_nanos()).is_err() {
+            return bad(
+                "conditions.replay_max",
+                "a span above 0 and below 292 years",
+            );
+        }
+        if c.checkpoint_interval.is_zero()
+            || i64::try_from(c.checkpoint_interval.as_nanos()).is_err()
+        {
+            return bad(
+                "conditions.checkpoint_interval",
+                "above 0 and below 292 years",
+            );
+        }
         Ok(())
+    }
+}
+
+/// How far a resume replays gate transitions (`conditions.replay_max`, spec §6 Gates, Resume).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReplayMax {
+    /// Most commit-clock time from the checkpoint to the resume (default 24 h).
+    pub span: Duration,
+    /// Most facts after the checkpoint (default 1,000,000).
+    pub facts: u64,
+}
+
+impl ReplayMax {
+    /// A bound of `span` and `facts`.
+    pub fn new(span: Duration, facts: u64) -> Self {
+        ReplayMax { span, facts }
+    }
+}
+
+impl Default for ReplayMax {
+    fn default() -> Self {
+        ReplayMax {
+            span: Duration::from_secs(24 * 3_600),
+            facts: 1_000_000,
+        }
+    }
+}
+
+/// Gates' resume (spec §6 Gates, Resume; Q-1395). The model backend keeps the whole log and replays without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConditionsConfig {
+    /// Beyond this nothing is replayed: the gates are rebuilt from history (`transitions_not_replayed`).
+    pub replay_max: ReplayMax,
+    /// The longest a consumer's gate checkpoint lags its engine while the engine moves (default 60 s).
+    pub checkpoint_interval: Duration,
+}
+
+impl ConditionsConfig {
+    /// Sets `replay_max`.
+    pub fn replay_max(mut self, replay_max: ReplayMax) -> Self {
+        self.replay_max = replay_max;
+        self
+    }
+
+    /// Sets `checkpoint_interval`.
+    pub fn checkpoint_interval(mut self, d: Duration) -> Self {
+        self.checkpoint_interval = d;
+        self
+    }
+}
+
+impl Default for ConditionsConfig {
+    fn default() -> Self {
+        ConditionsConfig {
+            replay_max: ReplayMax::default(),
+            checkpoint_interval: Duration::from_secs(60),
+        }
     }
 }
 

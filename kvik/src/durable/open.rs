@@ -184,7 +184,19 @@ impl Writer {
             }
         };
         let hub = match delivering {
-            Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
+            Ok(mut d) => {
+                let c = &config.conditions;
+                d.set_gate_config(deliver::GateConfig {
+                    span: i64::try_from(c.replay_max.span.as_nanos()).unwrap_or(i64::MAX),
+                    facts: c.replay_max.facts,
+                    interval: i64::try_from(c.checkpoint_interval.as_nanos()).unwrap_or(i64::MAX),
+                });
+                // No batch commits below a checkpoint's instant or a confirmed timer's (G10, Q-1394).
+                if let Some(t) = d.gate_start_floor() {
+                    writer.commit_clock().raise(t);
+                }
+                Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone()))
+            }
             Err(_) if start_fault.is_some() => None,
             Err(source) => {
                 return Err(OpenError::Io {
