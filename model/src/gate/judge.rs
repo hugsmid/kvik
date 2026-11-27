@@ -115,8 +115,9 @@ impl Judge<'_> {
         mut last: Option<(Position, Nanos)>,
     ) -> Result<(), GateError> {
         for (index, e) in entries.iter().enumerate() {
-            if let Some((p, c)) = last
-                && (e.position() <= p || e.commit_time() < c)
+            // A fact at the origin too: the seed's inner run starts after it (Q-1800).
+            if matches!(e, Entry::Fact { fact, .. } if fact.position == Position::ORIGIN)
+                || last.is_some_and(|(p, c)| e.position() <= p || e.commit_time() < c)
             {
                 return Err(GateError::Order(e.position()));
             }

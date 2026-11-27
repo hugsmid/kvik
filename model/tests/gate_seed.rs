@@ -591,3 +591,28 @@ fn seed_generator_coverage() {
     assert!(carried >= 10, "live fact carried: {carried}");
     assert!(late >= 10, "holds completing after the start: {late}");
 }
+
+#[test]
+fn a_fact_at_the_origin_position_is_refused_as_out_of_order_not_a_panic_in_the_seed() {
+    // Q-1800: positions start at 0:1, and the seed's inner run starts after the origin.
+    let f = fact(
+        S,
+        Position::ORIGIN,
+        98 * SECOND,
+        98 * SECOND,
+        Value::Num(25.0),
+        Quality::Good,
+    );
+    let mut h = H::new().watch(100, C, hold_5_both_ways());
+    h.entries.insert(
+        0,
+        Entry::Fact {
+            commit_time: 98 * SECOND,
+            fact: f,
+        },
+    );
+    assert_eq!(
+        judge(&h.entries, END * SECOND).map(|_| ()),
+        Err(kvik_model::gate::GateError::Order(Position::ORIGIN))
+    );
+}

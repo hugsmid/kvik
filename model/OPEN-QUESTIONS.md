@@ -205,6 +205,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1810 | `format.md` A.6; Q-1580 | The bounds of a set member: decimal scale and state index (decided at review, provisional) |
 | Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
 | Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
+| Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5424,6 +5425,15 @@ backend wrote the index unchecked, so the two disagreed once durable gates are l
 named states, every `each` gate included, is `NotSupportedYet` until `each` gates carry state names.
 **Pinned by.** `kvik/src/durable/gates/tests.rs`
 `a_named_state_member_is_checked_against_the_series_names_as_on_the_model`.
+
+## Q-1800 — A fact at position `0:0` in a history given to `judge`
+Decided by the lead at the re-check of cond2 step 1.
+**Scenario.** The seed's inner run starts after `Position::ORIGIN`, so a fact at `0:0` committed inside the
+look-back made `judge` panic; the outer run accepted it. No log holds one (positions start at `0:1`).
+**Decision.** `judge` refuses a fact at the origin as `GateError::Order`, so the seed's invariant holds for every
+history it accepts. A watch or other entry at the origin stays accepted (the tests' early-watch oracle uses one).
+**Pinned by.** `model/tests/gate_seed.rs`
+`a_fact_at_the_origin_position_is_refused_as_out_of_order_not_a_panic_in_the_seed`.
 
 ## Open at v0.2
 
