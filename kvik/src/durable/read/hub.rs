@@ -438,6 +438,9 @@ impl Hub {
             x.cursor = seq;
             x.cap = cap;
             s.holders = holders(&s);
+            if s.holders == 0 {
+                drop_taken(&mut s);
+            }
         }
         debug_assert_eq!(s.holders, holders(&s));
     }
