@@ -684,3 +684,19 @@ fn with_the_tree_off_the_dirty_set_stays_empty_and_nothing_is_written_under_tree
     st.stop();
     assert_eq!(st.fs.read_dir(&st.dir.join(DIR)).unwrap(), Vec::new());
 }
+
+#[test]
+fn a_tree_exactly_stretch_max_behind_is_within_the_stretch_and_one_more_is_past_it() {
+    use super::read::past_stretch;
+    use kvik_log::writer::Position;
+    let at = |sequence| Position {
+        generation: 0,
+        sequence,
+    };
+    assert!(!past_stretch(at(10), at(7), 3));
+    assert!(past_stretch(at(11), at(7), 3));
+    assert!(
+        !past_stretch(at(5), at(7), 0),
+        "a checkpoint ahead is never behind"
+    );
+}

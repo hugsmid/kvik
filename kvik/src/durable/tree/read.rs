@@ -23,6 +23,11 @@ use crate::env::Env;
 /// (section 6 `tree_stretch_max`, Q-2070: positions stand in for the 64 MiB of log).
 pub(crate) const STRETCH_MAX: u64 = 1 << 20;
 
+/// Whether a tree checkpointed at `k` is more than `max` positions behind `at`, so neither read nor kept at a start.
+pub(crate) fn past_stretch(at: LogPos, k: LogPos, max: u64) -> bool {
+    at.sequence.saturating_sub(k.sequence) > max
+}
+
 /// What the reader's tree reads have done.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -165,7 +170,7 @@ pub(crate) fn at_cut(
     let p = cut.durable;
     let mut c = lock(cache);
     let root = newest_root(&*env.fs, dir, |r| fits(r, store_id, cut))?;
-    if p.sequence.saturating_sub(root.checkpoint.sequence) > STRETCH_MAX {
+    if past_stretch(p, root.checkpoint, STRETCH_MAX) {
         return None;
     }
     if c.root.as_ref().is_none_or(|r| r.seq != root.seq) {

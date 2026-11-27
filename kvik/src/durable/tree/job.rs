@@ -18,7 +18,7 @@ use kvik_tree::set::{DAY, Policy, QUARTER};
 use kvik_tree::write::{Fact, Identity, Opening, TreeFiles, folded_levels, quarter_entries};
 
 use super::dirty::{Dirty, Key};
-use super::read::STRETCH_MAX;
+use super::read::{STRETCH_MAX, past_stretch};
 use super::stretch::dirty_from_log;
 use crate::durable::index::{Stored, log_pos};
 use crate::durable::loss::Latch;
@@ -267,7 +267,7 @@ impl Job {
             wall: self.env.clock.wall().0,
             now,
         };
-        let far = |k: LogPos| synced.sequence.saturating_sub(k.sequence) > self.stretch_max;
+        let far = |k: LogPos| past_stretch(synced, k, self.stretch_max);
         let (files, report) = TreeFiles::start(self.env.fs.clone(), &self.dir, self.id, at, |k| {
             self.lost_below(k, &[]) || far(k)
         })
