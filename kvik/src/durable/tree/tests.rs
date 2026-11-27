@@ -418,7 +418,10 @@ fn an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds() {
     st.emit(Intent::Normal, &[(1, Some(2.0))]);
     let synced = st.w.log().as_ref().unwrap().stats().mark_synced;
     let v = r.snapshot().unwrap();
-    assert!(v.cut().durable > synced, "the commit is above the synced mark");
+    assert!(
+        v.cut().durable > synced,
+        "the commit is above the synced mark"
+    );
     let _ = r.end(v);
     let job = st.w.tree.clone().unwrap();
     job.step(synced, Duration::from_secs(1 << 30), false);
@@ -451,3 +454,118 @@ fn a_reading_at_the_greatest_instant_is_taken_and_checkpointed() {
 }
 
 const QUARTER_NS: i64 = kvik_tree::set::QUARTER;
+
+fn step_at(st: &Store, hours: u64) {
+    let job = st.w.tree.clone().unwrap();
+    job.step(
+        kvik_log::writer::Position::default(),
+        Duration::from_secs((1 << 30) + hours * 3_600),
+        false,
+    );
+    assert_eq!(job.behind(), None);
+}
+
+fn found_loss(st: &Store, first: u64, last: u64) {
+    use crate::health::{LossCause, LossKind, LossReport, MarkState};
+    use crate::types::Position;
+    let g = st.w.log().as_ref().unwrap().stats().durable.generation;
+    let report = LossReport {
+        identity: Position::new(g, first),
+        kind: LossKind::DataLost,
+        cause: LossCause::Corruption,
+        first: Some(Position::new(g, first)),
+        last: Some(Position::new(g, last)),
+        file_id: Some(1),
+        bytes: 1,
+        readable_commit_blocks: 0,
+        mark_state: MarkState::Readable,
+        boot_id: None,
+        commit_time_before: None,
+        commit_time_after: None,
+        cursors_missing: Vec::new(),
+        recorded: false,
+        acknowledged: false,
+        absorbed: Vec::new(),
+    };
+    let at = |sequence| kvik_log::writer::Position {
+        generation: g,
+        sequence,
+    };
+    st.w.latch.note(&[crate::durable::loss::Find {
+        report,
+        file_id: 1,
+        span: (0, 1),
+        closed: (at(first), at(last)),
+    }]);
+}
+
+#[test]
+fn a_loss_found_while_running_discards_the_tree_once() {
+    let mut st = Store::new("loss-once");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.reader().unwrap();
+    step_at(&st, 0);
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    assert!(!first.parts.is_empty());
+    found_loss(&st, 1, 1);
+    st.emit(Intent::Normal, &[(5, Some(2.0))]);
+    step_at(&st, 1);
+    let (discarded, _) = tree_state(&st.fs, &st.dir);
+    assert!(discarded.floor > first.seq, "the loss raised the floor");
+    st.emit(Intent::Normal, &[(4, Some(3.0))]);
+    step_at(&st, 2);
+    let (next, _) = tree_state(&st.fs, &st.dir);
+    assert!(next.seq > discarded.seq);
+    assert_eq!(
+        next.floor, discarded.floor,
+        "the same loss discards nothing again"
+    );
+    assert!(!next.parts.is_empty());
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn a_store_with_facts_and_no_tree_starts_without_marking_its_log() {
+    let mut st = Store::new("no-pass");
+    for _ in 0..3 {
+        st.emit(Intent::Normal, &[(10, Some(1.0)), (5, Some(2.0))]);
+        st.clock.advance(Duration::from_secs(86_400));
+    }
+    st.stop();
+    let tree = st.dir.join(DIR);
+    for e in st.fs.read_dir(&tree).unwrap() {
+        st.fs.remove_file(&tree.join(&e.name)).unwrap();
+    }
+    st.reopen();
+    st.stop();
+    let (root, _) = tree_state(&st.fs, &st.dir);
+    assert!(root.checkpoint.sequence > 0, "K moved to the cut");
+    assert!(root.parts.is_empty(), "{} parts", root.parts.len());
+    assert!(root.floors.is_empty(), "{} floors", root.floors.len());
+}
+
+#[test]
+fn an_idle_store_writes_no_root_at_its_intervals() {
+    let mut st = Store::new("idle");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.reader().unwrap();
+    step_at(&st, 0);
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    for h in 1..4 {
+        step_at(&st, h);
+    }
+    let (last, _) = tree_state(&st.fs, &st.dir);
+    assert_eq!(last.seq, first.seq);
+    st.emit(Intent::Normal, &[(5, Some(2.0))]);
+    step_at(&st, 4);
+    assert!(tree_state(&st.fs, &st.dir).0.seq > first.seq);
+    st.w.shutdown().unwrap();
+}
+
+#[test]
+fn a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree() {
+    let mut st = Store::new("no-start");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    st.w.shutdown().unwrap();
+    assert!(st.fs.read_dir(&st.dir.join(DIR)).is_err());
+}
