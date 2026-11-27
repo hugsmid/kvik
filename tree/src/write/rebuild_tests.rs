@@ -329,6 +329,26 @@ proptest! {
 }
 
 #[test]
+fn t1_holds_when_a_series_rebuild_resumed_after_a_kill_finds_a_node_now_empty() {
+    let h = 3_600_000_000_000;
+    run(&[
+        Op::Facts(vec![
+            (0, 692_394 * S, Some(0.0)),
+            (0, -h, Some(0.0)),
+            (0, 23 * h, Some(0.0)),
+        ]),
+        Op::Sync,
+        Op::Sync,
+        Op::Stopped {
+            at: 14,
+            stop: Stop::Kill,
+            act: Act::Rebuild(0),
+        },
+        Op::Facts(vec![(0, 692_394 * S, None)]),
+    ]);
+}
+
+#[test]
 fn t8_holds_when_a_repair_follows_a_start_that_refused_a_newer_root() {
     use Act::Checkpoint as C;
     let h = 3_600_000_000_000;
