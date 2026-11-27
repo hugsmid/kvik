@@ -286,3 +286,34 @@ fn each_and_window_gates_are_refused_as_not_supported_yet() {
         assert_eq!(err, Err(CoreError::NotSupported(ConditionId(id as u32))));
     }
 }
+
+#[test]
+fn a_second_watch_of_an_id_an_unwatch_of_an_unknown_id_and_a_refused_gate_are_errors() {
+    let r = Replay::default();
+    let item = |seq, body| Item {
+        position: Position::new(0, seq),
+        body,
+    };
+    let watch = |seq, id, gate| item(seq, Body::Watch { id, gate });
+    let mut core = Core::new();
+    core.apply_batch(0, &[watch(1, ConditionId(1), hold_up(5))], &r)
+        .expect("first watch");
+    assert_eq!(
+        core.apply_batch(0, &[watch(2, ConditionId(1), hold_up(3))], &r),
+        Err(CoreError::Id(ConditionId(1)))
+    );
+    let unwatch = item(3, Body::Unwatch { id: ConditionId(2) });
+    assert_eq!(
+        core.apply_batch(0, &[unwatch], &r),
+        Err(CoreError::Id(ConditionId(2)))
+    );
+    let refused = gate(Kind::Levels(Vec::new()), None);
+    assert_eq!(
+        core.apply_batch(0, &[watch(4, ConditionId(3), refused)], &r),
+        Err(CoreError::Invalid(
+            ConditionId(3),
+            kvik_model::gate::GateError::Levels
+        ))
+    );
+    assert_eq!(core.states().len(), 1);
+}

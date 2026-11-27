@@ -20,7 +20,7 @@ pub(super) enum Op {
     Fact {
         dt: i64,
         series: u32,
-        v: u8,
+        v: Val,
         ahead: i64,
         bad: bool,
         version: u64,
@@ -38,9 +38,38 @@ pub(super) enum Op {
     },
 }
 
+/// A fact's value: numbers mostly, and the other kinds every rule must pass over (spec §6 Gates).
+#[derive(Clone, Debug)]
+pub(super) enum Val {
+    Num(u8),
+    Str(u8),
+    Bool(bool),
+    Absent,
+}
+
+impl Val {
+    fn value(&self) -> Value {
+        match self {
+            Val::Num(n) => Value::Num(f64::from(*n)),
+            Val::Str(n) => Value::Str(format!("s{n}")),
+            Val::Bool(b) => Value::Bool(*b),
+            Val::Absent => Value::Absent,
+        }
+    }
+}
+
+fn arb_val() -> impl Strategy<Value = Val> {
+    prop_oneof![
+        12 => (0..=10u8).prop_map(Val::Num),
+        2 => (0..3u8).prop_map(Val::Str),
+        1 => any::<bool>().prop_map(Val::Bool),
+        1 => Just(Val::Absent),
+    ]
+}
+
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        10 => (0..12i64, prop_oneof![6 => Just(1u32), 1 => 2..4u32], 0..=10u8,
+        10 => (0..12i64, prop_oneof![6 => Just(1u32), 1 => 2..4u32], arb_val(),
               prop_oneof![9 => Just(0i64), 1 => 1..8i64], prop::bool::weighted(0.1), 0..4u64)
             .prop_map(|(dt, series, v, ahead, bad, version)| Op::Fact { dt, series, v, ahead, bad, version }),
         1 => (0..5i64, 0..4usize).prop_map(|(dt, template)| Op::Watch { dt, template }),
@@ -49,8 +78,34 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn arb_levels() -> impl Strategy<Value = Vec<Level>> {
-    let holds = prop_oneof![2 => Just(0i64), 1 => Just(3), 1 => Just(7)];
+/// The unit a case's times are drawn in, the holds drawn (in units) and the two `stale_after` drawn.
+#[derive(Clone, Copy)]
+struct Scale {
+    unit: Nanos,
+    holds: [i64; 3],
+    stale: [i64; 2],
+}
+
+const SECONDS: Scale = Scale {
+    unit: SECOND,
+    holds: [0, 3, 7],
+    stale: [15, 4],
+};
+
+/// Holds past 12 h, so `2L` meets the seed's 24 h cap (Q-1390).
+const HOURS: Scale = Scale {
+    unit: 3_600 * SECOND,
+    holds: [0, 3, 13],
+    stale: [9, 30],
+};
+
+fn arb_hold(sc: Scale) -> impl Strategy<Value = i64> + Clone {
+    let [a, b, c] = sc.holds;
+    prop_oneof![2 => Just(a), 1 => Just(b), 1 => Just(c)].prop_map(move |h| h * sc.unit)
+}
+
+fn arb_levels(sc: Scale) -> impl Strategy<Value = Vec<Level>> {
+    let holds = arb_hold(sc);
     proptest::sample::subsequence((1..=9).collect::<Vec<i32>>(), 1..=3)
         .prop_flat_map(move |ats| {
             let n = ats.len();
@@ -65,11 +120,7 @@ fn arb_levels() -> impl Strategy<Value = Vec<Level>> {
             for ((a, g), (u, d)) in ats.into_iter().zip(gaps).zip(holds) {
                 let at = f64::from(a);
                 let floor = out.last().map_or(f64::MIN, |l| l.clear);
-                out.push(
-                    Level::at(at)
-                        .clear((at - g).max(floor))
-                        .hold(u * SECOND, d * SECOND),
-                );
+                out.push(Level::at(at).clear((at - g).max(floor)).hold(u, d));
             }
             out
         })
@@ -84,28 +135,30 @@ pub(super) fn gate(kind: Kind, stale_after: Option<Nanos>) -> Gate {
     }
 }
 
-fn arb_templates() -> impl Strategy<Value = Vec<Gate>> {
-    let stale = prop_oneof![Just(None), Just(Some(15 * SECOND)), Just(Some(4 * SECOND))];
+fn arb_templates(sc: Scale) -> impl Strategy<Value = Vec<Gate>> {
+    let [a, b] = sc.stale;
+    let stale = prop_oneof![Just(None), Just(Some(a * sc.unit)), Just(Some(b * sc.unit))];
+    let member = prop_oneof![
+        3 => (0..=10u8).prop_map(Val::Num),
+        1 => (0..3u8).prop_map(Val::Str),
+        1 => any::<bool>().prop_map(Val::Bool),
+    ];
     (
-        arb_levels(),
-        arb_levels(),
-        stale.clone(),
-        stale,
-        prop::collection::vec(0..=10u8, 1..4),
-        (0..6i64, 0..6i64),
+        arb_levels(sc),
+        arb_levels(sc),
+        (stale.clone(), stale.clone(), stale),
+        prop::collection::vec(member, 1..4),
+        (arb_hold(sc), arb_hold(sc)),
     )
-        .prop_map(|(l1, l2, st1, st2, members, (on, off))| {
+        .prop_map(|(l1, l2, (st1, st2, st3), members, (on, off))| {
             let set = Kind::Set {
-                members: members
-                    .into_iter()
-                    .map(|m| Value::Num(f64::from(m)))
-                    .collect(),
-                hold_on: on * SECOND,
-                hold_off: off * SECOND,
+                members: members.iter().map(Val::value).collect(),
+                hold_on: on,
+                hold_off: off,
             };
             vec![
                 gate(Kind::Levels(l1), st1),
-                gate(set, None),
+                gate(set, st3),
                 gate(Kind::Change { deadband: 1.5 }, st1),
                 gate(Kind::Levels(l2), st2),
             ]
@@ -217,7 +270,7 @@ impl Log {
     }
 }
 
-fn build(templates: &[Gate], first: &[usize], ops: &[Op], versioned: bool) -> Log {
+fn build(templates: &[Gate], first: &[usize], ops: &[Op], versioned: bool, unit: Nanos) -> Log {
     let mut log = Log::default();
     let mut in_force: Vec<(ConditionId, usize)> = Vec::new();
     let mut ids = 0u32;
@@ -235,38 +288,42 @@ fn build(templates: &[Gate], first: &[usize], ops: &[Op], versioned: bool) -> Lo
             Op::Fact {
                 dt,
                 series,
-                v,
+                ref v,
                 ahead,
                 bad,
                 version,
             } => {
-                now += dt * SECOND;
-                let q = if bad { Quality::Bad } else { Quality::Good };
-                let value = Value::Num(f64::from(v));
+                now += dt * unit;
+                let value = v.value();
+                let q = if bad || matches!(value, Value::Absent) {
+                    Quality::Bad
+                } else {
+                    Quality::Good
+                };
                 // A series is versioned for its whole life (spec §2.2): only S is, in a versioned case.
                 let changed_at = (versioned && series == S.0).then_some(version);
                 log.fact_v(
                     SeriesId(series),
                     now,
-                    now + ahead * SECOND,
+                    now + ahead * unit,
                     value,
                     q,
                     changed_at,
                 );
             }
             Op::Watch { dt, template } => {
-                now += dt * SECOND;
+                now += dt * unit;
                 watch(&mut log, &mut in_force, now, template);
             }
             Op::Unwatch { dt, k } => {
-                now += dt * SECOND;
+                now += dt * unit;
                 if !in_force.is_empty() {
                     let (id, _) = in_force.remove(k % in_force.len());
                     log.unwatch(now, id);
                 }
             }
             Op::Other { dt } => {
-                now += dt * SECOND;
+                now += dt * unit;
                 log.other(now);
             }
         }
@@ -355,8 +412,8 @@ pub(super) fn run(log: &Log, drive: &Drive, until: Nanos) -> (Vec<Transition>, C
 }
 
 /// Asserts the core gives `judge`'s transitions, in order, and its final states.
-pub(super) fn check(log: &Log, drive: &Drive) -> Result<(), TestCaseError> {
-    let until = log.last_commit() + 40 * SECOND;
+pub(super) fn check(log: &Log, drive: &Drive, unit: Nanos) -> Result<(), TestCaseError> {
+    let until = log.last_commit() + 40 * unit;
     let model = judge(&log.entries, until).expect("valid log");
     let (got, core) = run(log, drive, until);
     prop_assert_eq!(&got, &model.transitions);
@@ -367,13 +424,24 @@ pub(super) fn check(log: &Log, drive: &Drive) -> Result<(), TestCaseError> {
 proptest! {
     #[test]
     fn the_core_gives_what_judge_gives_over_any_split_floor_and_restore(
-        templates in arb_templates(),
+        templates in arb_templates(SECONDS),
         first in prop::collection::vec(0..4usize, 0..3),
         ops in prop::collection::vec(arb_op(), 0..48),
         drive in arb_drive(),
         versioned in prop::bool::weighted(0.3),
     ) {
-        let log = build(&templates, &first, &ops, versioned);
-        check(&log, &drive)?;
+        let log = build(&templates, &first, &ops, versioned, SECONDS.unit);
+        check(&log, &drive, SECONDS.unit)?;
+    }
+
+    #[test]
+    fn the_core_gives_what_judge_gives_with_holds_past_the_seeds_day_cap(
+        templates in arb_templates(HOURS),
+        first in prop::collection::vec(0..4usize, 0..3),
+        ops in prop::collection::vec(arb_op(), 0..48),
+        drive in arb_drive(),
+    ) {
+        let log = build(&templates, &first, &ops, false, HOURS.unit);
+        check(&log, &drive, HOURS.unit)?;
     }
 }
