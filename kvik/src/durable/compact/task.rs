@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use kvik_chunk::file::{
-    Batch, CHUNK_ROWS, Class, Description, Fact, FileWriter, Identity, IndexEntry, Input, Level,
-    Position, SeriesInfo,
+    BLOCK_ROWS, Batch, CHUNK_ROWS, Class, Description, Fact, FileWriter, Identity, IndexEntry,
+    Input, Level, Position, SeriesInfo,
 };
 use kvik_log::content::Item;
 use kvik_log::entries::{Definition, Entry};
@@ -29,12 +29,12 @@ use super::{
 
 /// Partitions one pass writes at most (§3.1 Bounded outputs).
 const MAX_OPEN: usize = 16;
-/// What a writer holds for a commit-time row (Q-1840).
-const BATCH_ROW: u64 = 40;
+/// What a writer holds for a commit-time row (Q-1840): the row and its count of rows held (`FileWriter::held_bytes`).
+const BATCH_ROW: u64 = std::mem::size_of::<Batch>() as u64 + 8;
 /// Bytes written to an output between its syncs (compaction design §4).
 const SYNC_EVERY: u64 = 1 << 20;
-/// What a writer's block being built may hold beyond its sink.
-const BLOCK_RESERVE: u64 = 64 << 10;
+/// What a writer's block being built holds beyond its sink: a block of rows as `FileWriter::held_bytes` counts them.
+const BLOCK_RESERVE: u64 = (BLOCK_ROWS * (std::mem::size_of::<Fact>() + 255)) as u64;
 /// The least a group may hold, so a census near the cap does not split every series; a cap of 0 makes every series
 /// its own pass, split as finely as it goes.
 const MIN_GROUP: u64 = 1 << 20;
@@ -224,6 +224,8 @@ struct Open {
     at: u64,
     unsynced: u64,
     series: Option<u32>,
+    /// Its writer is past its last series; the index goes out a block a step.
+    finishing: bool,
     written: Option<Written>,
 }
 
@@ -493,13 +495,15 @@ impl<'a> RunTask<'a> {
                 .len()
                 > 1
         });
-        // Q-1840: the window is as many partitions as the writers' index entries and commit-time rows fit in a
-        // quarter of the cap.
+        // Q-1840, Q-1940: the window is as many partitions as the writers' index entries and commit-time rows fit
+        // in a quarter of the cap, and their whole writers, by the writer's own figures, in half.
         let per_file = c.bytes.len() as u64 * 2 * std::mem::size_of::<IndexEntry>() as u64
             + batches.len() as u64 * BATCH_ROW;
-        let open = (self.cap / 4 / per_file.max(1)).clamp(1, MAX_OPEN as u64) as usize;
-        let reserved =
-            FIXED + c.held() + open as u64 * (2 * (PIECE as u64 + BLOCK_RESERVE) + per_file);
+        let per_writer = per_file + 2 * PIECE as u64 + BLOCK_RESERVE;
+        let open = (self.cap / 4 / per_file.max(1))
+            .min(self.cap / 2 / per_writer)
+            .clamp(1, MAX_OPEN as u64) as usize;
+        let reserved = FIXED + c.held() + open as u64 * per_writer;
         let budget = match self.cap {
             0 => 0,
             cap => (cap.saturating_sub(reserved) / 2).max(MIN_GROUP),
@@ -742,13 +746,19 @@ impl<'a> RunTask<'a> {
         }
         if let Some(o) = self.open.iter_mut().find(|o| o.w.is_some()) {
             let (pi, class) = plan.files[o.file];
-            let mut w = o.w.take().expect("checked");
-            if class == CURRENT
-                && let Some(e) = self.entries.remove(&pi)
-            {
-                w.entries(&e)?;
+            let w = o.w.as_mut().expect("checked");
+            if !o.finishing {
+                o.finishing = true;
+                if class == CURRENT
+                    && let Some(e) = self.entries.remove(&pi)
+                {
+                    w.entries(&e)?;
+                }
             }
-            let (sink, done) = w.finish()?;
+            if !w.finish_step()? {
+                return Ok(None);
+            }
+            let (sink, done) = o.w.take().expect("checked").finish()?;
             o.tail = sink;
             let meta = &plan.metas[&plan.files[o.file]];
             o.written = Some(Written {
@@ -1184,6 +1194,7 @@ fn open_output(input: &RunInput<'_>, plan: &Plan, i: usize) -> Result<Open, RunE
         at: 0,
         unsynced: 0,
         series: None,
+        finishing: false,
         written: None,
     })
 }
