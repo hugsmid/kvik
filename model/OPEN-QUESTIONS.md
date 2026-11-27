@@ -222,6 +222,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2161 | §6 Gates, Resume | The crash property's cases and checks (decided at review) |
 | Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
 | Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (decided at review, provisional; settle with cond2 step 6) |
+| Q-2220 | §6 Gates, Resume; Q-132 | A resync's confirmation over replayed transitions is written at once (decided in the fix round) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5636,6 +5637,17 @@ block limit. Today's limit, 4,096 single-series gates, stays under 3 MiB.
 **Decision (provisional).** Cond2 step 6 bounds the instances per consumer or splits the checkpoint across blocks.
 **Pinned by.** none yet.
 
+## Q-2220 — A resync's confirmation over replayed transitions is written at once
+Decided in the fix round of cond2 step 5.
+**Scenario.** A start replays transitions handed out before a crash and ends with a resync; the consumer confirms the
+resync, which returns, and the process crashes within a second. The confirmation's frontier covered the replayed
+transitions, but only a confirmed transition was written at once: the frontier went on the timed path (at most once
+a second), so the crash lost it and the next start replayed the same transitions again after their confirmation had
+returned. Found by the crash property at its full case count.
+**Decision.** Every gate confirmation, a transition or a resync's frontier, writes the cursor file before `confirm`
+returns, as a latch change does. A resync is confirmed once a resume, so the extra writes are few.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_confirmed_start_transition_does_not_come_again_after_three_crashes`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5882,6 +5894,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2161 | cond2 review | Decided at review: every case; two continuity checks; floors on checks reached |
 | Q-2162 | cond2 step 6 | Decided at review, provisional: keep the rule; measure bytes in the step 6 bench notes |
 | Q-2163 | cond2 step 6 | Decided at review, provisional: bound instances per consumer or split the checkpoint |
+| Q-2220 | cond2 review | Decided in the fix round: every gate confirmation written at once |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
