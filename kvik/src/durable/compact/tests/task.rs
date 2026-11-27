@@ -241,3 +241,123 @@ fn peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes() {
         assert!(peak <= MINIMAL_MEMORY, "{tag}: peak {peak} above the cap");
     }
 }
+
+/// The shapes that reach the cap hardest: many series, many series by many days, many batches by many days.
+fn heavy_shapes() -> Vec<(&'static str, Segments)> {
+    vec![
+        (
+            "many-series",
+            shape(200, 1_000, |b, k| {
+                reading(
+                    (b * 1_000 + k) as u32 / 2,
+                    399 * DAY + (k % 2) as i64,
+                    Value::F64(k),
+                )
+            }),
+        ),
+        (
+            "many-series-with-revisions",
+            shape(150, 1_000, |b, k| {
+                reading((b * 1_000 + k) as u32 / 3, 399 * DAY + 5, Value::F64(k))
+            }),
+        ),
+        (
+            "series-by-days",
+            shape(16, 12_000, |b, k| {
+                reading(k as u32, (384 + b as i64) * DAY + 7, Value::F64(k))
+            }),
+        ),
+        (
+            "batches-by-days",
+            shape(17_000, 15, |b, k| {
+                reading(k as u32, (385 + k as i64) * DAY + b as i64, Value::F64(k))
+            }),
+        ),
+        (
+            "one-series",
+            shape(350, 1_000, |b, k| {
+                reading(1, 399 * DAY + (b * 1_000 + k) as i64 * 100, Value::F64(k))
+            }),
+        ),
+        (
+            "full-text",
+            shape(30, 1_000, |b, k| {
+                reading(
+                    1,
+                    399 * DAY + (b * 1_000 + k) as i64,
+                    Value::Text("é".repeat(127) + "x"),
+                )
+            }),
+        ),
+    ]
+}
+
+const ALLOC_CHILD: &str = "KVIK_COMPACT_ALLOC_CHILD";
+
+/// Runs `allocated_peaks` alone in a process of its own, so that the heap counts the run and nothing else (Q-1841).
+#[test]
+fn the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes() {
+    let name = format!(
+        "{}::allocated_peaks",
+        module_path!().split_once("::").expect("in a crate").1
+    );
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            &name,
+        ])
+        .env(ALLOC_CHILD, "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    eprintln!("{text}");
+}
+
+#[test]
+#[ignore = "run alone by the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes"]
+fn allocated_peaks() {
+    if std::env::var_os(ALLOC_CHILD).is_none() {
+        return;
+    }
+    let heap = crate::heap();
+    let mut over = Vec::new();
+    for (tag, segs) in heavy_shapes() {
+        let dir = temp_dir(tag);
+        let set_aside = SetAside::new(vec![]);
+        let weeks = BTreeSet::new();
+        let cands = put_all(&dir, &segs);
+        let base = heap.current_usage();
+        heap.reset_peak_usage();
+        let mut task = RunTask::new(input(&dir, &set_aside, &weeks), cands, MINIMAL_MEMORY);
+        let mut stages: Vec<(&str, usize)> = Vec::new();
+        let mut real = 0;
+        loop {
+            let stage = task.stage();
+            let before = heap.peak_usage();
+            heap.reset_peak_usage();
+            let done = task.step_run();
+            let p = heap.peak_usage().saturating_sub(base);
+            real = real.max(p).max(before.saturating_sub(base));
+            match stages.iter_mut().find(|s| s.0 == stage) {
+                Some(s) => s.1 = s.1.max(p),
+                None => stages.push((stage, p)),
+            }
+            if done {
+                break;
+            }
+        }
+        let real = real as u64;
+        let counted = task.peak();
+        task.outcome().unwrap().unwrap();
+        eprintln!("{tag}: allocated {real}, counted {counted}, by stage {stages:?}");
+        if real > MINIMAL_MEMORY || counted > MINIMAL_MEMORY {
+            over.push((tag, real, counted));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    assert!(over.is_empty(), "above the cap: {over:?}");
+}

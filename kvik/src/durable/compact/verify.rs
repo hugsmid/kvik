@@ -1,7 +1,7 @@
 //! Verification of a run's outputs (§3.2), a step at a time: each output read back from the device through the
 //! stepped canonical check, then a data block a step for counts, per-series checksums and placement, then hashed in
-//! 128 KiB pieces for its description. It holds 24 bytes a series, one file's index and a block of each of two
-//! files.
+//! 128 KiB pieces for its description. It holds 24 bytes a series, one file's index (twice while the canonical
+//! check rebuilds it) and a block of each of two files.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kvik_chunk::file::{
     CanonicalCheck, CanonicalError, Class, CompactedFile, Directory, Fact, FileError, Identity,
-    IndexEntry, Input, Layout, Position, Reach, ReadAt, SeriesInfo,
+    IndexEntry, Input, Layout, Position, ReadAt, SeriesInfo,
 };
 use kvik_log::fs::{FsFile, OpenMode};
 use sha2::{Digest, Sha256};
@@ -160,7 +160,8 @@ impl ReadAt for Src {
     }
 }
 
-type Infos = Box<dyn Fn(u32) -> SeriesInfo + Send>;
+/// The registry is lent to each step (`CanonicalCheck::step_with`), so the check holds no name of a series.
+type Canon = CanonicalCheck<Src, fn(u32) -> SeriesInfo>;
 
 const PLACED: VerifyError = VerifyError::Placement("a revision row not outranked in the run");
 
@@ -220,7 +221,7 @@ impl Cursor {
 
 enum Phase {
     Open,
-    Canon(Box<CanonicalCheck<Src, Infos>>),
+    Canon(Box<Canon>),
     Content {
         file: Box<CompactedFile<Src>>,
         order: Vec<IndexEntry>,
@@ -241,8 +242,6 @@ pub(super) struct Check {
     held: Option<Held>,
     j: usize,
     phase: Phase,
-    sums: BTreeMap<u32, u128>,
-    facts: BTreeMap<u32, u64>,
     positions: u64,
     entries: u128,
     out: Vec<Output>,
@@ -256,8 +255,6 @@ impl Check {
             held: Held::new(ranges),
             j: 0,
             phase: Phase::Open,
-            sums: BTreeMap::new(),
-            facts: BTreeMap::new(),
             positions: 0,
             entries: 0,
             out: Vec::new(),
@@ -269,19 +266,21 @@ impl Check {
         &self.files
     }
 
-    /// Bytes it holds: its sums and counts by series, the open file's index and a block of each of two files.
+    /// Bytes it holds: the open file's index, the position bits and a block of each of two files; the sums and counts
+    /// it takes from are the census's.
     pub(super) fn held(&self) -> u64 {
         let index = match &self.phase {
             Phase::Content { order, .. } => {
-                (order.len() * std::mem::size_of::<IndexEntry>()) as u64
+                (order.capacity() * std::mem::size_of::<IndexEntry>()) as u64
             }
+            Phase::Canon(c) => c.held_bytes(),
             _ => 0,
         };
         let bits = self
             .held
             .as_ref()
             .map_or(0, |h| 8 * h.bits.len() + 32 * h.spans.len());
-        40 * self.sums.len() as u64 + index + bits as u64 + 2 * PIECE as u64
+        index + bits as u64 + 2 * PIECE as u64
     }
 
     /// The size of the next step's device call.
@@ -292,11 +291,12 @@ impl Check {
         }
     }
 
-    /// One step; the verified outputs once every check has passed.
+    /// One step; the verified outputs once every check has passed. Each row is taken off `expect`'s sums and counts,
+    /// which end at zero when the outputs hold what the inputs promised.
     pub(super) fn step(
         &mut self,
         input: &RunInput<'_>,
-        expect: &Expect,
+        expect: &mut Expect,
         infos: &dyn Fn(u32, Position) -> SeriesInfo,
     ) -> Result<Option<Vec<Output>>, VerifyError> {
         let Some(w) = self.files.get(self.j).cloned() else {
@@ -320,25 +320,17 @@ impl Check {
                 if d.run_count as usize != self.files.len() {
                     return Err(VerifyError::Description("run count"));
                 }
-                let mut named: BTreeMap<u32, SeriesInfo> = BTreeMap::new();
-                for e in file.index()? {
-                    named
-                        .entry(e.series_id)
-                        .or_insert_with(|| infos(e.series_id, w.greatest));
-                }
-                let registry: Infos = Box::new(move |s| {
-                    named.get(&s).cloned().unwrap_or(SeriesInfo {
-                        name: None,
-                        reach: Reach::Point,
-                    })
-                });
-                self.phase = Phase::Canon(Box::new(CanonicalCheck::new(src, &w.id, registry)?));
+                drop(file);
+                let lent: fn(u32) -> SeriesInfo = |_| unreachable!("lent to each step");
+                self.phase = Phase::Canon(Box::new(CanonicalCheck::new(src, &w.id, lent)?));
             }
             Phase::Canon(c) => {
-                if c.step()? {
+                if c.step_with(&|s| infos(s, w.greatest))? {
+                    let Phase::Canon(c) = std::mem::replace(&mut self.phase, Phase::Open) else {
+                        unreachable!("in the canonical phase")
+                    };
+                    let order = c.into_order();
                     let file = CompactedFile::open(Src::open(input, &w)?, &w.id, Some(&w.layout))?;
-                    let mut order = file.index()?;
-                    order.sort_by_key(|e| e.chunk_offset);
                     self.phase = Phase::Content {
                         file: Box::new(file),
                         order,
@@ -428,9 +420,10 @@ impl Check {
                         }
                     }
                     self.positions += 1;
-                    *self.facts.entry(f.series_id).or_default() += 1;
-                    let s = self.sums.entry(f.series_id).or_default();
-                    *s = s.wrapping_add(fact_digest(f, r.received_at, r.commit_time));
+                    let n = expect.anchors.facts.entry(f.series_id).or_default();
+                    *n = n.wrapping_sub(1);
+                    let s = expect.sums.entry(f.series_id).or_default();
+                    *s = s.wrapping_sub(fact_digest(f, r.received_at, r.commit_time));
                 }
             }
             Phase::Hash { src, at, hash } => {
@@ -456,13 +449,13 @@ impl Check {
     }
 
     fn totals(&mut self, expect: &Expect) -> Result<Vec<Output>, VerifyError> {
-        if self.positions != expect.anchors.positions || self.facts != expect.anchors.facts {
+        if self.positions != expect.anchors.positions
+            || expect.anchors.facts.values().any(|&n| n != 0)
+        {
             return Err(VerifyError::Counts);
         }
-        for (s, sum) in &expect.sums {
-            if self.sums.get(s) != Some(sum) {
-                return Err(VerifyError::Checksum(Some(*s)));
-            }
+        if let Some((s, _)) = expect.sums.iter().find(|(_, sum)| **sum != 0) {
+            return Err(VerifyError::Checksum(Some(*s)));
         }
         if self.entries != expect.entries {
             return Err(VerifyError::Checksum(None));

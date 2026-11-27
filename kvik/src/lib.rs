@@ -90,6 +90,11 @@
 
 #![forbid(unsafe_code)]
 
+/// Counts the heap so the compaction run's memory is measured against its cap (`durable::compact` tests).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: peak_alloc::PeakAlloc = peak_alloc::PeakAlloc;
+
 // The store's drivers and its manifest, wired by roadmap 8.1d and 8.3d.
 use {kvik_backup as _, kvik_files as _};
 
@@ -98,6 +103,10 @@ mod backup;
 mod config;
 mod consume;
 mod durable;
+#[cfg(test)]
+pub(crate) fn heap() -> &'static peak_alloc::PeakAlloc {
+    &ALLOC
+}
 mod error;
 mod fold;
 mod health;

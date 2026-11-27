@@ -60,31 +60,28 @@ pub fn check_canonical(
 pub struct CanonicalCheck<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> {
     file: CompactedFile<S>,
     writer: Option<FileWriter<Compare<S>>>,
-    registry: R,
-    /// Chunks in file order, each with the number of its first data block.
-    order: Vec<(IndexEntry, usize)>,
+    registry: Option<R>,
+    /// Chunks in file order; directories are read as their chunk is reached.
+    order: Vec<IndexEntry>,
     batches: Vec<Batch>,
     held: Vec<Vec<u64>>,
     /// The next chunk and data block.
     at: (usize, usize),
+    /// The number of the next chunk's first data block, in write order.
+    next_block: usize,
     dir: Option<Directory>,
     /// The chunk that ends the open series.
     series_end: Option<usize>,
+    /// Blocks of the open series' set-aside chunks, read when it opened, by chunk.
+    aside_blocks: Vec<(usize, usize)>,
 }
 
 impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
     /// Opens the file through the reader's checks and starts the writer.
     pub fn new(src: S, id: &Identity, registry: R) -> Result<Self, CanonicalError> {
         let file = CompactedFile::open(src.clone(), id, None)?;
-        let mut index = file.index()?;
-        index.sort_by_key(|e| e.chunk_offset);
-        let mut order = Vec::with_capacity(index.len());
-        let mut n = 0;
-        for e in index {
-            let blocks = file.directory(&e)?.blocks.len();
-            order.push((e, n));
-            n += blocks;
-        }
+        let mut order = file.index()?;
+        order.sort_unstable_by_key(|e| e.chunk_offset);
         let batches = file.batches()?;
         let compare = Compare {
             source: src,
@@ -93,25 +90,46 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
             window: Vec::new(),
             window_at: 0,
         };
-        let writer = FileWriter::new(
+        let mut writer = FileWriter::new(
             compare,
             *id,
             file.header().created_at,
             file.description(),
             batches.clone(),
         )?;
+        writer.reserve_index(order.len());
         let held = vec![Vec::new(); batches.len()];
         Ok(Self {
             file,
             writer: Some(writer),
-            registry,
+            registry: Some(registry),
             order,
             batches,
             held,
             at: (0, 0),
+            next_block: 0,
             dir: None,
             series_end: None,
+            aside_blocks: Vec::new(),
         })
+    }
+
+    /// The file's index in file order, for a caller that reads the file again after the check.
+    pub fn into_order(self) -> Vec<IndexEntry> {
+        self.order
+    }
+
+    /// Bytes it holds besides the file's blocks: its index, the writer's and the position bits.
+    pub fn held_bytes(&self) -> u64 {
+        let entry = std::mem::size_of::<IndexEntry>() as u64;
+        self.order.capacity() as u64 * entry
+            + self.writer.as_ref().map_or(0, FileWriter::held_bytes)
+            + (self.batches.capacity() * std::mem::size_of::<Batch>()) as u64
+            + self
+                .held
+                .iter()
+                .map(|b| 24 + 8 * b.capacity() as u64)
+                .sum::<u64>()
     }
 
     fn writer(&mut self) -> &mut FileWriter<Compare<S>> {
@@ -140,29 +158,39 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
     }
 
     /// Opens the series of the chunk at `i`: its run of chunks, and its set-aside facts read whole.
-    fn open_series(&mut self, i: usize) -> Result<(), CanonicalError> {
-        let id = self.order[i].0.series_id;
+    fn open_series(
+        &mut self,
+        i: usize,
+        registry: &dyn Fn(u32) -> SeriesInfo,
+    ) -> Result<(), CanonicalError> {
+        let id = self.order[i].series_id;
         let end = i + self.order[i..]
             .iter()
-            .take_while(|(e, _)| e.series_id == id)
+            .take_while(|e| e.series_id == id)
             .count();
+        let last_aside = (i..end)
+            .rev()
+            .find(|&k| self.order[k].flags & SET_ASIDE != 0);
         let mut aside = Vec::new();
-        for k in i..end {
-            let (e, first) = self.order[k];
-            if e.flags & SET_ASIDE == 0 {
-                continue;
-            }
+        self.aside_blocks.clear();
+        let mut first = self.next_block;
+        for k in i..last_aside.map_or(i, |k| k + 1) {
+            let e = self.order[k];
             let d = self.file.directory(&e)?;
-            for b in 0..d.blocks.len() {
-                let (block, body) = self.file.data_block_raw(&e, &d, b)?;
-                for f in facts_of(id, &block) {
-                    self.hold(f.position)?;
-                    aside.push(f);
+            if e.flags & SET_ASIDE != 0 {
+                for b in 0..d.blocks.len() {
+                    let (block, body) = self.file.data_block_raw(&e, &d, b)?;
+                    for f in facts_of(id, &block) {
+                        self.hold(f.position)?;
+                        aside.push(f);
+                    }
+                    self.writer().offer_body(first + b, body);
                 }
-                self.writer().offer_body(first + b, body);
+                self.aside_blocks.push((k, d.blocks.len()));
             }
+            first += d.blocks.len();
         }
-        let info = (self.registry)(id);
+        let info = registry(id);
         self.writer()
             .begin_series(id, info.name.as_deref(), info.reach, aside)?;
         self.series_end = Some(end);
@@ -171,14 +199,26 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
 
     /// Checks one data block, or ends a series, or at the end the entries and the tail; `true` once the file passed.
     pub fn step(&mut self) -> Result<bool, CanonicalError> {
+        let registry = self.registry.take().expect("held between steps");
+        let r = self.step_with(&registry);
+        self.registry = Some(registry);
+        r
+    }
+
+    /// [`Self::step`] with the registry given for this step, for a caller that cannot lend it for the whole check.
+    pub fn step_with(
+        &mut self,
+        registry: &dyn Fn(u32) -> SeriesInfo,
+    ) -> Result<bool, CanonicalError> {
         let (i, b) = self.at;
         if i == self.order.len() {
             return self.finish().map(|()| true);
         }
         if self.series_end.is_none() {
-            self.open_series(i)?;
+            self.open_series(i, registry)?;
         }
-        let (e, first) = self.order[i];
+        let e = self.order[i];
+        let first = self.next_block;
         if e.flags & SET_ASIDE == 0 {
             if self.dir.is_none() {
                 self.dir = Some(self.file.directory(&e)?);
@@ -195,6 +235,13 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
                 self.at.1 += 1;
                 return Ok(false);
             }
+            self.next_block += d.blocks.len();
+        } else {
+            self.next_block += self
+                .aside_blocks
+                .iter()
+                .find(|a| a.0 == i)
+                .map_or(0, |a| a.1);
         }
         self.dir = None;
         self.at = (i + 1, 0);

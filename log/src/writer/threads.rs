@@ -342,6 +342,9 @@ impl Log {
         dirs: Option<DirectoryOptions>,
         task: Option<Task>,
     ) -> io::Result<Self> {
+        if let Some(t) = &task {
+            t.share.check()?;
+        }
         let dirs = dirs.map(|opts| {
             let start = writer.directory_start();
             let store = writer.store();

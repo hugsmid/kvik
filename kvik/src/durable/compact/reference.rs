@@ -71,7 +71,7 @@ pub(super) fn verified_or_removed(
     taken: &Inputs,
     written: &[Written],
 ) -> Result<Vec<Output>, RunError> {
-    let expect = expect(taken)?;
+    let mut expect = expect(taken)?;
     let ranges: Vec<(Position, Position)> = taken.ranges.iter().map(|r| (r.0, r.1)).collect();
     let mut check = Check::new(written.to_vec(), &ranges);
     let infos = |s: u32, g: Position| {
@@ -79,7 +79,7 @@ pub(super) fn verified_or_removed(
         kvik_chunk::file::SeriesInfo { name, reach }
     };
     loop {
-        match check.step(input, &expect, &infos) {
+        match check.step(input, &mut expect, &infos) {
             Ok(None) => {}
             Ok(Some(out)) => return Ok(out),
             Err(e) => {

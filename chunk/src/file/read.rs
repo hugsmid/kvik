@@ -231,7 +231,15 @@ impl<S: ReadAt> CompactedFile<S> {
 
     /// Every index entry, in index order.
     pub fn index(&self) -> Result<Vec<IndexEntry>, FileError> {
-        let mut out = Vec::with_capacity(self.trailer.chunk_count.min(1 << 16) as usize);
+        // Exact when the root is honest; never more entries than the file has room for.
+        let listed: u64 = self
+            .index
+            .records
+            .iter()
+            .map(|r| u64::from(r.entry_count))
+            .sum();
+        let room = self.src.len() / super::parts::ENTRY_LEN as u64;
+        let mut out = Vec::with_capacity(usize::try_from(listed.min(room)).unwrap_or(0));
         for i in 0..self.index.records.len() {
             out.extend(self.index_block(i)?);
         }
