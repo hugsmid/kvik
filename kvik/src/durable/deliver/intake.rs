@@ -213,10 +213,8 @@ impl Deliverer {
         }
         let mut fed: Vec<u32> = Vec::new();
         let commit = b.content.received_at;
+        // Each item's call fires the timers due by `commit` first (Q-1144); they queue by position.
         let mut gating = !self.loading && self.gating();
-        if gating {
-            self.gate_batch(commit, ctx);
-        }
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();
         // The consumers with more to take after the batch; an entry may change what any of them takes.

@@ -275,3 +275,75 @@ fn a_backward_clock_step_pauses_timers_until_the_clock_catches_up() {
         ]
     );
 }
+
+#[test]
+fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_state_on_reattaching()
+{
+    let clock = kvik::env::ManualClock::new(common::start());
+    let mut limits = kvik::Limits::default();
+    limits.consumer_queue = 2;
+    let config = common::config_on(Backend::Durable, "gates-api-overflow", &clock).limits(limits);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.watch("moved", Gate::change(Input::value(id)).deadband(5.0))).unwrap();
+    for k in 0..10 {
+        clock.advance(Duration::from_secs(1));
+        block_on(s.emit(&[kvik::Reading::new(
+            id,
+            clock.wall(),
+            Value::F64(f64::from(k) * 10.0),
+        )]))
+        .unwrap();
+    }
+    let mut got = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let kvik::DeliveryKind::Transition(t) = &d.kind {
+            got.push(t.clone());
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    assert!(s.stats().delivery.transitions_not_delivered > 0);
+    assert!(got.windows(2).all(|w| w[0].id < w[1].id), "{got:#?}");
+    assert_eq!(
+        got.last().and_then(|t| t.to.clone()),
+        Some(kvik::GateState::Value(Value::F64(90.0)))
+    );
+    assert!(got.len() < 11);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor()
+ {
+    let clock = kvik::env::ManualClock::new(common::start());
+    let config = common::config_on(Backend::Durable, "gates-api-reseed", &clock);
+    let s = block_on(Store::open(config.clone())).unwrap();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(75.0))])).unwrap();
+    // Handed out, not confirmed: a replay would send it again.
+    while c.try_next().unwrap().is_some() {}
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = block_on(Store::open(config)).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut gates = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        match &d.kind {
+            kvik::DeliveryKind::Transition(t) => panic!("replayed {t:?}"),
+            kvik::DeliveryKind::Resync(r) => gates.extend(r.gates.clone()),
+            _ => {}
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    assert_eq!(gates.len(), 1);
+    assert_eq!(
+        (gates[0].state.clone(), gates[0].set_by),
+        (kvik::GateState::Level(0), None)
+    );
+    assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    block_on(s.shutdown()).unwrap();
+}

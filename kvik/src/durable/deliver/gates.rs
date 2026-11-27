@@ -282,14 +282,6 @@ impl Deliverer {
         }
     }
 
-    /// Before a batch committed at `commit`: timers due by then fire first (Q-1144).
-    pub(super) fn gate_batch(&mut self, commit: Nanos, ctx: &Ctx<'_>) {
-        let names = self.gate_names();
-        for name in names {
-            self.gate_call(&name, ctx, |core, _| Ok(core.advance(commit)));
-        }
-    }
-
     /// One item of a batch committed at `commit`, at `p`, for every consumer judging gates; a consumer's first
     /// watch starts its run.
     pub(super) fn gate_item(&mut self, p: LogPos, commit: Nanos, feed: &Feed<'_>, ctx: &Ctx<'_>) {
