@@ -5267,6 +5267,136 @@ returns those events again, so dropping the round's collector lost facts for eve
 over, since a carried collector grows without bound while the fault lasts. A round that took nothing is dropped.
 **Pinned by.** `kvik/src/durable/read/live/lags.rs` `a_round_failing_after_taking_events_lags_the_tail_it_took_them_for`.
 
+## Q-1460 — How a nodes block stores a node version
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.9), provisional.
+**Scenario.** The design gave each entry one `as_of: uv64` relative to the block's `base_pos`. A version is a position
+(Q-1422), and positions of current facts can belong to an older generation, whose sequences restart at 1, so one
+unsigned difference cannot hold every version a run may carry.
+**Options.** (a) Two fields: the generation difference from `base_pos`, then the sequence, as a difference when the
+generation is the same and whole otherwise; (b) a full 12-byte position per entry; (c) one field, refusing a run
+that spans generations.
+**Decision (provisional).** (a), with `base_pos` the least version of the whole run so both differences are
+non-negative, the same in each of the run's blocks so a block's split does not depend on the versions it holds. It
+costs one byte more than the design's field in the usual case; (c) would make an ordinary restore fail a checkpoint.
+**Pinned by.** `tests/refusals.rs` vectors `AsOf` and `BasePosition`; `tests/files/mod.rs` `day_part` (an older
+generation's version).
+
+## Q-1461 — Tree files accept only canonical bytes
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.8, T.11), provisional.
+**Scenario.** `format.md`'s common rules have readers ignore reserved bytes and padding and accept non-canonical
+blocks, so a later minor version may use them. A tree part or root that passes the listed checks but is not what the
+writer would write (other padding, another block split, a stale directory) could then be read with nothing to say
+which bytes are meant.
+**Options.** (a) Accept only canonical bytes, as the derived files of A.18 already refuse unknown skippable blocks;
+(b) the common rules, with a separate canonical check for the scrub.
+**Decision (provisional).** (a): a tree file is derived, so a refusal costs a rebuild and never data, and a reader
+that accepts only what encodes to itself has one meaning for every accepted file, which the fuzz target checks.
+A newer writer's additions take version refusals (Q-1462), not reserved bytes.
+**Pinned by.** `tests/refusals.rs` vectors `Reserved`, `Padding`, `Split`, `Directory`, `DirectoryRoot`, `Summary`;
+`tests/fuzz_inputs.rs`.
+
+## Q-1462 — A record size above v1 in a tree file
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12), provisional.
+**Scenario.** A.18 lets a reader ignore the tail of a record longer than it knows. With canonical reading (Q-1461) a
+file whose records carry such a tail would not encode to itself.
+**Options.** (a) A version refusal; (b) keep the tail bytes through a decode and encode.
+**Decision (provisional).** (a): the reader leaves the file to the newer writer that wrote it and takes facts; a
+size below v1 is damage.
+**Pinned by.** `tests/refusals.rs` vectors `RecordSize`, `RecordSizeSmall`;
+`root_refusals_shared_with_parts`, `a_directory_or_directory_root_record_size_above_v1_is_a_version_refusal`.
+
+## Q-1540 — What a part's `seq` is, and whether two live parts may share one
+Settled by the lead with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12).
+**Scenario.** A part split on series ranges above 256 MiB gives two parts written for one root; a merge that leaves
+out a newer delta of its period (a week merged from day parts of `seq` 100 to 107 while a late-data delta of `seq`
+150 sits on one day) must not overlay that delta, so its `seq` has to be the highest of its inputs, equal to an
+input's and, split, to its sibling's. Distinct `seq`s in a root cannot hold either.
+**Options.** (a) Delta and rebuilt parts take the `seq` of the root that first lists them, a merged part the highest
+`seq` of its inputs; parts of one `seq` are allowed when their series ranges or periods are disjoint, and the root
+refuses two of one `seq` whose periods and series ranges both overlap; (b) as (a), overlay order `(seq, file_id)` and
+no refusal; (c) distinct `seq` kept, every merge taking every live part overlapping its output.
+**Decision.** (a). Periods are half-open and series ranges inclusive, as the trailer records them (an empty part's
+is 0 to 0); a range whose least is above its greatest overlaps nothing.
+**Pinned by.** `tests/refusals.rs` `parts_of_one_seq_are_accepted_when_periods_or_series_ranges_are_disjoint`,
+`parts_of_one_seq_overlapping_in_period_and_series_are_refused`,
+`parts_of_one_seq_are_refused_exactly_when_a_pair_overlaps_in_period_and_series`.
+
+## Q-1550 — A roll-up over a stale child
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merge writes each roll-up as the merge of its visible children (design 7.1b T2). A child may be
+marked `stale`, so its node is not the canonical one, or has none.
+**Options.** (a) The roll-up is `stale` with no node bytes, at the children's highest version; (b) merge the nodes
+that are present and mark it `stale`; (c) leave the roll-up out.
+**Decision (provisional).** (a): the reader takes facts for a stale entry anyway, so bytes would never be read, and
+(c) would read as an empty node where the span is covered.
+**Pinned by.** `tests/set.rs` `a_merge_leaves_visible_unchanged_and_writes_the_rollups_of_t2` (`check_rollups`).
+
+## Q-1551 — The age of a delta part
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design merges two deltas of a day once the oldest is two hours old. A root records no write time
+per part.
+**Options.** (a) The age of the lowest-`seq` delta's greatest entry end; (b) add a write time to the root's part
+record.
+**Decision (provisional).** (a): no format change, and a delta's newest entry ends near the checkpoint that wrote it.
+A delta of late data looks old at once, which only merges it sooner.
+**Pinned by.** `tests/plan.rs` `two_deltas_merge_once_the_oldest_ends_two_hours_before_now`.
+
+## Q-1552 — Where weeks and 13- and 52-week periods start
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** Merged parts span a UTC day, a week, 13 weeks or 52 weeks; the design does not fix their alignment.
+**Options.** (a) Weeks from Monday 1970-01-05 UTC, and 13 and 52 weeks counted from the same Monday; (b) ISO weeks
+and quarters or years, which are not whole numbers of weeks.
+**Decision (provisional).** (a): every period is a whole number of the next shorter one, so a 52-week part is the
+merge of four 13-week parts. Periods are internal; no reader sees them.
+**Pinned by.** `tree/src/set/plan.rs` `weeks_start_on_monday_and_each_period_lies_inside_the_next`; `tests/plan.rs`
+`a_week_of_day_parts_merges_two_weeks_after_it_ends`.
+
+## Q-1553 — A delta part that spans day boundaries
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** A checkpoint writes one delta part, so late data can give it a period over many days. Day, week and
+longer merges take parts inside their period, so such a part would never be merged.
+**Options.** (a) The planner first splits it into one part per UTC day that holds an entry, of the same `seq`;
+(b) day merges take it whole and widen their period; (c) the checkpoint writes one delta per day.
+**Decision (provisional).** (a): (b) breaks the period tiers and (c) multiplies syncs at a checkpoint; the split is
+one more merge and keeps every later rule per day.
+**Pinned by.** `tests/plan.rs` `a_delta_crossing_a_day_boundary_is_split_by_day`.
+
+## Q-1554 — The `seq` of a merged part
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merged part overlays other live parts by its `seq`. If it took a new, higher `seq`, a live part
+outside the merge that overlaid one of its inputs would fall beneath it.
+**Options.** (a) The inputs' highest `seq` (as Q-1540 settles), refusing a merge when a live part outside it has a
+`seq` inside the inputs' range, a period overlapping an input's or an output period, and a series range overlapping
+the inputs'; (b) a new `seq`, taking as inputs every overlapping part above the lowest input.
+**Decision (provisional).** (a): order against every part outside the merge is kept, and the planner can merge a
+run of deltas without waiting for parts that interleave them. Every entry of the output keeps the version it had.
+**Pinned by.** `tests/plan.rs` `merge_refuses_a_part_between_the_inputs_seqs`,
+`a_delta_between_the_seqs_of_others_breaks_their_run`.
+
+## Q-1555 — When a day counts as merged
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design writes a day's roll-ups when its day part is written, and the planner must know which days
+have one. The root records roll-up spans only through `covered`.
+**Options.** (a) A day is merged when every roll-up span inside it that the finest cover level covers is covered at
+its own level, so a day with nothing covered counts as merged; (b) a day is merged when a merged part spans it.
+**Decision (provisional).** (a): it follows the level table rather than fixed levels, and a day with nothing covered
+would otherwise be merged again at every pass, since its roll-ups can never be covered.
+**Pinned by.** `tests/plan.rs` `a_day_past_its_late_window_gets_its_day_part_with_rollups`,
+`without_rollup_levels_a_day_never_waits_for_a_day_part`, `the_planner_reads_level_widths_from_the_table`.
+
+## Q-1670 — A merge that leaves out a sibling of its own `seq`
+Raised by the re-check of roadmap 7.1b step 1; decided with step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** Inputs A (`seq` 100, series 0 to 100) and B (`seq` 107, series 0 to 50); B's split sibling C (`seq`
+107, series 51 to 100) is not taken. The output takes `seq` 107 and series 0 to 100, overlaps C in period and series,
+and a root listing both is refused (T.12).
+**Options.** (a) A merge takes every live part of its output's `seq` that overlaps its output in period and series,
+and never writes an empty merged part; (b) overlay order `(seq, file_id)` and no refusal.
+**Decision (provisional).** (a): the merge refuses a live part outside it whose `seq` lies in the inputs' range and
+whose period and series range overlap theirs (Q-1554), which covers the sibling; it writes a part only for a period
+that keeps an entry; the planner's runs and whole-period merges take such siblings.
+**Pinned by.** `tests/plan.rs` `a_merge_must_take_the_overlapping_siblings_of_its_output_seq`,
+`the_planner_takes_a_delta_run_with_its_same_seq_siblings`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

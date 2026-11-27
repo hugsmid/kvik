@@ -73,6 +73,8 @@ files-rebuild   files rebuild
 files-fuzz      files fuzz_inputs
 tree-properties tree properties
 tree-fuzz-inputs tree fuzz_inputs
+tree-refusals   tree refusals
+tree-set        tree set
 backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys
