@@ -801,8 +801,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 - `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
   tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
   (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). An `emit` returns
-  without reading its batch back; the `kvik-deliver` thread reads it shortly after, or the next call that takes
-  batches, as of the emit's acknowledgement (Q-1119). These counts may then lag an emit's return, and
+  without reading its batch back; the `kvik-deliver` thread reads it shortly after (within about a second while no consumer is known, Q-1490, Q-1610),
+  or the next call that takes batches, as of the emit's acknowledgement (Q-1119). These counts may then lag an emit's return, and
   `refresh_errors` counts the failed reads, not the calls (Q-706).
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per

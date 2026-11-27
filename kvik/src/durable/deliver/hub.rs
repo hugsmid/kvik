@@ -38,6 +38,10 @@ pub(crate) struct Hub {
     acked: Mutex<Vec<(LogPos, Stamp)>>,
 }
 
+/// How often the `kvik-deliver` thread reads acknowledged batches back while no consumer is known: it bounds how far
+/// behind the delivery reader, its lease and its counts run (Q-1490).
+const IDLE_READ: Duration = Duration::from_secs(1);
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -151,6 +155,8 @@ impl Hub {
             .name("kvik-deliver".into())
             .spawn(move || {
                 let mut seen = 0;
+                let mut read_at = Instant::now();
+                let mut sealed = watch.stats().sealed_segments;
                 loop {
                     seen = watch.wait_progress(seen, Duration::from_secs(1));
                     if watch.stopped() || hub.closed.load(Ordering::SeqCst) {
@@ -165,6 +171,19 @@ impl Hub {
                     if due {
                         hub.ticked();
                     }
+                    // With no consumer known the batches have no reader yet: a take pumps before it computes the
+                    // consumer's start, so reading them back on each progress is work nobody needs (Q-1490). A seal
+                    // still reads at once: the series directory written for it covers what the read-back folded.
+                    let now_sealed = watch.stats().sealed_segments;
+                    let read = due
+                        || hub.has_consumers()
+                        || now_sealed != sealed
+                        || read_at.elapsed() >= IDLE_READ;
+                    if !read {
+                        continue;
+                    }
+                    read_at = Instant::now();
+                    sealed = now_sealed;
                     let r = hub.run(|d, c| {
                         d.pump(c);
                         if due {

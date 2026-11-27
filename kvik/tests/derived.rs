@@ -387,6 +387,9 @@ fn a_run_over_a_region_the_start_meets_and_no_lost_range_records_writes_no_serie
     wait_sealed_with(&w, 2_222.5);
     wait_for(&w, lost);
     emit(&s, &[num(g, 2, 3_333.5)]);
+    // The deliverer takes the newest batch before the damage: its last batch read is not the damaged one, which the
+    // next refresh would check again and find (Q-1490).
+    s.tick().unwrap();
     damage(&w, 2_222.5);
     block_on(s.shutdown()).unwrap();
     assert!(series_dir(&w).is_some());

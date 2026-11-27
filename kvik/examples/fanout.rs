@@ -1,17 +1,18 @@
 //! CPU and reaction of push delivery as subscribers are added, on the W0 home load: 37 series at 1 Hz, unaligned,
-//! from 8 calling threads.
+//! from 8 calling threads (`--series 74` for W0x2).
 //!
 //! ```sh
 //! cargo run --release -p kvik --example fanout -- --dir <scratch dir> \
-//!     [--live 5,20,50,200] [--consumers 20,50] [--seconds 30] [--warmup 5]
+//!     [--live 5,20,50,200] [--consumers 20,50] [--series 37] [--seconds 30] [--warmup 5]
 //! ```
 //!
 //! Each cell is a fresh durable store under `--dir` with the default configuration. Every subscriber watches 2 to 6
 //! of the series: a live session (`min_batch_interval` 20 ms) with a `Tail` of them, waiting in `next`, or a
 //! consumer routed to them that confirms each delivery. After the warm-up it prints, over the window: the whole
-//! process's CPU and the log writer thread's (% of one core, from `/proc`), context switches a second over every
-//! thread (wakes), and reaction from a reading's timestamp to its delivery (p50, p99). Each store directory is
-//! removed afterwards.
+//! process's CPU and that of the `kvik-writer`, `kvik-fanout` and `kvik-deliver` threads (% of one core, from
+//! `/proc`), context switches a second over every thread (wakes) and on `kvik-fanout` alone, read calls a second on
+//! `kvik-fanout` and `kvik-deliver`, and reaction from a reading's timestamp to its delivery (p50, p99). A thread not
+//! running shows as NaN. Each store directory is removed afterwards.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -26,7 +27,6 @@ use kvik::{
     SeriesSpec, SessionOptions, Start, Store, StoreConfig, Timestamp, Value, ValueType,
 };
 
-const SERIES: usize = 37;
 const CALLERS: usize = 8;
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -51,6 +51,7 @@ struct Args {
     dir: PathBuf,
     live: Vec<usize>,
     consumers: Vec<usize>,
+    series: usize,
     seconds: u64,
     warmup: u64,
 }
@@ -60,6 +61,7 @@ fn args() -> Args {
         dir: std::env::temp_dir(),
         live: vec![5, 20, 50, 200],
         consumers: vec![20, 50],
+        series: 37,
         seconds: 30,
         warmup: 5,
     };
@@ -76,6 +78,7 @@ fn args() -> Args {
             "--dir" => a.dir = v.into(),
             "--live" => a.live = list(&v),
             "--consumers" => a.consumers = list(&v),
+            "--series" => a.series = v.parse().unwrap(),
             "--seconds" => a.seconds = v.parse().unwrap(),
             "--warmup" => a.warmup = v.parse().unwrap(),
             _ => panic!("unknown option {k}"),
@@ -93,13 +96,43 @@ fn cpu_of(path: &str) -> Option<Duration> {
     Some(Duration::from_millis(ticks * 10))
 }
 
-/// The stat file of this process's thread with the given name.
-fn thread_stat(name: &str) -> Option<String> {
+/// The `/proc` directory of this process's thread with the given name.
+fn thread_dir(name: &str) -> Option<PathBuf> {
     std::fs::read_dir("/proc/self/task").ok()?.find_map(|t| {
         let t = t.ok()?.path();
         let comm = std::fs::read_to_string(t.join("comm")).ok()?;
-        (comm.trim() == name).then(|| t.join("stat").to_string_lossy().into_owned())
+        (comm.trim() == name).then_some(t)
     })
+}
+
+/// A numeric field of a `/proc` key-value file (`io`, `status`), summed over the keys containing `key`.
+fn field(path: &std::path::Path, key: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(path).ok()?;
+    Some(
+        s.lines()
+            .filter(|l| l.split(':').next().is_some_and(|k| k.contains(key)))
+            .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .sum(),
+    )
+}
+
+/// One reading of a named thread's CPU time, context switches and read calls.
+#[derive(Clone, Copy, Default)]
+struct ThreadSample {
+    cpu: Option<Duration>,
+    switches: Option<u64>,
+    reads: Option<u64>,
+}
+
+fn sample(dir: Option<&PathBuf>) -> ThreadSample {
+    let Some(d) = dir else {
+        return ThreadSample::default();
+    };
+    ThreadSample {
+        cpu: cpu_of(&d.join("stat").to_string_lossy()),
+        switches: field(&d.join("status"), "ctxt_switches"),
+        reads: field(&d.join("io"), "syscr"),
+    }
 }
 
 /// Voluntary and involuntary context switches of every thread of this process.
@@ -270,7 +303,7 @@ fn cell(a: &Args, what: &str, n: usize) {
         StoreConfig::new(&dir, "Etc/UTC").create_if_missing(true),
     ))
     .unwrap();
-    let ids: Vec<SeriesId> = (0..SERIES)
+    let ids: Vec<SeriesId> = (0..a.series)
         .map(|i| {
             let spec = SeriesSpec::new(
                 format!("w0/s{i}/power"),
@@ -297,20 +330,16 @@ fn cell(a: &Args, what: &str, n: usize) {
         .collect();
     let callers = feed(&store, &ids, &sh);
     thread::sleep(Duration::from_secs(a.warmup));
-    let writer = thread_stat("kvik-writer").unwrap_or_default();
-    let (p0, w0, s0, t0) = (
+    let threads = ["kvik-writer", "kvik-fanout", "kvik-deliver"].map(thread_dir);
+    let take = || threads.each_ref().map(|d| sample(d.as_ref()));
+    let (p0, th0, s0, t0) = (
         cpu_of("/proc/self/stat"),
-        cpu_of(&writer),
+        take(),
         switches(),
         Instant::now(),
     );
     thread::sleep(Duration::from_secs(a.seconds));
-    let (p1, w1, s1, wall) = (
-        cpu_of("/proc/self/stat"),
-        cpu_of(&writer),
-        switches(),
-        t0.elapsed(),
-    );
+    let (p1, th1, s1, wall) = (cpu_of("/proc/self/stat"), take(), switches(), t0.elapsed());
     sh.stop.store(true, Ordering::SeqCst);
     for c in callers {
         c.join().unwrap();
@@ -324,12 +353,25 @@ fn cell(a: &Args, what: &str, n: usize) {
             100.0 * e.saturating_sub(b).as_secs_f64() / wall.as_secs_f64()
         })
     };
+    let rate = |b: Option<u64>, e: Option<u64>| {
+        e.zip(b).map_or(f64::NAN, |(e, b)| {
+            e.saturating_sub(b) as f64 / wall.as_secs_f64()
+        })
+    };
+    let cpu = |i: usize| pct(th0[i].cpu, th1[i].cpu);
+    let reads = |i: usize| rate(th0[i].reads, th1[i].reads);
     let mut r = std::mem::take(&mut *sh.reactions.lock().unwrap());
     println!(
-        "| {what} | {n} | {:.2} | {:.2} | {:.0} | {:.2} | {:.2} | {} |",
+        "| {what} | {} | {n} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2} | {:.2} | {} |",
+        a.series,
         pct(p0, p1),
-        pct(w0, w1),
+        cpu(0),
+        cpu(1),
+        cpu(2),
         (s1 - s0) as f64 / wall.as_secs_f64(),
+        rate(th0[1].switches, th1[1].switches),
+        reads(1),
+        reads(2),
         quantile(&mut r, 0.5).as_secs_f64() * 1e3,
         quantile(&mut r, 0.99).as_secs_f64() * 1e3,
         r.len(),
@@ -341,9 +383,10 @@ fn cell(a: &Args, what: &str, n: usize) {
 fn main() {
     let a = args();
     println!(
-        "| mode | subscribers | process CPU % | writer CPU % | wakes/s | reaction p50 ms | p99 ms | deliveries |"
+        "| mode | series | subscribers | process CPU % | writer CPU % | fanout CPU % | deliver CPU % | wakes/s \
+         | fanout wakes/s | fanout reads/s | deliver reads/s | reaction p50 ms | p99 ms | deliveries |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for &n in &a.live {
         cell(&a, "live", n);
     }
