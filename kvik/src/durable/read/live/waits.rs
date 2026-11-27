@@ -7,6 +7,8 @@ use super::tests::{TICK, World, apply, emit, gauge, watched};
 use crate::config::ReaderConfig;
 use crate::durable::tests::block_on;
 use crate::read::{Live, LiveOptions, SessionOptions};
+use crate::time::Timestamp;
+use crate::types::{Quality, Reading, Value};
 use crate::{Query, Reader, Selection};
 
 #[test]
@@ -330,5 +332,113 @@ fn a_fan_out_thread_that_panics_rings_every_session_and_leaves_them_rung_by_ever
     assert!(d.fanout_failed.load(Ordering::SeqCst));
     assert!(session.durable_mut().and_then(|x| x.rung()).unwrap() > before);
     drop(session);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// A `Latest` whose series is unsure (a good reading corrected to bad at the same `t`) is not due at once on every
+/// turn: `next` sleeps rather than turns while it waits.
+#[test]
+fn next_sleeps_while_a_latest_series_is_unsure() {
+    let w = World::new("unsure-sleep");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let t = Timestamp(w.clock.wall().0 - 5_000_000_000);
+    block_on(s.emit(&[Reading::new(id, t, Value::F64(1.0))])).unwrap();
+    block_on(s.emit(&[Reading::new(id, t, Value::F64(1.0)).with_quality(Quality::Bad)])).unwrap();
+    let r = s.reader();
+    let (mut session, ..) = watched(&r, LiveOptions::default());
+    let before = session.turns();
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            for _ in 0..300 {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(session.next(Duration::from_millis(300)).unwrap().is_none());
+        ticking.join().unwrap();
+    });
+    assert!(
+        session.turns() - before < 100,
+        "{}",
+        session.turns() - before
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_latest_value_falling_due_long_after_the_last_batch_arrives_at_its_due_time_not_an_interval_later()
+ {
+    let w = World::new("due-latency");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let now = w.clock.wall().0;
+    block_on(s.emit(&[Reading::new(
+        id,
+        Timestamp(now - 5_000_000_000),
+        Value::F64(1.0),
+    )]))
+    .unwrap();
+    block_on(s.emit(&[Reading::new(
+        id,
+        Timestamp(now + 2_050_000_000),
+        Value::F64(2.0),
+    )]))
+    .unwrap();
+    let r = s.reader();
+    let opts = SessionOptions::new(Duration::from_secs(1), Duration::from_millis(100));
+    let mut session = r.session_with(opts).unwrap();
+    session
+        .open(Query::Latest(Selection::all()), LiveOptions::default())
+        .unwrap();
+    assert!(session.next(Duration::ZERO).unwrap().is_some());
+    w.clock.advance(Duration::from_secs(2));
+    while session.next(Duration::ZERO).unwrap().is_some() {}
+    let start = w.clock.wall().0;
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let got = session.next(Duration::from_secs(5)).unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waited = (w.clock.wall().0 - start) / 1_000_000;
+        assert!(got.is_some());
+        assert!(waited < 500, "due in 50 ms, arrived after {waited} ms");
+    });
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn next_sleeps_out_the_batch_interval_after_a_due_time_inside_it_passes() {
+    let w = World::new("due-inside");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = s.reader();
+    let (mut session, ..) = watched(&r, LiveOptions::default());
+    w.clock.advance(Duration::from_secs(1));
+    let now = w.clock.wall().0;
+    block_on(s.emit(&[
+        Reading::new(id, Timestamp(now), Value::F64(1.0)),
+        Reading::new(id, Timestamp(now + 20_000_000), Value::F64(2.0)),
+    ]))
+    .unwrap();
+    while session.next(Duration::ZERO).unwrap().is_some() {}
+    let before = session.turns();
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            for _ in 0..180 {
+                w.clock.advance(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(session.next(Duration::from_millis(180)).unwrap().is_none());
+        ticking.join().unwrap();
+    });
+    let turns = session.turns() - before;
+    assert!(turns < 100, "{turns}");
     block_on(s.shutdown()).unwrap();
 }

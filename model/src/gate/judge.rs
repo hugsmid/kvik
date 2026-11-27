@@ -124,6 +124,10 @@ impl Judge {
                     .get(&fact.t)
                     .is_some_and(|c| c.rank() > fact.rank());
                 if !outranked {
+                    // Q-1200: an arrival not yet due goes with the fact it came from.
+                    if fact.t > now {
+                        sd.arrivals.retain(|a| *a != fact.t);
+                    }
                     sd.current.insert(fact.t, fact.clone());
                     // A bad or valueless fact refreshes nothing (spec §2.5, §5.4); a future one counts
                     // once it takes effect (spec §4 Future facts).

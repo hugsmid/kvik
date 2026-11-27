@@ -215,9 +215,6 @@ struct Rt {
     /// Known (routes or an unreadable cursor file) but without a cursor, and not taken in this run: it starts with a
     /// resync when it is (`spec.md` §4 Resync, a consumer with no cursor file).
     dormant: bool,
-    /// Taken lost in this run, its `NoCursor` resync not yet confirmed: the position before its start, sent again
-    /// at every take (Q-1450).
-    no_cursor: Option<LogPos>,
     queue: VecDeque<Pend>,
     parts: VecDeque<(Delivery, Out)>,
     unconfirmed: Vec<Out>,
@@ -233,6 +230,8 @@ struct Rt {
     reset_open: bool,
     /// Reading stopped at a reset point until its resync is confirmed and its cursor file synced.
     paused: bool,
+    /// The `forget_above` of a `NoCursor` resync not yet confirmed: a second take in this run sends it again.
+    forget: Option<LogPos>,
     runners: BTreeMap<u32, Runner>,
     /// A void changed the funnels in force: the runners are synced at the next evaluation.
     stale_runners: bool,

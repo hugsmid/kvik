@@ -5,7 +5,7 @@
 use std::fmt;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// An instant: nanoseconds since the Unix epoch, UTC.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -274,6 +274,13 @@ mod jiff_conversions {
             );
         }
     }
+}
+
+/// The instant `timeout` from now; a timeout no instant can hold is a deadline far ahead.
+pub(crate) fn deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }
 
 #[cfg(test)]

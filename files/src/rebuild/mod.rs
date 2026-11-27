@@ -203,6 +203,7 @@ pub fn plan(
         .iter()
         .map(|r| r.generation)
         .find(|g| *g > 0 && !restored.contains(g))
+        .or_else(|| image.missing_restore_record())
     {
         return Err(RebuildError::RestoreRecord(g));
     }

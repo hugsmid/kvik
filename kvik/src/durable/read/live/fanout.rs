@@ -19,7 +19,7 @@ use crate::durable::tests::block_on;
 use crate::env::Env;
 use crate::read::{LiveId, LiveOptions, Query, Selection};
 use crate::time::Timestamp;
-use crate::types::{Reading, SeriesId, Value};
+use crate::types::{Fact, Reading, SeriesId, Value};
 use crate::{LiveSession, Select, Store};
 
 const S: i64 = 1_000_000_000;
@@ -307,7 +307,8 @@ impl Rig {
         for (k, s) in self.subs.iter_mut().enumerate() {
             any |= s.poll(racing == Some(k))?;
             if s.small {
-                passed_over(&s.held[0], &s.held[1])?;
+                let same_cut = !stopped(&mut s.fan) && !stopped(&mut s.every);
+                passed_over(&s.held[0], &s.held[1], same_cut)?;
             } else {
                 prop_assert_eq!(&s.held[0], &s.held[1]);
             }
@@ -322,8 +323,11 @@ impl Rig {
                 break;
             }
         }
-        for s in &self.subs {
-            if !s.small {
+        for s in &mut self.subs {
+            if s.small {
+                prop_assert!(!stopped(&mut s.fan) && !stopped(&mut s.every));
+                passed_over(&s.held[0], &s.held[1], true)?;
+            } else {
                 prop_assert_eq!(plain(&s.held[0]), plain(&s.held[2]));
             }
         }
@@ -331,12 +335,21 @@ impl Rig {
     }
 }
 
+/// Whether the session's last batch stopped at a row limit inside its rounds (Q-1014): its `Latest`s then stand at that
+/// cut.
+fn stopped(s: &mut LiveSession) -> bool {
+    s.durable_mut().is_some_and(|d| d.rest)
+}
+
 /// A small backlog counted every row before Q-1118, so the old path also lagged over rounds holding nothing the
-/// session selects: the fan-out session holds every fact the old one does, and others only inside a range the old one
-/// was told it lagged over; its `Latest`s are the same.
+/// session selects: the fan-out session holds facts the old one lacks only inside a range the old one was told it
+/// lagged over. A session that does not lag may stop at a row limit where the old one lagged past, and lag later over
+/// facts the old one then delivers, so once neither has stopped short of the view the fan-out session holds every fact
+/// the old one does or was told it lagged over it, and its `Latest`s are the same.
 fn passed_over(
     fan: &BTreeMap<LiveId, Held>,
     old: &BTreeMap<LiveId, Held>,
+    same_cut: bool,
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(
         fan.keys().collect::<Vec<_>>(),
@@ -344,17 +357,19 @@ fn passed_over(
     );
     for (id, f) in fan {
         let o = &old[id];
-        prop_assert_eq!(&f.latest, &o.latest);
-        prop_assert!(o.tail.iter().all(|x| f.tail.contains(x)), "{:?} {:?}", f, o);
+        let within = |h: &Held, x: &Fact| {
+            h.lagged
+                .iter()
+                .any(|(a, b)| *a <= x.position && x.position <= *b)
+        };
+        if same_cut {
+            prop_assert_eq!(&f.latest, &o.latest);
+            for x in o.tail.iter().filter(|x| !f.tail.contains(x)) {
+                prop_assert!(within(f, x), "{:?} {:?}", f, o);
+            }
+        }
         for x in f.tail.iter().filter(|x| !o.tail.contains(x)) {
-            prop_assert!(
-                o.lagged
-                    .iter()
-                    .any(|(a, b)| *a <= x.position && x.position <= *b),
-                "{:?} {:?}",
-                f,
-                o
-            );
+            prop_assert!(within(o, x), "{:?} {:?}", f, o);
         }
         prop_assert!(f.lagged.len() <= o.lagged.len(), "{:?} {:?}", f, o);
     }
@@ -426,6 +441,64 @@ fn a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it() {
             Step::Poll,
             Step::Open(0, 1, 3),
             Step::Race(0, vec![(1, 0, 5)]),
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_small_session_raced_after_a_late_open_holds_the_old_paths_latest() {
+    let r = run((
+        vec![
+            (0, 0, false),
+            (0, 81, true),
+            (2, 14, false),
+            (0, 0, false),
+            (0, 0, false),
+            (0, 0, false),
+        ],
+        vec![
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Advance(0),
+            Step::Open(253, 1, 46),
+            Step::Race(2, vec![(1, 0, 0)]),
+            Step::Emit(vec![(0, 0, 16), (0, 0, 14), (20, 0, 0)]),
+            Step::Emit(vec![(141, 0, 8), (0, 0, 0), (0, 0, 28)]),
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_latest_opened_while_a_small_tail_stops_at_its_row_limit_holds_the_old_paths_latest_once_caught_up()
+ {
+    let r = run((
+        vec![(1, 8, true), (0, 0, false)],
+        vec![
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Race(7, vec![(80, 0, 11), (29, 0, 3)]),
+            Step::Emit(vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (31, 0, 0), (0, 1, 0)]),
+            Step::Open(14, 0, 35),
+            Step::Define,
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn a_small_tail_that_stops_where_the_old_path_lagged_may_lag_later_over_a_fact_the_old_path_delivers()
+ {
+    let r = run((
+        vec![(2, 20, true), (0, 0, false), (0, 0, false), (0, 0, false)],
+        vec![
+            Step::Define,
+            Step::Emit(vec![(0, 0, 0)]),
+            Step::Race(1, vec![(179, 0, 0)]),
+            Step::Emit(vec![(0, 0, 0), (0, 0, 1), (0, 0, 38)]),
+            Step::Emit(vec![(0, 0, 3), (0, 0, 4), (0, 0, 59)]),
+            Step::Poll,
+            Step::Emit(vec![(97, 0, 253)]),
+            Step::Poll,
         ],
     ));
     assert!(r.is_ok(), "{r:?}");

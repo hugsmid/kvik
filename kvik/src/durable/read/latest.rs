@@ -324,16 +324,22 @@ impl Latest {
 
     /// The earliest time after `now` at which series `id`'s live fact may change with no new fact: a fact ahead
     /// falling due, a candidate above `now` or an interval reading becoming ready (spec §4; the query design's
-    /// section 3.6). A state that cannot tell, or a broken one, is due at once.
-    pub(crate) fn due(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Option<i64> {
+    /// section 3.6). A state that cannot tell, or a broken one, is due at `unsure`.
+    pub(crate) fn due(
+        &self,
+        id: u32,
+        versioned: bool,
+        p: &Params,
+        (now, unsure): (i64, i64),
+    ) -> Option<i64> {
         if self.broken {
-            return Some(now.saturating_add(1));
+            return Some(unsure);
         }
         let h = self.series.get(&id)?;
         let mut st = h.state.clone();
         st.promote(now, versioned);
         if st.unsure() {
-            return Some(now.saturating_add(1));
+            return Some(unsure);
         }
         let [first, last] = st.ahead();
         let c = st.candidate();

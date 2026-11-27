@@ -45,7 +45,8 @@ store.shutdown().await?;                               // final sync, checkpoint
 `Store::open` runs recovery and returns only when the log is consistent. It fails if another writer holds the
 directory, also in the same process (`OpenError::Locked`), if the store id of a file does not match, or if a file has
 a newer major format version or an unknown critical element. It also resumes a directory part-way through a restore
-(roadmap 8.3).
+(roadmap 8.3). A checksum-valid batch in an unsealed segment whose content does not decode is not recorded as a loss:
+the start is refused with `OpenError::Corrupt`.
 
 `time_zone` is the site zone at creation; at every later open it must equal the zone in force after resolving links,
 else `OpenError::SiteZoneMismatch`. The zone is changed by `store.set_site_zone(zone, effective_from).await` (a
@@ -89,8 +90,9 @@ yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), an
 bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
 latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
 sealed segments' indexes and the maps of their batches, also during one lookup; a batch read again, or appended
-since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
-cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
+since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a consumer taken in this run from
+its cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms; none
+are kept for one not taken in this run, whose take reads the log again (Q-1201). A start reads the whole log once, a part at a time (Q-752); the public
 `Reader` still holds every fact it has read (roadmap 9.0a), and so does the store's own reader, opened by the first
 `facts`, `at` or `interval` call on a `Store`. `series`, `series_stats` and the registry file written after a
 routing change and at a clean shutdown are answered from the deliverer's held state (registry and per-series
@@ -369,6 +371,8 @@ enum Live { Value(Fact), None, Unknown }
   and all carrying the same `cause` and `forget_above`. The consumer confirms the delivery id of the `last` part
   (confirming an earlier part does nothing); nothing further is delivered until then. `funnels` carries one
   `FunnelState` per funnel and series on the resync that ends a resume (spec §4 Resync). Details in roadmap 5.3.
+- `CursorBehindLog` is model only until the log trims: the durable backend never trims below a cursor and never
+  issues it (Q-1202).
 - During a restore a condition evaluation with no local detail, and live state whose fact may not be local yet (spec §2.3), are
   `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
   unchanged, the resync carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
@@ -800,8 +804,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 - `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
   tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
   (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). An `emit` returns
-  without reading its batch back; the `kvik-deliver` thread reads it shortly after, or the next call that takes
-  batches, as of the emit's acknowledgement (Q-1119). These counts may then lag an emit's return, and
+  without reading its batch back; the `kvik-deliver` thread reads it shortly after (within about a second while no consumer is known, Q-1490, Q-1610),
+  or the next call that takes batches, as of the emit's acknowledgement (Q-1119). These counts may then lag an emit's return, and
   `refresh_errors` counts the failed reads, not the calls (Q-706).
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per

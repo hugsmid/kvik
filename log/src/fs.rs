@@ -419,6 +419,7 @@ mod tests {
         assert_eq!(fs.read_durable(p).unwrap(), b"abcde");
         g.write_at(b"zz", 0).unwrap();
         drop(g);
+        fs.sync_dir(p.parent().unwrap()).unwrap();
         fs.power_loss();
         assert_eq!(fs.read(p).unwrap(), b"abcde");
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -428,6 +429,24 @@ mod tests {
         })));
         fs.open(p, OpenMode::Read).unwrap().sync_all().unwrap();
         assert_eq!(*lock(&seen), vec![p.to_path_buf()]);
+    }
+
+    #[test]
+    fn power_loss_undoes_every_name_change_not_made_durable_by_a_directory_sync() {
+        let fs = MemFs::new();
+        let (kept, lost) = (Path::new("d/kept"), Path::new("d/lost"));
+        for p in [kept, lost] {
+            let f = fs.open(p, OpenMode::CreateNew).unwrap();
+            f.write_at(b"x", 0).unwrap();
+            f.sync_all().unwrap();
+        }
+        fs.sync_dir(Path::new("d")).unwrap();
+        fs.rename(kept, Path::new("d/renamed")).unwrap();
+        fs.open(Path::new("d/new"), OpenMode::CreateNew).unwrap();
+        fs.remove_file(lost).unwrap();
+        fs.power_loss();
+        assert!(fs.read(kept).is_some() && fs.read(lost).is_some());
+        assert!(fs.read(Path::new("d/renamed")).is_none() && fs.read(Path::new("d/new")).is_none());
     }
 
     #[test]

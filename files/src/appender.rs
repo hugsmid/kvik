@@ -236,11 +236,12 @@ impl Appender {
         store_id: [u8; 16],
         lease_epoch: u64,
     ) -> Result<Opened, OpenError> {
+        fs.sync_dir(dir)?;
         remove_leftover(fs, dir)?;
         let path = dir.join(MANIFEST);
         let bytes = read_file(fs, &path)?;
         let image = read(&bytes, &store_id)?;
-        if image.is_corrupt() {
+        if image.is_corrupt() || image.missing_restore_record().is_some() {
             return Ok(Opened::Corrupt(Box::new(image)));
         }
         let catalogue = Catalogue::replay(image.records())?;

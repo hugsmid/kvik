@@ -7,6 +7,9 @@
 //! Each subscriber has a [`Bell`] and states the series that can give it a batch ([`Reach`]). Ending a round rings
 //! only the subscribers it reaches, and passes a subscriber that has taken every earlier round over one that holds
 //! nothing it selects: a commit costs no turn of a session it does not touch (Q-1118).
+//!
+//! Rounds are dropped when the last subscriber holding the oldest advances past it: an advance counts down the
+//! holders, and only the advance that frees a round scans the subscribers again.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,6 +166,8 @@ pub(crate) struct Collector {
     bytes: u64,
     cap: (u64, u64),
     whole: bool,
+    /// Whether it took any event; one that did not can be dropped.
+    taken: bool,
     /// The series of its facts, and whether it holds an entry, a void or a gap.
     series: BTreeSet<u32>,
     other: bool,
@@ -199,6 +204,7 @@ impl Collector {
 
     /// Takes what a part of the refresh read, and the ranges its pass found lost.
     pub(crate) fn events(&mut self, events: &[ReadEvent], found: &[Find]) {
+        self.taken |= !events.is_empty() || !found.is_empty();
         for e in events {
             match e {
                 ReadEvent::Batch(b) => {
@@ -229,9 +235,22 @@ impl Collector {
         }
     }
 
+    /// The collector of a round that failed (Q-1203): the log reader never returns what it took again, so one that
+    /// took events ends as not whole and every session is told `Lagged`; one that took none is dropped.
+    pub(crate) fn failed(mut self) -> Option<Collector> {
+        if !self.taken {
+            return None;
+        }
+        self.whole = false;
+        self.pieces.retain(Piece::kept_when_trimmed);
+        (self.rows, self.bytes) = (0, 0);
+        Some(self)
+    }
+
     /// Positions found lost by another read of the process (Q-938).
     pub(crate) fn gap(&mut self, first: LogPos, last: LogPos) {
         if first <= last {
+            self.taken = true;
             self.push(Piece::Gap(first, last));
         }
     }
@@ -264,9 +283,14 @@ struct State {
     ring: Vec<Arc<Bell>>,
     rows: u64,
     bytes: u64,
+    /// Active subscribers whose cursor is below the oldest round's end: the oldest round is dropped when it is zero.
+    holders: usize,
     /// The most facts held at once, collectors included.
     #[cfg(test)]
     peak: u64,
+    /// Scans of every subscriber for the rounds to drop.
+    #[cfg(test)]
+    trims: u64,
 }
 
 /// See the module documentation.
@@ -300,6 +324,7 @@ impl Hub {
             bytes: 0,
             cap,
             whole: true,
+            taken: false,
             series: BTreeSet::new(),
             other: false,
             #[cfg(test)]
@@ -408,10 +433,13 @@ impl Hub {
 
     /// Sets a subscriber's cursor and backlog limit.
     pub(crate) fn start(&self, sub: u64, seq: u64, cap: (u64, u64)) {
-        if let Some(x) = self.lock().subs.get_mut(&sub) {
+        let mut s = self.lock();
+        if let Some(x) = s.subs.get_mut(&sub) {
             x.cursor = seq;
             x.cap = cap;
+            s.holders = holders(&s);
         }
+        debug_assert_eq!(s.holders, holders(&s));
     }
 
     /// A read was opened: sets a subscriber's backlog limit and has it reach anything until its next
@@ -506,15 +534,27 @@ impl Hub {
         }
     }
 
-    /// Moves `sub`'s cursor to round `seq`, taken whole, with what can give it its next batch.
+    /// Moves `sub`'s cursor to round `seq`, taken whole, with what can give it its next batch. Drops the rounds every
+    /// active subscriber has taken once it was the last to hold the oldest; trimming to the backlog limit waits for the
+    /// next round, as an advance only lowers what is held.
     pub(crate) fn advance(&self, sub: u64, seq: u64, (reach, fresh): (Reach, Reach)) {
         let mut s = self.lock();
-        if let Some(x) = s.subs.get_mut(&sub) {
-            x.cursor = x.cursor.max(seq);
-            x.reach = reach;
-            x.fresh = fresh;
+        let front = s.rounds.front().map(|r| r.last);
+        let Some(x) = s.subs.get_mut(&sub) else {
+            return;
+        };
+        let old = x.cursor;
+        x.cursor = old.max(seq);
+        x.reach = reach;
+        x.fresh = fresh;
+        let freed = !x.idle && front.is_some_and(|f| old < f && f <= x.cursor);
+        if freed {
+            s.holders = s.holders.saturating_sub(1);
+            if s.holders == 0 {
+                drop_taken(&mut s);
+            }
         }
-        trim(&mut s);
+        debug_assert_eq!(s.holders, holders(&s));
     }
 
     /// Facts and bytes held and rounds kept, for the memory tests.
@@ -528,6 +568,12 @@ impl Hub {
     #[cfg(test)]
     pub(crate) fn peak(&self) -> u64 {
         self.lock().peak
+    }
+
+    /// Scans of every subscriber for rounds to drop.
+    #[cfg(test)]
+    pub(crate) fn scans(&self) -> u64 {
+        self.lock().trims
     }
 }
 
@@ -561,9 +607,22 @@ fn cap(s: &State) -> Option<(u64, u64)> {
         .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
 }
 
-/// Drops rounds every active subscriber has taken, then keeps only the voids and gaps of the oldest rounds while
-/// more than the largest backlog allowed is held.
-fn trim(s: &mut State) {
+/// Active subscribers that have not taken the oldest round.
+fn holders(s: &State) -> usize {
+    s.rounds.front().map_or(0, |r| {
+        s.subs
+            .values()
+            .filter(|x| !x.idle && x.cursor < r.last)
+            .count()
+    })
+}
+
+/// Drops rounds every active subscriber has taken and counts the holders of the oldest left.
+fn drop_taken(s: &mut State) {
+    #[cfg(test)]
+    {
+        s.trims += 1;
+    }
     let floor = s.subs.values().filter(|x| !x.idle).map(|x| x.cursor).min();
     while let Some(r) = s.rounds.front() {
         if floor.is_some_and(|f| r.last > f) {
@@ -573,6 +632,13 @@ fn trim(s: &mut State) {
         s.bytes -= r.bytes;
         s.rounds.pop_front();
     }
+    s.holders = holders(s);
+}
+
+/// Drops rounds every active subscriber has taken, then keeps only the voids and gaps of the oldest rounds while
+/// more than the largest backlog allowed is held.
+fn trim(s: &mut State) {
+    drop_taken(s);
     let (rows, bytes) = cap(s).unwrap_or((0, 0));
     let mut i = 0;
     while (s.rows > rows || s.bytes > bytes) && i < s.rounds.len() {
@@ -586,141 +652,4 @@ fn trim(s: &mut State) {
 }
 
 #[cfg(test)]
-mod tests {
-    use kvik_log::facts::{FactFlags, FactRow, Quality};
-
-    use super::*;
-
-    #[test]
-    fn a_run_of_empty_refreshes_a_cursor_stands_inside_is_kept_until_taken() {
-        let hub = Hub::default();
-        let now = Duration::ZERO;
-        let (sub, _) = hub.subscribe((100, 1 << 20), now);
-        hub.every(sub);
-        hub.start(sub, 0, (100, 1 << 20));
-        for _ in 0..3 {
-            hub.finish(hub.collector(), now, Duration::MAX);
-        }
-        hub.advance(sub, 2, (Reach::All, Reach::All));
-        let mut c = hub.collector().unwrap();
-        let p = LogPos {
-            generation: 0,
-            sequence: 1,
-        };
-        c.push(Piece::Fact(Stored {
-            position: p,
-            received_at: 0,
-            row: FactRow {
-                series_id: 1,
-                t: 0,
-                quality: Quality::Good,
-                flags: FactFlags::default(),
-                value: LogValue::F64(0),
-                changed_at: None,
-            },
-        }));
-        let seq = hub.finish(Some(c), now, Duration::MAX);
-        assert_eq!(seq, 4);
-        let t = hub.take(sub, seq, now);
-        assert!(!t.lagged, "{t:?}");
-        assert_eq!(t.rounds.len(), 2);
-    }
-
-    fn fact(series: u32, sequence: u64) -> Piece {
-        Piece::Fact(Stored {
-            position: LogPos {
-                generation: 0,
-                sequence,
-            },
-            received_at: 0,
-            row: FactRow {
-                series_id: series,
-                t: 0,
-                quality: Quality::Good,
-                flags: FactFlags::default(),
-                value: LogValue::F64(0),
-                changed_at: None,
-            },
-        })
-    }
-
-    fn round(hub: &Hub, pieces: Vec<Piece>) -> u64 {
-        let mut c = hub.collector().unwrap();
-        for p in pieces {
-            c.push(p);
-        }
-        let seq = hub.finish(Some(c), Duration::ZERO, Duration::MAX);
-        hub.ring_pending();
-        seq
-    }
-
-    #[test]
-    fn a_round_rings_only_the_subscribers_it_reaches_and_the_others_caught_up_pass_over_it() {
-        let hub = Hub::default();
-        let cap = (100, 1 << 20);
-        let subs: Vec<(u64, Arc<Bell>)> =
-            (0..3).map(|_| hub.subscribe(cap, Duration::ZERO)).collect();
-        for (k, (s, _)) in subs.iter().enumerate() {
-            hub.start(*s, 0, cap);
-            hub.advance(*s, 0, (Reach::Series([k as u32 + 1].into()), Reach::All));
-        }
-        let rung = || subs.iter().map(|(_, b)| b.rung()).collect::<Vec<_>>();
-        let seq = round(&hub, vec![fact(2, 1)]);
-        assert_eq!(rung(), [0, 1, 0]);
-        // Subscribers 1 and 3 passed over it; 2 must take it, so it is kept.
-        assert_eq!(hub.held().2, 1);
-        assert!(hub.take(subs[0].0, seq, Duration::ZERO).rounds.is_empty());
-        let t = hub.take(subs[1].0, seq, Duration::ZERO);
-        assert_eq!((t.rounds.len(), t.lagged), (1, false));
-        // Subscriber 2 has a round still to take: the next round rings it whatever it holds.
-        let seq = round(&hub, vec![fact(3, 2)]);
-        assert_eq!(rung(), [0, 2, 1]);
-        hub.advance(subs[1].0, seq - 1, (Reach::Series([2].into()), Reach::All));
-        // An entry, a void or a gap reaches everyone.
-        round(&hub, vec![Piece::Void(LogPos::default())]);
-        assert_eq!(rung(), [1, 3, 2]);
-    }
-
-    #[test]
-    fn a_round_ending_between_an_open_and_the_batch_that_answers_it_is_not_passed_over() {
-        let hub = Hub::default();
-        let cap = (100, 1 << 20);
-        let (sub, bell) = hub.subscribe(cap, Duration::ZERO);
-        hub.start(sub, 0, cap);
-        hub.advance(sub, 0, (Reach::Series([1].into()), Reach::All));
-        hub.open(sub, cap);
-        let seq = round(&hub, vec![fact(2, 1)]);
-        hub.advance(sub, 0, (Reach::Series([1, 2].into()), Reach::All));
-        let t = hub.take(sub, seq, Duration::ZERO);
-        assert_eq!(bell.rung(), 1);
-        assert!(!t.lagged);
-        assert_eq!(
-            t.rounds.len(),
-            1,
-            "the fact of the series just opened was passed over"
-        );
-    }
-
-    #[test]
-    fn a_waiting_session_is_not_marked_idle_and_a_refresh_rings_only_its_series() {
-        let hub = Hub::default();
-        let (sub, bell) = hub.subscribe((100, 1 << 20), Duration::ZERO);
-        hub.advance(sub, 0, (Reach::All, Reach::Series([4].into())));
-        std::thread::scope(|s| {
-            let waiter = s.spawn(|| bell.wait(0, Duration::from_secs(20)));
-            while !bell.waiting.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            hub.finish(
-                hub.collector(),
-                Duration::from_secs(600),
-                Duration::from_secs(60),
-            );
-            hub.ring_refreshed([5].into());
-            assert!(hub.subscribed());
-            hub.ring_refreshed([4].into());
-            assert_eq!(waiter.join().unwrap(), 1);
-        });
-        assert!(!hub.take(sub, 1, Duration::from_secs(600)).idle);
-    }
-}
+mod tests;

@@ -52,8 +52,13 @@ impl LiveSession {
     }
 
     /// Opens a live read; its `Opened` comes with the next batch, at that batch's cut. A selection by a pattern
-    /// outside the routing grammar is [`QueryError::Invalid`].
+    /// outside the routing grammar, or `max_rows` of 0, is [`QueryError::Invalid`].
     pub fn open(&mut self, query: Query, options: LiveOptions) -> Result<LiveId, QueryError> {
+        if options.max_rows == 0 {
+            return Err(QueryError::Invalid {
+                reason: "max_rows is 0".into(),
+            });
+        }
         match &mut self.inner {
             Inner::Model(s) => s.open(query),
             Inner::Durable(d) => {

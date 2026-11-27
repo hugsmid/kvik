@@ -6,7 +6,7 @@ mod support;
 use kvik_files::appender::{Appender, Opened};
 use kvik_files::catalogue::Catalogue;
 use kvik_files::image::read;
-use kvik_files::rebuild::{Finality, plan, rebuild_manifest};
+use kvik_files::rebuild::{Finality, encode_manifest, plan, rebuild_manifest, replace_manifest};
 use kvik_files::record::{Body, Record};
 use std::sync::Arc;
 
@@ -313,23 +313,7 @@ fn two_corrupt_merges_retire_every_input_down_the_chain() {
 fn opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable() {
     let (h, i) = lost_record_history();
     let (bytes, _) = image_with_corrupt(&h, &[i]);
-    let store = || {
-        let fs = MemFs::new();
-        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
-        let new = NewStore {
-            store_id: STORE_ID,
-            created_at: T0,
-            site_zone: "Etc/UTC".into(),
-            tzdata: "2026a".into(),
-            software: "kvik test".into(),
-        };
-        drop(StoreDir::open(afs.clone(), &dir(), Some(&new)).unwrap());
-        let f = fs.open(&manifest_path(), OpenMode::ReadWrite).unwrap();
-        f.set_len(0).unwrap();
-        f.write_at(&bytes, 0).unwrap();
-        f.sync_all().unwrap();
-        (fs, afs)
-    };
+    let store = || store_holding(&bytes);
     let rebuild = |fs: &MemFs| {
         rebuild_manifest(
             fs,
@@ -367,5 +351,39 @@ fn opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable() {
         let img = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
         assert!(!img.is_corrupt(), "seed {seed}");
         assert_eq!(img.last_epoch(), appended, "seed {seed}");
+    }
+}
+
+fn store_holding(bytes: &[u8]) -> (MemFs, Arc<dyn Fs>) {
+    let fs = MemFs::new();
+    let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+    let new = NewStore {
+        store_id: STORE_ID,
+        created_at: T0,
+        site_zone: "Etc/UTC".into(),
+        tzdata: "2026a".into(),
+        software: "kvik test".into(),
+    };
+    drop(StoreDir::open(afs.clone(), &dir(), Some(&new)).unwrap());
+    let f = fs.open(&manifest_path(), OpenMode::ReadWrite).unwrap();
+    f.set_len(0).unwrap();
+    f.write_at(bytes, 0).unwrap();
+    f.sync_all().unwrap();
+    (fs, afs)
+}
+
+/// `spec.md` §7 step 4: once `replace_manifest` returns, the rename is durable on its own, whatever opens the manifest
+/// next.
+#[test]
+fn a_replaced_manifest_survives_a_power_loss_with_no_other_directory_sync() {
+    let (h, i) = lost_record_history();
+    let (bytes, _) = image_with_corrupt(&h, &[i]);
+    let new = encode_manifest(&h.records, STORE_ID, 0, T0).unwrap();
+    for seed in 0..32 {
+        let (fs, _afs) = store_holding(&bytes);
+        replace_manifest(&fs, &dir(), &new).unwrap();
+        fs.power_loss_partial(seed);
+        fs.restart();
+        assert_eq!(fs.read(&manifest_path()).unwrap(), new, "seed {seed}");
     }
 }

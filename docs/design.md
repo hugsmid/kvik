@@ -1,8 +1,9 @@
 # kvik — design direction
 
-kvik is planned as an embedded Rust engine for device time series: a durable, ordered log and an analytical
-store in one library, with no database service. The engine does not exist yet; this note gives the intended
-direction and budgets. The rules are in [`spec.md`](spec.md).
+kvik is an embedded Rust engine for device time series: a durable, ordered log and an analytical store in one
+library, with no database service. The engine is in development: the durable log and the interface on it work, and
+compaction, the summary tree, tiers, restore and query are not finished (see the status block in the
+[README](../README.md)). This note gives the intended direction and budgets. The rules are in [`spec.md`](spec.md).
 
 ## Requirements
 - **Solid first.** Nothing a consumer reacted to may differ from what is on disk. Every block is checksummed. On

@@ -69,3 +69,34 @@ fn a_gap_after_a_row_limit_stop_is_named_in_that_batch_and_survives_the_round_s_
     latest_is_static(&w, &held[&l]);
     block_on(s.shutdown()).unwrap();
 }
+
+/// A tail that could never hold a row is refused at `open`.
+#[test]
+fn a_tail_with_no_rows_allowed_is_refused() {
+    let w = World::new("zero-rows");
+    let s = w.open();
+    let r = s.reader();
+    let got = r
+        .session()
+        .open(super::tests::tail_all(), LiveOptions::default().max_rows(0));
+    assert!(
+        matches!(got, Err(crate::QueryError::Invalid { .. })),
+        "{got:?}"
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+/// A timeout no instant can hold means no deadline.
+#[test]
+fn next_with_the_longest_timeout_returns_what_is_ready() {
+    let w = World::new("max-timeout");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let r = s.reader();
+    let (mut session, ..) = watched(&r, LiveOptions::default());
+    note(&w, &s, id, 0, "MT-ONE");
+    w.clock.advance(super::tests::TICK);
+    let got = session.next(std::time::Duration::MAX).unwrap();
+    assert!(got.is_some());
+    block_on(s.shutdown()).unwrap();
+}

@@ -3228,3 +3228,27 @@ fn row_21a_interval_series_in_named_zones() {
     let rs = oracle::readings(m.current().unwrap(), s);
     assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
 }
+
+/// The longest staleness a funnel accepts must neither panic nor fire at once, in a fresh, resumed or scheduled
+/// runner.
+#[test]
+fn stale_for_with_the_longest_duration_neither_panics_nor_fires() {
+    let never = Condition::StaleFor {
+        staleness: i64::MAX,
+        n: SECOND,
+    };
+    let mut fresh = Runner::new(never.clone(), 0);
+    assert!(fresh.on_tick(10 * SECOND).is_empty());
+    assert!(fresh.on_scheduled(Some(10 * SECOND)).is_empty());
+    let mut resumed = Runner::resume(
+        never,
+        0,
+        None,
+        None,
+        kvik_model::condition::ResumeHistory {
+            since_arrival: Some(10 * SECOND),
+            ..Default::default()
+        },
+    );
+    assert!(resumed.on_tick(10 * SECOND).is_empty());
+}

@@ -186,6 +186,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1147 | §6 Gates, Windows | Window inputs in the model: sampling and the reading at `now` (decided by the lead, provisional) |
 | Q-1148 | §6 Gates; §4 Future facts, Outranked facts; Q-16 | What counts as an arrival for a gate's staleness (decided by the lead, provisional) |
 | Q-1149 | §6 Gates, Durations | The longest duration of a gate (decided by the lead, provisional) |
+| Q-1200 | §6 Gates; §4 Future facts, Outranked facts; Q-1148 | A future fact outranked before its `t` (settled by the owner) |
+| Q-1201 | §4 Consumers; `api.md` Memory | Records held for a consumer not taken in this run (settled by the owner) |
+| Q-1202 | §4 Resync; `api.md` Consumers | `CursorBehindLog` on the durable backend (settled by the owner) |
+| Q-1203 | `api.md` Live reads; Q-1011, Q-1118 | A fan-out round that fails after taking events (settled by the owner) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -214,6 +218,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1032 | §3 Recovery, Order of a start | The next position after a start that cannot read a published segment (decided by the lead) |
 | Q-1033 | §4 Resync, §11 Health; `format.md` A.16 | The registry file keeps every recovery entry; the durable deliverer takes reset points from it (decided by the lead) |
 | Q-1034 | §11 Health, `api.md` Health | A sealed segment whose body is zeroed, passed over with health `Ok` |
+| Q-1490 | `api.md` Health and statistics; Q-706 | With no consumer known, the `kvik-deliver` thread reads acknowledged batches back at most once a second (decided by the item, provisional) |
+| Q-1610 | `api.md` Health and statistics; Q-1490 | The about-one-second lag of `Stats.delivery` with no consumer is stated as current behaviour, not a promise (decided by the lead) |
+| Q-1611 | `api.md` Health and statistics; Q-1490 | `stats()` does not pump before it reads the delivery counts (decided by the lead) |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -2447,6 +2454,46 @@ thread ran at most 3,500 to 6,000 readings behind the last acknowledged position
 `a_consumer_taken_during_emits_receives_every_fact_after_its_route_once_and_in_order`,
 `a_consumer_taken_after_many_emits_without_one_receives_what_its_start_promises`,
 `the_delivery_counters_reach_the_same_counts_with_or_without_a_consumer` (`kvik/tests/emit_without_consumers.rs`).
+
+## Q-1490 — The `kvik-deliver` thread's read-back while no consumer is known
+Recorded by the deliver-idle item (Q-1387, Q-1441). Provisional.
+**Scenario.** Q-706 took the read-back off an emit's path while no consumer is known, but the `kvik-deliver` thread
+still read every batch back on each progress of the writer: about six read calls a commit, 0.37 points of a core at
+W0 and 0.6 at W0x2 in the fan-out harness, for batches nobody reads. A take pumps under the decision lock and again
+under the deliverer's lock before it computes the consumer's start, so a consumer receives the same whether the
+thread read the batches or not.
+**Question.** May the thread's read-back lag the writer by up to about a second while no consumer is known?
+Four things follow: `refresh_errors` and `corruptions` lag by as much (Q-706 already lets them lag an emit's
+return); the delivery reader's lease and position, which hold the log behind them, trail by as much; a take after a
+busy second reads that second's batches itself; and when nothing else reads the log, damage to the newest batch is
+found up to a second later, so a replay of its readings emitted in that second is dropped as a duplicate rather than
+recorded (today the window is the thread's wake).
+**Settle by:** the owner's review of the fan-out results (step C4).
+**Provisional default: yes.** With the flag of Q-706 lowered, the thread reads back only when the timers are due, or
+a second (`IDLE_READ`, `kvik/src/durable/deliver/hub.rs`) after its last read, or at once after a seal, since the
+series directory written for a seal covers only what the read-back has folded (`format.md` A.18); once the flag is
+raised it reads on every progress, as before. Skipping the read-back for the whole stretch was not taken: the reader's lease would hold
+the log at the first batch of the stretch, and a first consumer would read the whole stretch at its take.
+**Pinned by.** `with_no_consumer_the_delivery_thread_reads_no_batch_back_on_each_emit`,
+`with_no_consumer_the_delivery_thread_reads_once_at_a_seal_and_not_on_each_emit_after_it` (`kvik/tests/write_path.rs`);
+`with_no_consumer_and_no_timers_the_delivery_thread_still_takes_a_batch_within_its_idle_interval`,
+`with_a_consumer_the_delivery_thread_takes_each_batch_on_progress_not_at_the_idle_interval`
+(`kvik/src/durable/registering.rs`);
+`a_consumer_taken_after_a_long_idle_stretch_starts_after_the_last_batch_with_nothing_skipped_or_repeated`,
+`a_consumer_taken_after_a_restart_without_one_starts_after_the_last_batch_with_nothing_skipped_or_repeated`
+(`kvik/tests/emit_without_consumers.rs`); the read at a seal by
+`a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start` (`kvik/src/durable/read/source/tests.rs`).
+
+## Q-1610 — Is the lag of the delivery counts a promise?
+Recorded by the deliver-idle review. Settled by the lead to the default.
+**Question.** Should `api.md` state the bound (about a second) by which `Stats.delivery` may lag with no consumer
+known (Q-1490) as a promise?
+**Decision: no.** `api.md` states it as the current behaviour.
+
+## Q-1611 — Should `stats()` pump before reading the delivery counts?
+Recorded by the deliver-idle review. Settled by the lead to the default.
+**Question.** Should `stats()` pump the intake before it reads `Stats.delivery`, so the counts never lag while idle?
+**Decision: no.** It would put log reads on a statistics call; the lag is bounded and documented (Q-1490).
 
 ## Q-710 — The default floor of the batch-sync interval
 
@@ -5169,7 +5216,8 @@ Decided by the lead with the gates model, provisional.
 **Scenario.** A bad-quality reading, an outranked one, and a future one arrive while a gate's series is quiet.
 **Decision (provisional).** An arrival is a fact not outranked at commit (§4 Outranked facts) and neither bad
 quality nor without a value (§2.5, §5.4: such a fact "does not refresh staleness"), at its commit time, or for a
-future fact at its `t` (§4 Future facts: ignored by staleness until `t ≤ now`). A sensor that keeps sending bad
+future fact at its `t` (§4 Future facts: ignored by staleness until `t ≤ now`). A future fact outranked before its `t` by a fact
+that is not an arrival is not an arrival at `t` (Q-1200). A sensor that keeps sending bad
 readings therefore goes `Stale`; a `Value::Absent` reading is bad whatever quality was supplied, so no reading of
 Q-16 (e) covers it. A series with no arrival yet stays `Unknown`, however long since the watch: `Unknown` means no
 data yet, `Stale` silence after data. Today's stale-for conditions are unchanged.
@@ -5248,6 +5296,35 @@ file keeps what it held, and the write lands when a mark sync reaches it; a conf
 position; a crash first drops it (`model/tests/starts.rs`
 `a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it`).
 
+## Q-1200 — A future fact outranked before its `t`
+Settled by the owner on 2026-11-26.
+**Scenario.** `stale_after` 10 s; a reading at 1 s; a future fact for 30 s commits at 2 s and is outranked at 3 s by
+a valueless revision. Counting the future fact at 30 s takes a silent series out of `Stale` on a reading withdrawn.
+**Decision.** It is not an arrival at `t`: an arrival not yet due is dropped when its `t` is outranked by a fact that
+is not an arrival (sentence added to Q-1148).
+**Pinned by.** `tests/gates.rs` `a_future_fact_outranked_before_its_t_does_not_take_a_silent_series_out_of_stale`.
+
+## Q-1201 — Records held for a consumer not taken in this run
+Settled by the owner on 2026-11-26.
+**Scenario.** A consumer with a cursor file that no process takes pinned every record above its cursor for the life
+of the process, and no call removes a consumer.
+**Decision.** No records are held for a consumer not taken in this run; its take reads the log again. A call to
+forget a consumer's name is later work.
+**Pinned by.** `kvik/src/durable/deliver/tests.rs` `a_consumer_not_taken_in_this_run_holds_no_records`.
+
+## Q-1202 — `CursorBehindLog` on the durable backend
+Settled by the owner on 2026-11-26.
+**Scenario.** Spec §4 names the cause; the durable backend never trims the log below a cursor, so never issues it.
+**Decision.** Model only until the log trims, said in `api.md`; built with the first trimming path.
+
+## Q-1203 — A fan-out round that fails after taking events
+Settled by the owner on 2026-11-26.
+**Scenario.** A round longer than one part takes events from the log reader, then a read fails; the reader never
+returns those events again, so dropping the round's collector lost facts for every `Tail` with nothing said.
+**Decision.** The round finishes as not whole, so every session is told `Lagged`; its collector is never carried
+over, since a carried collector grows without bound while the fault lasts. A round that took nothing is dropped.
+**Pinned by.** `kvik/src/durable/read/live/lags.rs` `a_round_failing_after_taking_events_lags_the_tail_it_took_them_for`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5261,7 +5338,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. The owner's rulings of 2026-11-26 settled Q-1200 to Q-1203, recorded by the review of conditions and fan-out.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -5808,8 +5885,10 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-893 | Labels kept out of the series directory, the chunk index and chunk headers (series labels design) | §2.1 Labels |
 | Q-1102 | A start's lost range across two recorded losses | §3 Order of a start step 4, `format.md` A.14 lost range, `api.md` Health (ruled by the owner, 2026-11-21: one loss under the lower identity, option (a)) |
 | Q-1109 | Delivery before durability: an automation may act on a reading later withdrawn | §4 Provisional streams, `api.md` Provisional streams (ruled by the owner, 2026-11-22: acceptable; opt-in per stream, each delivery labelled provisional or durable, a loss reported as withdrawn) |
-| Q-1201 | Records held for delivery to a consumer not attached in this run | §4 Overflow, `api.md` Configuration (owner's ruling, 26 November): none are held; a consumer catching up below the deliverer's recent window reads from the log a part at a time, and a call to forget a consumer's name comes later (Q-1408). Applied by roadmap 5.3 step 3. Scenario: a hundred thousand facts behind a consumer known to the registry and not attached hold no memory |
-| Q-1202 | `CursorBehindLog` and the catch-up that needs an entry on no local tier, on the durable backend | §4 Resync, Overflow, `api.md` Consuming (owner's ruling, 26 November): model only until the local log is trimmed; built with the first trimming path. The model sets each cause where it issues the `resync`, and the model backend maps it one to one. Scenario: a cursor older than the oldest local log segment (`rules.rs` `s4_resync_for_a_cursor_behind_the_log_waits_for_its_confirmation`) |
+| Q-1200 | A future fact outranked before its `t` | Q-1148 (ruled by the owner, 2026-11-26: not an arrival at `t`) |
+| Q-1201 | Records held for a consumer not taken in this run | `api.md` Memory (ruled by the owner, 2026-11-26: none held) |
+| Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
+| Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
 | Q-1401 | A saved point whose stamp matches and whose position is above the last position | §4 New consumer, §7 Readers (decided by the lead, 26 November, to the provisional default): the check answers `Kept`; a start at it begins at the last position, as every start is lowered to it. Scenario: a point built by hand with a zero stamp against a store that never reset (`starts.rs` `each_start_kind_begins_after_its_position_with_no_resync`; `kvik/tests/api.rs` `a_new_consumer_starts_after_the_position_before_its_start_with_no_resync`, both backends) |
 | Q-1403 | "First fact at or after T" for `start: time` | §4 New consumer (decided by the lead, 26 November, to the provisional default): by the receive time of the batch, as the durable backend's commit index; the model takes the last entry received before T. Scenario: facts received a second apart; a start at the second's receive time begins after the first (`starts.rs`; `kvik/tests/api.rs`, both backends) |
 | Q-1450 | A lost consumer taken again before it confirms its `NoCursor` resync | §4 Resync, invariant 25 (settled by the lead, 26 November, to the recommended default): every take before the confirmation sends the `NoCursor` resync again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`; `kvik/tests/consumers.rs`) |

@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use kvik::{Reader, SeriesId, TimeRange};
+use kvik::{Position, Reader, SeriesId, TimeRange};
 
 use crate::layout::{self, Month, file_name, partial_file_name, partition_dir};
 use crate::{
@@ -68,6 +68,7 @@ where
     for f in reader.facts_of(&set, options.range, options.view)? {
         let f = f?;
         let m = Month::of(f.t);
+        check_month_order(month, m, f.position)?;
         if month != Some(m) {
             if let Some(done) = month {
                 finish(&mut writing, done, &mut files)?;
@@ -105,6 +106,18 @@ where
     Ok(files)
 }
 
+/// Refuses a fact of a month before the one being written: its path was already returned (docs/export.md Publishing).
+fn check_month_order(
+    current: Option<Month>,
+    next: Month,
+    position: Position,
+) -> Result<(), ExportError> {
+    match current {
+        Some(done) if next < done => Err(ExportError::MonthRegressed { position }),
+        _ => Ok(()),
+    }
+}
+
 /// Closes the files of `month`, in the order of their series.
 fn finish<W: Write + Send>(
     writing: &mut BTreeMap<usize, (SeriesWriter<W>, String)>,
@@ -119,4 +132,28 @@ fn finish<W: Write + Send>(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvik::Timestamp;
+
+    fn month(t: i64) -> Month {
+        Month::of(Timestamp(t))
+    }
+
+    #[test]
+    fn a_regress_to_an_earlier_month_is_refused() {
+        let later = month(1_800_000_000_000_000_000);
+        let earlier = month(1_700_000_000_000_000_000);
+        let p = Position::default();
+        assert!(matches!(
+            check_month_order(Some(later), earlier, p),
+            Err(ExportError::MonthRegressed { .. })
+        ));
+        assert!(check_month_order(Some(earlier), later, p).is_ok());
+        assert!(check_month_order(Some(later), later, p).is_ok());
+        assert!(check_month_order(None, earlier, p).is_ok());
+    }
 }

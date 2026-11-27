@@ -492,6 +492,13 @@ impl DurableReader {
             w.lost_ranges = log.lost_ranges().into();
         }
         let latest = w.latest.as_mut().expect("seeded above");
+        let abandon = |tail: Option<Collector>, e: Arc<QueryError>| {
+            if let Some(c) = tail.and_then(Collector::failed) {
+                self.hub.finish(Some(c), self.monotonic(), self.cut_max_age);
+                self.hub.ring_pending();
+            }
+            e
+        };
         let mut own = Vec::new();
         let mut tail = self.hub.collector();
         let taken = take(
@@ -516,7 +523,9 @@ impl DurableReader {
         {
             self.cuts.lose_all();
         }
-        taken.map_err(failed)?.map_err(Arc::new)?;
+        if let Err(e) = taken.map_err(failed).and_then(|t| t.map_err(Arc::new)) {
+            return Err(abandon(tail, e));
+        }
         let st = log.state();
         // A reset between the directory's check and the first pass: the directory may cover what it voided.
         if w.seed_stamp.take().is_some_and(|s| s != st.stamp) {
@@ -553,13 +562,16 @@ impl DurableReader {
         lose(latest, &mut w.facts, &mut tail, log.lost_ranges());
         if (latest.broken() || self.want_facts.load(Ordering::SeqCst)) && w.facts.is_none() {
             w.facts = Some(FactsReader {
-                log: self.second_reader().map_err(failed)?,
+                log: match self.second_reader() {
+                    Ok(log) => log,
+                    Err(e) => return Err(abandon(tail, failed(e))),
+                },
                 index: Index::default(),
             });
         }
         if let Some(f) = w.facts.as_mut() {
             let index = &mut f.index;
-            take(
+            let indexed = take(
                 &mut f.log,
                 w.part,
                 Some(st.durable),
@@ -567,9 +579,10 @@ impl DurableReader {
                 #[cfg(test)]
                 &mut w.parts,
                 |events, durable| index.apply(events, durable),
-            )
-            .map_err(failed)?
-            .map_err(Arc::new)?;
+            );
+            if let Err(e) = indexed.map_err(failed).and_then(|t| t.map_err(Arc::new)) {
+                return Err(abandon(tail, e));
+            }
             for (first, last) in &recorded_since {
                 index.forget(*first, *last);
             }
@@ -596,6 +609,12 @@ impl DurableReader {
         );
         v.closed_taken = w.closed_seen;
         Ok(Arc::new(v))
+    }
+
+    /// Reads a round in parts of `part` items.
+    #[cfg(test)]
+    pub(crate) fn set_part(&self, part: usize) {
+        self.lock().part = part;
     }
 
     /// Live values found in the log because a state could not tell.

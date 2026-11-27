@@ -394,7 +394,7 @@ impl Drop for Stream {
 
 impl Stream {
     pub(crate) fn next(&mut self, timeout: Duration) -> Option<ProvisionalEvent> {
-        let until = Instant::now() + timeout;
+        let until = crate::time::deadline(timeout);
         loop {
             if let Some(e) = self.out.pop_front() {
                 return Some(e);

@@ -76,14 +76,14 @@ impl Deliverer {
             }
         };
         let head = self.head;
-        let retaken = self.consumers.get(name).and_then(|rt| rt.no_cursor);
-        let lost = !new && (self.consumers[name].dormant || retaken.is_some());
-        let point = match retaken {
-            Some(p) => Some(p),
-            None if new || lost => Some(self.start_point(start, ctx)?),
-            None => None,
+        let lost = !new && self.consumers[name].dormant;
+        let point = if new || lost {
+            Some(self.start_point(start, ctx)?)
+        } else {
+            None
         };
         let rt = self.consumers.entry(name.to_string()).or_default();
+        let again = rt.attached.then_some(rt.forget).flatten();
         if rt.attached {
             // The consumer process restarted (Q-95 (b)): what it was handed is dropped and it resumes from its
             // confirmed cursor, with its latches, as after downtime.
@@ -102,16 +102,16 @@ impl Deliverer {
         }
         rt.handle = true;
         rt.attached = true;
-        let Some(point) = point else {
+        let Some(point) = point.or(again) else {
             return Ok(Ok(()));
         };
         rt.dormant = false;
         rt.resume = None;
         rt.cursor = point;
         rt.behind = (point < head).then(|| next(point));
-        if lost {
-            rt.no_cursor = Some(point);
+        if lost || again.is_some() {
             rt.latches.clear();
+            rt.forget = Some(point);
             self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
             return Ok(Ok(()));
         }

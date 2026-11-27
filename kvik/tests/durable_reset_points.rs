@@ -261,3 +261,36 @@ fn a_recovery_entry_in_a_removed_segment_stays_a_reset_point() {
 fn a_recovery_entry_in_a_zeroed_segment_stays_a_reset_point() {
     told_to_forget_first(Harm::ZeroBody);
 }
+
+#[test]
+fn two_reset_points_with_nothing_routed_between_are_one_resync_forgetting_above_the_lower() {
+    let mut w = World::new("reset-twice");
+    let s = open(&w, Duration::from_secs(300));
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    block_on(s.emit(&[note(id, 0, "P-ONE")])).unwrap();
+    while let Some(d) = c.try_next().unwrap() {
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    block_on(s.emit(&[note(id, 1, "P-TWO")])).unwrap();
+    w.crash(s, vec![c], true);
+    let s = open(&w, Duration::from_secs(300));
+    w.crash(s, Vec::new(), true);
+    let s = open(&w, Duration::from_secs(300));
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut resets = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let DeliveryKind::Resync(r) = &d.kind {
+            resets.push(r.forget_above);
+        }
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let entries = recovery_entries(&w);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(resets.len(), 1, "{resets:?}");
+    let forget = resets[0].expect("a reset point names what to forget");
+    assert!(forget.sequence < entries[0], "{forget:?} {entries:?}");
+}

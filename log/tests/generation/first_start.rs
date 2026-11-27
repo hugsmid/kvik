@@ -231,6 +231,38 @@ fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_firs
     }
 }
 
+/// Q-1310: a mark and every segment lost together do not make a first start when a cursor file names a position of the
+/// generation: the recovery entry is placed above it.
+#[test]
+fn a_cursor_naming_a_position_makes_a_start_with_no_mark_and_no_segment_a_recovery_not_a_first_start()
+ {
+    for generation in [0, 1] {
+        let mut r = if generation == 0 {
+            Rig::on(MemFs::new(), lazy(), None)
+        } else {
+            restored(lazy()).0
+        };
+        r.open();
+        for k in 0..3 {
+            r.submit(vec![fact(5, k)]);
+            r.drain();
+        }
+        let state = CursorState {
+            consumer: "c".into(),
+            position: at(generation, 3),
+            latches: Vec::new(),
+            reset: None,
+        };
+        append(&r.fs, &dir(), STORE_ID, generation, T0, &state, None).unwrap();
+        lose_unsealed(&mut r, generation, false);
+        r.fs.remove_file(&log_path("MARK")).unwrap();
+        r.boot += 1;
+        let rep = r.open();
+        let e = rep.entry.as_ref().expect("a recovery entry");
+        assert!(e.sequence >= 4, "generation {generation}: {}", e.sequence);
+    }
+}
+
 /// The anchor of a generation starting above 1: after its first start, a start on the same boot or after a reboot
 /// with nothing written reports nothing lost below the first position.
 #[test]
