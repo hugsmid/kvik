@@ -31,6 +31,8 @@ pub(crate) struct Counts {
     pub(crate) served: u64,
     /// Parts that would not read or check, whose periods were then read from facts (`tree_damaged`).
     pub(crate) damaged: u64,
+    /// Parts read and held.
+    pub(crate) held: usize,
 }
 
 /// The parts read so far, by `file_id`, and those that failed.
@@ -133,9 +135,11 @@ pub(crate) struct Cache {
 impl Cache {
     #[cfg(test)]
     pub(crate) fn counts(&self) -> Counts {
+        let parts = lock(&self.parts);
         Counts {
             served: self.served,
-            damaged: lock(&self.parts).found_damaged,
+            damaged: parts.found_damaged,
+            held: parts.read.len(),
         }
     }
 }

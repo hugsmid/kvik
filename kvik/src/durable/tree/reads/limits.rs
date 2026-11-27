@@ -159,3 +159,20 @@ fn a_part_that_decodes_but_is_not_the_one_the_root_records_is_damaged_and_charts
     assert_t7_on(&reader, &rig, &super::ranges(rig.now()));
     assert!(reader.tree_counts().damaged > 0);
 }
+
+#[test]
+fn the_reading_before_a_chart_of_a_series_silent_for_days_reads_no_part_outside_the_charts_days() {
+    let mut rig = Rig::new("silent");
+    let old: Vec<(i64, u8)> = (0..60i64)
+        .map(|k| (3 * 24 * HOUR + k * HOUR, (k % 200) as u8))
+        .collect();
+    rig.emit(crate::types::Intent::Normal, &old);
+    rig.checkpoint();
+    let parts = rig.newest_root().parts.len();
+    assert!(parts >= 3, "{parts} parts");
+    let now = rig.now();
+    let reader = rig.reader();
+    assert_t7_on(&reader, &rig, &[(now - 2 * HOUR, now)]);
+    let held = reader.tree_counts().held;
+    assert!(held < parts, "{held} of {parts} parts held");
+}
