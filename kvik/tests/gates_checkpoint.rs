@@ -238,12 +238,11 @@ fn a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_u
     let mut c = take(&s);
     block_on(c.watch("moved", Gate::change(Input::value(id)).deadband(5.0))).unwrap();
     let mut k = 0.0;
-    while s.stats().delivery.transitions_not_delivered == 0 {
+    for _ in 0..4 {
         w.clock.advance(Duration::from_secs(1));
         k += 10.0;
         emit(&w, &s, id, k);
     }
-    assert_eq!(s.stats().delivery.transitions_not_delivered, 1);
     let mut confirmed = Vec::new();
     while let Some(d) = c.try_next().unwrap() {
         match &d.kind {
@@ -255,6 +254,7 @@ fn a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_u
             _ => block_on(c.confirm(d.id)).unwrap(),
         }
     }
+    assert_eq!(s.stats().delivery.transitions_not_delivered, 1);
     let last = *confirmed.last().unwrap();
     w.crash(s, vec![c], false);
     let s = block_on(Store::open(config)).unwrap();
