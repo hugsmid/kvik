@@ -9,14 +9,15 @@ use km::registry::Timing;
 use km::summary::Params;
 use kvik_model as km;
 use kvik_tree as kt;
-use kvik_tree::set::{Key, QUARTER, Seen, Tile, cover, covered, served};
+use kvik_tree::part::{Entry, Part};
+use kvik_tree::set::{QUARTER, Tile, cover_by, covered, served, visible_entries};
 
 use super::super::read::source::{Plan, each_row, search_back_each};
 use super::super::read::view::View;
 use super::super::reader::DurableReader;
 use super::super::reader::facts::plan;
 use super::super::registry::Series;
-use super::super::tree::read::TreeAt;
+use super::super::tree::read::{TreeAt, Window};
 use super::stream::{needs_last, readable, reading};
 use super::{params, reading_of};
 use crate::backend::convert;
@@ -57,12 +58,13 @@ struct Chart<'a> {
     r: &'a DurableReader,
     v: &'a View,
     tree: &'a TreeAt,
+    root: &'a kvik_tree::root::Root,
     series: &'a Series,
     id: u32,
     p: Params,
     np: kt::Params,
     now: i64,
-    vis: BTreeMap<Key, Seen>,
+    vis: BTreeMap<(u8, i64), &'a Entry>,
     plan: Plan,
 }
 
@@ -74,6 +76,7 @@ pub(super) fn chart(
     r: &DurableReader,
     v: &View,
     tree: &TreeAt,
+    w: &Window,
     series: &Series,
     (a, b, step): (i64, i64, i64),
     max: Option<usize>,
@@ -81,17 +84,18 @@ pub(super) fn chart(
 ) -> Result<Option<ChartData>, QueryError> {
     let id = series.def.id;
     let p = params(&series.def);
-    if step % QUARTER != 0 || !p.stores(1) || !served(&tree.root, u64::from(id)) || tree.changed(id)
-    {
+    if step % QUARTER != 0 || !p.stores(1) || !served(&w.root, u64::from(id)) || tree.changed(id) {
         return Ok(None);
     }
-    let Some(vis) = tree.visible(id) else {
+    let live: Vec<&Part> = w.live.iter().map(|p| &**p).collect();
+    let Ok(vis) = visible_entries(&w.root, &live, u64::from(id)) else {
         return Ok(None);
     };
     let c = Chart {
         r,
         v,
         tree,
+        root: &w.root,
         series,
         id,
         np: fold::node_params(&p),
@@ -147,10 +151,7 @@ impl Chart<'_> {
     /// automatic resolution's most points; a fact gives at most one reading, so more readings mean more facts.
     fn readings_at_most(&self, from: i64, to: i64, max: usize) -> bool {
         let mut n: u64 = 0;
-        for ((_, _, start), seen) in self
-            .vis
-            .range((u64::from(self.id), LEVEL, from)..(u64::from(self.id), LEVEL, to))
-        {
+        for ((_, start), seen) in self.vis.range((LEVEL, from)..(LEVEL, to)) {
             if start.saturating_add(QUARTER) > to
                 || seen.stale
                 || self.tree.dirty(self.id, *start, start + QUARTER)
@@ -203,8 +204,10 @@ impl Chart<'_> {
     }
 
     fn tiles<'a>(&'a self, out: &mut Vec<Piece<'a>>, from: i64, to: i64) {
-        let root = &self.tree.root;
-        for tile in cover(root, &self.vis, u64::from(self.id), from, to) {
+        let tiles = cover_by(self.root, u64::from(self.id), from, to, |level, start| {
+            self.vis.get(&(level, start)).copied()
+        });
+        for tile in tiles {
             match tile {
                 Tile::Node {
                     level,
@@ -235,8 +238,8 @@ impl Chart<'_> {
     }
 
     fn quarter<'a>(&'a self, out: &mut Vec<Piece<'a>>, q: i64) {
-        let seen = self.vis.get(&(u64::from(self.id), LEVEL, q));
-        if !covered(&self.tree.root, LEVEL, q, q + QUARTER)
+        let seen = self.vis.get(&(LEVEL, q)).copied();
+        if !covered(self.root, LEVEL, q, q + QUARTER)
             || seen.is_some_and(|s| s.stale)
             || self.tree.dirty(self.id, q, q + QUARTER)
         {
@@ -299,14 +302,10 @@ impl Chart<'_> {
 
     /// `Some` with the last reading before `qa` when the tree alone tells it.
     fn prior_node(&self, qa: i64) -> Option<Option<Reading>> {
-        let s = u64::from(self.id);
-        let root = &self.tree.root;
-        let found = self
-            .vis
-            .range((s, LEVEL, i64::MIN)..(s, LEVEL, qa))
-            .next_back();
+        let root = self.root;
+        let found = self.vis.range((LEVEL, i64::MIN)..(LEVEL, qa)).next_back();
         let from = match found {
-            Some(((_, _, start), _)) => *start,
+            Some(((_, start), _)) => *start,
             None => {
                 // No node before: no reading, if the covered range reaches back to the first quarter-hour.
                 let c = root

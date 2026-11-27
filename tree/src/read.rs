@@ -106,6 +106,33 @@ pub fn without(root: &Root, damaged: &[u64]) -> Root {
     out
 }
 
+/// `root` covering only what lies in `[from, to)`, for a reader that has the parts of that span alone.
+pub fn within(root: &Root, from: i64, to: i64) -> Root {
+    let mut out = root.clone();
+    out.covered = root
+        .covered
+        .iter()
+        .filter_map(|c| {
+            let w = root.levels.iter().find(|l| l.id == c.level)?.width;
+            let a = c.from.max(ceil(from, w));
+            let b = c.to.min(to - to.rem_euclid(w));
+            (a < b).then_some(Covered {
+                from: a,
+                to: b,
+                ..*c
+            })
+        })
+        .collect();
+    out
+}
+
+fn ceil(x: i64, w: i64) -> i64 {
+    match x.rem_euclid(w) {
+        0 => x,
+        r => x.saturating_add(w - r),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +198,44 @@ mod tests {
             ]
         );
         assert_eq!(without(&root, &[]), root);
+    }
+
+    #[test]
+    fn within_trims_each_covered_range_to_the_span_on_its_level_width() {
+        let mut root = root_of(Vec::new());
+        root.covered = vec![
+            Covered {
+                level: 2,
+                from: 0,
+                to: 10 * DAY,
+            },
+            Covered {
+                level: 4,
+                from: 0,
+                to: 10 * DAY,
+            },
+            Covered {
+                level: 4,
+                from: 20 * DAY,
+                to: 30 * DAY,
+            },
+        ];
+        let q = 15 * crate::MINUTE;
+        let out = within(&root, 2 * DAY + q + 1, 5 * DAY + q + 1);
+        assert_eq!(
+            out.covered,
+            vec![
+                Covered {
+                    level: 2,
+                    from: 2 * DAY + 2 * q,
+                    to: 5 * DAY + q,
+                },
+                Covered {
+                    level: 4,
+                    from: 3 * DAY,
+                    to: 5 * DAY,
+                },
+            ]
+        );
     }
 }

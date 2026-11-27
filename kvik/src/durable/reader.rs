@@ -359,7 +359,7 @@ impl DurableReader {
     /// The tree's read counters: cuts served from a root, and parts found damaged.
     #[cfg(test)]
     pub(crate) fn tree_counts(&self) -> super::tree::read::Counts {
-        super::lock(&self.tree).counts
+        super::lock(&self.tree).counts()
     }
 
     /// The window clock now (spec §6 `now`).
