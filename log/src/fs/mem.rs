@@ -361,7 +361,7 @@ impl MemFs {
         lock(&self.state).files.keys().cloned().collect()
     }
 
-    /// A simulated power loss: every file goes back to its durable image and every lock is released. Names stay.
+    /// A simulated power loss: every file goes back to its durable image and every lock is released. Every creation, rename or removal not yet made durable by a directory sync is undone.
     /// Handles still open stay usable, so a test drops them first.
     pub fn power_loss(&self) {
         self.crash(None);
@@ -414,9 +414,9 @@ impl MemFs {
             *f = (*f as i128 + freed).max(0) as u64;
         }
         let names = std::mem::take(&mut s.names);
-        if let Some(r) = rng.as_mut() {
+        {
             for n in names.into_iter().rev() {
-                if r.next() % 2 == 0 {
+                if rng.as_mut().is_some_and(|r| r.next() % 2 == 0) {
                     continue;
                 }
                 match n {

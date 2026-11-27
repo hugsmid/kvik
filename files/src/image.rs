@@ -12,7 +12,7 @@ use kvik_log::crc::PrefixCrc;
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 use kvik_log::scan::{FailedReads, ScanStats};
 
-use crate::record::{RECORD_PREFIX, Record, RecordError};
+use crate::record::{RECORD_PREFIX, Record, RecordError, record_type};
 
 /// A valid record and where it lies.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +300,16 @@ impl Image {
     /// Whether a corrupt record was found.
     pub fn is_corrupt(&self) -> bool {
         !self.corrupt.is_empty()
+    }
+
+    /// The header's generation when it is above 0 and no valid restore record of it exists: the record is damaged or
+    /// lost, and it is never rebuilt (`spec.md` §7, §8 Generations).
+    pub fn missing_restore_record(&self) -> Option<u32> {
+        let g = self.header.generation;
+        let present = self
+            .records()
+            .any(|r| r.generation == g && r.body.record_type() == record_type::RESTORE);
+        (g > 0 && !present).then_some(g)
     }
 
     /// The valid records, in order.

@@ -1853,6 +1853,7 @@ fn a_full_disk_at_a_start_that_needs_a_segment_leaves_it_read_only() {
     for p in r.fs.paths() {
         if p.to_string_lossy().ends_with(".open") {
             r.fs.remove_file(&p).unwrap();
+            r.fs.sync_dir(p.parent().unwrap()).unwrap();
         }
     }
     r.power_loss(None);
