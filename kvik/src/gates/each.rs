@@ -81,19 +81,21 @@ impl Core {
     pub(super) fn reconcile(
         &mut self,
         id: ConditionId,
-        wanted: Vec<SeriesId>,
+        mut wanted: Vec<SeriesId>,
         total: &mut usize,
         at: Position,
         now: Nanos,
         history: &dyn History,
         out: &mut Vec<Transition>,
     ) -> Result<(), CoreError> {
+        wanted.sort_unstable();
+        wanted.dedup();
         let leaving: Vec<SeriesId> = self
             .members(id)
-            .filter(|s| self.instances.contains_key(&(id, *s)) && !wanted.contains(s))
+            .filter(|s| self.instances.contains_key(&(id, *s)) && wanted.binary_search(s).is_err())
             .collect();
         if let Some(r) = self.refused.get_mut(&id) {
-            r.retain(|s| wanted.contains(s));
+            r.retain(|s| wanted.binary_search(s).is_ok());
         }
         let cause = Cause::Entry { position: at };
         for s in leaving {
