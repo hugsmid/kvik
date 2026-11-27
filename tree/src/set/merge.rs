@@ -195,13 +195,10 @@ where
             .any(|&(s, l)| s <= start && start.saturating_add(w) <= s.saturating_add(l as i64))
     };
     let covers = cover_levels(&root.levels);
-    if let Some(&(s, _, _)) = kept.keys().find(|&&(s, level, start)| {
-        covers
-            .iter()
-            .find(|l| l.id == level)
-            .is_some_and(|l| inside(start, l.width))
-            && params(s).is_none()
-    }) {
+    if let Some(&(s, _, _)) = kept
+        .keys()
+        .find(|&&(s, level, _)| covers.iter().any(|l| l.id == level) && params(s).is_none())
+    {
         return Err(MergeError::NoParams(s));
     }
     let parents: Vec<Level> = pairs.iter().map(|p| p.0).collect();

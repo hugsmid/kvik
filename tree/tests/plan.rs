@@ -626,3 +626,50 @@ fn a_rollup_merge_writes_no_rollup_over_an_uncovered_quarter() {
         .collect();
     assert_eq!(rolled, vec![(3, T0)]);
 }
+
+#[test]
+fn the_planner_survives_a_delta_in_the_last_day_before_the_greatest_instant() {
+    let d = i64::MAX - i64::MAX.rem_euclid(DAY);
+    let r = root_with(
+        vec![pref(1, 1, Class::Delta, d + HOUR, HOUR)],
+        vec![all(2, d, d + 4 * HOUR)],
+    );
+    assert!(Root::decode(&r.encode().unwrap()).is_ok());
+    let _ = plan(&r, i64::MAX, &POLICY);
+}
+
+#[test]
+fn a_merged_part_a_day_long_but_off_the_day_boundary_is_split() {
+    let mut p = pref(1, 1, Class::Merged, T0 + HOUR, DAY);
+    p.greatest_end = T0 + DAY + HOUR;
+    let plans = plan(&root_with(vec![p], Vec::new()), T0 + DAY, &POLICY);
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(
+        plans[0].periods,
+        vec![(T0, DAY as u64), (T0 + DAY, DAY as u64)]
+    );
+}
+
+#[test]
+fn a_rollup_merge_survives_an_entry_in_the_first_partial_day() {
+    let q = 15 * MINUTE;
+    let s = i64::MIN + (q - i64::MIN.rem_euclid(q));
+    let mut p = quarter_part(1, 4, 0);
+    p.period_start = s;
+    p.runs[0].entries[0].start = s;
+    p.runs[0].entries[0].node = Some(node(Kind::Gauge, s, q, 2, 4));
+    let parts = [p];
+    let mut r = listed(&parts);
+    r.covered = vec![all(2, s, s + 4 * q)];
+    let plan = Plan {
+        inputs: vec![1],
+        periods: vec![(s, DAY as u64)],
+        rollups: true,
+        minute_from: i64::MIN,
+    };
+    let out = merge(&r, &parts, &plan, &part_header(0), |_| {
+        Some(Params::new(Kind::Gauge, None))
+    })
+    .unwrap();
+    assert_eq!(out.len(), 1);
+}
