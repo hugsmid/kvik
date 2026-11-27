@@ -307,7 +307,8 @@ impl Judge<'_> {
             });
         }
         for s in wanted {
-            let consumer_full = self.each_instances() >= MAX_EACH_INSTANCES;
+            let consumer_full = matches!(self.gates[&id].gate.selector, Selector::Each(_))
+                && self.each_instances() >= MAX_EACH_INSTANCES;
             let w = self.gates.get_mut(&id).expect("watched");
             if w.instances.contains_key(&s) {
                 continue;

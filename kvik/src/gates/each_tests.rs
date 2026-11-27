@@ -92,6 +92,17 @@ fn a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gat
     for g in 0..=full {
         log.watch(SECOND, ConditionId(g + 1), pattern(g));
     }
+    // Single-series gates hold instances that the bound does not count.
+    for k in 0..2 {
+        log.watch(
+            SECOND,
+            ConditionId(full + 2 + k),
+            Gate {
+                selector: Selector::Series(series(0, k + 1)),
+                ..each(&[Level::at(10.0)])
+            },
+        );
+    }
     // Gate 1 loses a series and the last gate, below its own cap, takes one of its two in the same definition.
     log.define(2 * SECOND, series(0, 0), &["elsewhere"]);
     let until = 3 * SECOND;
@@ -109,7 +120,7 @@ fn a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gat
     assert_eq!(core.states(), model.states);
     assert_eq!(model.instances_refused, 2);
     assert_eq!(core.take_refused(), 2);
-    assert_eq!(core.instances.len(), MAX_EACH_INSTANCES);
+    assert_eq!(core.instances.len(), MAX_EACH_INSTANCES + 2);
     let last = ConditionId(full + 1);
     assert_eq!(
         model.states.keys().filter(|k| k.0 == last).count(),
