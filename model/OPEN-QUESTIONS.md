@@ -210,6 +210,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1852 | compaction design §3.4, §3.5 | A merge's counts after a rebuild restates a retirement without its layout (provisional) |
 | Q-1853 | compaction design §5, §6 (6.3e); `api.md` Threads; Q-1531 | Publish built over the manifest's writer, not yet started by the running store (provisional) |
 | Q-1854 | compaction design §3.5 | The rebuild's verifier compacts the inputs again (provisional) |
+| Q-2120 | compaction design §3.4; Q-1850 | When publish records without field 3 stop being accepted (provisional) |
+| Q-2121 | compaction design §3.4 | Whether a new record may leave the rule undecided (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5357,7 +5359,7 @@ Raised by roadmap 6.2a2b's review (S3), provisional. To be settled before roadma
 ## Q-1850 — Publish record field 3, the layout, and records without it
 Decided with roadmap 6.3e, provisional. To be settled by the owner with Q-792.
 **Scenario.** The compaction design adds a repeated field 3 to the publish record: one layout per published compacted file, in the order of field 1, so that the catalogue checks counts and finds C(g) without opening files (§3.4). Q-792 asks the owner to accept it as an addition inside version 1. Publish records written before it (by tests, and by a rebuild restating a file whose layout it cannot read) have none.
-**Decision (provisional).** Field 3 is laid out as `format.md` A.14 now states (`kvik_files::layout::CompactedLayout`) and is decoded strictly. A record carries a layout for every published compacted file or for none. The catalogue's rule covers the files that have a layout; a file without one is outside rules 1, 3 and 4 and is counted only as naming its inputs (rule 2, C(g)). The writer judges only new records with layouts. Reason: no released version wrote a publish record, so a record without field 3 comes only from tests or a restatement; refusing it would refuse every manifest the 6.3a tests write.
+**Decision (provisional).** Field 3 is laid out as `format.md` A.14 now states (`kvik_files::layout::CompactedLayout`) and is decoded strictly. A record carries a layout for every published compacted file or for none. The catalogue's rule covers the files that have a layout; a file without one is outside rules 1, 3 and 4 and is counted only as naming its inputs (rule 2, C(g)). The writer refuses a new record that publishes a compacted file without one (Q-2120). Reason: no released version wrote a publish record, so a record without field 3 comes only from tests or a restatement; refusing it would refuse every manifest the 6.3a tests write.
 **Pinned by.** `files/tests/records.rs` `a_publish_record_refuses_layouts_that_are_not_one_per_compacted_file_in_order`; `files/src/layout.rs` tests; `files/tests/compaction_rule.rs`.
 
 ## Q-1851 — The rebuild's verdict on outputs no valid record names
@@ -5383,6 +5385,18 @@ Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
 **Scenario.** §3.5's rebuild judges a set of outputs no valid record names against their inputs with the checks of §3.2, which a run makes as it reads its inputs.
 **Decision (provisional).** The verifier compacts the run's input segments again into `.tmp` files, with the run's generation, run id (its first `file_id`) and the `created_at` read from a found output, then compares each found output's SHA-256 with that of the file of the same identity, and removes what it wrote. A found file that differs, or has no counterpart, fails the run; matching files fewer than the run made cannot be judged; an input that is not local, a merge's outputs or a run that stalls cannot be judged either. Reason: a run is deterministic (Q-1535), so equality of bytes is every check of §3.2 at once; a run made under a later week rule or registry fails and is discarded only when its inputs are local, so their positions are compacted again and nothing is lost.
 **Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_set_of_outputs_is_judged_against_its_inputs_by_compacting_them_again`, `a_corrupt_run_record_whose_outputs_fail_against_local_inputs_discards_them`.
+
+## Q-2120 — When publish records without field 3 stop being accepted
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** With the catalogue broken by rule 2, a new record publishing a compacted file without field 3 was accepted, after which the state read as holding and C(g) moved; a second run over a compacted segment without field 3 was accepted and the state still held, as files without a layout are outside rules 1, 3 and 4 (Q-1850).
+**Decision (provisional).** The writer refuses a new record (`old_epoch` none) that publishes a compacted file without a layout (`AppendError::Unlaid`), before the hold and the rule are judged. A restated record (`old_epoch` set) may still have none and is judged on the state. The generated histories of `kvik-files`' tests give their records layouts. Reason: `publish()` always writes layouts, so only tests wrote such records, and accepting them let a record end a hold or break rule 1 unseen.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_new_record_publishing_a_compacted_file_without_a_layout_is_refused_while_broken`, `a_second_run_without_a_layout_over_a_compacted_segment_is_refused`.
+
+## Q-2121 — Whether a new record may leave the rule undecided
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** From a state that holds, a laid-out run naming a segment no record lists was appended; the state was then undecided and every later publish was refused as held until a sealed-segment record listed the segment, and rule 3 was never checked for the run.
+**Decision (provisional).** The writer refuses a new publish record unless the state after it holds (`AppendError::Undecided`, naming the files the catalogue lacks). Reason: §3.4 makes the writer's check a guard against its own mistakes; the state before is known to hold at that point, so the only source of an undecided state is the record.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_run_naming_an_unlisted_segment_is_refused_from_a_state_that_holds`.
 
 ## Open at v0.2
 

@@ -8,8 +8,9 @@ use std::io;
 
 use kvik_files::appender::{AcknowledgeError, Appender, Held, Opened};
 use kvik_files::catalogue::{Catalogue, CatalogueError};
-use kvik_files::desc::FileClass;
+use kvik_files::desc::{FileClass, FileDescription};
 use kvik_files::image::read;
+use kvik_files::layout::CompactedLayout;
 use kvik_files::record::{AckedLoss, Acknowledgement, Body, Publish, Record};
 use kvik_log::fs::{FaultOp, MemFs};
 use kvik_log::manifest::LossCause;
@@ -219,9 +220,14 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     let a = compacted(1, FileClass::Current, (1, 9), &[seg_ref(1)]);
     let b = compacted(2, FileClass::Current, (1, 9), &[seg_ref(1)]);
     m.append(Body::Sealed(vec![s1]), T0).unwrap();
+    let run = |d: &FileDescription| CompactedLayout {
+        run_id: 1,
+        run_count: 2,
+        ..layout_of(d)
+    };
     m.append(
         Body::Publish(Publish {
-            layouts: Vec::new(),
+            layouts: vec![run(&a), run(&b)],
             published: vec![a.clone(), b.clone()],
             retired: vec![],
         }),
@@ -263,7 +269,7 @@ fn records_that_contradict_the_manifest_are_refused_before_anything_is_written()
     // The merge, then publishing `a` again, is refused.
     m.append(
         Body::Publish(Publish {
-            layouts: Vec::new(),
+            layouts: vec![layout_of(&c)],
             published: vec![c],
             retired: vec![a.clone()],
         }),

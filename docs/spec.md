@@ -741,7 +741,8 @@ rules, identities and resume.
   temporary outputs, and removes a compacted file no valid record names only once it knows the manifest valid; a
   rebuild discards such a file only when nothing names any file of its run, its inputs are local and the run's
   files fail against them, and otherwise keeps it (compaction design §3.5, Q-1851). The writer refuses a publish
-  record that breaks the catalogue's rule for compacted files; a start that finds the rule undecided or broken opens
+  record that breaks the catalogue's rule for compacted files, leaves it undecided or gives a compacted file no
+  layout (Q-2120, Q-2121); a start that finds the rule undecided or broken opens
   and holds runs, merges, removals and releases (compaction design §3.4, Q-1850, Q-1852).
 - **Manifest:** append-only, checksummed records, each with an epoch. One record may add files, retire files and
   move files between tiers **atomically**. An epoch never lists two live compacted files holding the same position. A log segment holds the same positions as

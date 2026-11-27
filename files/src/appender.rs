@@ -25,7 +25,7 @@ use kvik_log::fs::{Fs, FsFile, OpenMode};
 
 use crate::catalogue::{Catalogue, CatalogueError};
 use crate::compaction::{Breach, Judgement, judge, publish_shape};
-use crate::desc::FileRef;
+use crate::desc::{FileRef, kind};
 use crate::image::{Image, ReadError, read};
 use crate::record::{Acknowledgement, Body, EncodeError, Record};
 use crate::{MANIFEST, MANIFEST_NEW};
@@ -340,16 +340,23 @@ impl Appender {
         }
         self.catalogue.check(&r)?;
         if let (Body::Publish(p), None) = (&r.body, r.old_epoch)
-            && !p.layouts.is_empty()
+            && p.published.iter().any(|d| d.kind == kind::COMPACTED)
         {
+            if let Some(d) = p.published.iter().find(|d| {
+                d.kind == kind::COMPACTED && !p.layouts.iter().any(|l| l.file_ref() == d.file_ref())
+            }) {
+                return Err(AppendError::Unlaid(d.file_ref()));
+            }
             if self.compaction.holds_compaction() {
                 return Err(AppendError::CompactionHeld);
             }
             publish_shape(p)?;
             let mut after = self.catalogue.clone();
             after.apply(&r)?;
-            if let Judgement::Broken(b) = judge(&after) {
-                return Err(b.into());
+            match judge(&after) {
+                Judgement::Holds => {}
+                Judgement::Undecided(f) => return Err(AppendError::Undecided(f)),
+                Judgement::Broken(b) => return Err(b.into()),
             }
         }
         let bytes = r.encode()?;

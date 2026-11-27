@@ -2,8 +2,8 @@
 //! catalogue's state whatever order its records came in, and C(g), the end of the compacted prefix of generation g.
 //!
 //! The writer judges a new publish record's shape ([`publish_shape`]) and the state it would make ([`judge`]) and
-//! refuses a breach; a start judges the replayed state and, when a rule cannot be decided or fails, holds runs,
-//! merges, removals and releases instead of refusing the manifest.
+//! refuses a breach or an undecided state (Q-2121); a start judges the replayed state and, when a rule cannot be
+//! decided or fails, holds runs, merges, removals and releases instead of refusing the manifest.
 
 use std::collections::{BTreeMap, BTreeSet};
 

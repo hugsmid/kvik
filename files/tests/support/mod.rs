@@ -604,6 +604,7 @@ pub fn play(steps: &[Step]) -> History {
     let mut live_comp: Vec<FileDescription> = Vec::new();
     let mut losses: Vec<SimLoss> = Vec::new();
     let mut retired_refs: Vec<FileRef> = Vec::new();
+    let mut layouts: BTreeMap<FileRef, CompactedLayout> = BTreeMap::new();
     let mut gap = 0u64;
     let push = |h: &mut History, epoch: &mut u64, gap: &mut u64, body: Body| {
         *epoch += 1 + std::mem::take(gap);
@@ -668,12 +669,21 @@ pub fn play(steps: &[Step]) -> History {
                 for o in &outs {
                     h.files.push(local(o, Place::Hot));
                 }
+                let run: Vec<CompactedLayout> = outs
+                    .iter()
+                    .map(|o| CompactedLayout {
+                        run_id: outs[0].file_id,
+                        run_count: outs.len() as u32,
+                        ..layout_of(o)
+                    })
+                    .collect();
+                layouts.extend(run.iter().map(|l| (l.file_ref(), l.clone())));
                 push(
                     &mut h,
                     &mut epoch,
                     &mut gap,
                     Body::Publish(Publish {
-                        layouts: Vec::new(),
+                        layouts: run,
                         published: outs.clone(),
                         retired: Vec::new(),
                     }),
@@ -696,12 +706,22 @@ pub fn play(steps: &[Step]) -> History {
                 let out = compacted(next_comp, FileClass::Current, (lo, hi), &inputs);
                 next_comp += 1;
                 h.files.push(local(&out, Place::Hot));
+                let mut merged = layout_of(&out);
+                let mut per_gen: BTreeMap<u32, u64> = BTreeMap::new();
+                for l in inputs.iter().map(|i| &layouts[i]) {
+                    for (g, n) in &l.positions {
+                        *per_gen.entry(*g).or_default() += n;
+                    }
+                }
+                merged.positions = per_gen.into_iter().collect();
+                merged.fact_count = inputs.iter().map(|i| layouts[i].fact_count).sum();
+                layouts.insert(out.file_ref(), merged.clone());
                 push(
                     &mut h,
                     &mut epoch,
                     &mut gap,
                     Body::Publish(Publish {
-                        layouts: Vec::new(),
+                        layouts: vec![merged],
                         published: vec![out.clone()],
                         retired: current.clone(),
                     }),
