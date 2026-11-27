@@ -111,6 +111,9 @@ mod store;
 mod time;
 mod types;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod gates;
+
 pub mod env;
 
 pub use backup::{
