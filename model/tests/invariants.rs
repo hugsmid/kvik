@@ -2402,8 +2402,8 @@ proptest! {
     }
 
     /// 10 with lost ranges: every fact ever durable is durable at the end,
-    /// unless its position lies in a recorded lost range; each lost range is
-    /// reported as `data_lost`, and the store stays writable.
+    /// unless its position lies in a recorded lost range; each lost range lies
+    /// in a loss reported as `data_lost`, and the store stays writable.
     #[test]
     fn inv10_only_lost_ranges_remove_facts(ops in proptest::collection::vec(arb_lossy_op(), 1..120)) {
         use kvik_model::engine::Reason;
@@ -2421,8 +2421,9 @@ proptest! {
             prop_assert!(now.get(p) == Some(f) || lost.contains(p), "fact at {} removed outside a lost range", p);
         }
         let h = m.health();
+        // A range that grows a loss is reported under the grown loss (§3 Recovery rule 2).
         for (from, to) in m.disk.lost_ranges() {
-            prop_assert!(h.reasons.contains(&Reason::DataLost(from, to)));
+            prop_assert!(h.reasons.iter().any(|r| matches!(r, Reason::DataLost(a, b) if *a <= from && to <= *b)));
         }
         prop_assert!(!m.is_read_only());
     }

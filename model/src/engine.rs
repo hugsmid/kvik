@@ -1258,6 +1258,9 @@ pub struct Disk {
     /// injection), each with the first and last position it held; the next
     /// recovery finds them (§3 Recovery rule 2).
     pub damaged: BTreeMap<(FileId, usize), (Position, Position)>,
+    /// Damaged batches already recorded as lost: their bytes stay invalid, so a batch damaged next to one later is
+    /// in the same invalid region and grows its loss (§3 Recovery rule 2).
+    pub recorded_damage: BTreeMap<(FileId, usize), (Position, Position)>,
     /// Batches of the log flagged in their commit block: acknowledged once
     /// written (§3 Batches, `format.md` A.7).
     pub flagged: BTreeSet<(FileId, usize)>,
@@ -1575,10 +1578,18 @@ impl Disk {
             .iter()
             .fold(
                 Vec::<(FileId, Position, Position)>::new(),
-                |mut runs, ((f, _), (from, to))| {
+                |mut runs, ((f, b), (from, to))| {
                     match runs.last_mut() {
                         Some((g, _, end)) if g == f && end.next() == *from => *end = *to,
-                        _ => runs.push((*f, *from, *to)),
+                        _ => {
+                            // The invalid region starts after the last valid batch before it.
+                            let from = (0..*b)
+                                .rev()
+                                .map_while(|k| self.recorded_damage.get(&(*f, k)))
+                                .last()
+                                .map_or(*from, |(first, _)| *first);
+                            runs.push((*f, from, *to));
+                        }
                     }
                     runs
                 },

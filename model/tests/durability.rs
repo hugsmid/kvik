@@ -520,6 +520,34 @@ fn s3_a_complete_flagged_batch_after_a_damaged_one_is_kept_and_the_damage_is_a_l
 }
 
 #[test]
+fn a_batch_damaged_next_to_one_recorded_lost_grows_that_loss_from_its_first_position() {
+    let (mut m, fast, _) = levels_model();
+    commit(&mut m, fast, 1);
+    let first = commit(&mut m, fast, 2);
+    let b = m.disk.files[&m.disk.active.unwrap()].batches.len() - 1;
+    let second = commit(&mut m, fast, 3);
+    m.sync_log();
+    m.crash();
+    m.corrupt_open_batch(b).unwrap();
+    m.remount();
+    m.restart();
+    assert_eq!(m.disk.lost_ranges(), [(first, first)]);
+    commit(&mut m, fast, 4);
+    m.sync_log();
+    m.crash();
+    m.corrupt_open_batch(b + 1).unwrap();
+    m.remount();
+    m.restart();
+    assert_eq!(
+        m.disk.lost_ranges(),
+        [(first, first), (first, second)],
+        "§3 Recovery rule 2: the invalid region starts after the last valid batch"
+    );
+    let losses: Vec<_> = m.losses().iter().map(|l| (l.first, l.last)).collect();
+    assert_eq!(losses, [(Some(first), Some(second))], "one loss, grown");
+}
+
+#[test]
 fn s4_a_consumer_resuming_over_unsynced_flagged_batches_catches_them_up() {
     let (mut m, fast, _) = levels_model();
     let ps: Vec<Position> = (1..=2).map(|t| commit(&mut m, fast, t)).collect();

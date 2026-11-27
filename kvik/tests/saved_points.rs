@@ -632,3 +632,42 @@ fn a_power_loss_after_a_lost_recovery_entry_keeps_the_model_s_last_position() {
     rig.entry_lost = false;
     rig.step(&PowerLoss(1), &mut seen);
 }
+
+/// Spec §3 Recovery rule 2: a batch damaged next to one recorded lost before lies in the same invalid region and
+/// grows that loss, so its reset point forgets from below both; a consumer started between them is sent it.
+#[test]
+fn a_batch_damaged_next_to_a_recorded_loss_grows_it_and_a_start_between_them_meets_its_reset_point()
+{
+    use Step::*;
+    let steps = [
+        Emit,
+        Damage(0, false),
+        Emit,
+        Save(1),
+        Sync,
+        Damage(0, false),
+        Emit,
+        Start(0),
+    ];
+    let mut rig = Rig::new();
+    let mut seen = Seen::default();
+    for s in &steps {
+        rig.step(s, &mut seen);
+    }
+    let losses = |s: &Store| {
+        s.losses()
+            .iter()
+            .map(|l| (l.first, l.last))
+            .collect::<Vec<_>>()
+    };
+    let (d, m) = (losses(rig.d()), losses(rig.m()));
+    assert_eq!(d, m);
+    let at = |sequence| {
+        Some(Position {
+            generation: 0,
+            sequence,
+        })
+    };
+    assert_eq!(d, [(at(2), at(3))], "one grown loss");
+    assert_eq!(seen.started, 1);
+}

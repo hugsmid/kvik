@@ -250,6 +250,9 @@ impl Model {
                 }
             }
             file.batches.truncate(keep);
+            self.disk
+                .recorded_damage
+                .retain(|(f, b), _| *f != id || *b < keep);
             self.unflag_from(id, keep);
         }
         (batches, torn)
@@ -372,7 +375,8 @@ impl Model {
     /// takes the range from the last valid batch before it to the next valid
     /// batch or, with none, to the mark's last position; the model keeps the
     /// positions each damaged batch held, which give the same range when its
-    /// neighbours are valid, and do not repeat an earlier lost range next to it.
+    /// neighbours are valid; a run next to batches recorded damaged before
+    /// starts at the first of them, growing their loss.
     /// A recovery whose sync fails writes no record (Q-79), but reports the
     /// ranges it found as `data_lost` (§8 "recorded when found"); the next
     /// recovery that can write records them, with any a scrub found while the
@@ -410,7 +414,8 @@ impl Model {
                 },
             });
         }
-        self.disk.damaged.clear();
+        let damaged = std::mem::take(&mut self.disk.damaged);
+        self.disk.recorded_damage.extend(damaged);
     }
 
     /// Moves the durable mark (in the page cache) to the end of the active
