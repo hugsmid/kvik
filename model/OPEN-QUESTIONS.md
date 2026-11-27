@@ -5451,7 +5451,8 @@ reseeds the gates in force at the head by the seed rule, emits no start transiti
 (Q-1392), counted `gates_reseeded`; nothing is replayed.
 **Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`,
 `a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
-`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`.
+`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`; `kvik/tests/gates.rs`
+`every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor`.
 
 ## Q-2001 — What the durable backend's gate history reads cost
 Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
@@ -5472,7 +5473,9 @@ are queued as the catch-up passes their positions, so a short catch-up loses non
 gates quiet: judged, counted `transitions_not_delivered`, not queued. On re-attaching, before any live delivery, each
 instance whose state differs from the last it was sent receives the transition that set its present state (a real id
 from the judgement), in id order. No new resync cause.
-**Pinned by.** none yet: the model backend has no overflow (its transitions are computed when handed out).
+**Pinned by.** `kvik/tests/gates.rs`
+`a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_state_on_reattaching` (the model backend
+has no overflow: its transitions are computed when handed out).
 
 ## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
 Decided by the lead with cond2 step 4, provisional.
