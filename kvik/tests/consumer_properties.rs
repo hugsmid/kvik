@@ -385,6 +385,44 @@ fn runner() -> TestRunner {
     })
 }
 
+fn differential(history: &[Step], small: bool, smalls: &AtomicU64) -> Result<(), TestCaseError> {
+    let m_clock = ManualClock::new(start());
+    let dir = format!("kvik-test/consumers-differential/{}", next_id());
+    let mut env = Env::test(m_clock.clone());
+    env.background_timers = false;
+    let m_config = StoreConfig::new(&dir, "Europe/London")
+        .create_if_missing(true)
+        .backend(Backend::Model)
+        .env(env);
+    let model = block_on(Store::open(m_config.clone())).unwrap();
+    let m = run(
+        model,
+        &|| block_on(Store::open(m_config.clone())).unwrap(),
+        &|name| {
+            assert!(kvik::model_fault(
+                &m_config.dir,
+                kvik::ModelFault::LoseCursorFile(name.into())
+            ));
+        },
+        &m_clock,
+        history,
+    );
+    let mut w = World::quiet(&format!("differential-{}", next_id()));
+    if small {
+        w.window_memory = Some(8 << 10);
+        smalls.fetch_add(1, Ordering::Relaxed);
+    }
+    let lose = |name: &str| {
+        let path = w
+            .path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
+            .expect("a consumer is given its cursor file at the take");
+        w.fs.poke(&path, 0, &[0; 16]);
+    };
+    let d = run(w.open(), &|| w.open(), &lose, &w.clock, history);
+    prop_assert_eq!(m, d);
+    Ok(())
+}
+
 /// Timers run only when the store is called, on both backends, so that both see the same evaluations; condition
 /// sequences start at 1 at every start on both (spec §4 Order).
 /// Half the histories, chosen with each history, run with windows of a few dozen facts (Q-751).
@@ -394,43 +432,7 @@ fn deliveries_follow_the_model_over_restarts() {
     runner()
         .run(
             &(steps(false), prop::bool::weighted(0.5)),
-            |(history, small)| {
-                let m_clock = ManualClock::new(start());
-                let dir = format!("kvik-test/consumers-differential/{}", next_id());
-                let mut env = Env::test(m_clock.clone());
-                env.background_timers = false;
-                let m_config = StoreConfig::new(&dir, "Europe/London")
-                    .create_if_missing(true)
-                    .backend(Backend::Model)
-                    .env(env);
-                let model = block_on(Store::open(m_config.clone())).unwrap();
-                let m = run(
-                    model,
-                    &|| block_on(Store::open(m_config.clone())).unwrap(),
-                    &|name| {
-                        assert!(kvik::model_fault(
-                            &m_config.dir,
-                            kvik::ModelFault::LoseCursorFile(name.into())
-                        ));
-                    },
-                    &m_clock,
-                    &history,
-                );
-                let mut w = World::quiet(&format!("differential-{}", next_id()));
-                if small {
-                    w.window_memory = Some(8 << 10);
-                    smalls.fetch_add(1, Ordering::Relaxed);
-                }
-                let lose = |name: &str| {
-                    let path = w
-                        .path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
-                        .expect("a consumer is given its cursor file at the take");
-                    w.fs.poke(&path, 0, &[0; 16]);
-                };
-                let d = run(w.open(), &|| w.open(), &lose, &w.clock, &history);
-                prop_assert_eq!(m, d);
-                Ok(())
-            },
+            |(history, small)| differential(&history, small, &smalls),
         )
         .unwrap();
     assert!(
@@ -493,6 +495,18 @@ impl Seen {
 /// `forget_above`, if any, is at or above the position durable before the crash (always present after a power loss)
 /// and below its id; nothing follows before it is confirmed; and a condition it reports as no transition is in a
 /// state handed to the consumer before a confirmation, so that a transition is never lost.
+#[test]
+fn a_fact_after_a_retake_with_no_cursor_unconfirmed_is_flagged_as_the_model_flags_it() {
+    let history = [
+        Step::LoseCursor(1),
+        Step::Route(1, FunnelKind::All),
+        Step::Retake(1),
+        Step::Emit(0, 0),
+        Step::Drain(1, 0),
+    ];
+    differential(&history, false, &AtomicU64::new(0)).unwrap();
+}
+
 #[test]
 fn deliveries_after_crashes_follow_the_rules() {
     runner()
