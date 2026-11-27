@@ -295,6 +295,10 @@ impl Deliverer {
 
     /// The commit floor: once every batch assigned below it has been taken, timers due by it fire.
     pub(super) fn gate_timers(&mut self, ctx: &Ctx<'_>) {
+        // The floor raises the commit clock: on a store with no gate, commit times stay as without gates (§2).
+        if !self.gating() {
+            return;
+        }
         let Some((f, p)) = self.floor(ctx) else {
             return;
         };
