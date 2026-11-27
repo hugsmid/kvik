@@ -213,7 +213,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2120 | compaction design §3.4; Q-1850 | When publish records without field 3 stop being accepted (provisional) |
 | Q-2121 | compaction design §3.4 | Whether a new record may leave the rule undecided (provisional) |
 | Q-2122 | compaction design §3.5; Q-1851 | What a rebuild's held file holds (provisional) |
-| Q-2125 | compaction design §3.3; Q-1853 | Publish after an unsure record (provisional) |
+| Q-2125 | compaction design §3.5; Q-1853 | Publish after an unsure record (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5405,6 +5405,12 @@ Decided with the review of roadmap 6.3e, provisional. To be settled by the roadm
 **Scenario.** `RebuildPlan::held` lists outputs that can be neither published nor discarded, said to hold runs, merges, removals and releases; only the start's clean-up took the list. With a held file on disk the planner would compact its segments again, and a copy of the corrupt record arriving later would then name two runs for one segment (rule 1, a hold with no end).
 **Decision (provisional).** The appender carries the held files (`Appender::hold_unlocated`, called by `rebuild_manifest`): while a record has not named one, `Appender::compaction` is undecided and names it, so one accessor answers for both holds and new publish records are refused as held. A carried copy of the corrupt record that names the file ends its hold. The hold lasts for the run of the process; the driver (Q-1853) consults `compaction()` before planning a run and keeps the held files out of a later start's clean-up while the rebuild is provisional. Reason: §3.5 keeps such a file and holds as for an unlocated one; carrying it in the appender's judgement needs no new record.
 **Pinned by.** `files/tests/unnamed_outputs.rs` `a_held_output_holds_compaction_in_the_rebuilt_appender_until_a_copy_of_its_record_names_it`.
+
+## Q-2125 — Publish after an unsure record
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** A failed sync leaves the appender faulted, the record possibly on disk and the outputs under their final names. A second publish of the same segments with the same first `file_id` renamed its outputs over them, was refused by the faulted appender, and its clean-up removed the final names, so a durable record could name absent files.
+**Decision (provisional).** The appender's fault ends compaction for the run of the process: `publish` refuses (`PublishError::Refused(AppendError::ReadOnly)`) before any rename when the appender is faulted; the next start finds the record or not and cleans up as §3.5 says. Reason: only the next start can tell whether the unsure record is on disk.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_publish_after_an_unsure_record_leaves_the_outputs_that_record_may_name`.
 
 ## Open at v0.2
 

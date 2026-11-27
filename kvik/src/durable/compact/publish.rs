@@ -122,6 +122,10 @@ pub(crate) fn publish(
     outputs: &[Output],
     written_at: i64,
 ) -> Result<u64, PublishError> {
+    // An unsure record may be on disk naming final names these outputs would take (Q-2125).
+    if manifest.is_faulted() {
+        return Err(PublishError::Refused(AppendError::ReadOnly));
+    }
     let finals: Vec<PathBuf> = outputs
         .iter()
         .map(|o| final_path(dir, o.id.generation, o.id.file_id))
