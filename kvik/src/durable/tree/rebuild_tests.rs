@@ -292,3 +292,24 @@ fn a_checkpoint_that_meets_a_damaged_part_repairs_it_at_the_same_step_not_at_the
     let (_, vis) = tree_state(&st.fs, &st.dir);
     assert_model(&st, &vis);
 }
+
+#[test]
+fn a_floor_close_over_a_merged_day_equals_the_model_with_rollups() {
+    let mut st = Store::new("floor-model");
+    history(&mut st);
+    let d0 = day_of(&st);
+    st.w.reader().unwrap();
+    step_until(&st, "the first day's roll-ups are written", |r| {
+        set::covered(r, 4, d0, d0 + DAY)
+    });
+    let id = st.id;
+    st.w.retire(id, st.clock.wall()).unwrap();
+    step_until(&st, "the floor is opened and closed", |r| {
+        r.floors.len() == 1 && r.floors.iter().all(|f| !f.rebuilding)
+    });
+    st.stop();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(set::covered(&root, 4, d0, d0 + DAY));
+    assert!(vis.keys().any(|k| k.1 == 4), "the day's roll-up is rebuilt");
+    assert_model(&st, &vis);
+}
