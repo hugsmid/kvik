@@ -17,7 +17,7 @@ use kvik_tree::write::{Fact, Identity, Opening, TreeFiles, folded_levels, quarte
 
 use super::dirty::{Dirty, Key};
 use super::stretch::dirty_from_log;
-use crate::durable::index::Stored;
+use crate::durable::index::{Stored, log_pos};
 use crate::durable::loss::Latch;
 use crate::durable::read::source::each_row;
 use crate::durable::read::view::View;
@@ -70,6 +70,8 @@ struct State {
     last_step: Duration,
     last_ok: Option<Duration>,
     failed: Option<String>,
+    /// The ranges of the losses a discard this run already answered (Q-2182).
+    answered: Vec<(LogPos, LogPos)>,
 }
 
 /// What a job runs on besides the store's files.
@@ -107,6 +109,10 @@ impl Job {
         st.first_step.get_or_insert(now);
         st.last_step = now;
         if st.files.is_none() {
+            // Q-1950: a clean shutdown reads no log, and the start's pass is a read of the log.
+            if stopping && !self.reader_open() {
+                return None;
+            }
             if let Err(e) = self.start(&mut st, synced, now) {
                 st.failed = Some(e);
                 return (!stopping).then_some(RETRY);
@@ -165,10 +171,37 @@ impl Job {
         let _ = self.marks.set(w);
     }
 
-    /// Whether a loss this run found, that no lost range of the manifest held at the start, begins at or below `k`
-    /// (Q-1429).
-    fn lost_below(&self, k: LogPos) -> bool {
-        crate::durable::derived::lost_since(&self.latch.found(), &self.recorded, k)
+    fn reader_open(&self) -> bool {
+        self.readers
+            .get()
+            .is_some_and(|f| matches!(f(false), Ok(Some(_))))
+    }
+
+    /// Whether a loss this run found, that no lost range of the manifest held at the start and no discard in
+    /// `answered` answered, begins at or below `k` (Q-1429, Q-2182).
+    fn lost_below(&self, k: LogPos, answered: &[(LogPos, LogPos)]) -> bool {
+        let found: Vec<_> = self
+            .latch
+            .found()
+            .into_iter()
+            .filter(|l| {
+                let (Some(a), Some(b)) = (l.first, l.last) else {
+                    return true;
+                };
+                let (a, b) = (log_pos(a), log_pos(b));
+                !answered.iter().any(|&(lo, hi)| lo <= a && b <= hi)
+            })
+            .collect();
+        crate::durable::derived::lost_since(&found, &self.recorded, k)
+    }
+
+    /// The ranges of the losses found so far, for `answered`.
+    fn found_ranges(&self) -> Vec<(LogPos, LogPos)> {
+        self.latch
+            .found()
+            .iter()
+            .filter_map(|l| Some((log_pos(l.first?), log_pos(l.last?))))
+            .collect()
     }
 
     fn start(&self, st: &mut State, synced: LogPos, now: Duration) -> Result<(), String> {
@@ -178,13 +211,19 @@ impl Job {
             wall: self.env.clock.wall().0,
             now,
         };
-        let (files, _) = TreeFiles::start(self.env.fs.clone(), &self.dir, self.id, at, |k| {
-            self.lost_below(k)
+        let (files, report) = TreeFiles::start(self.env.fs.clone(), &self.dir, self.id, at, |k| {
+            self.lost_below(k, &[])
         })
         .map_err(|e| format!("tree start: {e}"))?;
-        let s = dirty_from_log(&self.dir, &self.env, files.root().checkpoint, synced)
-            .map_err(|e| format!("tree start: {e}"))?;
-        self.dirty.fill(&s.keys, &s.series);
+        if report.discarded {
+            st.answered = self.found_ranges();
+        }
+        // Q-2181: a store with facts and no root covers nothing, so nothing below the mark needs marking.
+        if report.continued.is_some() || self.fresh {
+            let s = dirty_from_log(&self.dir, &self.env, files.root().checkpoint, synced)
+                .map_err(|e| format!("tree start: {e}"))?;
+            self.dirty.fill(&s.keys, &s.series);
+        }
         st.files = Some(files);
         Ok(())
     }
@@ -240,11 +279,23 @@ impl Job {
         let files = st.files.as_mut().expect("started");
         let wall = self.env.clock.wall().0;
         let root = files.root();
-        if (!root.covered.is_empty() || !root.parts.is_empty()) && self.lost_below(root.checkpoint)
+        let mut discarded = false;
+        if (!root.covered.is_empty() || !root.parts.is_empty())
+            && self.lost_below(root.checkpoint, &st.answered)
         {
+            let answered = self.found_ranges();
+            let files = st.files.as_mut().expect("started");
             files.discard(wall, now).map_err(|e| e.to_string())?;
+            st.answered = answered;
+            discarded = true;
         }
+        let files = st.files.as_mut().expect("started");
         let root = files.root();
+        // Q-2183: nothing to write and K unchanged publishes no root.
+        if !discarded && keys.is_empty() && rebuild.is_empty() && k == root.checkpoint {
+            files.remove_retired(now);
+            return Ok(());
+        }
         let mut skip: BTreeSet<u64> = rebuild.iter().map(|&s| u64::from(s)).collect();
         skip.extend(
             root.floors

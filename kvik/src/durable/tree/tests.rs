@@ -564,8 +564,39 @@ fn an_idle_store_writes_no_root_at_its_intervals() {
 
 #[test]
 fn a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree() {
-    let mut st = Store::new("no-start");
-    st.emit(Intent::Normal, &[(10, Some(1.0))]);
-    st.w.shutdown().unwrap();
-    assert!(st.fs.read_dir(&st.dir.join(DIR)).is_err());
+    let fs = MemFs::new();
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock);
+    env.fs = Arc::new(fs.clone());
+    let dir = PathBuf::from("tree-unit/no-start");
+    let job = super::Job::new(super::job::Parts {
+        dir: dir.clone(),
+        env,
+        latch: Arc::default(),
+        recorded: Vec::new(),
+        id: kvik_tree::write::Identity {
+            generation: 1,
+            reset: Default::default(),
+            store_id: [0; 16],
+        },
+        fresh: false,
+        dirty: Arc::default(),
+    });
+    job.readers(Box::new(|_| Ok(None)));
+    fs.create_dir_all(&dir.join(DIR)).unwrap();
+    drop(
+        fs.open(
+            &dir.join(DIR).join("x.tmp"),
+            kvik_log::fs::OpenMode::CreateNew,
+        )
+        .unwrap(),
+    );
+    assert_eq!(job.step(Default::default(), Duration::ZERO, true), None);
+    assert!(fs.read(&dir.join(DIR).join("x.tmp")).is_some());
+    assert_eq!(job.behind(), None);
+    job.step(Default::default(), Duration::ZERO, false);
+    assert!(
+        fs.read(&dir.join(DIR).join("x.tmp")).is_none(),
+        "an interval step starts it"
+    );
 }
