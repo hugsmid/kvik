@@ -471,3 +471,30 @@ fn a_gate_call_failing_mid_batch_reseeds_at_its_item_and_repeats_no_fact() {
         ]
     );
 }
+
+#[test]
+fn the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement() {
+    let (w, _, clock) = open_clocked("gates-held-fresh");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.watch(
+        "c",
+        "humidity",
+        &Gate::change(Input::value(s)).deadband(5.0),
+    )
+    .unwrap();
+    emit(&w, &clock, s, 50.0);
+    assert_eq!(transitions(&w, true).len(), 2);
+    for v in [51.0, 52.0, 53.0] {
+        clock.advance(Duration::from_secs(1));
+        emit(&w, &clock, s, v);
+        assert!(transitions(&w, true).is_empty());
+    }
+    let quiet = head(&w);
+    clock.advance(Duration::from_secs(1));
+    emit(&w, &clock, s, 70.0);
+    let ts = transitions(&w, false);
+    assert_eq!(ts.len(), 1);
+    let held = cursor(&w).1.expect("held while outstanding");
+    assert_eq!(held.at.sequence, quiet.sequence);
+}
