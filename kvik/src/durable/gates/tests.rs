@@ -273,8 +273,14 @@ fn the_gate_limits_admit_the_last_gate_and_refuse_one_more() {
 }
 
 fn emit(w: &Arc<Writer>, clock: &ManualClock, s: SeriesId, v: f64) {
-    let r = crate::types::Reading::new(s, clock.wall(), Value::F64(v));
-    match w.emit(&[r], crate::types::Intent::Normal, true) {
+    emit_all(
+        w,
+        &[crate::types::Reading::new(s, clock.wall(), Value::F64(v))],
+    );
+}
+
+fn emit_all(w: &Arc<Writer>, rs: &[crate::types::Reading]) {
+    match w.emit(rs, crate::types::Intent::Normal, true) {
         Ok(crate::durable::Emitted::Ready(_)) => {}
         Ok(crate::durable::Emitted::Queued(mut q)) => {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -318,7 +324,7 @@ fn cursor(
 }
 
 #[test]
-fn a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot() {
+fn a_confirmed_transition_or_resync_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot() {
     let (w, _, clock) = open_clocked("gates-confirm");
     let s = gauge(&w, "hall/air/humidity");
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
@@ -351,6 +357,19 @@ fn a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_sna
         .unwrap();
     let (_, held, outstanding) = cursor(&w);
     assert_eq!((held, outstanding), (None, 0));
+    w.release("c");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    let at = head(&w);
+    let mut resyncs = 0;
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        resyncs += usize::from(matches!(d.kind, crate::consume::DeliveryKind::Resync(_)));
+        w.confirm("c", d.id).unwrap();
+    }
+    assert_eq!(resyncs, 1);
+    assert!(matches!(
+        cursor(&w).0,
+        Some(super::super::deliver::GatePoint::Frontier(f)) if f.at.sequence == at.sequence
+    ));
 }
 
 #[test]
@@ -385,4 +404,134 @@ fn no_timer_fires_while_a_batch_assigned_below_the_floor_is_not_yet_judged() {
     hub.run(|d, _| d.hold_floor(None));
     clock.advance(Duration::from_secs(100));
     assert!(transitions(&w, true).is_empty(), "the hold never completed");
+}
+
+#[test]
+fn a_pump_on_a_store_without_gates_leaves_the_commit_clock_at_the_last_batch() {
+    let (w, _, clock) = open_clocked("gates-none-clock");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    emit(&w, &clock, s, 50.0);
+    let committed = |w: &Writer| {
+        w.hub()
+            .unwrap()
+            .run(|_, c| c.watch.map(|x| x.commit_clock().floor(i64::MIN).0))
+    };
+    let before = committed(&w);
+    clock.advance(Duration::from_secs(100));
+    assert!(transitions(&w, true).is_empty());
+    assert_eq!(committed(&w), before);
+}
+
+#[test]
+fn a_gate_call_failing_mid_batch_reseeds_at_its_item_and_repeats_no_fact() {
+    let (w, _, clock) = open_clocked("gates-fail-mid-batch");
+    let a = gauge(&w, "hall/air/humidity");
+    let b = gauge(&w, "hall/air/temperature");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &crate::consume::Funnel::facts(Select::All))
+        .unwrap();
+    w.watch("c", "a", &Gate::change(Input::value(a)).deadband(5.0))
+        .unwrap();
+    w.watch("c", "b", &Gate::change(Input::value(b)).deadband(5.0))
+        .unwrap();
+    emit(&w, &clock, a, 50.0);
+    emit(&w, &clock, b, 1.0);
+    transitions(&w, true);
+    let h = head(&w);
+    let second = kvik_log::writer::Position {
+        generation: h.generation,
+        sequence: h.sequence + 2,
+    };
+    let hub = w.hub().unwrap().clone();
+    hub.run(|d, _| d.fail_gate_at(Some(second)));
+    clock.advance(Duration::from_secs(1));
+    let rs = [
+        crate::types::Reading::new(a, clock.wall(), Value::F64(60.0)),
+        crate::types::Reading::new(b, clock.wall(), Value::F64(20.0)),
+    ];
+    emit_all(&w, &rs);
+    let mut facts = Vec::new();
+    let mut gates = Vec::new();
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        match &d.kind {
+            crate::consume::DeliveryKind::Fact(f) => facts.push(f.position),
+            crate::consume::DeliveryKind::Resync(r) => gates.extend(r.gates.clone()),
+            _ => {}
+        }
+        w.confirm("c", d.id).unwrap();
+    }
+    hub.run(|d, _| d.fail_gate_at(None));
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    assert_eq!(
+        gates.iter().map(|g| g.state.clone()).collect::<Vec<_>>(),
+        [
+            GateState::Value(Value::F64(60.0)),
+            GateState::Value(Value::F64(20.0))
+        ]
+    );
+}
+
+#[test]
+fn the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement() {
+    let (w, _, clock) = open_clocked("gates-held-fresh");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.watch(
+        "c",
+        "humidity",
+        &Gate::change(Input::value(s)).deadband(5.0),
+    )
+    .unwrap();
+    emit(&w, &clock, s, 50.0);
+    assert_eq!(transitions(&w, true).len(), 2);
+    for v in [51.0, 52.0, 53.0] {
+        clock.advance(Duration::from_secs(1));
+        emit(&w, &clock, s, v);
+        assert!(transitions(&w, true).is_empty());
+    }
+    let quiet = head(&w);
+    clock.advance(Duration::from_secs(1));
+    emit(&w, &clock, s, 70.0);
+    let ts = transitions(&w, false);
+    assert_eq!(ts.len(), 1);
+    let held = cursor(&w).1.expect("held while outstanding");
+    assert_eq!(held.at.sequence, quiet.sequence);
+}
+
+#[test]
+fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
+    let (w, config, clock) = open_clocked("gates-reseed-reads");
+    let s = gauge(&w, "hall/air/humidity");
+    let t = gauge(&w, "hall/air/temperature");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    for (k, v) in [50.0, 60.0, 72.0].into_iter().enumerate() {
+        clock.advance(Duration::from_secs(1));
+        emit(&w, &clock, s, v);
+        emit(&w, &clock, t, v + 1.0);
+        w.watch("c", &format!("s{k}"), &humidity(s)).unwrap();
+    }
+    w.watch("c", "t", &humidity(t)).unwrap();
+    drop(w);
+    // Without its cursor file the take reseeds rather than replays (Q-2080).
+    config
+        .env
+        .fs
+        .remove_file(&PathBuf::from(
+            "durable-unit/gates-reseed-reads/cursors/c.cur",
+        ))
+        .unwrap();
+    let w = Writer::open(&config).unwrap();
+    let reads = |w: &Writer| w.hub().unwrap().run(|d, _| d.gate_reads());
+    let before = reads(&w);
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    assert_eq!(reads(&w) - before, 2);
+    let mut gates = 0;
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        if let crate::consume::DeliveryKind::Resync(r) = &d.kind {
+            gates += r.gates.len();
+        }
+        w.confirm("c", d.id).unwrap();
+    }
+    assert_eq!(gates, 4);
 }

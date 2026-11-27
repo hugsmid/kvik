@@ -224,3 +224,48 @@ fn a_gate_confirmation_writes_a_checkpoint_within_the_interval() {
     assert_eq!(s.stats().delivery.transitions_not_replayed, 0);
     block_on(s.shutdown()).unwrap();
 }
+
+/// Q-1396, Q-2002: a transition dropped while quiet keeps the checkpoint before it until the resync ending the
+/// catch-up is confirmed, so a crash after every transition but that resync is confirmed replays it.
+#[test]
+fn a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_up_resync_is_confirmed()
+ {
+    let mut w = World::quiet("gates-checkpoint-quiet");
+    let mut config = w.config();
+    config.limits.consumer_queue = 2;
+    let s = block_on(Store::open(config.clone())).unwrap();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.watch("moved", Gate::change(Input::value(id)).deadband(5.0))).unwrap();
+    let mut k = 0.0;
+    while s.stats().delivery.transitions_not_delivered == 0 {
+        w.clock.advance(Duration::from_secs(1));
+        k += 10.0;
+        emit(&w, &s, id, k);
+    }
+    assert_eq!(s.stats().delivery.transitions_not_delivered, 1);
+    let mut confirmed = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        match &d.kind {
+            DeliveryKind::Transition(t) => {
+                confirmed.push(t.id);
+                block_on(c.confirm(d.id)).unwrap();
+            }
+            DeliveryKind::Resync(_) => break,
+            _ => block_on(c.confirm(d.id)).unwrap(),
+        }
+    }
+    let last = *confirmed.last().unwrap();
+    w.crash(s, vec![c], false);
+    let s = block_on(Store::open(config)).unwrap();
+    let mut c = take(&s);
+    let replayed: Vec<_> = ready(&mut c)
+        .into_iter()
+        .filter_map(|d| match d.kind {
+            DeliveryKind::Transition(t) if d.flags.replayed && t.id > last => Some(t.to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, [Some(kvik::GateState::Value(Value::F64(k)))]);
+    block_on(s.shutdown()).unwrap();
+}

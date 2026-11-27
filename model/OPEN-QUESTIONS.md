@@ -207,8 +207,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
 | Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
 | Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (superseded by Q-2080) |
-| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided by the lead, provisional; settle with cond2 step 5) |
-| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: the transitions that set the changed states, not a resync (decided by the lead, provisional) |
+| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided at review, provisional; settle with cond2 step 5) |
+| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: a resync, cause `Resume` (decided at review, provisional) |
 | Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
 | Q-2080 | §6 Gates, Resume; `format.md` A.15; Q-2000 | The durable gate cursor and checkpoint in the cursor file, replayed at the first take (decided by the builder, provisional) |
 | Q-2081 | `format.md` A.15; Q-1391 | The checkpoint block as built: series apart from instances, every field the core restores (decided by the builder, provisional) |
@@ -227,6 +227,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2172 | §6 Gates; §4 Resync | A lost range recorded at run time, after the engine judged its facts (decided by the builder, provisional) |
 | Q-2173 | §6 Gates, One stream; `format.md` A.15; Q-1143 | An `Each` gate's refused series are not in the checkpoint (decided by the builder, provisional) |
 | Q-2220 | §6 Gates, Resume; Q-132 | A resync's confirmation over replayed transitions is written at once (decided in the fix round) |
+| Q-2250 | §4.3 held snapshot; G5 | When a run takes the snapshot that becomes `held`: only with nothing outstanding and nothing deferred (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2251 | §6 Gates, Resume; Q-2003 | Deferred transitions older than a dropped one, delivered after the resync that ended the quiet (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2270 | §6 Gates, Resume; Q-1396, Q-2002 | The checkpoint while a quiet catch-up ends with a resync (decided at merge) |
+| Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (open, for the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5473,26 +5477,34 @@ replaced by Q-2080's replay, pinned by `kvik/tests/gates.rs`
 `a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by`.
 
 ## Q-2001 — What the durable backend's gate history reads cost
-Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
-**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double.
-**Decision (provisional).** Each read scans the log from its start to `through` and judges the series' facts by the
-double's own rules (`Replay`), so the two cannot differ; the gate differential checks it end to end. Cost: one log
-scan per read; reads happen at a watch with holds (two), at a reseed (two per gate) and when a bad fact replaces the
-live one (one). Fine for the tests' logs; a store of 30 days needs the bounded read of Q-1880 (from
-`commit_at(T − 2L)`, with the series' state there from the summaries), which cond2 step 5 builds with replay.
-**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`.
+Decided by the lead with cond2 step 4, narrowed at its review, provisional; settle with cond2 step 5.
+**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double. The first
+decision scanned the whole log per read, twice per gate at every reseed, under the deliverer lock.
+**Decision (provisional).** A read takes the series' facts at or before `through` through the segment indexes
+(`format.md` A.8; a segment without one is scanned) and judges them by the double's own rules (`Replay`), so the two
+cannot differ; the gate differential checks it end to end. One read per series and position serves a whole core
+call, so a reseed reads each watched series once for all its gates. A read that cannot read every place that may
+hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; still
+unbounded in time. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
+summaries) is a merge condition on cond2 step 5, which builds it with replay.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`;
+`kvik/src/durable/gates/tests.rs` `a_reseed_reads_a_series_from_the_log_once_for_all_its_gates`.
 
 ## Q-2002 — Gate state after an overflow catch-up
-Decided by the lead with cond2 step 4, provisional.
+Decided by the lead with cond2 step 4; replaced at its review, provisional.
 **Scenario.** Spec §6 Gates, Resume says the overflow catch-up's resync carries gate states, but §4 Overflow ends a
-catch-up with no resync: condition funnels re-attach by sending each changed state.
+catch-up with no resync: condition funnels re-attach by sending each changed state. The first decision re-sent, on
+re-attaching, the transition that set each changed state. That transition was judged before any snapshot the run
+still holds, so G5 cannot hold for it, and after a second take it came again unflagged though confirmed.
 **Decision (provisional).** Transitions judged while a consumer is behind wait in a buffer as large as its queue and
-are queued as the catch-up passes their positions, so a short catch-up loses none. A buffer that fills makes the
-gates quiet: judged, counted `transitions_not_delivered`, not queued. On re-attaching, before any live delivery, each
-instance whose state differs from the last it was sent receives the transition that set its present state (a real id
-from the judgement), in id order. No new resync cause.
+are queued as the catch-up passes their positions, so a short catch-up loses none and needs no resync. A buffer that
+fills makes the gates quiet: judged, counted `transitions_not_delivered`, not queued. Any resync queued while quiet
+ends it (its states are taken as it is handed out, Q-2003); a catch-up still quiet at its end issues one at the last
+position taken, as a resume does: cause `Resume`, funnel states included, so funnels re-attach by it (§4 Overflow, a
+resync counts as emitting the states it carries). No new resync cause.
 **Pinned by.** `kvik/tests/gates.rs`
-`a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_state_on_reattaching` (the model backend
+`a_gate_that_overflows_its_queue_counts_what_it_drops_and_ends_its_catch_up_with_a_resync_of_the_present_state` and
+`a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_take_while_quiet` (the model backend
 has no overflow: its transitions are computed when handed out).
 
 ## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
@@ -5704,6 +5716,51 @@ returned. Found by the crash property at its full case count.
 **Decision.** Every gate confirmation, a transition or a resync's frontier, writes the cursor file before `confirm`
 returns, as a latch change does. A resync is confirmed once a resume, so the extra writes are few.
 **Pinned by.** `kvik/tests/gates_durable.rs` `a_confirmed_start_transition_does_not_come_again_after_three_crashes`.
+
+## Q-2250 — When a run takes the snapshot that becomes `held`
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A consumer that is behind with nothing outstanding can hold transitions in `deferred`, judged in an
+earlier batch. A snapshot taken at the next batch is after their judgement, and the catch-up then makes it `held`
+under them (G5).
+**Decision (provisional).** A run takes the snapshot that becomes `held` only when `outstanding` and `deferred` are
+both empty: in `gate_batch` and in `ready`. `gate_confirm` takes none; it clears `pre`, and the next `ready` retakes it
+under the same condition. Settle with cond2 step 5, which writes `held` as the checkpoint.
+**Pinned by.** `kvik/tests/gates_snapshot.rs`
+`a_transition_deferred_while_behind_is_delivered_once_after_later_batches_judge_nothing`; the S5 test
+`the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement` still holds.
+**At the step 5 merge.** The condition is written as `held` none: the durable hold sets `held` at every judged
+transition and keeps it while one is outstanding, deferred or dropped (Q-2270), so it is the same condition.
+
+## Q-2251 — Deferred transitions older than a dropped one, after the resync that ended the quiet
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A resync that ends a quiet clears `quiet` while `deferred` may hold transitions above the resync's
+position and older than the ones dropped; they arrive after it with a state it superseded.
+**Decision (provisional).** Keep, as Q-2003 accepts (`set_by` names the newer id). `api.md` is not changed here: a
+transition whose id is below a resync's `set_by` for its instance is superseded. Not probed in this round; settle
+by step 5's merge.
+**At the step 5 merge.** Unchanged: the checkpoint hold (Q-2270) does not move `held` past these transitions,
+and a quiet ended by a resync below a dropped id keeps the checkpoint until a later confirmation covers it.
+
+## Q-2270 — The checkpoint while a quiet catch-up ends with a resync
+Decided when the overflow resync (Q-2002) met the durable checkpoint (Q-2086).
+**Scenario.** A consumer behind fills its buffer, so its gates go quiet; the transition that filled it is dropped,
+then the catch-up ends with a resync of the present state. The consumer confirms every transition queued before
+that resync but not the resync, and the process crashes. Nothing is outstanding or deferred and the run is no
+longer quiet, so without more the checkpoint moves to the core now, after the dropped transition, and the restart
+does not replay it although it is after the gate cursor.
+**Decision.** The highest dropped id is kept (the one that makes the gates quiet included) and holds the checkpoint
+before it until the gate cursor covers it: the confirmed resync's frontier does. Kept rather than a "resync
+pending" flag, since it holds whatever confirms past it.
+**Pinned by.** `kvik/tests/gates_checkpoint.rs`
+`a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_up_resync_is_confirmed`.
+
+## Q-2271 — The bounded gate history read named as a merge condition on cond2 step 5
+Open, for the lead.
+**Scenario.** Q-2001, as narrowed at the step 4 review, makes the bounded read of Q-1880 (from `commit_at(T − 2L)`,
+with the series' state there from the summaries) a merge condition on step 5. Step 5 bounds replay by
+`conditions.replay_max`, but each history read still takes all of a series' facts at or before its position.
+**Default (provisional).** Merge step 5 without it; the bounded read lands with step 6, measured in its bench notes;
+Q-2001 keeps its text until then.
 
 ## Open at v0.2
 
@@ -5936,8 +5993,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
 | Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
 | Q-2000 | cond2 step 5 | Superseded by Q-2080 |
-| Q-2001 | cond2 step 5 | Decided by the lead, provisional: a log scan per read; the bounded read with replay |
-| Q-2002 | cond2 step 6 | Decided by the lead, provisional: buffered while behind; changed states re-sent on re-attaching |
+| Q-2001 | cond2 step 5 | Decided at review, provisional: one indexed read per series per core call; the bounded read with replay, before step 5 merges |
+| Q-2002 | cond2 step 6 | Decided at review, provisional: buffered while behind; a quiet catch-up ends with a resync |
 | Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
 | Q-2080 | cond2 review | Decided by the builder, provisional: field 4 and block 0x31; replay at the first take |
 | Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
@@ -5956,6 +6013,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2172 | cond2 review | Decided by the builder, provisional: the engine keeps what it judged; reseeded at the next replay across it |
 | Q-2173 | cond2 review | Decided by the builder, provisional: recomputed at restore from the names in force |
 | Q-2220 | cond2 review | Decided in the fix round: every gate confirmation written at once |
+| Q-2270 | cond2 review | Decided at merge: the highest dropped id holds the checkpoint until the gate cursor covers it |
+| Q-2271 | cond2 step 6 | Open, for the lead: step 5 merges without the bounded read; it lands with step 6 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

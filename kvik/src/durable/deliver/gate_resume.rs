@@ -104,7 +104,7 @@ impl Deliverer {
                 if matches!(why, NoReplay::Bound) {
                     self.stats.transitions_not_replayed += 1;
                 }
-                self.reseeded(name, ctx)?
+                self.reseeded(name, self.head, self.take_commit(ctx))?
             }
         };
         run.confirmed = confirmed;
@@ -192,7 +192,7 @@ impl Deliverer {
             .filter_map(|g| restore_defs.remove_entry(g))
             .collect();
         let held = snap.clone();
-        let history = self.history(ctx);
+        let history = self.history();
         let mut core =
             Core::restore(snap, restore_defs, &history).map_err(|_| NoReplay::Unusable)?;
         core.reseed(&reseed, k.at, k.now, &history)
@@ -338,8 +338,6 @@ impl Deliverer {
         }
         let mut deferred = VecDeque::new();
         for t in out {
-            let k = (t.id.condition, t.id.series);
-            run.last.insert(k, t.clone());
             if confirmed.is_none_or(|g| !covers(&g, &t.id)) {
                 deferred.push_back((t, true));
             }
