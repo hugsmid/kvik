@@ -67,6 +67,17 @@ pub struct SavedPoint {
     pub stamp: ResetStamp,
 }
 
+/// The answer for a saved point (spec §7 Readers, Reset stamp and saved points).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PointCheck {
+    /// Nothing was reset since: every position up to the point still names what it named.
+    Kept,
+    /// Forget every position above this and continue from it.
+    VoidAbove(Position),
+    /// The reset the mark names is not known: start again as if no position was kept.
+    Unknown,
+}
+
 impl fmt::Display for Position {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.generation, self.sequence)

@@ -98,6 +98,11 @@ impl Latest {
         }
     }
 
+    /// The registry entries held, in log order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (LogPos, &Entry)> {
+        self.entries.iter().map(|(p, (_, e))| (*p, e))
+    }
+
     /// The position the state was seeded through; the origin when it was not seeded.
     #[cfg(test)]
     pub(crate) fn seeded_through(&self) -> LogPos {

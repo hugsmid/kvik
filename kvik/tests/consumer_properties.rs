@@ -13,8 +13,8 @@ use common::{block_on, start};
 use kvik::env::{Env, ManualClock};
 use kvik::{
     Backend, Condition, ConditionState, Consumer, Delivery, DeliveryId, DeliveryKind, Funnel,
-    FunnelId, Outcome, Position, Reading, ResyncCause, Select, SeriesId, Start, Store, StoreConfig,
-    Value,
+    FunnelId, Outcome, Position, Reading, ResetStamp, ResyncCause, SavedPoint, Select, SeriesId,
+    Start, Store, StoreConfig, Value,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -47,6 +47,10 @@ enum Step {
     /// Takes every ready delivery and confirms up to the one at this index, if any.
     Drain(usize, usize),
     Retake(usize),
+    /// Binds the slot to a new consumer name started now, at a time or at an emitted fact, by the kind modulo 3.
+    Register(usize, u8),
+    /// A clean restart with the slot's cursor file unreadable at the start (Q-131).
+    LoseCursor(usize),
     Restart,
     Define,
     Alias,
@@ -90,6 +94,8 @@ fn steps(crashes: bool) -> impl Strategy<Value = Vec<Step>> {
         1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unroute(c, n)),
         5 => (0usize..2, 0usize..8).prop_map(|(c, n)| Step::Drain(c, n)),
         1 => (0usize..2).prop_map(Step::Retake),
+        2 => (0usize..2, any::<u8>()).prop_map(|(c, k)| Step::Register(c, k)),
+        1 => (0usize..2).prop_map(Step::LoseCursor),
         2 => stop,
         1 => Just(Step::Define),
         1 => Just(Step::Alias),
@@ -189,13 +195,20 @@ impl Record {
 
     fn push(&mut self, name: &str, d: &Delivery) {
         let line = format!("{name}: {}", self.normal(d));
+        if resync(d).is_some_and(|r| r.cause == ResyncCause::NoCursor) {
+            NO_CURSOR.fetch_add(1, Ordering::Relaxed);
+        }
         self.out.push(line);
     }
 
     /// Takes a consumer. A new one is sent no resync on either backend (Q-131); the first delivery of one taken
     /// again is taken at once on both and kept for the next drain to confirm.
     fn take(&mut self, s: &Store, name: &str) -> Option<Consumer> {
-        match block_on(s.consumer(name, Start::Now, Select::None)) {
+        self.take_at(s, name, Start::Now)
+    }
+
+    fn take_at(&mut self, s: &Store, name: &str, start: Start) -> Option<Consumer> {
+        match block_on(s.consumer(name, start, Select::None)) {
             Ok(mut c) => {
                 if let Some(d) = c.try_next().unwrap() {
                     self.push(name, &d);
@@ -215,6 +228,7 @@ impl Record {
 fn run(
     store: Store,
     reopen: &dyn Fn() -> Store,
+    lose_cursor: &dyn Fn(&str),
     clock: &ManualClock,
     history: &[Step],
 ) -> Vec<String> {
@@ -224,7 +238,9 @@ fn run(
         .iter()
         .map(|n| block_on(s.define_series(gauge(n))).unwrap())
         .collect();
-    let mut cs: Vec<Option<Consumer>> = CONSUMERS.iter().map(|n| rec.take(&s, n)).collect();
+    let mut names: Vec<String> = CONSUMERS.iter().map(|n| n.to_string()).collect();
+    let mut registered = 0;
+    let mut cs: Vec<Option<Consumer>> = names.iter().map(|n| rec.take(&s, n)).collect();
     for step in history {
         match step {
             Step::Emit(i, v) => {
@@ -270,7 +286,7 @@ fn run(
                 }
             }
             Step::Drain(c, n) => {
-                let name = CONSUMERS[*c];
+                let name = names[*c].as_str();
                 if let Some(cons) = cs[*c].as_mut() {
                     let mut got = rec.held.remove(name).unwrap_or_default();
                     while let Some(d) = cons.try_next().unwrap() {
@@ -284,16 +300,41 @@ fn run(
             }
             Step::Retake(c) => {
                 cs[*c] = None;
-                rec.held.remove(CONSUMERS[*c]);
-                cs[*c] = rec.take(&s, CONSUMERS[*c]);
+                rec.held.remove(&names[*c]);
+                cs[*c] = rec.take(&s, &names[*c]);
             }
-            Step::Restart => {
+            Step::Register(c, k) => {
+                cs[*c] = None;
+                rec.held.remove(&names[*c]);
+                registered += 1;
+                names[*c] = format!("r{registered}");
+                let start = match k % 3 {
+                    0 => Start::Now,
+                    1 => Start::Time(kvik::Timestamp(
+                        clock.wall().0 - i64::from(*k % 5) * 1_000_000_000,
+                    )),
+                    _ => Start::Position(SavedPoint {
+                        position: rec
+                            .emitted
+                            .get(usize::from(*k) % (rec.emitted.len() + 1))
+                            .copied()
+                            .unwrap_or_default(),
+                        stamp: ResetStamp::default(),
+                    }),
+                };
+                rec.out.push(format!("register {} {}", names[*c], k % 3));
+                cs[*c] = rec.take_at(&s, &names[*c], start);
+            }
+            Step::LoseCursor(_) | Step::Restart => {
                 block_on(s.shutdown()).unwrap();
                 cs.clear();
                 drop(s);
                 rec.held.clear();
+                if let Step::LoseCursor(c) = step {
+                    lose_cursor(&names[*c]);
+                }
                 s = reopen();
-                cs = CONSUMERS.iter().map(|n| rec.take(&s, n)).collect();
+                cs = names.iter().map(|n| rec.take(&s, n)).collect();
             }
             Step::Define => {
                 if ids.len() == 3 {
@@ -311,7 +352,7 @@ fn run(
     for (i, c) in cs.iter_mut().enumerate() {
         if let Some(c) = c {
             while let Some(d) = c.try_next().unwrap() {
-                rec.push(CONSUMERS[i], &d);
+                rec.push(&names[i], &d);
                 block_on(c.confirm(d.id)).unwrap();
             }
         }
@@ -324,6 +365,9 @@ fn run(
 
 /// The deliverer's reads of the log for facts outside its recent window, over the differential histories.
 static SLOW: AtomicU64 = AtomicU64::new(0);
+
+/// `NoCursor` resyncs handed out, over both backends' runs.
+static NO_CURSOR: AtomicU64 = AtomicU64::new(0);
 
 fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -341,6 +385,44 @@ fn runner() -> TestRunner {
     })
 }
 
+fn differential(history: &[Step], small: bool, smalls: &AtomicU64) -> Result<(), TestCaseError> {
+    let m_clock = ManualClock::new(start());
+    let dir = format!("kvik-test/consumers-differential/{}", next_id());
+    let mut env = Env::test(m_clock.clone());
+    env.background_timers = false;
+    let m_config = StoreConfig::new(&dir, "Europe/London")
+        .create_if_missing(true)
+        .backend(Backend::Model)
+        .env(env);
+    let model = block_on(Store::open(m_config.clone())).unwrap();
+    let m = run(
+        model,
+        &|| block_on(Store::open(m_config.clone())).unwrap(),
+        &|name| {
+            assert!(kvik::model_fault(
+                &m_config.dir,
+                kvik::ModelFault::LoseCursorFile(name.into())
+            ));
+        },
+        &m_clock,
+        history,
+    );
+    let mut w = World::quiet(&format!("differential-{}", next_id()));
+    if small {
+        w.window_memory = Some(8 << 10);
+        smalls.fetch_add(1, Ordering::Relaxed);
+    }
+    let lose = |name: &str| {
+        let path = w
+            .path_with(std::path::Path::new("cursors").join(format!("{name}.cur")))
+            .expect("a consumer is given its cursor file at the take");
+        w.fs.poke(&path, 0, &[0; 16]);
+    };
+    let d = run(w.open(), &|| w.open(), &lose, &w.clock, history);
+    prop_assert_eq!(m, d);
+    Ok(())
+}
+
 /// Timers run only when the store is called, on both backends, so that both see the same evaluations; condition
 /// sequences start at 1 at every start on both (spec §4 Order).
 /// Half the histories, chosen with each history, run with windows of a few dozen facts (Q-751).
@@ -350,31 +432,7 @@ fn deliveries_follow_the_model_over_restarts() {
     runner()
         .run(
             &(steps(false), prop::bool::weighted(0.5)),
-            |(history, small)| {
-                let m_clock = ManualClock::new(start());
-                let dir = format!("kvik-test/consumers-differential/{}", next_id());
-                let mut env = Env::test(m_clock.clone());
-                env.background_timers = false;
-                let m_config = StoreConfig::new(&dir, "Europe/London")
-                    .create_if_missing(true)
-                    .backend(Backend::Model)
-                    .env(env);
-                let model = block_on(Store::open(m_config.clone())).unwrap();
-                let m = run(
-                    model,
-                    &|| block_on(Store::open(m_config.clone())).unwrap(),
-                    &m_clock,
-                    &history,
-                );
-                let mut w = World::quiet(&format!("differential-{}", next_id()));
-                if small {
-                    w.window_memory = Some(8 << 10);
-                    smalls.fetch_add(1, Ordering::Relaxed);
-                }
-                let d = run(w.open(), &|| w.open(), &w.clock, &history);
-                prop_assert_eq!(m, d);
-                Ok(())
-            },
+            |(history, small)| differential(&history, small, &smalls),
         )
         .unwrap();
     assert!(
@@ -384,6 +442,10 @@ fn deliveries_follow_the_model_over_restarts() {
     assert!(
         SLOW.load(Ordering::Relaxed) > 0,
         "some history reads facts outside the deliverer's recent window"
+    );
+    assert!(
+        NO_CURSOR.load(Ordering::Relaxed) > 0,
+        "some history loses the cursor file of a routed consumer"
     );
 }
 
@@ -433,6 +495,18 @@ impl Seen {
 /// `forget_above`, if any, is at or above the position durable before the crash (always present after a power loss)
 /// and below its id; nothing follows before it is confirmed; and a condition it reports as no transition is in a
 /// state handed to the consumer before a confirmation, so that a transition is never lost.
+#[test]
+fn a_fact_after_a_retake_with_no_cursor_unconfirmed_is_flagged_as_the_model_flags_it() {
+    let history = [
+        Step::LoseCursor(1),
+        Step::Route(1, FunnelKind::All),
+        Step::Retake(1),
+        Step::Emit(0, 0),
+        Step::Drain(1, 0),
+    ];
+    differential(&history, false, &AtomicU64::new(0)).unwrap();
+}
+
 #[test]
 fn deliveries_after_crashes_follow_the_rules() {
     runner()
@@ -585,7 +659,12 @@ fn deliveries_after_crashes_follow_the_rules() {
                         }
                         s = Some(st);
                     }
-                    Step::Retake(_) | Step::Restart | Step::Define | Step::Alias => {}
+                    Step::Retake(_)
+                    | Step::Register(..)
+                    | Step::LoseCursor(_)
+                    | Step::Restart
+                    | Step::Define
+                    | Step::Alias => {}
                 }
             }
             drop(cs);

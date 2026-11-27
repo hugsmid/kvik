@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
+use kvik_model::engine::Start;
 use kvik_model::engine::{Alert, Corruption};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
@@ -1282,9 +1283,16 @@ fn s3_missing_cursor_file_is_named_by_the_recovery_entry() {
             .iter()
             .any(|l| l.kind == LossKind::PossibleLoss && l.cursors_missing == vec![C])
     );
+    assert!(m.cursor_lost(C), "waits to be started again (Q-131)");
+    m.start_consumer(C, Start::Time(0)).unwrap();
     m.drain().unwrap();
+    let last = m.observed[&C].last().unwrap().session;
     assert!(
-        m.observed[&C].iter().filter(|o| o.session == 2).count() == 1,
+        m.observed[&C]
+            .iter()
+            .filter(|o| o.session == last && o.replayed)
+            .count()
+            == 1,
         "replayed from no cursor"
     );
 }
@@ -1453,6 +1461,7 @@ fn s4_resync_for_a_cursor_behind_the_log_waits_for_its_confirmation() {
     let r = got[0].resync().unwrap();
     assert_eq!(r.forget_above, Some(cursor));
     assert!(r.replaced.is_some());
+    assert_eq!(r.cause, kvik_model::engine::ResyncCause::CursorBehindLog);
     m.confirm(C, got[0].position).unwrap();
     m.catch_up(C, 100).unwrap();
     let after: Vec<Position> = m.poll(C, 100).unwrap().iter().map(|d| d.position).collect();
@@ -2984,6 +2993,14 @@ fn s4_generation_changed_and_resync_follow_catch_up_after_restore() {
             (end, "generation_changed"),
             (end, "resync")
         ]
+    );
+    let cause = r.received[&C]
+        .last()
+        .and_then(|x| x.delivery.resync())
+        .map(|r| r.cause);
+    assert_eq!(
+        cause,
+        Some(kvik_model::engine::ResyncCause::GenerationChanged)
     );
 }
 

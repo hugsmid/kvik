@@ -39,6 +39,7 @@ pub(crate) mod reader;
 mod registering;
 mod registry;
 mod routing;
+mod saved;
 mod scan;
 mod seed;
 mod start;

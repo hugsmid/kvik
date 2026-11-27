@@ -46,6 +46,11 @@ pub enum ROp {
     LoseCursor {
         c: usize,
     },
+    /// Starts the consumer again: now, at a time, or at its last saved point, by `kind` modulo 3.
+    Start {
+        c: usize,
+        kind: u8,
+    },
     Corrupt(usize),
     /// Restart; with `true` the start's sync fails.
     Restart(bool),
@@ -121,6 +126,7 @@ pub fn arb_rop() -> impl Strategy<Value = ROp> {
         1 => any::<bool>().prop_map(ROp::LoseMark),
         1 => (1usize..4).prop_map(ROp::LoseMarkAndBatches),
         1 => (0usize..2).prop_map(|c| ROp::LoseCursor { c }),
+        1 => (0usize..2, any::<u8>()).prop_map(|(c, kind)| ROp::Start { c, kind }),
         1 => (0usize..8).prop_map(ROp::Corrupt),
         1 => proptest::bool::weighted(0.1).prop_map(ROp::Restart),
         1 => Just(ROp::Acknowledge),

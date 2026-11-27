@@ -112,6 +112,9 @@ mod types;
 
 pub mod env;
 
+#[doc(hidden)]
+pub use backend::{ModelFault, model_fault};
+
 pub use backup::{
     BackupSink, Encryption, ListPage, Rebuild, RestoreMode, RestoreScope, SinkError, SinkFuture,
     Stored, Verified, VerifyError,
@@ -152,6 +155,6 @@ pub use series::{
 pub use store::{Consumer, LiveSession, Reader, Store};
 pub use time::{LocalDate, LocalTime, ParseError, Span, TimeRange, Timestamp, ZoneName};
 pub use types::{
-    Ack, Fact, FactFlags, FactRow, Intent, Outcome, Pending, Position, Quality, Reading,
-    ResetStamp, SavedPoint, SeriesId, TimeSource, Value,
+    Ack, Fact, FactFlags, FactRow, Intent, Outcome, Pending, PointCheck, Position, Quality,
+    Reading, ResetStamp, SavedPoint, SeriesId, TimeSource, Value,
 };

@@ -5,6 +5,7 @@ use kvik_log::content::Item;
 use kvik_log::entries::Entry;
 use kvik_log::fs::{Fs, MemFs, OpenMode};
 use kvik_log::lease::LeaseSlot;
+use kvik_log::manifest::LossCause;
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{Clock, Log, LogWriter, SystemClock, WriterConfig};
 

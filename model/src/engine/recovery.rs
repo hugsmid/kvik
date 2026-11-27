@@ -249,6 +249,7 @@ impl Model {
                     batches += 1;
                 }
             }
+            // Recorded damage lies below the synced mark, so none is truncated here.
             file.batches.truncate(keep);
             self.unflag_from(id, keep);
         }
@@ -372,7 +373,8 @@ impl Model {
     /// takes the range from the last valid batch before it to the next valid
     /// batch or, with none, to the mark's last position; the model keeps the
     /// positions each damaged batch held, which give the same range when its
-    /// neighbours are valid, and do not repeat an earlier lost range next to it.
+    /// neighbours are valid; a run next to batches recorded damaged before
+    /// starts at the first of them, growing their loss.
     /// A recovery whose sync fails writes no record (Q-79), but reports the
     /// ranges it found as `data_lost` (§8 "recorded when found"); the next
     /// recovery that can write records them, with any a scrub found while the
@@ -410,7 +412,8 @@ impl Model {
                 },
             });
         }
-        self.disk.damaged.clear();
+        let damaged = std::mem::take(&mut self.disk.damaged);
+        self.disk.recorded_damage.extend(damaged);
     }
 
     /// Moves the durable mark (in the page cache) to the end of the active
@@ -451,6 +454,7 @@ impl Model {
             });
             if self.config.mark_sync == MarkSync::EveryCommit || file.batches.len() == 1 {
                 self.disk.synced_mark = self.disk.mark;
+                self.land_cursors();
             }
         }
     }
@@ -480,6 +484,7 @@ impl Model {
     /// that is not a fact (§3 Commit).
     pub(super) fn force_mark_sync(&mut self) {
         self.disk.synced_mark = self.disk.mark;
+        self.land_cursors();
     }
 
     /// The timed mark sync fires (§3 Durable mark, `mark_sync_interval`):

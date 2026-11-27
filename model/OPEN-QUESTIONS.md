@@ -5238,6 +5238,73 @@ arithmetic, so a late commit clock plus the maximum never panics: a deadline bey
 **Pinned by.** `tests/gate_edges.rs` `durations_beyond_the_maximum_are_refused_and_the_maximum_is_accepted`,
 `the_longest_durations_late_on_the_commit_clock_judge_without_overflow`.
 
+## Q-1450 — A lost consumer taken again before it confirms its `NoCursor` resync
+
+§4 Resync, invariant 25; Q-95 (b), Q-131. Scenario: a power loss reassigns positions above P; the consumer's cursor
+file is lost; it is taken, sent `NoCursor` with `forget_above` = P, and its process restarts before confirming. The
+durable backend (`deliver/take.rs`: `dormant` is cleared at the first take and the cursor file waits for the
+confirmation) resumes it from P with a plain `Resume`, so facts above P reach a consumer that was never told to
+forget above P; `recovery_generator_coverage` at 1,024 cases finds the model doing the same. Recommended default:
+until the `NoCursor` resync is confirmed the consumer stays lost, and every take sends it again (model `reconnect`
+and the durable `take`, together, so the differential still agrees). **Settled by the lead, 26 November, to the
+recommended default; built with roadmap 5.3 step 1:** every take before the confirmation sends the `NoCursor` resync
+again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`;
+`kvik/tests/consumers.rs`). Until then neither backend reads the log for it, so a fact committed meanwhile follows the
+confirmation as replayed (`kvik/tests/consumer_properties.rs`
+`a_fact_after_a_retake_with_no_cursor_unconfirmed_is_flagged_as_the_model_flags_it`).
+
+## Q-1400 — Restore records in the saved-point check
+
+§7 Readers, Reset stamp and saved points. Scenario: a point of generation 1 checked in generation 2. The log does not
+yet expose restore records with their stamps, so the durable check (`kvik/src/durable/saved.rs`) has the restore case
+and never fills it. **Provisional default:** a point judged after a restore is `Unknown` by the ordinary rule (no kept
+entry carries the mark's stamp), which is safe; the restore records join the check with roadmap 8.3.
+
+## Q-1406 — `Tail` from a saved point
+
+`api.md` Live reads. Scenario: a live read opened at a saved point rather than at the cut of its `Opened`.
+**Provisional default:** moves to roadmap 9.0f, which builds the static-prefix-then-live mechanism for "from a time";
+5.3 supplies the check (`Reader::check`).
+
+## Q-1630 — A lost range at the tail and a consumer at the position before it
+
+§4 Resync. Scenario: a fact's batch, the last of the log, is damaged and the store restarts on the same boot; the
+lost range is a reset point whose id is the mark's last position. A consumer started then (now, or at a kept saved
+point) begins at the last kept position before the range. The model sends it the reset point, a resync whose
+`forget_above` is the consumer's own position; the durable backend's last position is below the range and it sends
+none (`kvik/tests/saved_points.rs`
+`a_lost_range_at_the_tail_gives_a_new_consumer_a_resync_with_nothing_to_forget_on_the_model_only`). Nothing above the
+consumer's position is affected either way. **Provisional default:** the two differ only by that resync; the history
+property ignores reset points with nothing to forget at the start; align with the run-time lost range of step 5.
+
+## Q-1631 — A power loss after a lost recovery entry
+
+§3 Recovery. Scenario: a power loss writes a recovery entry; the entry's batch is damaged and the store restarts on
+the same boot (the lost range takes the entry; the check answers `Unknown` on both backends, as row 7b); a fact and a
+consumer registration follow; a second power loss. The durable backend's last position is then one above the
+model's (`kvik/tests/saved_points.rs` `a_power_loss_after_a_lost_recovery_entry_keeps_the_model_s_last_position`,
+ignored while open). In the same histories, a consumer started at a point below the lost entry is sent the lost
+range's reset point by the durable backend and none by the model. **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
+kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
+until then the history property stops restarting and comparing deliveries once an entry is lost.
+Traced at the end of the ignored history: the consumer start synced both marks to the fact, so the second power loss
+loses nothing on the model, which then writes no recovery entry (last position 3, the fact); the history's power loss
+zeroes the fact's bytes on the durable backend anyway, which grows the recorded loss over them (§3 Recovery rule 2)
+and writes an entry at 4. §3 Recovery rule 3 has a start on another boot write an entry unless it adopts one, and the
+last kept batch is a fact, so the model is the backend at fault on the last position; the history also cuts a batch
+the mark was synced past, which no power loss does. Both are to be ruled, with a fault on each backend that loses the
+same bytes, before step 5 compares whole histories.
+
+## Q-1621 — A start whose position the synced mark cannot reach
+
+§3 Durable mark, §4 New consumer; invariants 25 and 26. A cursor file never names a position above the last synced
+mark, so a start beyond it cannot write its cursor at once. Writing the mark's last position instead resumes the
+consumer below its start after a crash, under a reset point it was never meant to meet; writing nothing loses the
+start. **Settled by the lead, 27 November:** as the durable backend, the start's write stays pending, the cursor
+file keeps what it held, and the write lands when a mark sync reaches it; a confirmation meanwhile raises the pending
+position; a crash first drops it (`model/tests/starts.rs`
+`a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it`).
+
 ## Q-1200 — A future fact outranked before its `t`
 Settled by the owner on 2026-11-26.
 **Scenario.** `stale_after` 10 s; a reading at 1 s; a future fact for 30 s commits at 2 s and is outranked at 3 s by
@@ -5410,6 +5477,14 @@ start; not the cause).
 ## Q-2051 — Where the S2 follow-up goes
 Raised with Q-2050; settled. The four follow-up edits and their test go with the train-6 review fixes, not into the
 next docs item.
+
+## Q-2010 — A saved point judged after it answered unknown
+
+§7 Readers, Reset stamp and saved points. A point answers unknown while no kept entry carries the mark's stamp; a
+later recovery writes an entry that carries the new stamp, after which the same point answers void above, a position
+higher than unknown's nothing. **Decided by the lead, 27 November:** allowed; unknown already told the holder to
+start again as if it kept no position, so "never rises" holds only until a point answers unknown
+(`kvik/tests/saved_points.rs`, the history property).
 
 ## Open at v0.2
 
@@ -5622,6 +5697,12 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1133 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
 | Q-1150 | 6.2 | Decided by the lead: series batches at seal (A.8a), one-series lookups from their own batches, read without the lookups' lock; the halves, gap, pair limit and reference size provisional; for review |
 | Q-1151 | 6.2 | For review: concurrent many-series reads; (a) as built until callers' reads arrive together |
+| Q-1400 | 8.3 | Provisional: restore records are not read by the check; a point judged after a restore is `Unknown` |
+| Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
+| Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
+| Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
+| Q-1631 | 5.3 step 5, before it compares whole histories | Open: the model is wrong on the last position (no recovery entry on another boot after a lost entry, against §3 Recovery rule 3), and the history cuts a batch the mark was synced past; until ruled the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-2010 | 5.3 step 2 | Decided by the lead: a point that answered unknown may later answer void above |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |
@@ -5970,6 +6051,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1201 | Records held for a consumer not taken in this run | `api.md` Memory (ruled by the owner, 2026-11-26: none held) |
 | Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
 | Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
+| Q-1401 | A saved point whose stamp matches and whose position is above the last position | §4 New consumer, §7 Readers (decided by the lead, 26 November, to the provisional default): the check answers `Kept`; a start at it begins at the last position, as every start is lowered to it. Scenario: a point built by hand with a zero stamp against a store that never reset (`starts.rs` `each_start_kind_begins_after_its_position_with_no_resync`; `kvik/tests/api.rs` `a_new_consumer_starts_after_the_position_before_its_start_with_no_resync`, both backends) |
+| Q-1403 | "First fact at or after T" for `start: time` | §4 New consumer (decided by the lead, 26 November, to the provisional default): by the receive time of the batch, as the durable backend's commit index; the model takes the last entry received before T. Scenario: facts received a second apart; a start at the second's receive time begins after the first (`starts.rs`; `kvik/tests/api.rs`, both backends) |
+| Q-1450 | A lost consumer taken again before it confirms its `NoCursor` resync | §4 Resync, invariant 25 (settled by the lead, 26 November, to the recommended default): every take before the confirmation sends the `NoCursor` resync again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`; `kvik/tests/consumers.rs`) |
 | Q-2051 | Where the S2 follow-up goes | With the train-6 review fixes (`api.md` `Store::open`, `log/tests/recovery.rs`) |
 
 ## Where the model differs from the specification

@@ -892,7 +892,9 @@ rules, identities and resume.
   - If no kept recovery entry or restore record carries S' (the reset the mark names is in a lost range, or was
     lost with a manifest record), the answer is **unknown**: the holder starts again as if it kept no position. An
     adopted recovery entry written before the stamp existed carries none; the mark then takes a fresh stamp that no
-    entry carries, so every saved point is unknown until the next reset.
+    entry carries, so every saved point is unknown until the next reset. A point that answered unknown may be void
+    above a position once a later reset writes an entry carrying the mark's stamp; the holder started again at the
+    unknown and keeps nothing to forget (Q-2010).
   A reader opens the mark by path for every read of it and
   reads files by position, never mapping them (`format.md` A.10, A.13), so it never reads past a mark the writer no
   longer maintains (invariant 11).
