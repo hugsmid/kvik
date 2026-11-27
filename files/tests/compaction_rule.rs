@@ -6,7 +6,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kvik_files::appender::{AppendError, Appender, Opened};
-use kvik_files::catalogue::Catalogue;
+use kvik_files::catalogue::{Catalogue, CatalogueError};
 use kvik_files::compaction::{Judgement, compacted_through, judge};
 use kvik_files::desc::{FileClass, FileDescription, FileRef};
 use kvik_files::layout::CompactedLayout;
@@ -219,6 +219,91 @@ fn a_second_run_without_a_layout_over_a_compacted_segment_is_refused() {
         Err(AppendError::Unlaid(f)) if f == comp_ref(101)
     ));
     assert_eq!(a.compaction(), &Judgement::Holds);
+}
+
+fn judged(records: &[Record]) -> Judgement {
+    judge(&Catalogue::replay(records).unwrap())
+}
+
+fn broken_what(j: Judgement) -> (u8, &'static str) {
+    match j {
+        Judgement::Broken(b) => (b.rule, b.what),
+        j => panic!("not broken: {j:?}"),
+    }
+}
+
+#[test]
+fn a_listed_segment_inside_a_named_segments_range_counts_as_named_under_rule_2() {
+    let segs = [segment(1, 1, 10), segment(2, 11, 20), segment(3, 11, 15)];
+    let o = output(100, 1, 20, &[seg_ref(1), seg_ref(2)]);
+    let run = publish(&[(o.clone(), laid(&o, 7, 1, 20))], &[]);
+    let records = [sealed(1, &segs), Record::new(2, 0, T0, run)];
+    assert_eq!(judged(&records), Judgement::Holds);
+    let c = Catalogue::replay(&records).unwrap();
+    assert_eq!(compacted_through(&c), BTreeMap::from([(0, 20)]));
+}
+
+#[test]
+fn a_run_output_ending_above_the_span_of_its_inputs_breaks_rule_3() {
+    let o = output(100, 1, 15, &[seg_ref(1)]);
+    let run = publish(&[(o.clone(), laid(&o, 7, 1, 15))], &[]);
+    let records = [sealed(1, &[segment(1, 1, 10)]), Record::new(2, 0, T0, run)];
+    assert_eq!(broken_what(judged(&records)).0, 3);
+}
+
+#[test]
+fn more_files_of_a_run_than_its_count_break_rule_4() {
+    let a = output(100, 1, 5, &[seg_ref(1)]);
+    let b = output(101, 6, 10, &[seg_ref(1)]);
+    let run = publish(
+        &[
+            (a.clone(), laid(&a, 7, 1, 5)),
+            (b.clone(), laid(&b, 7, 1, 5)),
+        ],
+        &[],
+    );
+    let records = [sealed(1, &[segment(1, 1, 10)]), Record::new(2, 0, T0, run)];
+    assert_eq!(
+        broken_what(judged(&records)),
+        (4, "more files of a run than its count")
+    );
+}
+
+#[test]
+fn files_of_one_run_disagreeing_on_its_count_break_rule_4() {
+    let a = output(100, 1, 5, &[seg_ref(1)]);
+    let b = output(101, 6, 10, &[seg_ref(1)]);
+    let run = publish(
+        &[
+            (a.clone(), laid(&a, 7, 2, 5)),
+            (b.clone(), laid(&b, 7, 3, 5)),
+        ],
+        &[],
+    );
+    let records = [sealed(1, &[segment(1, 1, 10)]), Record::new(2, 0, T0, run)];
+    assert_eq!(
+        broken_what(judged(&records)),
+        (4, "files of one run disagree on its count")
+    );
+}
+
+#[test]
+fn a_publish_record_giving_a_file_another_layout_than_recorded_is_refused() {
+    let o = output(100, 1, 10, &[seg_ref(1)]);
+    let first = publish(&[(o.clone(), laid(&o, 7, 1, 10))], &[]);
+    let again = publish(&[(o.clone(), laid(&o, 8, 1, 10))], &[]);
+    let same = publish(&[(o.clone(), laid(&o, 7, 1, 10))], &[]);
+    let mut records = vec![
+        sealed(1, &[segment(1, 1, 10)]),
+        Record::new(2, 0, T0, first),
+    ];
+    let c = Catalogue::replay(&records).unwrap();
+    assert!(matches!(
+        c.check(&Record::new(3, 0, T0, again)),
+        Err(CatalogueError::Conflict(f)) if f == o.file_ref()
+    ));
+    records.push(Record::new(3, 0, T0, same));
+    assert!(Catalogue::replay(&records).is_ok());
 }
 
 // ---- Generated compaction histories ----
