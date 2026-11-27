@@ -125,3 +125,37 @@ fn a_newer_root_of_another_generation_store_or_reset_or_with_k_past_the_cut_is_p
     rig.publish(r);
     assert_eq!(nodes_used(&rig), 0, "a fit root covering nothing is taken");
 }
+
+#[test]
+fn a_series_retired_in_the_stretch_is_charted_from_facts_and_equals_the_fact_path() {
+    let mut rig = Rig::new("retired");
+    let first: Vec<(i64, u8)> = (0..1_500i64)
+        .map(|k| (k * 7 * MIN, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    assert!(nodes_used(&rig) > 0);
+    let now = rig.now();
+    for (id, _) in &rig.ids {
+        rig.w.retire(*id, Timestamp(now - 30 * HOUR)).unwrap();
+    }
+    assert_eq!(nodes_used(&rig), 0, "a node-changing entry in the stretch");
+    assert_t7_on(&rig.reader(), &rig, &super::ranges(now));
+}
+
+#[test]
+fn a_part_that_decodes_but_is_not_the_one_the_root_records_is_damaged_and_charts_equal_the_fact_path()
+ {
+    let mut rig = Rig::new("not-recorded");
+    let first: Vec<(i64, u8)> = (0..1_500i64)
+        .map(|k| (k * 97 * super::S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    let mut r = rig.newest_root();
+    for p in &mut r.parts {
+        p.file_crc32c ^= 1;
+    }
+    rig.publish(r);
+    let reader = rig.reader();
+    assert_t7_on(&reader, &rig, &super::ranges(rig.now()));
+    assert!(reader.tree_counts().damaged > 0);
+}
