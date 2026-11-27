@@ -316,6 +316,10 @@ fn a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_l
         "a cursor file never names a position above the synced mark (Q-1621)"
     );
     let later = facts(&mut m, s, 8, 3.0)[0];
+    assert_eq!(
+        m.disk.cursors[&C], head,
+        "the commit's own mark sync lands the start's write"
+    );
     m.sync_mark_file();
     assert!(m.disk.synced_mark.is_some_and(|k| k.last >= later));
     assert_eq!(
