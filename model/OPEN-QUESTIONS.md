@@ -5248,6 +5248,14 @@ file keeps what it held, and the write lands when a mark sync reaches it; a conf
 position; a crash first drops it (`model/tests/starts.rs`
 `a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it`).
 
+## Q-2010 — A saved point judged after it answered unknown
+
+§7 Readers, Reset stamp and saved points. A point answers unknown while no kept entry carries the mark's stamp; a
+later recovery writes an entry that carries the new stamp, after which the same point answers void above, a position
+higher than unknown's nothing. **Decided by the lead, 27 November:** allowed; unknown already told the holder to
+start again as if it kept no position, so "never rises" holds only until a point answers unknown
+(`kvik/tests/saved_points.rs`, the history property).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5464,6 +5472,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
 | Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
 | Q-1631 | 5.3 step 5 | Open: a lost recovery entry, then a power loss or a consumer below it; the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-2010 | 5.3 step 2 | Decided by the lead: a point that answered unknown may later answer void above |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |
