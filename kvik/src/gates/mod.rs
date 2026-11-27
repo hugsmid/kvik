@@ -60,7 +60,7 @@ pub(crate) struct FactItem {
     pub value: Value,
     /// Quality after stamping.
     pub quality: Quality,
-    /// Revision of a versioned series (spec §2.2).
+    /// Revision of a versioned series (spec §2.2); unread by the core, kept for the resume checkpoint (Q-1391).
     pub changed_at: Option<u64>,
 }
 
@@ -76,13 +76,13 @@ impl FactItem {
 pub(crate) struct Held {
     /// Event time.
     pub t: Nanos,
-    /// Position.
+    /// Position; unread by the core, kept for the resume checkpoint (Q-1391).
     pub position: Position,
     /// Value.
     pub value: Value,
     /// Whether it is usable.
     pub usable: bool,
-    /// Revision of a versioned series.
+    /// Revision of a versioned series; unread by the core, kept for the resume checkpoint (Q-1391).
     pub changed_at: Option<u64>,
 }
 

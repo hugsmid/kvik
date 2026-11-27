@@ -10,7 +10,6 @@ use super::rules::Inst;
 use super::{Core, CoreError, History, SeriesState};
 
 /// A core's instances and series at its frontier. Facts ahead are not kept: [`Core::restore`] reads them
-///
 /// again.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
@@ -28,6 +27,8 @@ impl Core {
             .iter()
             .map(|(s, st)| {
                 let mut st = st.clone();
+                // A no-op while every usable fact ahead has a timer at its `t` (`rules::next_due`); kept so a
+                // fact due by `now` is never cleared with the rest.
                 bring_up(&mut st, now);
                 st.ahead.clear();
                 (*s, st)

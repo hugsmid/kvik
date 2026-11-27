@@ -50,9 +50,7 @@ pub(super) fn bring_up(s: &mut SeriesState, now: Nanos) {
         let h = e.remove();
         if h.usable {
             s.last_arrival = s.last_arrival.max(Some(h.t));
-            if s.live.as_ref().is_none_or(|l| h.t >= l.t) {
-                s.live = Some(h);
-            }
+            s.live = Some(h);
         }
     }
 }
