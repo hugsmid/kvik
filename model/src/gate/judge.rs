@@ -254,6 +254,7 @@ impl Judge<'_> {
             Entry::Unwatch { id, .. } => {
                 self.gates.remove(id).ok_or(GateError::Id(*id))?;
             }
+            Entry::Reset { .. } => self.reseed(now, at),
             Entry::Other { .. } => {}
         }
         Ok(())
@@ -317,38 +318,65 @@ impl Judge<'_> {
                 continue;
             }
             w.refused.remove(&s);
-            let n = match &w.gate.kind {
-                Kind::Levels(ls) => ls.len(),
-                Kind::Set { .. } => 1,
-                Kind::Change { .. } => 0,
-            };
-            let start = TransitionId {
-                at,
-                due: None,
-                condition: id,
-                series: s,
-            };
-            let fresh = Instance {
-                on: vec![false; n],
-                pending: vec![None; n],
-                reference: None,
-                reported: GateState::Unknown,
-                set_by: start,
-                last_eval: now,
-            };
-            let instance = match self.seed(id, s, now) {
-                Some(seeded) => Instance {
-                    set_by: start,
-                    ..seeded
-                },
-                None => fresh,
-            };
+            let instance = self.started(id, s, now, at);
             self.gates
                 .get_mut(&id)
                 .expect("watched")
                 .instances
                 .insert(s, instance);
             self.evaluate_start(id, s, now, at, cause.clone());
+        }
+    }
+
+    /// Every instance in force seeded again at the entry at `at`, `now`, as a start there with no transition: its
+    /// `set_by` the start id it would have had (carried as none, Q-1392); the gate's series set is kept.
+    fn reseed(&mut self, now: Nanos, at: Position) {
+        let keys: Vec<(ConditionId, SeriesId)> = self
+            .gates
+            .values()
+            .flat_map(|w| w.instances.keys().map(|s| (w.id, *s)))
+            .collect();
+        for (id, s) in keys {
+            let instance = self.started(id, s, now, at);
+            self.gates
+                .get_mut(&id)
+                .expect("watched")
+                .instances
+                .insert(s, instance);
+            let before = self.out.transitions.len();
+            self.evaluate(id, s, now, at, None, Cause::Entry { position: at });
+            self.out.transitions.truncate(before);
+        }
+    }
+
+    /// An instance starting at the entry at `at`, `now`: seeded, or with its boundaries uncrossed.
+    fn started(&self, id: ConditionId, s: SeriesId, now: Nanos, at: Position) -> Instance {
+        let start = TransitionId {
+            at,
+            due: None,
+            condition: id,
+            series: s,
+        };
+        match self.seed(id, s, now) {
+            Some(seeded) => Instance {
+                set_by: start,
+                ..seeded
+            },
+            None => {
+                let n = match &self.gates[&id].gate.kind {
+                    Kind::Levels(ls) => ls.len(),
+                    Kind::Set { .. } => 1,
+                    Kind::Change { .. } => 0,
+                };
+                Instance {
+                    on: vec![false; n],
+                    pending: vec![None; n],
+                    reference: None,
+                    reported: GateState::Unknown,
+                    set_by: start,
+                    last_eval: now,
+                }
+            }
         }
     }
 

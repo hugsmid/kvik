@@ -3,6 +3,7 @@
 //! the same log. No clock and no files: facts it cannot hold are read through [`History`].
 
 mod checkpoint;
+mod each;
 mod engine;
 mod replay;
 mod rules;
@@ -11,6 +12,8 @@ mod snapshot;
 
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod each_tests;
 #[cfg(test)]
 mod tests;
 
@@ -46,6 +49,13 @@ pub(crate) enum Body {
     },
     /// An unwatch of this consumer.
     Unwatch { id: ConditionId },
+    /// A series definition, alias or retirement: the series' names after it (none: retired), for `Each`.
+    Define {
+        series: SeriesId,
+        names: Vec<String>,
+    },
+    /// A reset point or a new generation: every instance seeded again, with no transition (Q-2170).
+    Reset,
     /// Any other entry: it moves the frontier only.
     Other,
 }
@@ -122,6 +132,8 @@ pub(crate) trait History {
         from: Nanos,
         through: Position,
     ) -> Result<SeriesState, HistoryError>;
+    /// The series whose names, as of `through`, a pattern matches (spec §4 Funnel grammar), in id order.
+    fn matching(&self, pattern: &str, through: Position) -> Result<Vec<SeriesId>, HistoryError>;
     /// Facts of `series` committed at or after `from`, at or before `through`, in position order, each
     /// with its batch's commit time and whether it is outranked.
     #[allow(clippy::type_complexity)]
@@ -145,7 +157,7 @@ pub(crate) enum CoreError {
     /// A watch under an id in force, or an unwatch of an id not in force.
     #[error("gate {0:?} watched twice or not in force")]
     Id(ConditionId),
-    /// A gate the core does not judge yet: `Each` or a window input.
+    /// A gate the core does not judge yet: a window input.
     #[error("gate {0:?} not supported yet")]
     NotSupported(ConditionId),
     /// A gate whose parameters the model refuses.

@@ -54,6 +54,15 @@ impl H {
         self
     }
 
+    pub fn reset(mut self, secs: i64) -> Self {
+        let position = self.next();
+        self.entries.push(Entry::Reset {
+            position,
+            commit_time: secs * SECOND,
+        });
+        self
+    }
+
     pub fn define(mut self, secs: i64, series: SeriesId, names: &[&str]) -> Self {
         let position = self.next();
         self.entries.push(Entry::Define {

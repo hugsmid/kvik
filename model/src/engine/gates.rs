@@ -73,10 +73,47 @@ impl Model {
     /// watches and unwatches, and every other entry as [`gate::Entry::Other`].
     pub fn gate_history(&self, consumer: ConsumerId) -> Result<Vec<gate::Entry>, Error> {
         let v = self.vol()?;
+        let resets: BTreeMap<crate::types::Position, ()> = self
+            .reset_points()
+            .into_iter()
+            .map(|r| (r.id, ()))
+            .collect();
+        let mut pending = resets.keys().copied().peekable();
         let mut registry = Registry::default();
-        let mut out = Vec::with_capacity(v.entries.len());
+        let mut out: Vec<gate::Entry> = Vec::with_capacity(v.entries.len());
+        let mut last: Option<(crate::types::Position, crate::types::Nanos)> = None;
         for (p, e) in &v.entries {
             let (position, commit_time) = (*p, e.received_at);
+            // A reset point with no entry of its own (a lost range's last position) goes before the next entry, at
+            // the commit time before it; so does the start of a new generation (Q-2170).
+            while let Some(r) = pending.next_if(|r| *r < position) {
+                out.push(gate::Entry::Reset {
+                    position: r,
+                    commit_time: last.map_or(commit_time, |(_, c)| c),
+                });
+            }
+            if let Some((lp, lc)) = last
+                && lp.generation != position.generation
+                && out
+                    .last()
+                    .is_none_or(|x| !matches!(x, gate::Entry::Reset { .. }))
+            {
+                out.push(gate::Entry::Reset {
+                    position: crate::types::Position::new(position.generation, 0),
+                    commit_time: lc,
+                });
+            }
+            last = Some((position, commit_time));
+            if pending.next_if(|r| *r == position).is_some() {
+                out.push(gate::Entry::Reset {
+                    position,
+                    commit_time,
+                });
+                if let EntryBody::Registry(r) = &e.body {
+                    registry.apply(r);
+                }
+                continue;
+            }
             out.push(match &e.body {
                 EntryBody::Fact(f) => gate::Entry::Fact {
                     commit_time,
@@ -133,6 +170,12 @@ impl Model {
                     commit_time,
                 },
             });
+        }
+        if let Some((_, c)) = last {
+            out.extend(pending.map(|r| gate::Entry::Reset {
+                position: r,
+                commit_time: c,
+            }));
         }
         Ok(out)
     }

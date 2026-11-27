@@ -365,6 +365,14 @@ pub enum Entry {
         /// Id.
         id: ConditionId,
     },
+    /// A reset point (spec §4 Resync), or the start of a new generation: every instance in force is seeded again at
+    /// it by the seed rule, with no transition, as if starting there (cond2 design §4.4 step 5; Q-2170).
+    Reset {
+        /// Position.
+        position: Position,
+        /// Commit time.
+        commit_time: Nanos,
+    },
     /// Any other log entry: it moves the frontier only, so a timer's `at` is the last position of the whole log
     /// before its instant (Q-1582).
     Other {
@@ -383,6 +391,7 @@ impl Entry {
             Entry::Define { position, .. }
             | Entry::Watch { position, .. }
             | Entry::Unwatch { position, .. }
+            | Entry::Reset { position, .. }
             | Entry::Other { position, .. } => *position,
         }
     }
@@ -394,6 +403,7 @@ impl Entry {
             | Entry::Define { commit_time, .. }
             | Entry::Watch { commit_time, .. }
             | Entry::Unwatch { commit_time, .. }
+            | Entry::Reset { commit_time, .. }
             | Entry::Other { commit_time, .. } => *commit_time,
         }
     }

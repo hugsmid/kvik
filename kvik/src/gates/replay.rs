@@ -11,6 +11,8 @@ use super::{FactItem, Held, History, HistoryError, SeriesState};
 pub(crate) struct Replay {
     facts: Vec<(Nanos, Position, FactItem, bool)>,
     ranks: BTreeMap<(SeriesId, Nanos), (u64, Position)>,
+    /// Each series' names from each definition entry on, in position order.
+    names: BTreeMap<SeriesId, Vec<(Position, Vec<String>)>>,
 }
 
 fn held(position: Position, f: &FactItem) -> Held {
@@ -54,6 +56,15 @@ impl Replay {
         }
         self.facts.push((commit, position, fact, outranked));
         outranked
+    }
+
+    /// Records a definition entry giving `series` the names `names` (none: retired).
+    #[cfg(test)]
+    pub fn define(&mut self, position: Position, series: SeriesId, names: Vec<String>) {
+        self.names
+            .entry(series)
+            .or_default()
+            .push((position, names));
     }
 
     fn of(
@@ -130,6 +141,23 @@ impl History for Replay {
             .of(series, through)
             .filter(|(c, _, _, _)| *c >= from)
             .cloned()
+            .collect())
+    }
+
+    fn matching(&self, pattern: &str, through: Position) -> Result<Vec<SeriesId>, HistoryError> {
+        Ok(self
+            .names
+            .iter()
+            .filter(|(_, defs)| {
+                defs.iter()
+                    .take_while(|(p, _)| *p <= through)
+                    .last()
+                    .is_some_and(|(_, ns)| {
+                        ns.iter()
+                            .any(|n| kvik_model::gate::pattern_matches(pattern, n))
+                    })
+            })
+            .map(|(s, _)| *s)
             .collect())
     }
 }

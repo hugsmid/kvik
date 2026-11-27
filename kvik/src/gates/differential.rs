@@ -36,7 +36,20 @@ pub(super) enum Op {
     Other {
         dt: i64,
     },
+    /// A definition entry giving a series one of [`NAMES`], or retiring it (`name` beyond them).
+    Define {
+        dt: i64,
+        series: u32,
+        name: usize,
+    },
+    Reset {
+        dt: i64,
+    },
 }
+
+/// Names a definition gives; the first two match [`PATTERN`].
+const NAMES: [&str; 3] = ["room/a/temp", "room/b/temp", "hall/a/temp"];
+pub(super) const PATTERN: &str = "room/*/temp";
 
 /// A fact's value: numbers mostly, and the other kinds every rule must pass over (spec §6 Gates).
 #[derive(Clone, Debug)]
@@ -72,9 +85,11 @@ fn arb_op() -> impl Strategy<Value = Op> {
         10 => (0..12i64, prop_oneof![6 => Just(1u32), 1 => 2..4u32], arb_val(),
               prop_oneof![9 => Just(0i64), 1 => 1..8i64], prop::bool::weighted(0.1), 0..4u64)
             .prop_map(|(dt, series, v, ahead, bad, version)| Op::Fact { dt, series, v, ahead, bad, version }),
-        1 => (0..5i64, 0..4usize).prop_map(|(dt, template)| Op::Watch { dt, template }),
+        1 => (0..5i64, 0..5usize).prop_map(|(dt, template)| Op::Watch { dt, template }),
         1 => (0..5i64, 0..4usize).prop_map(|(dt, k)| Op::Unwatch { dt, k }),
         1 => (0..5i64).prop_map(|dt| Op::Other { dt }),
+        2 => (0..5i64, 1..4u32, 0..4usize).prop_map(|(dt, series, name)| Op::Define { dt, series, name }),
+        1 => (0..5i64).prop_map(|dt| Op::Reset { dt }),
     ]
 }
 
@@ -156,11 +171,16 @@ fn arb_templates(sc: Scale) -> impl Strategy<Value = Vec<Gate>> {
                 hold_on: on,
                 hold_off: off,
             };
+            let each = Gate {
+                selector: Selector::Each(PATTERN.into()),
+                ..gate(Kind::Levels(l2.clone()), st2)
+            };
             vec![
                 gate(Kind::Levels(l1), st1),
                 gate(set, st3),
                 gate(Kind::Change { deadband: 1.5 }, st1),
                 gate(Kind::Levels(l2), st2),
+                each,
             ]
         })
 }
@@ -249,18 +269,46 @@ impl Log {
 
     pub fn other(&mut self, commit: Nanos) {
         let position = self.next();
-        self.entries.push(Entry::Define {
+        self.entries.push(Entry::Other {
             position,
             commit_time: commit,
-            series: SeriesId(2),
-            names: vec!["hall/b/temp".into()],
-            params: Params::new(SeriesKind::Gauge, None),
         });
         self.items.push((
             commit,
             Item {
                 position,
                 body: Body::Other,
+            },
+        ));
+    }
+
+    /// A definition entry giving `series` the names `names` (none: retired).
+    pub fn define(&mut self, commit: Nanos, series: SeriesId, names: &[&str]) {
+        let position = self.next();
+        let names: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        self.entries.push(Entry::Define {
+            position,
+            commit_time: commit,
+            series,
+            names: names.clone(),
+            params: Params::new(SeriesKind::Gauge, None),
+        });
+        self.replay.define(position, series, names.clone());
+        let body = Body::Define { series, names };
+        self.items.push((commit, Item { position, body }));
+    }
+
+    pub fn reset(&mut self, commit: Nanos) {
+        let position = self.next();
+        self.entries.push(Entry::Reset {
+            position,
+            commit_time: commit,
+        });
+        self.items.push((
+            commit,
+            Item {
+                position,
+                body: Body::Reset,
             },
         ));
     }
@@ -325,6 +373,15 @@ fn build(templates: &[Gate], first: &[usize], ops: &[Op], versioned: bool, unit:
             Op::Other { dt } => {
                 now += dt * unit;
                 log.other(now);
+            }
+            Op::Define { dt, series, name } => {
+                now += dt * unit;
+                let names: &[&str] = NAMES.get(name).map_or(&[], std::slice::from_ref);
+                log.define(now, SeriesId(series), names);
+            }
+            Op::Reset { dt } => {
+                now += dt * unit;
+                log.reset(now);
             }
         }
     }
@@ -425,7 +482,7 @@ proptest! {
     #[test]
     fn the_core_gives_what_judge_gives_over_any_split_floor_and_restore(
         templates in arb_templates(SECONDS),
-        first in prop::collection::vec(0..4usize, 0..3),
+        first in prop::collection::vec(0..5usize, 0..3),
         ops in prop::collection::vec(arb_op(), 0..48),
         drive in arb_drive(),
         versioned in prop::bool::weighted(0.3),
@@ -437,7 +494,7 @@ proptest! {
     #[test]
     fn the_core_gives_what_judge_gives_with_holds_past_the_seeds_day_cap(
         templates in arb_templates(HOURS),
-        first in prop::collection::vec(0..4usize, 0..3),
+        first in prop::collection::vec(0..5usize, 0..3),
         ops in prop::collection::vec(arb_op(), 0..48),
         drive in arb_drive(),
     ) {

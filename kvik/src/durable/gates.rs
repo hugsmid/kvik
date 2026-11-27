@@ -44,11 +44,6 @@ pub(crate) fn entry_spec(registry: &Registry, name: &str, gate: &Gate) -> Result
         }
         _ => return Err(Error::Gate(GateError::Selector)),
     };
-    if gate.each.is_some() {
-        return Err(Error::NotSupportedYet(
-            "an each gate on the durable backend (Q-1583)",
-        ));
-    }
     if gate.input.window.is_some() {
         return Err(Error::NotSupportedYet(
             "a window input to a gate on the durable backend (no incremental window fold yet)",

@@ -1,6 +1,6 @@
 //! A starting instance's hold seeded from history (Q-1145 (b), Q-1390, Q-1560).
 
-use kvik_model::gate::{ConditionId, Gate};
+use kvik_model::gate::{ConditionId, Gate, Selector};
 use kvik_model::types::{DAY, Nanos, Position, SeriesId};
 
 use super::rules::{Inst, longest_hold};
@@ -28,7 +28,10 @@ pub(super) fn seed(
         position: Position::ORIGIN,
         body: Body::Watch {
             id,
-            gate: gate.clone(),
+            gate: Gate {
+                selector: Selector::Series(s),
+                ..gate.clone()
+            },
         },
     };
     core.apply_batch(from, &[watch], history)?;

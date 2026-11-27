@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use kvik_model::gate::{ConditionId, Gate};
+use kvik_model::gate::{ConditionId, Gate, Selector};
 use kvik_model::types::SeriesId;
 
 use super::engine::{Frontier, bring_up};
@@ -73,6 +73,23 @@ impl Core {
         for k in keys {
             core.readers.entry(k.1).or_default().insert(k.0);
             core.reschedule(k);
+        }
+        // An `Each` gate's refusals are every series its pattern matches beyond its instances (Q-1143).
+        let each: Vec<(ConditionId, String)> = core
+            .defs
+            .iter()
+            .filter_map(|(id, g)| match &g.selector {
+                Selector::Each(p) => Some((*id, p.clone())),
+                Selector::Series(_) => None,
+            })
+            .collect();
+        for (id, p) in each {
+            let refused = history
+                .matching(&p, frontier.at)?
+                .into_iter()
+                .filter(|s| !core.instances.contains_key(&(id, *s)))
+                .collect();
+            core.refused.insert(id, refused);
         }
         Ok(core)
     }

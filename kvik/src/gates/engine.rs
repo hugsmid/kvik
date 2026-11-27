@@ -33,6 +33,11 @@ pub(crate) struct Core {
     pub(super) frontier: Frontier,
     /// Starts seed from history; off inside a seed (Q-1390).
     pub(super) seeding: bool,
+    /// Per `Each` gate, the series its pattern matches beyond its instances (Q-1143): with the instances, every series
+    /// it matches at the frontier.
+    pub(super) refused: BTreeMap<ConditionId, BTreeSet<SeriesId>>,
+    /// Series refused by a full `Each`, counted as `judge` counts them (Q-1143).
+    pub(super) instances_refused: u64,
 }
 
 impl Default for Core {
@@ -55,7 +60,7 @@ pub(super) fn bring_up(s: &mut SeriesState, now: Nanos) {
     }
 }
 
-fn input(s: &SeriesState) -> (Option<Value>, Option<Nanos>) {
+pub(super) fn input(s: &SeriesState) -> (Option<Value>, Option<Nanos>) {
     match &s.live {
         Some(l) => (Some(l.value.clone()), Some(l.t)),
         None => (None, None),
@@ -77,6 +82,8 @@ impl Core {
                 now: Nanos::MIN,
             },
             seeding: true,
+            refused: BTreeMap::new(),
+            instances_refused: 0,
         }
     }
 
@@ -141,6 +148,10 @@ impl Core {
                 }
                 Body::Watch { id, gate } => self.watch(*id, gate, at, commit, history, &mut out)?,
                 Body::Unwatch { id } => self.unwatch(*id)?,
+                Body::Define { series, names } => {
+                    self.define(*series, names, at, commit, history, &mut out)?;
+                }
+                Body::Reset => self.reset(at, commit, history)?,
                 Body::Other => {}
             }
         }
@@ -205,9 +216,6 @@ impl Core {
         history: &dyn History,
         out: &mut Vec<Transition>,
     ) -> Result<(), CoreError> {
-        let Selector::Series(s) = gate.selector else {
-            return Err(CoreError::NotSupported(id));
-        };
         if !matches!(gate.input, Input::Value) {
             return Err(CoreError::NotSupported(id));
         }
@@ -215,18 +223,46 @@ impl Core {
         if self.defs.contains_key(&id) {
             return Err(CoreError::Id(id));
         }
-        // Every read before any change, so a failed read adds nothing of the gate (Q-1881).
-        let state = if self.series.contains_key(&s) {
-            None
-        } else {
-            Some(history.series(s, now, at)?)
-        };
-        let seeded = if self.seeding {
-            seed::seed(gate, id, s, now, at, history)?
-        } else {
-            None
-        };
-        self.defs.insert(id, gate.clone());
+        match &gate.selector {
+            Selector::Series(s) => {
+                let s = *s;
+                // Every read before any change, so a failed read adds nothing of the gate (Q-1881).
+                let state = if self.series.contains_key(&s) {
+                    None
+                } else {
+                    Some(history.series(s, now, at)?)
+                };
+                let seeded = if self.seeding {
+                    seed::seed(gate, id, s, now, at, history)?
+                } else {
+                    None
+                };
+                self.defs.insert(id, gate.clone());
+                self.start(id, s, state, seeded, at, now, out);
+            }
+            Selector::Each(p) => {
+                let wanted = history.matching(p, at)?;
+                self.defs.insert(id, gate.clone());
+                self.refused.insert(id, BTreeSet::new());
+                self.reconcile(id, wanted, at, now, history, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// An instance of gate `id` on series `s` joins at `at`, `now` with its start transition from none (spec §6 Gates,
+    /// Transitions): `state` is the series' state when the core does not hold it, `seeded` the seed's instance.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start(
+        &mut self,
+        id: ConditionId,
+        s: SeriesId,
+        state: Option<SeriesState>,
+        seeded: Option<Inst>,
+        at: Position,
+        now: Nanos,
+        out: &mut Vec<Transition>,
+    ) {
         if let Some(st) = state {
             self.series.insert(s, st);
         }
@@ -262,7 +298,6 @@ impl Core {
                 });
             }
         }
-        Ok(())
     }
 
     /// Starts `gates` at `at`, `now` by the seed rule without their start transitions (spec §6 Gates, Transitions;
@@ -291,9 +326,10 @@ impl Core {
         self.timers.first_key_value().map(|(k, _)| k.0)
     }
 
-    /// Removes a gate with its instance, timer and, when no other gate reads it, its series.
+    /// Removes a gate with its instances, timers and, when no other gate reads them, their series.
     fn unwatch(&mut self, id: ConditionId) -> Result<(), CoreError> {
         self.defs.remove(&id).ok_or(CoreError::Id(id))?;
+        self.refused.remove(&id);
         let keys: Vec<(ConditionId, SeriesId)> = self
             .instances
             .range((id, SeriesId(0))..)
@@ -301,16 +337,22 @@ impl Core {
             .map(|(k, _)| *k)
             .collect();
         for k in keys {
-            self.instances.remove(&k);
-            self.unschedule(k);
-            let readers = self.readers.get_mut(&k.1).expect("series read");
-            readers.remove(&id);
-            if readers.is_empty() {
-                self.readers.remove(&k.1);
-                self.series.remove(&k.1);
-            }
+            self.drop_instance(k);
         }
         Ok(())
+    }
+
+    /// Removes one instance with its timer and, when no other instance reads it, its series (G9).
+    pub(super) fn drop_instance(&mut self, k: (ConditionId, SeriesId)) -> Option<Inst> {
+        let i = self.instances.remove(&k)?;
+        self.unschedule(k);
+        let readers = self.readers.get_mut(&k.1).expect("series read");
+        readers.remove(&k.0);
+        if readers.is_empty() {
+            self.readers.remove(&k.1);
+            self.series.remove(&k.1);
+        }
+        Some(i)
     }
 
     fn unschedule(&mut self, k: (ConditionId, SeriesId)) {
@@ -329,7 +371,7 @@ impl Core {
     }
 
     /// Evaluates one instance at `now`; a transition when its state changes.
-    fn evaluate(
+    pub(super) fn evaluate(
         &mut self,
         id: ConditionId,
         s: SeriesId,

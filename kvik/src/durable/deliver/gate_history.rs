@@ -85,4 +85,14 @@ impl History for LogHistory<'_> {
         self.replay(series, through)?
             .facts_since(series, from, through)
     }
+
+    fn matching(&self, pattern: &str, through: Position) -> Result<Vec<SeriesId>, HistoryError> {
+        let view = if log_pos(through) >= self.d.head {
+            None
+        } else {
+            Some(self.d.view_before(next(log_pos(through))))
+        };
+        let v = view.as_ref().unwrap_or(&self.d.view);
+        Ok(v.matching(pattern).into_iter().map(SeriesId).collect())
+    }
 }

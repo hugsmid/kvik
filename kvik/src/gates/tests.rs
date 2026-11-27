@@ -260,7 +260,7 @@ fn a_snapshot_keeps_a_pending_hold() {
 }
 
 #[test]
-fn each_and_window_gates_are_refused_as_not_supported_yet() {
+fn window_gates_are_refused_as_not_supported_yet() {
     let window = Gate {
         input: Input::Window(Window {
             width: 10 * SECOND,
@@ -270,11 +270,7 @@ fn each_and_window_gates_are_refused_as_not_supported_yet() {
         }),
         ..hold_up(0)
     };
-    let each = Gate {
-        selector: Selector::Each("room/*/temp".into()),
-        ..hold_up(0)
-    };
-    for (id, g) in [(1, window), (2, each)] {
+    for (id, g) in [(1, window)] {
         let item = Item {
             position: Position::new(0, id),
             body: Body::Watch {
@@ -363,6 +359,11 @@ impl History for Failing<'_> {
     ) -> Result<Vec<(Nanos, Position, FactItem, bool)>, HistoryError> {
         self.check("facts_since")?;
         self.replay.facts_since(s, from, through)
+    }
+
+    fn matching(&self, pattern: &str, through: Position) -> Result<Vec<SeriesId>, HistoryError> {
+        self.check("matching")?;
+        self.replay.matching(pattern, through)
     }
 }
 

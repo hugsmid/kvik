@@ -90,6 +90,11 @@ fn resolve(registry: &Registry, pattern: &str) -> BTreeSet<u32> {
 }
 
 impl View {
+    /// The live series with a name or alias matching `pattern`, in id order.
+    pub(crate) fn matching(&self, pattern: &str) -> BTreeSet<u32> {
+        resolve(&self.registry, pattern)
+    }
+
     /// Applies an entry at its position.
     pub(crate) fn apply(&mut self, p: LogPos, e: &Entry) {
         match e {

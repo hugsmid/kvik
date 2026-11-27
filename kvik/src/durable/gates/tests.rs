@@ -92,16 +92,16 @@ fn watch_validates_first_and_refuses_not_supported_yet_with_gates_off() {
 }
 
 #[test]
-fn an_each_gate_is_refused_not_supported_yet_and_writes_nothing() {
+fn an_each_gate_is_written_with_its_pattern() {
     let (w, _) = open("gates-each");
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
     let before = head(&w);
     let pump = Gate::set(Input::value_each(), [Value::F64(0.0)]).each("plant/*/code");
-    assert!(matches!(
-        w.watch("c", "pump", &pump),
-        Err(Error::NotSupportedYet(_))
-    ));
-    assert_eq!(head(&w), before);
+    w.watch("c", "pump", &pump).unwrap();
+    assert!(head(&w) > before);
+    let gates = w.gates("c").unwrap();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[0].2.each.as_deref(), Some("plant/*/code"));
 }
 
 #[test]
