@@ -500,6 +500,43 @@ fn the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_i
 }
 
 #[test]
+fn a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history() {
+    let (w, config, clock) = open_clocked("gates-reseed-bounded");
+    let s = gauge(&w, "hall/air/humidity");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    for v in [40.0, 41.0, 42.0, 43.0, 44.0] {
+        clock.advance(Duration::from_secs(60));
+        emit(&w, &clock, s, v);
+    }
+    clock.advance(Duration::from_secs(3 * 86_400));
+    emit(&w, &clock, s, 72.0);
+    clock.advance(Duration::from_secs(1));
+    emit(&w, &clock, s, 73.0);
+    w.watch("c", "s", &humidity(s)).unwrap();
+    drop(w);
+    config
+        .env
+        .fs
+        .remove_file(&PathBuf::from(
+            "durable-unit/gates-reseed-bounded/cursors/c.cur",
+        ))
+        .unwrap();
+    let w = Writer::open(&config).unwrap();
+    let facts = |w: &Writer| w.hub().unwrap().run(|d, _| d.gate_facts_read());
+    let before = facts(&w);
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    assert_eq!(facts(&w) - before, 2);
+    let mut states = Vec::new();
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        if let crate::consume::DeliveryKind::Resync(r) = &d.kind {
+            states.extend(r.gates.iter().map(|g| g.state.clone()));
+        }
+        w.confirm("c", d.id).unwrap();
+    }
+    assert_eq!(states.len(), 1);
+}
+
+#[test]
 fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
     let (w, config, clock) = open_clocked("gates-reseed-reads");
     let s = gauge(&w, "hall/air/humidity");

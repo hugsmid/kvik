@@ -89,6 +89,10 @@ impl<'a> LogHistory<'a> {
         .between(series.0, i64::MIN, i64::MAX)
         .ok_or_else(unreadable)?;
         drop(reader);
+        #[cfg(test)]
+        self.d
+            .gate_facts_read
+            .set(self.d.gate_facts_read.get() + facts.len() as u64);
         let through = log_pos(through);
         let mut r = Replay::default();
         for f in facts.iter().filter(|f| f.position <= through) {

@@ -192,6 +192,11 @@ impl Deliverer {
         self.gate_reads.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn gate_facts_read(&self) -> u64 {
+        self.gate_facts_read.get()
+    }
+
     pub(super) fn history(&self) -> LogHistory<'_> {
         LogHistory::new(self)
     }

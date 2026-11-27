@@ -340,6 +340,8 @@ pub(crate) struct Deliverer {
     /// Gate history reads from the log.
     #[cfg(test)]
     gate_reads: Cell<u64>,
+    #[cfg(test)]
+    gate_facts_read: Cell<u64>,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
     resets: BTreeMap<LogPos, LogPos>,
     /// Per consumer named in a recovery entry (field 47: its cursor file was missing or unreadable), the lowest
@@ -490,6 +492,8 @@ impl Deliverer {
             gate_fail_at: None,
             #[cfg(test)]
             gate_reads: Cell::new(0),
+            #[cfg(test)]
+            gate_facts_read: Cell::new(0),
             resets: BTreeMap::new(),
             lost: BTreeMap::new(),
             consumers: BTreeMap::new(),
