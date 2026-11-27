@@ -4,14 +4,17 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::block_on;
 use common::world::{World, gauge, ready, resync};
 use kvik::{
-    Consumer, DeliveryKind, Gate, Input, Level, Reading, ResyncCause, Select, SeriesId, Start,
-    Store, TransitionId, Value,
+    ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Gate, Health, Input, Level, Reading,
+    ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store, TransitionId, Value,
 };
+use kvik_log::fs::FaultOp;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
 
@@ -98,6 +101,235 @@ fn a_confirmed_transition_is_not_delivered_again_after_a_crash() {
         ["Some(Level(1)) r=true", "resync Resume [(Level(1), true)]"]
     );
     assert_eq!(s.stats().delivery.gates_reseeded, 0);
+}
+
+/// The cursor file's blocks as `(type, offset)`, in order, up to the first that is not whole.
+fn blocks(bytes: &[u8]) -> Vec<(u8, usize)> {
+    use kvik_log::block::{BLOCK_HEADER_LEN, BlockHeader};
+    let mut at = kvik_log::header::HEADER_LEN;
+    let mut out = Vec::new();
+    while let Some(h) = bytes
+        .get(at..at + BLOCK_HEADER_LEN)
+        .and_then(|b| <&[u8; BLOCK_HEADER_LEN]>::try_from(b).ok())
+        .and_then(BlockHeader::decode)
+    {
+        out.push((h.block_type, at));
+        at += usize::try_from(h.block_len()).unwrap();
+    }
+    out
+}
+
+fn cursor_path(w: &World) -> PathBuf {
+    w.path_with(Path::new("cursors").join("c.cur")).unwrap()
+}
+
+/// A store whose consumer has confirmed the start transitions and then the hold's `Level(1)`, crashed (without a
+/// power loss) after that confirmation returned; the cursor file ends with the pair that confirmation wrote.
+fn confirmed_twice(name: &str) -> (World, Vec<u8>) {
+    let mut w = World::quiet(name);
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    emit(&w, &s, id, 50.0);
+    let got = ready(&mut c);
+    block_on(c.confirm(got[1].id)).unwrap();
+    emit(&w, &s, id, 80.0);
+    w.clock.advance(Duration::from_secs(121));
+    s.tick().unwrap();
+    let after = ready(&mut c);
+    assert_eq!(seen(&after), ["Some(Level(1)) r=false"]);
+    block_on(c.confirm(after[0].id)).unwrap();
+    w.crash(s, vec![c], false);
+    let bytes = w.fs.read(&cursor_path(&w)).unwrap();
+    (w, bytes)
+}
+
+/// Flips a byte inside the body of the last block of type `t`, as a write torn there leaves it.
+fn tear_last(w: &World, bytes: &[u8], t: u8) {
+    let bs = blocks(bytes);
+    let n = bs.len();
+    assert!(
+        n >= 2
+            && bs[n - 2].0 == kvik_log::cursor::CHECKPOINT_BLOCK
+            && bs[n - 1].0 == kvik_log::cursor::CURSOR_BLOCK,
+        "a confirmation appends [0x31][0x30]: {bs:?}"
+    );
+    let at = bs.iter().rev().find(|b| b.0 == t).unwrap().1 + kvik_log::block::BLOCK_HEADER_LEN;
+    w.fs.poke(&cursor_path(w), at, &[bytes[at] ^ 0xFF]);
+}
+
+/// Spec §6 Gates failure table, "torn inside the 0x31 block" (G8): the previous checkpoint and cursor block hold, so
+/// the transition whose confirmation wrote the torn pair comes again, `replayed`, from an exact replay.
+#[test]
+fn a_cursor_write_torn_in_its_checkpoint_replays_from_the_previous_pair() {
+    let (w, bytes) = confirmed_twice("gates-durable-torn-31");
+    tear_last(&w, &bytes, kvik_log::cursor::CHECKPOINT_BLOCK);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(
+        seen(&ready(&mut c)),
+        ["Some(Level(1)) r=true", "resync Resume [(Level(1), true)]"]
+    );
+    let d = s.stats().delivery;
+    assert_eq!((d.gates_reseeded, d.checkpoint_mismatch), (0, 0));
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Failure table, "torn inside the 0x30 block, 0x31 valid": the new checkpoint stands under the older cursor block;
+/// replay starts at it and delivers only ids after it, so the confirmed `Level(1)` does not come again.
+#[test]
+fn a_cursor_write_torn_in_its_cursor_block_replays_from_the_new_checkpoint() {
+    let (w, bytes) = confirmed_twice("gates-durable-torn-30");
+    tear_last(&w, &bytes, kvik_log::cursor::CURSOR_BLOCK);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(1), true)]"]);
+    let d = s.stats().delivery;
+    assert_eq!((d.gates_reseeded, d.checkpoint_mismatch), (0, 0));
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Failure table, "cursor file lost": a `NoCursor` resync; the gates are reseeded (state now, `set_by` none) and
+/// counted; nothing is replayed.
+#[test]
+fn a_lost_cursor_file_reseeds_the_gates() {
+    let (w, _) = confirmed_twice("gates-durable-lost");
+    w.fs.poke(&cursor_path(&w), 0, &[0; 16]);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(
+        seen(&ready(&mut c)),
+        ["resync NoCursor [(Level(1), false)]"]
+    );
+    assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Failure table, "failed write or sync at a cursor write": `confirm` returns the error, the store goes read-only and
+/// nothing further is delivered. At the next start (no power loss) a failed write leaves the last synced checkpoint,
+/// so the start transitions come again; a failed sync leaves the written pair in the page cache, confirmed.
+#[test]
+fn a_failed_cursor_write_at_a_confirmation_leaves_the_store_read_only() {
+    for (op, again) in [
+        (
+            FaultOp::Write,
+            &[
+                "Some(Unknown) r=true",
+                "Some(Level(0)) r=true",
+                "resync Resume [(Level(0), true)]",
+            ][..],
+        ),
+        (FaultOp::Sync, &["resync Resume [(Level(0), true)]"][..]),
+    ] {
+        let mut w = World::quiet(&format!("gates-durable-write-{op:?}"));
+        let s = w.open();
+        let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+        let mut c = take(&s);
+        block_on(c.watch("humidity", humidity(id))).unwrap();
+        emit(&w, &s, id, 50.0);
+        let got = ready(&mut c);
+        w.fs.fail_nth(op, "cursors", 0, std::io::ErrorKind::Other);
+        assert!(
+            matches!(block_on(c.confirm(got[1].id)), Err(ConsumerError::Write(_))),
+            "{op:?}"
+        );
+        assert!(matches!(s.health(), Health::ReadOnly { .. }), "{op:?}");
+        emit_ignoring(&w, &s, id, 80.0);
+        w.clock.advance(Duration::from_secs(121));
+        let _ = s.tick();
+        assert!(c.try_next().is_err(), "{op:?}");
+        w.crash(s, vec![c], false);
+        let s = w.open();
+        let mut c = take(&s);
+        assert_eq!(seen(&ready(&mut c)), again, "{op:?}");
+        block_on(s.shutdown()).unwrap();
+    }
+}
+
+fn emit_ignoring(w: &World, s: &Store, id: SeriesId, v: f64) {
+    let _ = block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(v))]));
+}
+
+/// `conditions.replay_max` (spec §6 Gates, Resume): more facts after the checkpoint than the bound, or more time,
+/// and nothing is replayed; the gates are rebuilt from history without `set_by`, counted `transitions_not_replayed`.
+#[test]
+fn a_resume_beyond_the_replay_bound_reseeds_without_replaying() {
+    for (name, max) in [
+        ("facts", ReplayMax::new(Duration::from_secs(24 * 3_600), 2)),
+        ("span", ReplayMax::new(Duration::from_secs(600), 1_000_000)),
+    ] {
+        let mut w = World::quiet(&format!("gates-durable-bound-{name}"));
+        w.conditions = Some(ConditionsConfig::default().replay_max(max));
+        let s = w.open();
+        let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+        let mut c = take(&s);
+        block_on(c.watch("humidity", humidity(id))).unwrap();
+        emit(&w, &s, id, 50.0);
+        for v in [55.0, 60.0, 80.0] {
+            emit(&w, &s, id, v);
+            w.clock.advance(Duration::from_secs(300));
+        }
+        s.tick().unwrap();
+        // Nothing confirmed: the checkpoint stays before the start transition.
+        assert_eq!(
+            seen(&ready(&mut c)),
+            [
+                "Some(Unknown) r=false",
+                "Some(Level(0)) r=false",
+                "Some(Level(1)) r=false"
+            ],
+            "{name}"
+        );
+        w.crash(s, vec![c], false);
+        let s = w.open();
+        let mut c = take(&s);
+        assert_eq!(
+            seen(&ready(&mut c)),
+            ["resync Resume [(Level(1), false)]"],
+            "{name}"
+        );
+        let d = s.stats().delivery;
+        assert_eq!(
+            (d.transitions_not_replayed, d.gates_reseeded),
+            (1, 1),
+            "{name}"
+        );
+        block_on(s.shutdown()).unwrap();
+    }
+}
+
+/// G10: with the host clock stepped back across a restart, no batch commits below the checkpoint's `now`, so a hold
+/// that starts after the start runs from that instant, not from the stepped-back wall clock.
+#[test]
+fn a_clock_stepped_back_across_a_restart_does_not_shorten_a_hold() {
+    let w = World::quiet("gates-durable-clock-back");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    emit(&w, &s, id, 50.0);
+    let got = ready(&mut c);
+    block_on(c.confirm(got[1].id)).unwrap();
+    w.clock.advance(Duration::from_secs(100));
+    s.tick().unwrap();
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    w.clock.jump_wall(Span::from_secs(-90));
+    let s = w.open();
+    let mut c = take(&s);
+    let r = ready(&mut c);
+    block_on(c.confirm(r.last().unwrap().id)).unwrap();
+    emit(&w, &s, id, 80.0);
+    // Committed at the checkpoint's instant, 90 s after the wall clock, the hold ends 210 s after the emit.
+    w.clock.advance(Duration::from_secs(200));
+    s.tick().unwrap();
+    assert_eq!(seen(&ready(&mut c)), Vec::<String>::new());
+    w.clock.advance(Duration::from_secs(11));
+    s.tick().unwrap();
+    assert_eq!(seen(&ready(&mut c)), ["Some(Level(1)) r=false"]);
+    block_on(s.shutdown()).unwrap();
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +478,7 @@ fn resume(s: &Store, track: &mut Track) -> Result<Consumer, TestCaseError> {
         block_on(c.confirm(got.last().unwrap().id)).unwrap();
     };
     if r.cause == ResyncCause::Resume && r.forget_above.is_none() {
+        REPLAYS_CHECKED.fetch_add(before.len() as u64, Ordering::SeqCst);
         for id in before {
             prop_assert!(
                 got.iter().any(
@@ -322,10 +555,16 @@ fn gate_deliveries_after_crashes_follow_the_rules() {
         Ok(())
     })
     .unwrap();
+    assert!(
+        REPLAYS_CHECKED.load(Ordering::SeqCst) > 0,
+        "no history replayed a transition handed out and never confirmed"
+    );
 }
 
+/// Transitions the crash property saw replayed after a crash, so a run that never reaches that check fails.
+static REPLAYS_CHECKED: AtomicU64 = AtomicU64::new(0);
+
 fn next_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::SeqCst)
 }

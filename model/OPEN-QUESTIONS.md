@@ -217,6 +217,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (decided by the builder, provisional) |
 | Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
 | Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
+| Q-2087 | §6 Gates, Resume, Transitions; Q-1392 | The instant a reseed starts the gates at: the commit floor, not the head's commit time (decided by the builder, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5509,7 +5510,8 @@ every checkpoint's instant and every gate cursor's (G10, Q-1394). Q-2001's effec
 history, but restoring reads each held series' facts ahead of the checkpoint with one history read, and a reseed two
 per gate, each a scan of the log from its start (not changed here).
 **Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`;
-`kvik/tests/gates_durable.rs`, `gate_deliveries_after_crashes_follow_the_rules` among them.
+`kvik/tests/gates_durable.rs`, `gate_deliveries_after_crashes_follow_the_rules` among them, and its failure-table rows
+(torn checkpoint, torn cursor block, lost file, failed cursor write, bound, clock stepped back).
 
 ## Q-2081 — The checkpoint block as built
 Decided by the builder with cond2 step 5, provisional.
@@ -5572,6 +5574,18 @@ engine now. The held snapshot stays until all of them are confirmed: a consumer 
 old checkpoint, whose replay may outgrow the bound (then reseeded, counted). A confirmed transition writes the cursor
 file at once.
 **Pinned by.** `kvik/tests/gates_durable.rs`.
+
+## Q-2087 — The instant a reseed starts the gates at
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A take reseeds (no cursor file, beyond `conditions.replay_max`, a reset point after the checkpoint) while
+a hold begun before the head's last commit has completed by the commit floor: in the previous run it fired, was
+delivered and was confirmed. Seeded at the head's commit time, the hold completes after the start and fires again, a
+transition with no `replayed` flag ahead of the resync, where the spec sends the resync alone.
+**Decision (provisional).** The reseed's start instant `T` is the commit floor when the deliverer has read through the
+floor's position (the floor's guarantee then holds: nothing later commits below it), else the head's commit time. A
+hold complete by then is in the resync's state, `set_by` none; nothing is sent before the resync.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_lost_cursor_file_reseeds_the_gates`,
+`a_resume_beyond_the_replay_bound_reseeds_without_replaying`.
 
 ## Open at v0.2
 
@@ -5814,6 +5828,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2084 | cond2 review | Decided by the builder, provisional: the start id it would have had |
 | Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
 | Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
+| Q-2087 | cond2 review | Decided by the builder, provisional: the commit floor once read through its position |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

@@ -209,7 +209,14 @@ impl Deliverer {
         let gates = self.gates_in_force(name);
         let mut core = Core::new();
         let at = core_pos(self.head);
-        let r = core.reseed(&gates, at, self.last_commit_time, &self.history(ctx));
+        // At the floor, not the head's commit time: a hold that completed by now is in the state, not a transition
+        // (spec §6 Gates, Resume: beyond replay the resync alone is sent). G3 allows it once the head is at the
+        // floor's position.
+        let now = match self.floor(ctx) {
+            Some((f, p)) if self.head >= p => f.max(self.last_commit_time),
+            _ => self.last_commit_time,
+        };
+        let r = core.reseed(&gates, at, now, &self.history(ctx));
         if r.is_err() {
             self.stats.gate_errors += 1;
             core = Core::new();
