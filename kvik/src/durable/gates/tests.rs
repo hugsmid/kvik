@@ -498,3 +498,32 @@ fn the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_i
     let held = cursor(&w).1.expect("held while outstanding");
     assert_eq!(held.at.sequence, quiet.sequence);
 }
+
+#[test]
+fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
+    let (w, config, clock) = open_clocked("gates-reseed-reads");
+    let s = gauge(&w, "hall/air/humidity");
+    let t = gauge(&w, "hall/air/temperature");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    for (k, v) in [50.0, 60.0, 72.0].into_iter().enumerate() {
+        clock.advance(Duration::from_secs(1));
+        emit(&w, &clock, s, v);
+        emit(&w, &clock, t, v + 1.0);
+        w.watch("c", &format!("s{k}"), &humidity(s)).unwrap();
+    }
+    w.watch("c", "t", &humidity(t)).unwrap();
+    drop(w);
+    let w = Writer::open(&config).unwrap();
+    let reads = |w: &Writer| w.hub().unwrap().run(|d, _| d.gate_reads());
+    let before = reads(&w);
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    assert_eq!(reads(&w) - before, 2);
+    let mut gates = 0;
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        if let crate::consume::DeliveryKind::Resync(r) = &d.kind {
+            gates += r.gates.len();
+        }
+        w.confirm("c", d.id).unwrap();
+    }
+    assert_eq!(gates, 4);
+}

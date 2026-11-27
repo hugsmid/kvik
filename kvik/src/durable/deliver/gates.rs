@@ -159,6 +159,12 @@ impl Deliverer {
         self.gate_fail_at = p;
     }
 
+    /// Gate history reads from the log so far.
+    #[cfg(test)]
+    pub(crate) fn gate_reads(&self) -> u64 {
+        self.gate_reads.get()
+    }
+
     fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
         LogHistory { d: self, ctx }
     }

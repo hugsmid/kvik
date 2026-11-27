@@ -40,6 +40,8 @@ pub(super) struct LogHistory<'a> {
 
 impl LogHistory<'_> {
     fn replay(&self, series: SeriesId, through: Position) -> Result<Replay, HistoryError> {
+        #[cfg(test)]
+        self.d.gate_reads.set(self.d.gate_reads.get() + 1);
         let facts = self
             .d
             .facts_between(LogPos::default(), next(log_pos(through)), self.ctx)
