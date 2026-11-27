@@ -269,3 +269,38 @@ fn a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_u
     assert_eq!(replayed, [Some(kvik::GateState::Value(Value::F64(k)))]);
     block_on(s.shutdown()).unwrap();
 }
+
+/// Q-2220: the confirmation of a resume's resync, whose frontier covers the replayed transitions, is written at once,
+/// even within a second of the replayed transition's own write, not at the next timed write.
+#[test]
+fn a_resume_resync_confirmation_over_replayed_transitions_is_written_at_once() {
+    let mut w = World::quiet("gates-durable-resync-written");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    emit(&w, &s, id, 50.0);
+    let got = ready(&mut c);
+    block_on(c.confirm(got[1].id)).unwrap();
+    emit(&w, &s, id, 80.0);
+    w.clock.advance(Duration::from_secs(121));
+    s.tick().unwrap();
+    assert_eq!(seen(&ready(&mut c)), ["Some(Level(1)) r=false"]);
+    w.crash(s, vec![c], false);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    assert_eq!(
+        seen(&got),
+        ["Some(Level(1)) r=true", "resync Resume [(Level(1), true)]"]
+    );
+    block_on(c.confirm(got[0].id)).unwrap();
+    let before = w.fs.read(&cursor_path(&w)).unwrap().len();
+    block_on(c.confirm(got[1].id)).unwrap();
+    assert!(w.fs.read(&cursor_path(&w)).unwrap().len() > before);
+    w.crash(s, vec![c], false);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(1), true)]"]);
+    block_on(s.shutdown()).unwrap();
+}
