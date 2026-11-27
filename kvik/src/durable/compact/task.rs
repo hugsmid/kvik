@@ -219,7 +219,9 @@ struct Open {
     id: Identity,
     w: Option<FileWriter<Vec<u8>>>,
     tail: Vec<u8>,
-    out: Box<dyn FsFile>,
+    /// The file, once its stale copy is removed (`removed`) and it is created, each a step of its own.
+    out: Option<Box<dyn FsFile>>,
+    removed: bool,
     path: PathBuf,
     at: u64,
     unsynced: u64,
@@ -227,6 +229,12 @@ struct Open {
     /// Its writer is past its last series; the index goes out a block a step.
     finishing: bool,
     written: Option<Written>,
+}
+
+impl Open {
+    fn file(&self) -> &dyn FsFile {
+        self.out.as_deref().expect("opened")
+    }
 }
 
 /// The rows of the open pass.
@@ -267,6 +275,7 @@ pub(crate) struct RunTask<'a> {
     open: Vec<Open>,
     written: Vec<Written>,
     created: Vec<PathBuf>,
+    data_dir: bool,
     stage: Stage,
     peak: u64,
     outcome: Option<Result<Vec<Output>, RunError>>,
@@ -305,6 +314,7 @@ impl<'a> RunTask<'a> {
             open: Vec::new(),
             written: Vec::new(),
             created: Vec::new(),
+            data_dir: false,
             stage: Stage::Census {
                 seg: 0,
                 segment: None,
@@ -396,9 +406,9 @@ impl<'a> RunTask<'a> {
                     };
                     return Ok(None);
                 };
-                let s = match segment {
-                    Some(s) => s,
-                    None => segment.insert(Segment::open(self.input.fs, c)?),
+                let Some(s) = segment else {
+                    *segment = Some(Segment::open(self.input.fs, c)?);
+                    return Ok(None);
                 };
                 match s.step(self.input.store_id, self.input.set_aside)? {
                     Event::Pending => {}
@@ -671,9 +681,9 @@ impl<'a> RunTask<'a> {
                 }
                 return Ok(None);
             };
-            let s = match &mut rows.segment {
-                Some(s) => s,
-                None => rows.segment.insert(Segment::open(self.input.fs, c)?),
+            let Some(s) = &mut rows.segment else {
+                rows.segment = Some(Segment::open(self.input.fs, c)?);
+                return Ok(None);
             };
             match s.step(self.input.store_id, self.input.set_aside)? {
                 Event::Pending => {}
@@ -707,17 +717,35 @@ impl<'a> RunTask<'a> {
         if !rows.opened && first_of_window {
             rows.opened = true;
             for i in (0..plan.files.len()).filter(|&i| window.contains(&plan.files[i].0)) {
-                let o = open_output(&self.input, plan, i)?;
-                self.created.push(o.path.clone());
-                self.open.push(o);
+                self.open.push(new_output(&self.input, plan, i)?);
             }
+            return Ok(None);
+        }
+        if !self.data_dir && !self.open.is_empty() {
+            self.input
+                .fs
+                .create_dir_all(&self.input.dir.join(DATA_DIR))?;
+            self.data_dir = true;
+            return Ok(None);
+        }
+        if let Some(o) = self.open.iter_mut().find(|o| o.out.is_none()) {
+            if o.removed {
+                o.out = Some(self.input.fs.open(&o.path, OpenMode::CreateNew)?);
+                self.created.push(o.path.clone());
+            } else {
+                match self.input.fs.remove_file(&o.path) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => o.removed = true,
+                }
+            }
+            return Ok(None);
         }
         if let Some(o) = self.open.iter_mut().find(|o| pending(o) >= PIECE) {
             drain(o)?;
             return Ok(None);
         }
         if let Some(o) = self.open.iter_mut().find(|o| o.unsynced >= SYNC_EVERY) {
-            o.out.sync_all()?;
+            o.file().sync_all()?;
             o.unsynced = 0;
             return Ok(None);
         }
@@ -775,7 +803,7 @@ impl<'a> RunTask<'a> {
         }
         if let Some(i) = self.open.iter().position(|o| o.written.is_some()) {
             let mut o = self.open.swap_remove(i);
-            o.out.sync_all()?;
+            o.file().sync_all()?;
             self.written.push(o.written.take().expect("finished"));
             return Ok(None);
         }
@@ -793,13 +821,21 @@ impl Background for RunTask<'static> {
             Stage::Census {
                 segment: Some(s), ..
             } => s.reading().map_or(Next::Cpu, Next::Device),
-            Stage::Pass { rows, .. } if !rows.collected => rows
-                .segment
-                .as_ref()
-                .and_then(Segment::reading)
-                .map_or(Next::Cpu, Next::Device),
+            Stage::Census { seg, .. } if *seg < self.segments.len() => Next::Device(0),
+            Stage::Pass { k, .. } if self.plan.as_ref().is_some_and(|p| *k >= p.passes.len()) => {
+                Next::Device(0)
+            }
+            Stage::Pass { rows, .. } if !rows.collected => match &rows.segment {
+                Some(s) => s.reading().map_or(Next::Cpu, Next::Device),
+                None if rows.seg < self.segments.len() => Next::Device(0),
+                None => Next::Cpu,
+            },
             Stage::Pass { .. } => {
-                if self
+                if self.open.iter().any(|o| o.out.is_none())
+                    || (!self.data_dir && !self.open.is_empty())
+                {
+                    Next::Device(0)
+                } else if self
                     .open
                     .iter()
                     .any(|o| pending(o) >= PIECE || !o.tail.is_empty())
@@ -1139,7 +1175,7 @@ fn by_file_names(
 }
 
 /// Creates output `i` and its writer.
-fn open_output(input: &RunInput<'_>, plan: &Plan, i: usize) -> Result<Open, RunError> {
+fn new_output(input: &RunInput<'_>, plan: &Plan, i: usize) -> Result<Open, RunError> {
     let key = plan.files[i];
     let meta = &plan.metas[&key];
     let (start, len) = plan.periods[key.0];
@@ -1180,21 +1216,14 @@ fn open_output(input: &RunInput<'_>, plan: &Plan, i: usize) -> Result<Open, RunE
         .collect();
     let mut w = FileWriter::new(Vec::new(), id, input.created_at, &description, batches)?;
     w.reserve_index(usize::try_from(meta.series + meta.rows / CHUNK_ROWS as u64).unwrap_or(0));
-    let data = input.dir.join(DATA_DIR);
-    input.fs.create_dir_all(&data)?;
-    let path = tmp_path(input.dir, &id);
-    match input.fs.remove_file(&path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
-    }
-    let out = input.fs.open(&path, OpenMode::CreateNew)?;
     Ok(Open {
         file: i,
         id,
         w: Some(w),
         tail: Vec::new(),
-        out,
-        path,
+        out: None,
+        removed: false,
+        path: tmp_path(input.dir, &id),
         at: 0,
         unsynced: 0,
         series: None,
@@ -1214,7 +1243,7 @@ fn drain(o: &mut Open) -> io::Result<()> {
         None => &mut o.tail,
     };
     let n = b.len().min(PIECE);
-    o.out.write_at(&b[..n], o.at)?;
+    o.out.as_ref().expect("opened").write_at(&b[..n], o.at)?;
     b.drain(..n);
     o.at += n as u64;
     o.unsynced += n as u64;

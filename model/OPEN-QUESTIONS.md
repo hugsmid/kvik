@@ -203,6 +203,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1841 | compaction design §4 Memory | What "counted" means for the cap (provisional) |
 | Q-1843 | compaction design §4; Q-1531 | A share configured as 0 or not a number (provisional) |
 | Q-1940 | compaction design §4 Memory; Q-1840 | A window's writers reserved by the writer's own figures; a file's index written a block a step (provisional) |
+| Q-1990 | compaction design §4; Q-1842 | The run's steps and their device calls (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5332,7 +5333,13 @@ Decided with the review of roadmap 6.2a2b, provisional. To be settled with its f
 Decided with the fix round of roadmap 6.2a2b's review, provisional. To be settled by roadmap 6.2c.
 **Scenario.** The group budget reserved 64 KiB for a writer's block being built, while the writer counts a block of rows at their longest text (4,096 × (fact + 255 bytes)) and a commit-time row at its own size; with many batches the tally passed the cap. Finishing a file encoded its whole index into the sink in one step, holding the index twice (19 MiB at 100,000 series), and the canonical check held a name for every series and read the index three times.
 **Decision (provisional).** A writer is reserved as `FileWriter::held_bytes` counts it, and a window also holds no more writers than fit half the cap. `FileWriter::finish_step` writes the commit-time table, then one index block a step, then the trailer, so the sink holds one index block between drains; `finish` is the same steps run together, and the bytes are unchanged. Verification lends the registry to each step of the canonical check (`CanonicalCheck::step_with`), reads a chunk's directory when the chunk is reached, and passes the check's index to the content phase. Reason: each removes a copy of a per-series structure without changing a byte written.
-**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`, `a_window_of_writers_at_their_fullest_holds_at_most_half_the_cap`.
+
+## Q-1990 — The run's steps and their device calls
+Decided with the third fix round of roadmap 6.2a2b's review, provisional. To be settled before roadmap 6.2c, with Q-1842.
+**Scenario.** §4 allows a step one blocking device call. Opening a segment, preparing an output (its directory, the removal of a stale copy, its creation) and syncing the data directory each shared a step with other calls, and some were declared CPU-only; verification read a block's header, body and directory, and the comparing sink's window, in separate calls, up to 26 in a step.
+**Decision (provisional).** In the census and the passes every call is a step of its own and declared as device work: a segment is opened a step before its first read, an output's directory, removal and creation are a step each, and the directory sync is declared `Device(0)`. Verification reads its outputs through windows of at least 128 KiB kept by the reader and the comparing sink, so most steps make one call; a step still makes up to three where an output is opened (open, header, tail), where the reader and the comparing sink cross a window together, and where a revision block reads the current file. Recommended: open, header and tail a step each; the comparing sink reads only the bytes it compares, from the reader's windows; the current file's rows read a block a step ahead of the revision block that needs them.
+**Pinned by.** `kvik/src/durable/compact/tests/steps.rs` `each_step_of_the_census_and_passes_makes_at_most_one_device_call_of_at_most_its_declared_bytes`, `each_verification_step_makes_at_most_three_device_calls`, `outputs_are_synced_every_mebibyte_at_their_end_and_the_directory_before_verification`.
 
 ## Open at v0.2
 

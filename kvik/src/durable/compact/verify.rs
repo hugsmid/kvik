@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kvik_chunk::file::{
     CanonicalCheck, CanonicalError, Class, CompactedFile, Directory, Fact, FileError, Identity,
@@ -126,18 +126,34 @@ impl Held {
     }
 }
 
-/// An output read back by offset.
+/// Bytes of a file from an offset.
+type Window = (u64, Vec<u8>);
+
+/// An output read back through windows of at least 128 KiB, shared by its clones: the reader and the canonical
+/// check's comparing sink each keep one, so that a step's header, body and directory reads are mostly one device
+/// read (compaction design §4, Q-1990).
 #[derive(Clone, Debug)]
 pub(super) struct Src {
     file: Arc<dyn FsFile>,
     len: u64,
+    windows: Arc<Mutex<[Window; 2]>>,
 }
 
 impl Src {
     fn open(input: &RunInput<'_>, w: &Written) -> io::Result<Self> {
         let file: Arc<dyn FsFile> = input.fs.open(&w.path, OpenMode::Read)?.into();
         let len = file.len()?;
-        Ok(Self { file, len })
+        Ok(Self {
+            file,
+            len,
+            windows: Arc::default(),
+        })
+    }
+
+    /// Bytes its windows hold.
+    fn held(&self) -> u64 {
+        let w = self.windows.lock().expect("not poisoned");
+        w.iter().map(|(_, b)| b.capacity() as u64).sum()
     }
 }
 
@@ -147,17 +163,46 @@ impl ReadAt for Src {
     }
 
     fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        let mut done = 0;
-        while done < len {
-            let n = self.file.read_at(&mut buf[done..], offset + done as u64)?;
-            if n == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            done += n;
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|&e| e <= self.len)
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
+        let mut w = self.windows.lock().expect("not poisoned");
+        if let Some(i) = w
+            .iter()
+            .position(|(at, b)| *at <= offset && end <= at + b.len() as u64)
+        {
+            w.swap(0, i);
+            let from = (offset - w[0].0) as usize;
+            return Ok(w[0].1[from..from + len].to_vec());
         }
-        Ok(buf)
+        if len > 2 * PIECE {
+            drop(w);
+            return read_whole(&*self.file, offset, len);
+        }
+        // A read near the end takes the file's last window, which holds its tail, index and commit times.
+        let n = (len as u64).max(PIECE as u64).min(self.len);
+        let at = offset.min(self.len - n);
+        let buf = read_whole(&*self.file, at, n as usize)?;
+        let from = (offset - at) as usize;
+        let out = buf[from..from + len].to_vec();
+        w.swap(0, 1);
+        w[0] = (at, buf);
+        Ok(out)
     }
+}
+
+fn read_whole(file: &dyn FsFile, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut done = 0;
+    while done < len {
+        let got = file.read_at(&mut buf[done..], offset + done as u64)?;
+        if got == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        done += got;
+    }
+    Ok(buf)
 }
 
 /// The registry is lent to each step (`CanonicalCheck::step_with`), so the check holds no name of a series.
@@ -242,6 +287,8 @@ pub(super) struct Check {
     held: Option<Held>,
     j: usize,
     phase: Phase,
+    /// The open files' sources, for their windows' bytes.
+    reading: Vec<Src>,
     positions: u64,
     entries: u128,
     out: Vec<Output>,
@@ -255,6 +302,7 @@ impl Check {
             held: Held::new(ranges),
             j: 0,
             phase: Phase::Open,
+            reading: Vec::new(),
             positions: 0,
             entries: 0,
             out: Vec::new(),
@@ -280,7 +328,8 @@ impl Check {
             .held
             .as_ref()
             .map_or(0, |h| 8 * h.bits.len() + 32 * h.spans.len());
-        index + bits as u64 + 2 * PIECE as u64
+        let windows: u64 = self.reading.iter().map(Src::held).sum();
+        index + bits as u64 + windows + 2 * PIECE as u64
     }
 
     /// The size of the next step's device call.
@@ -309,6 +358,7 @@ impl Check {
         match &mut self.phase {
             Phase::Open => {
                 let src = Src::open(input, &w)?;
+                self.reading = vec![src.clone()];
                 let file = CompactedFile::open(src.clone(), &w.id, Some(&w.layout))?;
                 let d = file.description();
                 if d.inputs != expect.names {
@@ -330,7 +380,9 @@ impl Check {
                         unreachable!("in the canonical phase")
                     };
                     let order = c.into_order();
-                    let file = CompactedFile::open(Src::open(input, &w)?, &w.id, Some(&w.layout))?;
+                    let src = Src::open(input, &w)?;
+                    self.reading = vec![src.clone()];
+                    let file = CompactedFile::open(src, &w.id, Some(&w.layout))?;
                     self.phase = Phase::Content {
                         file: Box::new(file),
                         order,
@@ -408,11 +460,14 @@ impl Check {
                                 .iter()
                                 .find(|o| o.period == w.period && o.class == Class::Current)
                                 .ok_or(PLACED)?;
-                            let cf = CompactedFile::open(
-                                Src::open(input, top)?,
-                                &top.id,
-                                Some(&top.layout),
-                            )?;
+                            let cf = match current.take() {
+                                Some(c) => c.file,
+                                None => {
+                                    let src = Src::open(input, top)?;
+                                    self.reading.push(src.clone());
+                                    CompactedFile::open(src, &top.id, Some(&top.layout))?
+                                }
+                            };
                             *current = Some(Box::new(Cursor::new(cf, f.series_id)?));
                         }
                         if !current.as_mut().expect("opened above").outranks(f)? {
