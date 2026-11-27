@@ -140,6 +140,23 @@ pub struct FileWriter<W: Write> {
     pub(super) block_rows: usize,
     pub(super) chunk_rows: usize,
     pub(super) stream: Option<super::stream::SeriesStream>,
+    finishing: Option<Finishing>,
+    finished: Option<Written>,
+}
+
+/// What [`FileWriter::finish_step`] carries between its calls.
+struct Finishing {
+    range: (Position, Position),
+    used: Vec<Batch>,
+    times_offset: u64,
+    times_dir_offset: u64,
+    times_dir_crc32c: u32,
+    times_count: u32,
+    /// Sorted; written an index block a call from `at`.
+    index: Vec<IndexEntry>,
+    at: usize,
+    index_offset: u64,
+    roots: Vec<RootRecord>,
 }
 
 /// A chunk being written: where it starts, its block records so far and its index entry's folds.
@@ -257,6 +274,8 @@ impl<W: Write> FileWriter<W> {
             block_rows: BLOCK_ROWS,
             chunk_rows: CHUNK_ROWS,
             stream: None,
+            finishing: None,
+            finished: None,
         };
         let header = FileHeader::new(
             KIND_COMPACTED,
@@ -321,7 +340,9 @@ impl<W: Write> FileWriter<W> {
     /// Bytes the writer holds besides its sink: index entries, commit-time rows and the open series' rows.
     pub fn held_bytes(&self) -> u64 {
         let fact = std::mem::size_of::<Fact>() as u64;
-        (self.index.capacity() * std::mem::size_of::<IndexEntry>()) as u64
+        let index =
+            self.index.capacity() + self.finishing.as_ref().map_or(0, |f| f.index.capacity());
+        (index * std::mem::size_of::<IndexEntry>()) as u64
             + (self.batches.capacity() * (std::mem::size_of::<Batch>() + 8)) as u64
             + self.held_rows() as u64 * (fact + 255)
     }
@@ -687,6 +708,52 @@ impl<W: Write> FileWriter<W> {
 
     /// Writes the commit-time table, the chunk index, the trailer and the end marker; returns the output.
     pub fn finish(mut self) -> Result<(W, Written), WriteError> {
+        while !self.finish_step()? {}
+        let written = self.finished.take().expect("finished above");
+        Ok((self.out, written))
+    }
+
+    /// One piece of [`Self::finish`]: the commit-time table, then an index block a call, then the root, trailer and
+    /// end marker; `true` once the file is whole, after which [`Self::finish`] only returns it. A caller that drains
+    /// the sink between calls holds one index block of it at a time.
+    pub fn finish_step(&mut self) -> Result<bool, WriteError> {
+        if self.finished.is_some() {
+            return Ok(true);
+        }
+        let Some(f) = self.finishing.as_mut() else {
+            self.begin_finish()?;
+            return Ok(false);
+        };
+        if f.at < f.index.len() {
+            let end = (f.at + INDEX_BLOCK_ENTRIES).min(f.index.len());
+            let body = encode_index_block(&f.index[f.at..end]);
+            let (first, last, min_t, count) = (
+                f.index[f.at].series_id,
+                f.index[end - 1].series_id,
+                f.index[f.at].min_t,
+                (end - f.at) as u32,
+            );
+            f.at = end;
+            let index_offset = f.index_offset;
+            let (offset, h) = self.block(block_type::INDEX, &body)?;
+            let f = self.finishing.as_mut().expect("finishing");
+            f.roots.push(RootRecord {
+                first_series_id: first,
+                last_series_id: last,
+                first_min_t: min_t,
+                offset: offset - index_offset,
+                entry_count: count,
+                body_crc32c: h.body_crc32c,
+            });
+            return Ok(false);
+        }
+        let f = self.finishing.take().expect("finishing");
+        let written = self.end_file(f)?;
+        self.finished = Some(written);
+        Ok(true)
+    }
+
+    fn begin_finish(&mut self) -> Result<(), WriteError> {
         if self.stream.is_some() {
             return Err(content("finished while a series is open"));
         }
@@ -696,7 +763,7 @@ impl<W: Write> FileWriter<W> {
         {
             return Err(content("description flags disagree with the content"));
         }
-        let Some((first, last)) = self.range else {
+        let Some(range) = self.range else {
             return Err(content("a file holds at least one position"));
         };
         let mut positions: Vec<(u32, u64)> = Vec::new();
@@ -746,20 +813,37 @@ impl<W: Write> FileWriter<W> {
         let (times_dir_offset, tdh) =
             self.block(block_type::TIMES_DIRECTORY, &encode_times_directory(&times))?;
         let mut index = std::mem::take(&mut self.index);
-        index.sort_by_key(sort_key);
+        index.sort_unstable_by_key(sort_key);
         let index_offset = if index.is_empty() { 0 } else { self.offset };
-        let mut roots = Vec::with_capacity(index.len().div_ceil(INDEX_BLOCK_ENTRIES));
-        for entries in index.chunks(INDEX_BLOCK_ENTRIES) {
-            let (offset, h) = self.block(block_type::INDEX, &encode_index_block(entries))?;
-            roots.push(RootRecord {
-                first_series_id: entries[0].series_id,
-                last_series_id: entries[entries.len() - 1].series_id,
-                first_min_t: entries[0].min_t,
-                offset: offset - index_offset,
-                entry_count: entries.len() as u32,
-                body_crc32c: h.body_crc32c,
-            });
-        }
+        let roots = Vec::with_capacity(index.len().div_ceil(INDEX_BLOCK_ENTRIES));
+        self.finishing = Some(Finishing {
+            range,
+            used,
+            times_offset,
+            times_dir_offset,
+            times_dir_crc32c: tdh.body_crc32c,
+            times_count: times.len() as u32,
+            index,
+            at: 0,
+            index_offset,
+            roots,
+        });
+        Ok(())
+    }
+
+    fn end_file(&mut self, f: Finishing) -> Result<Written, WriteError> {
+        let Finishing {
+            range: (first, last),
+            used,
+            times_offset,
+            times_dir_offset,
+            times_dir_crc32c,
+            times_count,
+            index,
+            index_offset,
+            roots,
+            ..
+        } = f;
         let (index_root_offset, rh) = self.block(block_type::ROOT, &encode_root(&roots))?;
         let no_fact = self.fact_count == 0;
         let trailer = Trailer {
@@ -772,7 +856,7 @@ impl<W: Write> FileWriter<W> {
             min_t: if no_fact { 0 } else { self.min_t },
             max_reach: if no_fact { 0 } else { self.max_reach },
             chunk_count: u32::try_from(index.len()).map_err(|_| content("too many chunks"))?,
-            times_count: times.len() as u32,
+            times_count,
             entries_offset: self.entries_offset,
             times_offset,
             times_dir_offset,
@@ -780,7 +864,7 @@ impl<W: Write> FileWriter<W> {
             index_root_offset,
             file_crc32c: self.crc.clone().finish(),
             root_crc32c: rh.body_crc32c,
-            times_dir_crc32c: tdh.body_crc32c,
+            times_dir_crc32c,
             description_crc32c: self.description_crc,
             entries_crc32c: self.entries_crc,
         };
@@ -789,13 +873,10 @@ impl<W: Write> FileWriter<W> {
         let (trailer_offset, _) = self.block(block_type::TRAILER, &body)?;
         self.put(&encode_end_marker(trailer_offset))?;
         let layout = Layout::of(&self.id, &self.description, &trailer);
-        Ok((
-            self.out,
-            Written {
-                len: self.offset,
-                trailer,
-                layout,
-            },
-        ))
+        Ok(Written {
+            len: self.offset,
+            trailer,
+            layout,
+        })
     }
 }
