@@ -14,9 +14,11 @@ use crate::env::MemFs;
 use crate::types::Intent;
 
 /// Advances the clock an interval at a time until the newest root on disk satisfies `done`.
-fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) {
+fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) -> usize {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut steps = 0;
     loop {
+        steps += 1;
         let step = Duration::from_secs(16 * 60);
         st.clock.advance(step);
         skew().fetch_add(
@@ -29,7 +31,7 @@ fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) {
             .read_dir(&st.dir.join(DIR))
             .is_ok_and(|es| es.iter().any(|e| e.name.starts_with("root-")));
         if has_root && done(&newest_root(&st.fs, &st.dir)) {
-            return;
+            return steps;
         }
         assert!(
             Instant::now() < deadline,
@@ -125,9 +127,13 @@ fn a_damaged_part_is_rebuilt_at_the_first_scrub_after_a_start() {
     st.fs
         .poke(&path, (bad.byte_len / 2) as usize, &[0xff, 0x00, 0xff]);
     st.reopen();
-    step_until(&st, "the damaged part is replaced", |r| {
+    let steps = step_until(&st, "the damaged part is replaced", |r| {
         !r.parts.iter().any(|x| x.file_id == bad.file_id)
     });
+    assert!(
+        steps <= 4,
+        "found by the scrub, not by a merge a day later: {steps} steps"
+    );
     st.stop();
     let (root, vis) = tree_state(&st.fs, &st.dir);
     assert!(

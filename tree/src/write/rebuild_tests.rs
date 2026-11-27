@@ -7,6 +7,7 @@ use proptest::prelude::*;
 
 use super::tests::{Current, S, SERIES, Stop, World, id, params, pos};
 use super::*;
+use crate::node::Value;
 use crate::set::{self, DAY, Policy, QUARTER, Seen, settled_period, visible};
 
 const POLICY: Policy = Policy {
@@ -418,4 +419,65 @@ fn a_reopened_floor_rises_to_the_new_checkpoints_seq() {
     assert!(again.rebuilding && again.seq > first.seq);
     close_floors(&mut w).unwrap();
     t3(&w);
+}
+
+#[test]
+fn a_part_unlike_its_record_in_the_root_is_damaged_though_it_decodes() {
+    let mut w = World::new();
+    w.append(&[(0, 10 * S, Some(1.0))]);
+    w.sync();
+    w.checkpoint().unwrap();
+    let f = w.files.as_mut().unwrap();
+    assert!(f.scrub().is_empty());
+    f.root.parts[0].seq += 1;
+    let id = f.root.parts[0].file_id;
+    assert_eq!(f.scrub(), vec![id]);
+}
+
+#[test]
+fn backfill_covers_finer_levels_only_within_minute_keep_and_rollups_only_over_settled_days() {
+    let now = 100 * DAY + 5 * QUARTER;
+    let c = backfill_cover(&LEVELS, Some(10 * DAY), None, now, &POLICY);
+    let of = |l: u8| c.iter().find(|x| x.level == l).copied();
+    assert_eq!(of(1).unwrap().from, 93 * DAY + 5 * QUARTER);
+    assert_eq!(of(2).unwrap().from, 10 * DAY);
+    assert_eq!(
+        (of(4).unwrap().from, of(4).unwrap().to),
+        (10 * DAY, 99 * DAY)
+    );
+    assert_eq!(of(3).unwrap().to, 99 * DAY);
+}
+
+#[test]
+fn series_entries_leave_out_the_rollups_keep_refuses() {
+    let facts: Vec<Fact> = (0..4)
+        .map(|i| Fact {
+            t: i * 3 * QUARTER,
+            reading: Some(Value::F64(1.0)),
+            at: pos(i as u64 + 1),
+        })
+        .collect();
+    let levels = folded_levels(&LEVELS);
+    let all = series_entries(&LEVELS, &levels, &params(), &facts, |_, _, _| true);
+    assert!(all.iter().any(|(l, _)| *l == 3) && all.iter().any(|(l, _)| *l == 4));
+    let some = series_entries(&LEVELS, &levels, &params(), &facts, |l, a, _| {
+        l != 3 || a != 0
+    });
+    assert!(!some.iter().any(|(l, e)| *l == 3 && e.start == 0));
+    assert!(some.iter().any(|(l, _)| *l == 4));
+}
+
+#[test]
+fn a_settled_period_is_the_widest_whose_merge_is_due_and_no_wider() {
+    let monday = 4 * DAY;
+    let t = monday + 2 * DAY;
+    let week_due = monday + 7 * DAY + 14 * DAY;
+    assert_eq!(
+        settled_period(t, week_due, &POLICY),
+        Some((monday, (7 * DAY) as u64))
+    );
+    assert_eq!(
+        settled_period(t, week_due - 1, &POLICY),
+        Some((t, DAY as u64))
+    );
 }
