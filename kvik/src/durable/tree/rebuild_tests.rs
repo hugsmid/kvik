@@ -13,9 +13,12 @@ use crate::durable::{lock, windows};
 use crate::env::MemFs;
 use crate::types::Intent;
 
-/// Advances the clock an interval at a time until the newest root on disk satisfies `done`.
-fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) -> usize {
+/// Advances the clock an interval at a time until the newest root on disk satisfies `done`; returns the number of
+/// intervals. With `lockstep`, each interval waits for the job to have stepped at the new time, so the count is the
+/// job's (the job thread wakes about once a second, so only for short waits).
+fn advance_until(st: &Store, what: &str, lockstep: bool, done: impl Fn(&Root) -> bool) -> usize {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let job = st.w.tree.clone().expect("a tree job");
     let mut steps = 0;
     loop {
         steps += 1;
@@ -25,7 +28,19 @@ fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) -> usize {
             u64::try_from(step.as_nanos()).unwrap(),
             std::sync::atomic::Ordering::SeqCst,
         );
-        std::thread::sleep(Duration::from_millis(30));
+        let at = st.clock.wall().0;
+        if lockstep {
+            while job.stepped_wall() < at {
+                assert!(
+                    Instant::now() < deadline,
+                    "no job step where {what}: {:?}",
+                    st.w.health()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(30));
+        }
         let has_root = st
             .fs
             .read_dir(&st.dir.join(DIR))
@@ -39,6 +54,10 @@ fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) -> usize {
             st.w.health()
         );
     }
+}
+
+fn step_until(st: &Store, what: &str, done: impl Fn(&Root) -> bool) -> usize {
+    advance_until(st, what, false, done)
 }
 
 fn newest_root(fs: &MemFs, dir: &Path) -> Root {
@@ -127,7 +146,7 @@ fn a_damaged_part_is_rebuilt_at_the_first_scrub_after_a_start() {
     st.fs
         .poke(&path, (bad.byte_len / 2) as usize, &[0xff, 0x00, 0xff]);
     st.reopen();
-    let steps = step_until(&st, "the damaged part is replaced", |r| {
+    let steps = advance_until(&st, "the damaged part is replaced", true, |r| {
         !r.parts.iter().any(|x| x.file_id == bad.file_id)
     });
     assert!(
@@ -197,3 +216,4 @@ fn a_backfill_reaches_full_cover_and_equals_the_live_tree_after_merges_and_a_kil
     assert_eq!(both(&live), both(&rebuilt), "T3: as_of included");
     assert!(both(&live).keys().any(|k| k.1 == 4));
 }
+

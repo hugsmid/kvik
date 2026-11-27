@@ -87,6 +87,9 @@ struct State {
     failed: Option<String>,
     /// When the scrub is next due; `None` until the first maintenance after a start.
     scrub_due: Option<Duration>,
+    /// The wall clock at the last step's start, for tests that step the clock in lockstep with the job.
+    #[cfg(test)]
+    stepped_wall: i64,
 }
 
 /// What a job runs on besides the store's files.
@@ -122,6 +125,10 @@ impl Job {
         let mut st = lock(&self.state);
         st.first_step.get_or_insert(now);
         st.last_step = now;
+        #[cfg(test)]
+        {
+            st.stepped_wall = self.env.clock.wall().0;
+        }
         if st.files.is_none() {
             if let Err(e) = self.start(&mut st, synced, now) {
                 st.failed = Some(e);
@@ -175,6 +182,12 @@ impl Job {
         let after = i64::try_from(AFTER_QUARTER.as_nanos()).unwrap_or(0);
         let next = wall - (wall - after).rem_euclid(step) + step;
         Duration::from_nanos(u64::try_from(next - wall).unwrap_or(0))
+    }
+
+    /// The wall clock at the start of the last step, read once that step has finished.
+    #[cfg(test)]
+    pub(crate) fn stepped_wall(&self) -> i64 {
+        lock(&self.state).stepped_wall
     }
 
     /// Gives the job the store's reader (Q-1951).
