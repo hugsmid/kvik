@@ -3,6 +3,9 @@
 //! the caller's; this module keeps invariants T5, T6 and T8.
 
 mod nodes;
+mod rebuild;
+#[cfg(test)]
+mod rebuild_tests;
 #[cfg(test)]
 mod tests;
 
@@ -18,6 +21,7 @@ use kvik_log::mark::ResetStamp;
 use kvik_log::writer::Position;
 
 pub use nodes::{Fact, folded_levels, quarter_entries};
+pub use rebuild::{Rebuild, Runs, backfill_cover, series_entries};
 
 use crate::frame::EncodeError;
 use crate::level::{LEVELS, Level};
@@ -96,6 +100,20 @@ pub enum WriteError {
         /// The root's.
         root: Position,
     },
+    /// A rebuild is not at the root's K.
+    #[error("rebuild at {k:?}, not at the root's K {root:?}")]
+    NotAtCheckpoint {
+        /// The rebuild's cut.
+        k: Position,
+        /// The root's.
+        root: Position,
+    },
+    /// A live part is missing, short or corrupt; the scrub rebuilds its period.
+    #[error("part {0:#x} is damaged")]
+    Damaged(u64),
+    /// A merge or roll-up could not be formed.
+    #[error(transparent)]
+    Merge(#[from] crate::set::MergeError),
     /// A part or root would not encode.
     #[error(transparent)]
     Encode(#[from] EncodeError),
@@ -385,15 +403,16 @@ impl TreeFiles {
         let mut next = self.root.clone();
         next.checkpoint = k;
         for &series in rebuilding {
-            if let Err(i) = next.floors.binary_search_by_key(&series, |f| f.series) {
-                next.floors.insert(
-                    i,
-                    root::Floor {
-                        series,
-                        seq,
-                        rebuilding: true,
-                    },
-                );
+            let open = root::Floor {
+                series,
+                seq,
+                rebuilding: true,
+            };
+            match next.floors.binary_search_by_key(&series, |f| f.series) {
+                Err(i) => next.floors.insert(i, open),
+                // A closed floor rises: what was rebuilt before this entry is no longer the series' truth.
+                Ok(i) if !next.floors[i].rebuilding => next.floors[i] = open,
+                Ok(_) => {}
             }
         }
         self.publish(next, parts, wall, now)

@@ -14,10 +14,27 @@ use jiff::tz::TimeZone;
 
 use crate::registry::Timing;
 use crate::summary::{Node, Params, credit_intervals, direct, merge, merge_all, with_stretches};
-use crate::types::{MINUTE, Nanos, QUARTER, Value, floor_to};
+use crate::types::{DAY, Fact, HOUR, MINUTE, Nanos, Position, QUARTER, Value, floor_to};
 
 /// Node widths of the stored levels: index 0 is 1 minute, 1 is 15 minutes.
 pub const LEVELS: [Nanos; 2] = [MINUTE, QUARTER];
+
+/// Widths of the UTC roll-ups over the 15-minute level (design 7.1b section 2, Q-1421): 2 hours and 1 day.
+pub const ROLLUPS: [Nanos; 2] = [2 * HOUR, DAY];
+
+/// A node's version (Q-1422, Q-2060): the highest position among the current facts of `[start, end)`, summarised
+/// or not; `None` when the span holds none.
+pub fn as_of<'a>(
+    facts: impl IntoIterator<Item = &'a Fact>,
+    start: Nanos,
+    end: Nanos,
+) -> Option<Position> {
+    facts
+        .into_iter()
+        .filter(|f| start <= f.t && f.t < end)
+        .map(|f| f.position)
+        .max()
+}
 
 /// Errors from calendar evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -180,6 +197,26 @@ impl SeriesTree {
             .get(&start)
             .cloned()
             .unwrap_or_else(|| Node::empty(self.params.kind, start, start + width))
+    }
+
+    /// The roll-up of [`ROLLUPS`] width `width` at `start` (design 7.1b section 2, T2): the merge of its 15-minute
+    /// nodes, present only when the series stores that level and one of them is non-empty.
+    pub fn rollup(&self, width: Nanos, start: Nanos) -> Option<Node> {
+        assert!(ROLLUPS.contains(&width), "not a roll-up width");
+        assert_eq!(start, floor_to(start, width), "unaligned roll-up start");
+        if !self.params.stores(1) {
+            return None;
+        }
+        let quarters: Vec<Node> = (0..width / QUARTER)
+            .map(|i| self.node(1, start + i * QUARTER))
+            .collect();
+        if quarters.iter().all(Node::is_empty) {
+            return None;
+        }
+        let mut n = merge_all(&self.params, start, quarters.iter());
+        n.start = start;
+        n.end = start + width;
+        Some(n)
     }
 
     /// Whether the series stores the level (§5.1 density rule).
@@ -498,5 +535,86 @@ impl SlidingWindow {
             &tree.core(q_hi, end),
         );
         with_stretches(p, merged, tree.last_before(start).as_ref(), end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Flags, Kind, Quality, SECOND, SeriesId};
+
+    fn params() -> Params {
+        Params {
+            expected_interval: Some(5 * SECOND),
+            ..Params::new(Kind::Gauge, 600 * SECOND)
+        }
+    }
+
+    fn fact(t: Nanos, seq: u64, quality: Quality) -> Fact {
+        Fact {
+            series: SeriesId(1),
+            t,
+            position: Position {
+                generation: 0,
+                sequence: seq,
+            },
+            received_at: t,
+            value: Value::Num(1.0),
+            quality,
+            supplied_quality: quality,
+            changed_at: None,
+            flags: Flags::default(),
+        }
+    }
+
+    #[test]
+    fn a_rollup_is_the_merge_of_its_quarters_and_absent_when_every_quarter_is_empty() {
+        let rs = vec![
+            (DAY + 10 * SECOND, Value::Num(1.0)),
+            (DAY + 3 * HOUR, Value::Num(4.0)),
+        ];
+        let tree = SeriesTree::build(params(), &rs);
+        let two = tree.rollup(2 * HOUR, DAY).expect("a reading in the span");
+        let quarters: Vec<Node> = (0..8).map(|i| tree.node(1, DAY + i * QUARTER)).collect();
+        let mut want = merge_all(&tree.params, DAY, quarters.iter());
+        want.end = DAY + 2 * HOUR;
+        assert_eq!(two, want);
+        assert_eq!(tree.rollup(2 * HOUR, DAY + 4 * HOUR), None);
+        let day = tree.rollup(DAY, DAY).unwrap();
+        let twos: Vec<Node> = (0..12)
+            .map(|i| {
+                tree.rollup(2 * HOUR, DAY + i * 2 * HOUR)
+                    .unwrap_or_else(|| {
+                        Node::empty(Kind::Gauge, DAY + i * 2 * HOUR, DAY + (i + 1) * 2 * HOUR)
+                    })
+            })
+            .collect();
+        let mut want = merge_all(&tree.params, DAY, twos.iter());
+        want.end = 2 * DAY;
+        assert_eq!(day, want, "the day is the merge of its 2-hour roll-ups");
+        let sparse = Params {
+            expected_interval: Some(HOUR),
+            ..params()
+        };
+        assert_eq!(SeriesTree::build(sparse, &rs).rollup(DAY, DAY), None);
+    }
+
+    #[test]
+    fn as_of_is_the_highest_position_in_the_span_bad_quality_included() {
+        let fs = [
+            fact(10, 4, Quality::Good),
+            fact(20, 9, Quality::Bad),
+            fact(QUARTER, 12, Quality::Good),
+        ];
+        let p = |s| {
+            Some(Position {
+                generation: 0,
+                sequence: s,
+            })
+        };
+        assert_eq!(as_of(&fs, 0, QUARTER), p(9));
+        assert_eq!(as_of(&fs, 0, 15), p(4));
+        assert_eq!(as_of(&fs, QUARTER, 2 * QUARTER), p(12));
+        assert_eq!(as_of(&fs, 2 * QUARTER, 3 * QUARTER), None);
     }
 }

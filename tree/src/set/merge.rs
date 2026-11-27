@@ -239,7 +239,7 @@ where
     Ok(())
 }
 
-fn rolled(
+pub(crate) fn rolled(
     p: &Params,
     series: u64,
     x: i64,
@@ -381,7 +381,7 @@ pub(crate) fn ceil(x: i64, w: i64) -> i64 {
 }
 
 /// Sorted by level and start, overlapping and touching ranges joined.
-fn normalise(mut v: Vec<Covered>) -> Vec<Covered> {
+pub(crate) fn normalise(mut v: Vec<Covered>) -> Vec<Covered> {
     v.sort_by_key(|c| (c.level, c.from));
     let mut out: Vec<Covered> = Vec::with_capacity(v.len());
     for c in v {
