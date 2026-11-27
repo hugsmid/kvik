@@ -49,6 +49,9 @@ pub enum MergeError {
     /// A child node is not of the kind the series' parameters give.
     #[error("series {0} has a node of another kind than its parameters")]
     Kind(u64),
+    /// A roll-up merge has no parameters for a series with entries in its periods (Q-1821).
+    #[error("series {0} has entries in the periods but no parameters for its roll-ups")]
+    NoParams(u64),
 }
 
 /// Merges the plan's inputs into one part per output period that keeps an entry (section 5 Merges): per key the

@@ -476,3 +476,153 @@ fn the_planner_takes_a_delta_run_with_its_same_seq_siblings() {
     let p = plan(&root_with(parts, Vec::new()), T0 + 6 * HOUR, &POLICY);
     assert_eq!(p[0].inputs, vec![1, 2, 3, 4]);
 }
+
+#[test]
+fn a_day_holding_only_a_run_output_gets_its_day_part_after_its_late_window() {
+    let r = root_with(deltas(8, T0), vec![all(2, T0, T0 + DAY)]);
+    let p = plan(&r, T0 + 10 * HOUR, &POLICY);
+    assert!(p.len() == 1 && !p[0].rollups, "{p:?}");
+    let r = root_with(
+        vec![pref(500, 8, Class::Merged, T0, DAY)],
+        vec![all(2, T0, T0 + DAY)],
+    );
+    let p = plan(&r, T0 + 2 * DAY, &POLICY);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].rollups && p[0].inputs == vec![500]);
+    assert_eq!(p[0].periods, vec![(T0, DAY as u64)]);
+}
+
+#[test]
+fn a_week_with_a_day_of_only_a_run_output_still_progresses() {
+    let monday = T0 + 4 * DAY;
+    let mut parts = vec![pref(500, 8, Class::Merged, monday, DAY)];
+    parts
+        .extend((1..7).map(|i| pref(500 + i, 20 + i, Class::Merged, monday + i as i64 * DAY, DAY)));
+    let cov = vec![
+        all(2, monday, monday + WEEK),
+        all(3, monday + DAY, monday + WEEK),
+        all(4, monday + DAY, monday + WEEK),
+    ];
+    let p = plan(&root_with(parts, cov), monday + 60 * DAY, &POLICY);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].rollups && p[0].inputs == vec![500]);
+}
+
+#[test]
+fn an_open_day_is_not_merged_with_rollups_however_overlaid() {
+    let mut parts = vec![pref(100, 8, Class::Merged, T0, DAY)];
+    parts.extend((0..5).map(|i| {
+        pref(
+            110 + i,
+            10 + i,
+            Class::Delta,
+            T0 + (3 + i as i64) * HOUR,
+            HOUR,
+        )
+    }));
+    let r = root_with(parts, vec![all(2, T0, T0 + 8 * HOUR)]);
+    let p = plan(&r, T0 + 8 * HOUR + 15 * MINUTE, &POLICY);
+    assert!(p.iter().all(|x| !x.rollups), "{p:?}");
+}
+
+#[test]
+fn a_rollup_merge_refuses_a_series_without_parameters() {
+    let parts = [quarter_part(1, 4, 0)];
+    let r = listed(&parts);
+    let plan = Plan {
+        inputs: vec![1],
+        periods: vec![(T0, DAY as u64)],
+        rollups: true,
+        minute_from: i64::MIN,
+    };
+    let out = merge(&r, &parts, &plan, &part_header(0), |_| None);
+    assert_eq!(out, Err(MergeError::NoParams(1)));
+    let out = merge(
+        &r,
+        &parts,
+        &Plan {
+            rollups: false,
+            ..plan
+        },
+        &part_header(0),
+        |_| None,
+    );
+    assert!(out.is_ok());
+}
+
+#[test]
+fn the_planner_survives_a_part_at_the_least_instant() {
+    let mut r = root_with(vec![pref(1, 1, Class::Merged, i64::MIN, DAY)], Vec::new());
+    r.parts[0].greatest_end = i64::MIN + HOUR;
+    assert!(Root::decode(&r.encode().unwrap()).is_ok());
+    let _ = plan(&r, T0, &POLICY);
+}
+
+#[test]
+fn the_planner_survives_a_crossing_part_ending_at_the_greatest_instant() {
+    let mut r = root_with(
+        vec![pref(1, 1, Class::Delta, i64::MAX - 2 * DAY, 2 * DAY)],
+        Vec::new(),
+    );
+    r.parts[0].greatest_end = i64::MAX;
+    assert!(Root::decode(&r.encode().unwrap()).is_ok());
+    let _ = plan(&r, T0, &POLICY);
+}
+
+#[test]
+fn a_delta_tied_in_seq_with_a_part_the_run_cannot_take_stays_out() {
+    let mut parts = deltas(7, T0);
+    parts.push(pref(9, 4, Class::Merged, T0 + 12 * HOUR, HOUR));
+    let p = plan(&root_with(parts, Vec::new()), T0 + 20 * HOUR, &POLICY);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].inputs, vec![1, 2, 3]);
+}
+
+#[test]
+fn a_day_part_waits_while_a_wider_part_overlaps_the_day() {
+    let monday = T0 + 4 * DAY;
+    let parts = vec![
+        pref(1, 1, Class::Delta, monday + DAY, HOUR),
+        pref(2, 2, Class::Merged, monday, WEEK),
+    ];
+    let r = root_with(parts, vec![all(2, monday, monday + WEEK)]);
+    assert!(plan(&r, monday + 3 * DAY, &POLICY).is_empty());
+}
+
+#[test]
+fn a_merge_writes_no_part_for_a_period_that_keeps_no_entry() {
+    let parts = [quarter_part(1, 4, 0)];
+    let out = try_merge(
+        &parts,
+        vec![1],
+        vec![(T0, DAY as u64), (T0 + DAY, DAY as u64)],
+        false,
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].period_start, T0);
+}
+
+#[test]
+fn a_rollup_merge_writes_no_rollup_over_an_uncovered_quarter() {
+    let parts = [quarter_part(1, 4, 0), quarter_part(2, 5, 40)];
+    let mut r = listed(&parts);
+    r.covered = vec![all(2, T0, T0 + 2 * HOUR)];
+    let plan = Plan {
+        inputs: vec![1, 2],
+        periods: vec![(T0, DAY as u64)],
+        rollups: true,
+        minute_from: i64::MIN,
+    };
+    let out = merge(&r, &parts, &plan, &part_header(0), |_| {
+        Some(Params::new(Kind::Gauge, None))
+    })
+    .unwrap();
+    let rolled: Vec<(u8, i64)> = out[0]
+        .runs
+        .iter()
+        .filter(|run| run.level > 2)
+        .flat_map(|run| run.entries.iter().map(move |e| (run.level, e.start)))
+        .collect();
+    assert_eq!(rolled, vec![(3, T0)]);
+}
