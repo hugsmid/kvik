@@ -238,6 +238,8 @@ fn scan_segment(
     }
     let mut batches = Vec::new();
     for (b, content) in r.batches.iter().zip(contents) {
+        // The scan keeps a batch only once every body decoded and a recovery entry is alone, so this refusal is a
+        // defence, not a path.
         let content = content.ok_or(StoreError::Corrupt("batch content"))?;
         batches.push(B {
             offset: b.offset,
