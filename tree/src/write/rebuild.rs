@@ -327,11 +327,7 @@ impl TreeFiles {
     /// The roll-up entries a checkpoint of `entries` must also write (section 5 step 3, T2): each roll-up span over a
     /// changed quarter-hour entry that is covered, recomputed from the visible children overlaid by `entries`; an
     /// empty marker where no child is left.
-    pub fn ancestors<F>(
-        &self,
-        entries: &Runs,
-        params: F,
-    ) -> Result<Runs, WriteError>
+    pub fn ancestors<F>(&self, entries: &Runs, params: F) -> Result<Runs, WriteError>
     where
         F: Fn(u64) -> Option<Params>,
     {

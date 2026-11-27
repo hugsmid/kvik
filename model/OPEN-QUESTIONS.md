@@ -5378,7 +5378,8 @@ facts through a reader, and a process that has not read opens one by reading the
 does (the registry file is written from the deliverer's index without reading the log).
 **Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
 leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
-that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it.
+that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it. Kept by 71b-4, which
+adds that a clean shutdown runs no maintenance either (no rebuild, scrub, backfill or merge).
 
 ## Q-1951 — One reader for the tree's checkpoints and the process's reads
 Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
@@ -5386,6 +5387,41 @@ Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
 start opened it only to learn whether the store held a series.
 **Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
 if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
+
+## Q-2060 — The node version and registry entries
+Decided with roadmap 7.1b step 4 (`tree/src/write/nodes.rs` `quarter_entries`, `model/src/tree.rs` `as_of`),
+provisional; settle with 72-1 (the version rule).
+**Scenario.** Q-1422 makes `as_of` the highest position among the span's current facts, or the position of the latest
+registry entry that changed the series' nodes if higher. The registry holds no position per series, so a rebuild
+from the log could not give the second without a scan of every entry.
+**Decision (provisional).** `as_of` is the highest position among the span's current facts, bad-quality facts
+included; a roll-up's is its children's highest. A node-changing entry is seen through the series' floor instead: a
+cache keys on the floor's `seq` with `as_of`. Live and rebuilt trees agree (T3), and the model's `as_of` is the same.
+
+## Q-2061 — The late window before a day's part and roll-ups
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `POLICY`), provisional; settle on 72-2's backfill
+storms.
+**Scenario.** The merge planner waits a late window after a UTC day ends before writing its day part and roll-ups;
+design section 5 names the window but not its length.
+**Decision (provisional).** One day. Late data after it still lands: the checkpoint recomputes the covered roll-ups
+over each changed quarter-hour from the visible children (T2).
+
+## Q-2062 — Where a backfill stops walking back
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job/maintain.rs` `backfill`), provisional.
+**Scenario.** A backfill rebuilds newest period first, but the store keeps no cheap earliest time across series, so
+the walk cannot tell when it has passed the oldest fact.
+**Decision (provisional).** The first range is from the start of today's UTC day upwards; then each settled period
+below (days, weeks, 13 and 52 weeks as alignment allows). A period holding no fact of any served series ends the walk:
+the same rebuild takes everything below it and the quarter-hour level is then covered without bound. A gap of a whole
+period in the data therefore reads all older facts in one rebuild, which is still each fact once.
+
+## Q-2063 — The scrub's cadence
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
+**Scenario.** Section 7 has the writer's scrub find a damaged part and rebuild its period, without a cadence; reading
+every live part costs a pass over the tree.
+**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge that meets
+a damaged input runs it at once. The rebuild covers the part's period widened to every live part it overlaps, which it
+retires, so that it is the whole truth of that period.
 
 ## Open at v0.2
 

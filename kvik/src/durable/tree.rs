@@ -3,6 +3,8 @@
 
 pub(crate) mod dirty;
 pub(crate) mod job;
+#[cfg(test)]
+mod rebuild_tests;
 pub(crate) mod stretch;
 #[cfg(test)]
 mod tests;
