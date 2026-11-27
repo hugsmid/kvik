@@ -5388,6 +5388,15 @@ start opened it only to learn whether the store held a series.
 **Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
 if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
 
+## Q-1952 — A fan-out session answers a race with an older value
+Recorded with roadmap 7.1b step 3, open; for a fix of the live fan-out (`kvik/src/durable/read/live/fanout.rs`).
+**Scenario.** The property `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive`
+found a history (pinned, ignored, as `a_race_between_two_rounds_of_one_series_delivers_the_later_value`) in which a
+session polled only when rung answers a `Latest` read with the value at sequence 6 where every-round sessions and the
+model give the one at sequence 11. It fails the same way on public main.
+**Recommended default.** Treat as a delivery bug: a later value of a series in the round that races the session's turn
+must reach it. Fix with the fan-out, then remove the `ignore`.
+
 ## Q-2060 — The node version and registry entries
 Decided with roadmap 7.1b step 4 (`tree/src/write/nodes.rs` `quarter_entries`, `model/src/tree.rs` `as_of`),
 provisional; settle with 72-1 (the version rule).

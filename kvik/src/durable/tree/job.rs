@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use kvik_log::manifest::LostRange;
-use kvik_log::writer::Position as LogPos;
+use kvik_log::writer::{Position as LogPos, Watch};
 use kvik_model::summary::Params;
 use kvik_tree::Level;
 use kvik_tree::part::Entry;
@@ -66,6 +66,7 @@ pub(crate) struct Job {
     fresh: bool,
     dirty: Arc<Dirty>,
     readers: OnceLock<Readers>,
+    marks: OnceLock<Watch>,
     interval: Duration,
     state: Mutex<State>,
 }
@@ -115,6 +116,7 @@ impl Job {
             fresh: p.fresh,
             dirty: p.dirty,
             readers: OnceLock::new(),
+            marks: OnceLock::new(),
             interval: INTERVAL,
             state: Mutex::new(State::default()),
         }
@@ -195,6 +197,11 @@ impl Job {
         let _ = self.readers.set(f);
     }
 
+    /// Gives the job the log's watch, through which an interval checkpoint has the mark synced through its K (Q-2180).
+    pub(crate) fn marks(&self, w: Watch) {
+        let _ = self.marks.set(w);
+    }
+
     /// Whether a loss this run found, that no lost range of the manifest held at the start, begins at or below `k`
     /// (Q-1429).
     fn lost_below(&self, k: LogPos) -> bool {
@@ -240,8 +247,16 @@ impl Job {
             };
         };
         let v = r.snapshot().map_err(|e| format!("tree cut: {e}"))?;
-        let out = self
-            .checkpoint_at(st, &r, &v, synced, now)
+        let k = v.cut().durable;
+        let synced = match self.marks.get() {
+            // Section 5 step 2: the root names K only once the mark on stable storage does (Q-2180).
+            Some(w) if !stopping && k > synced => {
+                w.sync_mark().map_err(|e| format!("tree mark sync: {e}"))
+            }
+            _ => Ok(synced),
+        };
+        let out = synced
+            .and_then(|synced| self.checkpoint_at(st, &r, &v, synced, now))
             .and_then(|()| match stopping {
                 true => Ok(false),
                 false => self.maintain(st, &r, &v, now),

@@ -430,3 +430,19 @@ fn a_round_ending_inside_the_turn_that_opens_a_tail_is_delivered_to_it() {
     ));
     assert!(r.is_ok(), "{r:?}");
 }
+
+#[test]
+#[ignore = "Q-1952: fails on public main; for the fan-out fix"]
+fn a_race_between_two_rounds_of_one_series_delivers_the_later_value() {
+    let r = run((
+        vec![(2, 149, true), (0, 0, false)],
+        vec![
+            Step::Emit(vec![(42, 0, 249)]),
+            Step::Race(29, vec![(95, 0, 0)]),
+            Step::Emit(vec![(129, 0, 0)]),
+            Step::Emit(vec![(0, 1, 0), (0, 0, 1), (0, 1, 1), (0, 0, 38), (0, 0, 3)]),
+            Step::Advance(0),
+        ],
+    ));
+    assert!(r.is_ok(), "{r:?}");
+}
