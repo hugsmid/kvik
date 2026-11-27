@@ -223,6 +223,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
 | Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (decided at review, provisional; settle with cond2 step 6) |
 | Q-2220 | §6 Gates, Resume; Q-132 | A resync's confirmation over replayed transitions is written at once (decided in the fix round) |
+| Q-2250 | §4.3 held snapshot; G5 | When a run takes the snapshot that becomes `held`: only with nothing outstanding and nothing deferred (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2251 | §6 Gates, Resume; Q-2003 | Deferred transitions older than a dropped one, delivered after the resync that ended the quiet (decided by the lead, provisional; settle with cond2 step 5) |
 | Q-2270 | §6 Gates, Resume; Q-1396, Q-2002 | The checkpoint while a quiet catch-up ends with a resync (decided at merge) |
 | Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (open, for the lead) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
@@ -5657,6 +5659,30 @@ returned. Found by the crash property at its full case count.
 **Decision.** Every gate confirmation, a transition or a resync's frontier, writes the cursor file before `confirm`
 returns, as a latch change does. A resync is confirmed once a resume, so the extra writes are few.
 **Pinned by.** `kvik/tests/gates_durable.rs` `a_confirmed_start_transition_does_not_come_again_after_three_crashes`.
+
+## Q-2250 — When a run takes the snapshot that becomes `held`
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A consumer that is behind with nothing outstanding can hold transitions in `deferred`, judged in an
+earlier batch. A snapshot taken at the next batch is after their judgement, and the catch-up then makes it `held`
+under them (G5).
+**Decision (provisional).** A run takes the snapshot that becomes `held` only when `outstanding` and `deferred` are
+both empty: in `gate_batch` and in `ready`. `gate_confirm` takes none; it clears `pre`, and the next `ready` retakes it
+under the same condition. Settle with cond2 step 5, which writes `held` as the checkpoint.
+**Pinned by.** `kvik/tests/gates_snapshot.rs`
+`a_transition_deferred_while_behind_is_delivered_once_after_later_batches_judge_nothing`; the S5 test
+`the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement` still holds.
+**At the step 5 merge.** The condition is written as `held` none: the durable hold sets `held` at every judged
+transition and keeps it while one is outstanding, deferred or dropped (Q-2270), so it is the same condition.
+
+## Q-2251 — Deferred transitions older than a dropped one, after the resync that ended the quiet
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A resync that ends a quiet clears `quiet` while `deferred` may hold transitions above the resync's
+position and older than the ones dropped; they arrive after it with a state it superseded.
+**Decision (provisional).** Keep, as Q-2003 accepts (`set_by` names the newer id). `api.md` is not changed here: a
+transition whose id is below a resync's `set_by` for its instance is superseded. Not probed in this round; settle
+by step 5's merge.
+**At the step 5 merge.** Unchanged: the checkpoint hold (Q-2270) does not move `held` past these transitions,
+and a quiet ended by a resync below a dropped id keeps the checkpoint until a later confirmation covers it.
 
 ## Q-2270 — The checkpoint while a quiet catch-up ends with a resync
 Decided when the overflow resync (Q-2002) met the durable checkpoint (Q-2086).
