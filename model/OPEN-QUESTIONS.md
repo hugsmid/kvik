@@ -5238,6 +5238,16 @@ range's reset point by the durable backend and none by the model. **Open; recomm
 kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
 until then the history property stops restarting and comparing deliveries once an entry is lost.
 
+## Q-1621 — A start whose position the synced mark cannot reach
+
+§3 Durable mark, §4 New consumer; invariants 25 and 26. A cursor file never names a position above the last synced
+mark, so a start beyond it cannot write its cursor at once. Writing the mark's last position instead resumes the
+consumer below its start after a crash, under a reset point it was never meant to meet; writing nothing loses the
+start. **Settled by the lead, 27 November:** as the durable backend, the start's write stays pending, the cursor
+file keeps what it held, and the write lands when a mark sync reaches it; a confirmation meanwhile raises the pending
+position; a crash first drops it (`model/tests/starts.rs`
+`a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5451,6 +5461,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1151 | 6.2 | For review: concurrent many-series reads; (a) as built until callers' reads arrive together |
 | Q-1400 | 8.3 | Provisional: restore records are not read by the check; a point judged after a restore is `Unknown` |
 | Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
+| Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
 | Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
 | Q-1631 | 5.3 step 5 | Open: a lost recovery entry, then a power loss or a consumer below it; the history property stops restarting and comparing deliveries once an entry is lost |
 

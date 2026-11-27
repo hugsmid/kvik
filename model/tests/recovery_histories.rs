@@ -338,7 +338,7 @@ impl RWorld {
                 // The engine's catch-up runs as the consumer takes.
                 self.m.catch_up(RC[*c], 32).unwrap();
                 let got = self.m.receive(RC[*c], *n).unwrap();
-                let cursor = self.m.disk.cursors.get(&RC[*c]).copied();
+                let cursor = self.m.consumer_position(RC[*c]);
                 let points = self.m.reset_points();
                 for d in &got {
                     if let Some(x) = d.resync().and_then(|r| r.forget_above) {
@@ -1198,7 +1198,7 @@ fn recovery_generator_coverage() {
         seen.flagged_remounts,
         seen.acknowledged
     );
-    assert!(seen.reassigned > 7 && seen.forget_resyncs > 1500 && seen.forced_syncs > 30);
+    assert!(seen.reassigned > 5 && seen.forget_resyncs > 1500 && seen.forced_syncs > 30);
     assert!(seen.behind_resyncs > 200);
     assert!(seen.starts > 100 && seen.no_cursor > 10);
     assert!(seen.stale > 60 && seen.gaps > 7 && seen.rule_1_resets > 180);

@@ -456,6 +456,7 @@ impl Model {
             });
             if self.config.mark_sync == MarkSync::EveryCommit || file.batches.len() == 1 {
                 self.disk.synced_mark = self.disk.mark;
+                self.land_cursors();
             }
         }
     }
@@ -485,6 +486,7 @@ impl Model {
     /// that is not a fact (§3 Commit).
     pub(super) fn force_mark_sync(&mut self) {
         self.disk.synced_mark = self.disk.mark;
+        self.land_cursors();
     }
 
     /// The timed mark sync fires (§3 Durable mark, `mark_sync_interval`):

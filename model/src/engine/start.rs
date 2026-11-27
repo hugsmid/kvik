@@ -75,11 +75,14 @@ impl Model {
         self.vol.as_mut().expect("up").consumers[i].started = lost.then_some(p);
         // Never ahead of the synced mark (invariant 26).
         self.disk.cover(p);
-        let written = p.min(self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last));
+        let reach = self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last);
         // A lost cursor is written by the confirmation of its `NoCursor` resync; until then every start finds it lost.
-        if !lost {
-            self.disk.cursors.insert(id, written);
+        // A start the synced mark cannot reach leaves the cursor file as it was until a mark sync reaches it, so a
+        // crash before then resumes from the old cursor or finds the consumer new (Q-1621; invariant 25).
+        if !lost && p <= reach {
+            self.disk.cursors.insert(id, p);
         }
+        self.vol.as_mut().expect("up").consumers[i].unwritten = (!lost && p > reach).then_some(p);
         self.disk.registered.insert(id);
         self.disk.latches.retain(|(c, _), _| *c != id);
         if lost {
@@ -89,6 +92,27 @@ impl Model {
             self.sync_runners(i);
         }
         Ok(p)
+    }
+
+    /// The consumer's position (§4 Resync, invariant 25): a start's cursor still waiting for the mark, else its
+    /// cursor file's.
+    pub fn consumer_position(&self, id: ConsumerId) -> Option<Position> {
+        let pending = self
+            .consumer_index(id)
+            .and_then(|i| self.vol.as_ref()?.consumers[i].unwritten);
+        pending.or_else(|| self.disk.cursors.get(&id).copied())
+    }
+
+    /// Writes each start's pending cursor that the synced mark now reaches (Q-1621).
+    pub(super) fn land_cursors(&mut self) {
+        let reach = self.disk.synced_mark.map_or(Position::ORIGIN, |m| m.last);
+        let Some(v) = self.vol.as_mut() else { return };
+        for c in &mut v.consumers {
+            if let Some(u) = c.unwritten.filter(|u| *u <= reach) {
+                c.unwritten = None;
+                self.disk.cursors.insert(c.decl.id, u);
+            }
+        }
     }
 
     /// A lost consumer taken again before confirming its `NoCursor` resync: dropped back to the position before its

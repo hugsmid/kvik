@@ -1890,6 +1890,9 @@ struct ConsumerRt {
     /// For a consumer started after its cursor file was lost: the position before its start, its cursor in this
     /// run until a confirmation writes one (Q-131).
     started: Option<Position>,
+    /// A start's cursor the synced mark did not reach: written once a mark sync reaches it, as the durable
+    /// backend's pending write (Q-1621); confirmations raise it meanwhile.
+    unwritten: Option<Position>,
 }
 
 /// State a crash discards.
@@ -2300,6 +2303,7 @@ impl Model {
                 awaiting: None,
                 pending: None,
                 started: None,
+                unwritten: None,
             });
         }
         self.vol = Some(Volatile {
@@ -4183,6 +4187,7 @@ impl Model {
     }
 
     fn confirm_prefix(&mut self, i: usize, n: usize, p: Position) {
+        let confirmed = p;
         self.sync_log_through(p);
         // A flagged position not yet synced while read-only: the cursor and
         // latch writes naming it wait, here for ever (§3 Durable mark,
@@ -4240,8 +4245,20 @@ impl Model {
         if gc_confirmed {
             self.disk.generation_changed.remove(&id);
         }
-        let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
-        *cur = (*cur).max(p);
+        let v = self.vol.as_mut().expect("up");
+        let unwritten = &mut v.consumers[i].unwritten;
+        match *unwritten {
+            // The start's write is still pending: the cursor file keeps what it held (Q-1621).
+            Some(u) if p < u.max(confirmed) => *unwritten = Some(u.max(confirmed)),
+            Some(_) => {
+                *unwritten = None;
+                self.disk.cursors.insert(id, p);
+            }
+            None => {
+                let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
+                *cur = (*cur).max(p);
+            }
+        }
         self.confirmed.entry(id).or_default().extend(done);
     }
 

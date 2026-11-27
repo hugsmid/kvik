@@ -301,3 +301,25 @@ fn a_consumer_started_never_routed_and_losing_its_cursor_is_sent_no_cursor_with_
         "no series state"
     );
 }
+
+#[test]
+fn a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it() {
+    let (mut m, s) = model(Selection::Series(Default::default()));
+    let first = *facts(&mut m, s, 0, 1.0).last().unwrap();
+    assert_eq!(m.start_consumer(C, Start::Now).unwrap(), first);
+    let head = *facts(&mut m, s, 4, 2.0).last().unwrap();
+    m.disk.synced_mark = None;
+    m.disk.mark = None;
+    assert_eq!(m.start_consumer(C, Start::Now).unwrap(), head);
+    assert_eq!(
+        m.disk.cursors[&C], first,
+        "a cursor file never names a position above the synced mark (Q-1621)"
+    );
+    let later = facts(&mut m, s, 8, 3.0)[0];
+    m.sync_mark_file();
+    assert!(m.disk.synced_mark.is_some_and(|k| k.last >= later));
+    assert_eq!(
+        m.disk.cursors[&C], head,
+        "the mark sync lands the start's write"
+    );
+}
