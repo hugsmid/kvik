@@ -813,7 +813,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   judgement resumes (`spec.md` §6 Gates, Resume). Body, packed, little-endian: `through` (12 bytes, the last position
   applied), `now` `i64` (the commit-clock instant reached), instance count `u32`, series count `u32`, reserved
   `u32` zero; then each instance in `(gate, series)` order, strictly increasing: gate id `u32`, series id `u32`,
-  `set_by` (a gate point of tag 1), `crossed` `u16` (a bit per boundary), pending count `u8` (at most 16), state tag
+  `set_by` (a gate point of tag 1 whose third byte, otherwise zero, is 1 when a reseed set the instance and no
+  transition has moved it since: the id is the start id no delivery carried, and a resync reports none (Q-2160)),
+  `crossed` `u16` (a bit per boundary), pending count `u8` (at most 16), state tag
   `u8` (0 unknown, 1 stale, 2 level, 3 match, 4 value), the last evaluation's instant `i64`, the pending holds
   (boundary index `u8`, first instant held `i64`, in index order), the state's byte for tags 2 (boundaries crossed)
   and 3 (0 or 1) or its value for tag 4, then a reference presence `u8` (0 or 1) and, if 1, the value; then each
@@ -822,8 +824,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `i64` if bit 1, then if bit 0 the live fact: `t` `i64`, position 12 bytes, revision `u64` if bit 3, its value. A
   value is a tag `u8` then: 0 none, 1 an `f64`, finite, 2 a boolean byte 0 or 1, 3 a length `u8` and that many
   bytes of UTF-8 (a named state or text). Facts ahead of `now` are not held: they are read again from the log at a
-  restore. A body that breaks any of these rules, or has bytes left over, is invalid; nothing is allocated from a
-  count before it is checked against the body. A write that carries a checkpoint appends `[0x31][0x30]` in one write
+  restore. A body that breaks any of these rules, or has bytes left over, is invalid, and is read as a torn block
+  is (the end of the file), not as a version refusal; nothing is allocated from a count before it is checked against
+  the body. A write that carries a checkpoint appends `[0x31][0x30]` in one write
   and one `sync_data`. The file's state is the last valid `0x30` block **and** the last valid `0x31` block; a torn
   `0x31` leaves the previous pair, a torn `0x30` after a valid `0x31` leaves the new checkpoint under the previous
   cursor block (both are exact resume points). A `0x30` block with a gate cursor and no valid `0x31` before it is
@@ -833,7 +836,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   value 45.0, last arrival 4,000; frontier `(0, 20)` at 5,000), the body in hex: `000000001400000000000000
   8813000000000000 01000000 01000000 00000000 04000000 09000000 01000000000000000c000000000000000000000000000000
   0400000009000000 0000 01 02 9411000000000000 00a00f000000000000 00 00 09000000 07 a00f000000000000
-  a00f000000000000 000000001200000000000000 010000000000804640`. A store that holds a gate is refused by binaries
+  a00f000000000000 000000001200000000000000 010000000000804640`. Set by a reseed, the instance's `set_by` starts
+  `01000100`. A store that holds a gate is refused by binaries
   older than this element (unknown critical routing fields and block type, A.3; Q-1397); one without stays readable
   by them. Every position a cursor file names is a source of F (`spec.md` §3 Recovery rule 3), and
   the file is never written naming one above the last synced mark. The header has `file_id` 0 and the generation at

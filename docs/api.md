@@ -432,8 +432,10 @@ In-store conditions on one stream (spec §6 Gates). The model backend serves the
 the run, and refuses `each` gates and window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Its cursor file holds
 the gate cursor and a checkpoint (`format.md` A.15): a second take in the same run, and the first take after a stop or
 a crash, receive the unconfirmed transitions again under their ids, flagged `replayed`; beyond `conditions.replay_max`,
-without a cursor file, or across a reset point the gates are rebuilt from history (`set_by` `None`), counted
-`gates_reseeded` (Q-2080, Q-2082). The model backend replays without bound (Q-2085).
+without a cursor file, or across a reset point the gates are rebuilt from history (`set_by` `None` until a transition
+moves the instance, across later restarts too), counted `gates_reseeded` (Q-2080, Q-2082, Q-2160). A consumer that
+watched and stopped before its first cursor write has no cursor file: its gates are rebuilt at the next start, so its
+start transitions never arrive and the resync carries their states. The model backend replays without bound (Q-2085).
 ```rust
 let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity), [
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),

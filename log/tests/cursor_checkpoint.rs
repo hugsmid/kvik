@@ -47,7 +47,7 @@ fn instance() -> impl Strategy<Value = CheckpointInstance> {
         value().prop_map(CheckpointState::Value),
     ];
     (
-        (any::<u32>(), any::<u32>(), state, id()),
+        (any::<u32>(), any::<u32>(), state, id(), any::<bool>()),
         (
             any::<u16>(),
             prop::collection::vec((any::<u8>(), any::<i64>()), 0..=16),
@@ -56,12 +56,16 @@ fn instance() -> impl Strategy<Value = CheckpointInstance> {
         ),
     )
         .prop_map(
-            |((gate, series, state, set_by), (crossed, pending, reference, last_eval))| {
+            |(
+                (gate, series, state, set_by, reseeded),
+                (crossed, pending, reference, last_eval),
+            )| {
                 CheckpointInstance {
                     gate,
                     series,
                     state,
                     set_by,
+                    reseeded,
                     crossed,
                     pending,
                     reference,

@@ -318,14 +318,19 @@ fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_st
 #[test]
 fn a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by() {
     let clock = kvik::env::ManualClock::new(common::start());
-    let config = common::config_on(Backend::Durable, "gates-api-reseed", &clock);
+    let config = common::config_on(Backend::Durable, "gates-api-replay", &clock);
     let s = block_on(Store::open(config.clone())).unwrap();
     let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     block_on(c.watch("humidity", humidity(id))).unwrap();
     block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(75.0))])).unwrap();
     // Handed out, not confirmed.
-    while c.try_next().unwrap().is_some() {}
+    let mut before = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        if let kvik::DeliveryKind::Transition(t) = &d.kind {
+            before.push(t.id);
+        }
+    }
     drop(c);
     block_on(s.shutdown()).unwrap();
     drop(s);
@@ -351,6 +356,7 @@ fn a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_b
             Some(kvik::GateState::Level(0))
         ]
     );
+    assert_eq!(replayed.iter().map(|t| t.id).collect::<Vec<_>>(), before);
     assert_eq!(gates.len(), 1);
     assert_eq!(
         (gates[0].state.clone(), gates[0].set_by),

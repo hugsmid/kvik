@@ -214,10 +214,14 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2081 | `format.md` A.15; Q-1391 | The checkpoint block as built: series apart from instances, every field the core restores (decided by the builder, provisional) |
 | Q-2082 | §6 Gates, Resume; §4 Resync | A reset point or lost range after the checkpoint reseeds, until cond2 step 6 (decided by the builder, provisional) |
 | Q-2083 | §6 Gates, Resume | Facts counted for `replay_max` without reading them; entries of a newer format in a replay (decided by the builder, provisional) |
-| Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (decided by the builder, provisional) |
+| Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (superseded by Q-2160) |
 | Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
 | Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
 | Q-2087 | §6 Gates, Resume, Transitions; Q-1392 | The instant a reseed starts the gates at: the commit floor, not the head's commit time (decided by the builder, provisional) |
+| Q-2160 | §6 Gates, Resume; `format.md` A.15; Q-1392, Q-2084 | `set_by` of a reseeded instance after a restart: a flag in the checkpoint keeps it `None` (decided at review) |
+| Q-2161 | §6 Gates, Resume | The crash property's cases and checks (decided at review) |
+| Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
+| Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (decided at review, provisional; settle with cond2 step 6) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5555,7 +5559,7 @@ taken then is replayed after a restart.
 **Decision (provisional).** The checkpoint holds the start id the instance would have had, not that a reseed set it, so
 after the replay the resync reports that id until a transition moves the instance. A flag in the instance record would
 keep `None`; not added while no consumer reads `set_by` to act.
-**Pinned by.** none yet.
+**Superseded by Q-2160.**
 
 ## Q-2085 — The model backend's resume
 Decided by the builder with cond2 step 5, provisional.
@@ -5592,6 +5596,45 @@ floor's position (the floor's guarantee then holds: nothing later commits below 
 hold complete by then is in the resync's state, `set_by` none; nothing is sent before the resync.
 **Pinned by.** `kvik/tests/gates_durable.rs` `a_lost_cursor_file_reseeds_the_gates`,
 `a_resume_beyond_the_replay_bound_reseeds_without_replaying`.
+
+## Q-2160 — `set_by` of a reseeded instance after a restart
+Decided at review of cond2 step 5 (S1), replacing Q-2084.
+**Scenario.** The cursor file is lost; the take reseeds (resync `NoCursor`, `set_by` none); the consumer confirms; a
+clean stop; the next start replays from the checkpoint that confirmation wrote. Under Q-2084 the resync then named
+the start id, which no delivery in either run carried; a consumer that de-duplicates or audits by `set_by` is misled.
+**Decision.** An instance record's `set_by` gate point sets its third byte, otherwise zero, to 1 when a reseed set the
+instance and no transition has moved it since (`format.md` A.15); a restore keeps the instance reported as `set_by`
+none until a transition moves it. Files written before the flag read it as 0.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_reseeded_gate_keeps_set_by_none_after_a_restart`;
+`log/src/cursor/tests.rs` `a_reseeded_instance_sets_byte_2_of_its_set_by_and_round_trips`; the crash property's check
+that a resync's `set_by` is an id handed out.
+
+## Q-2161 — The crash property's cases and checks
+Decided at review of cond2 step 5 (S2).
+**Scenario.** `gate_deliveries_after_crashes_follow_the_rules` ran a quarter of the configured cases and checked three
+rules, so a transition lost between a checkpoint and the head, or a wrong state in a resync, would pass.
+**Decision.** It runs every configured case and adds two continuity checks needing no log oracle: a new transition
+starts from the state the consumer last learnt for its instance; a resync's `set_by` is none or an id handed out, and
+its state is the one that id set. It fails when fewer than one history in 64 reaches the replay check or fewer than
+one `set_by` check per 4 histories (measured at 1,024 cases: one in 22, and 0.8 a history).
+**Pinned by.** `kvik/tests/gates_durable.rs` `gate_deliveries_after_crashes_follow_the_rules`.
+
+## Q-2162 — Bytes written per confirmed transition by a consumer with many gates
+Decided at review of cond2 step 5 (S4), provisional.
+**Scenario.** A confirmed transition with nothing else outstanding appends the consumer's whole checkpoint and syncs
+(Q-2086). From the A.15 layout a levels instance with no pending hold takes 54 bytes and the series it reads 42
+(a numeric live fact and a last arrival), so a consumer with 1,000 single-series gates appends about 96 KB a confirmed
+transition and writes its 16 MiB file again about every 170.
+**Decision (provisional).** Keep the rule; the bench notes of cond2 step 6 measure bytes as well as syncs. If the
+bytes show, write a checkpoint on a confirmation at most once per `conditions.checkpoint_interval` and rely on replay.
+**Pinned by.** none: a measurement.
+
+## Q-2163 — A checkpoint larger than a block once `Each` lands
+Decided at review of cond2 step 5, provisional.
+**Scenario.** `Each` allows 4,096 gates of up to 256 instances on one consumer; their checkpoint would pass the 16 MiB
+block limit. Today's limit, 4,096 single-series gates, stays under 3 MiB.
+**Decision (provisional).** Cond2 step 6 bounds the instances per consumer or splits the checkpoint across blocks.
+**Pinned by.** none yet.
 
 ## Open at v0.2
 
@@ -5831,10 +5874,14 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
 | Q-2082 | cond2 step 6 | Decided by the builder, provisional: reseed when a reset point follows the checkpoint |
 | Q-2083 | cond2 review | Decided by the builder, provisional: positions less entries; newer-format entries not fed |
-| Q-2084 | cond2 review | Decided by the builder, provisional: the start id it would have had |
+| Q-2084 | cond2 review | Superseded by Q-2160 |
 | Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
 | Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
 | Q-2087 | cond2 review | Decided by the builder, provisional: the commit floor once read through its position |
+| Q-2160 | cond2 review | Decided at review: a reseed flag in the instance's `set_by` |
+| Q-2161 | cond2 review | Decided at review: every case; two continuity checks; floors on checks reached |
+| Q-2162 | cond2 step 6 | Decided at review, provisional: keep the rule; measure bytes in the step 6 bench notes |
+| Q-2163 | cond2 step 6 | Decided at review, provisional: bound instances per consumer or split the checkpoint |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
