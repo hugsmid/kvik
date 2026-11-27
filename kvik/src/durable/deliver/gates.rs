@@ -137,7 +137,8 @@ pub(super) enum Feed<'a> {
 impl Deliverer {
     /// The floor live gate timers fire under (Q-1393, provisional: the commit clock; spec §6 Gates, Clock): an
     /// instant no later batch commits below, with the position every batch committing below it is at or below.
-    /// The monotonic alternative replaces this function alone.
+    /// The monotonic alternative replaces this function and clamps `commit` in [`Deliverer::gate_item`] to the
+    /// floor given, since no batch may commit below a core's `now` (G3).
     fn floor(&self, ctx: &Ctx<'_>) -> Option<(Nanos, LogPos)> {
         #[cfg(test)]
         if let Some(f) = self.floor_hold {
