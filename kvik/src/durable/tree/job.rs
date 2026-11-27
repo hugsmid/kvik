@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use kvik_log::manifest::LostRange;
@@ -17,14 +17,13 @@ use kvik_tree::write::{Fact, Identity, Opening, TreeFiles, folded_levels, quarte
 
 use super::dirty::{Dirty, Key};
 use super::stretch::dirty_from_log;
-use crate::durable::clock::Clocks;
 use crate::durable::index::Stored;
 use crate::durable::loss::Latch;
 use crate::durable::read::source::each_row;
 use crate::durable::read::view::View;
 use crate::durable::reader::DurableReader;
 use crate::durable::reader::facts::plan;
-use crate::durable::{READER_LEASE, lock, windows};
+use crate::durable::{lock, windows};
 use crate::env::Env;
 use crate::read::View as ReadView;
 use crate::types::SeriesId;
@@ -37,15 +36,20 @@ const RETRY: Duration = Duration::from_secs(60);
 /// `tree_behind` once no checkpoint has succeeded for this many intervals (section 6 The stretch).
 const BEHIND_AFTER: u32 = 3;
 
+/// The store's reader, opened when `open` and not yet open (Q-1951); `Ok(None)` when not open and not to be opened.
+pub(crate) type Readers =
+    Box<dyn Fn(bool) -> Result<Option<Arc<DurableReader>>, String> + Send + Sync>;
+
 /// See the module documentation.
 pub(crate) struct Job {
     dir: PathBuf,
     env: Env,
-    clocks: Arc<Clocks>,
     latch: Arc<Latch>,
     recorded: Vec<LostRange>,
     id: Identity,
+    fresh: bool,
     dirty: Arc<Dirty>,
+    readers: OnceLock<Readers>,
     interval: Duration,
     state: Mutex<State>,
 }
@@ -59,7 +63,6 @@ impl std::fmt::Debug for Job {
 #[derive(Default)]
 struct State {
     files: Option<TreeFiles>,
-    reader: Option<Arc<DurableReader>>,
     /// When the next checkpoint is due, on the monotonic clock.
     due: Option<Duration>,
     first_step: Option<Duration>,
@@ -72,10 +75,11 @@ struct State {
 pub(crate) struct Parts {
     pub(crate) dir: PathBuf,
     pub(crate) env: Env,
-    pub(crate) clocks: Arc<Clocks>,
     pub(crate) latch: Arc<Latch>,
     pub(crate) recorded: Vec<LostRange>,
     pub(crate) id: Identity,
+    /// The store held no series when it opened.
+    pub(crate) fresh: bool,
     pub(crate) dirty: Arc<Dirty>,
 }
 
@@ -84,11 +88,12 @@ impl Job {
         Job {
             dir: p.dir,
             env: p.env,
-            clocks: p.clocks,
             latch: p.latch,
             recorded: p.recorded,
             id: p.id,
+            fresh: p.fresh,
             dirty: p.dirty,
+            readers: OnceLock::new(),
             interval: INTERVAL,
             state: Mutex::new(State::default()),
         }
@@ -110,8 +115,9 @@ impl Job {
         if !stopping && st.due.is_some_and(|d| d > now) {
             return st.due.map(|d| d - now);
         }
-        match self.checkpoint(&mut st, synced, now) {
-            Ok(()) => {
+        match self.checkpoint(&mut st, synced, now, stopping) {
+            Ok(false) => {}
+            Ok(true) => {
                 st.last_ok = Some(now);
                 st.failed = None;
                 st.due = Some(now + self.until_due());
@@ -147,22 +153,9 @@ impl Job {
         Duration::from_nanos(u64::try_from(next - wall).unwrap_or(0))
     }
 
-    fn reader(&self, st: &mut State) -> Result<Arc<DurableReader>, String> {
-        if let Some(r) = &st.reader {
-            return Ok(r.clone());
-        }
-        let r = DurableReader::open_with(
-            &self.dir,
-            &self.env,
-            (READER_LEASE, READER_LEASE),
-            self.clocks.clone(),
-            self.latch.clone(),
-            None,
-        )
-        .map_err(|e| format!("tree reader: {e}"))?;
-        let r = Arc::new(r);
-        st.reader = Some(r.clone());
-        Ok(r)
+    /// Gives the job the store's reader (Q-1951).
+    pub(crate) fn readers(&self, f: Readers) {
+        let _ = self.readers.set(f);
     }
 
     /// Whether a loss this run found, that no lost range of the manifest held at the start, begins at or below `k`
@@ -172,13 +165,9 @@ impl Job {
     }
 
     fn start(&self, st: &mut State, synced: LogPos, now: Duration) -> Result<(), String> {
-        let r = self.reader(st)?;
-        let v = r.snapshot().map_err(|e| format!("tree start: {e}"))?;
-        let fresh = v.latest().registry().len() == 0;
-        let _ = r.end(v);
         let at = Opening {
             mark: synced,
-            fresh,
+            fresh: self.fresh,
             wall: self.env.clock.wall().0,
             now,
         };
@@ -193,12 +182,30 @@ impl Job {
         Ok(())
     }
 
-    fn checkpoint(&self, st: &mut State, synced: LogPos, now: Duration) -> Result<(), String> {
-        let r = self.reader(st)?;
+    /// Whether a checkpoint was taken: a clean shutdown takes one only on a reader already open, so that it never
+    /// reads the log to build one (Q-1950).
+    fn checkpoint(
+        &self,
+        st: &mut State,
+        synced: LogPos,
+        now: Duration,
+        stopping: bool,
+    ) -> Result<bool, String> {
+        let r = match self.readers.get() {
+            Some(f) => f(!stopping).map_err(|e| format!("tree reader: {e}"))?,
+            None => None,
+        };
+        let Some(r) = r else {
+            return if stopping {
+                Ok(false)
+            } else {
+                Err("tree reader: none".into())
+            };
+        };
         let v = r.snapshot().map_err(|e| format!("tree cut: {e}"))?;
         let out = self.checkpoint_at(st, &r, &v, synced, now);
         let _ = r.end(v);
-        out
+        out.map(|()| true)
     }
 
     fn checkpoint_at(

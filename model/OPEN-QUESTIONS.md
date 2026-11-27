@@ -5371,6 +5371,22 @@ Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs` `covered_all`), provis
 no series (no fact can exist), and nothing otherwise until backfill (71b-4). A tree whose first checkpoint never
 landed therefore waits for backfill; reads take facts meanwhile.
 
+## Q-1950 — A clean shutdown's checkpoint and reading the log
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle with 71b-4.
+**Scenario.** Design section 5 checkpoints at a clean shutdown, but the checkpoint reads the dirty quarter-hours'
+facts through a reader, and a process that has not read opens one by reading the log, which a clean shutdown never
+does (the registry file is written from the deliverer's index without reading the log).
+**Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
+leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
+that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it.
+
+## Q-1951 — One reader for the tree's checkpoints and the process's reads
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
+**Scenario.** A checkpoint job with its own reader holds a second index of the log in the writer's process, and its
+start opened it only to learn whether the store held a series.
+**Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
+if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

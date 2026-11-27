@@ -104,6 +104,12 @@ impl Store {
         }
     }
 
+    /// A clean shutdown once the store's reader is open, so that it checkpoints (Q-1950).
+    fn stop(&self) {
+        self.w.reader().unwrap();
+        self.w.shutdown().unwrap();
+    }
+
     fn params(&self) -> kvik_tree::Params {
         let d = lock(&self.w.decider);
         let s = d.registry.get(self.id.0).unwrap();
@@ -186,7 +192,7 @@ fn a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark() {
     let mut st = Store::new("shutdown");
     history(&mut st);
     let p = st.params();
-    st.w.shutdown().unwrap();
+    st.stop();
     let (root, vis) = tree_state(&st.fs, &st.dir);
     assert!(root.checkpoint.sequence > 0);
     assert_eq!(root.floor, 0);
@@ -199,17 +205,43 @@ fn a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark() {
 }
 
 #[test]
+fn a_clean_shutdown_with_the_reader_unopened_leaves_k_and_the_next_start_refills() {
+    let mut st = Store::new("unread");
+    history(&mut st);
+    let p = st.params();
+    st.stop();
+    let (first, _) = tree_state(&st.fs, &st.dir);
+    st.reopen();
+    st.emit(Intent::Normal, &[(7_000, Some(5.0)), (5, Some(6.0))]);
+    st.w.shutdown().unwrap();
+    assert!(
+        lock(&st.w.reader).is_none(),
+        "the shutdown opened no reader"
+    );
+    let (unread, _) = tree_state(&st.fs, &st.dir);
+    assert_eq!(
+        unread.checkpoint, first.checkpoint,
+        "no checkpoint without a reader"
+    );
+    st.reopen();
+    st.stop();
+    let (root, vis) = tree_state(&st.fs, &st.dir);
+    assert!(root.checkpoint > first.checkpoint);
+    assert_t1(&p, st.id.0, &st.current, &vis);
+}
+
+#[test]
 fn a_restart_continues_the_root_and_late_readings_recompute_their_quarter_hours() {
     let mut st = Store::new("restart");
     history(&mut st);
     let p = st.params();
-    st.w.shutdown().unwrap();
+    st.stop();
     let (first, _) = tree_state(&st.fs, &st.dir);
     st.clock.advance(Duration::from_secs(600));
     st.reopen();
     st.emit(Intent::Normal, &[(7_000, Some(5.0)), (5, Some(6.0))]);
     st.emit(Intent::Revise, &[(6_600, Some(7.0))]);
-    st.w.shutdown().unwrap();
+    st.stop();
     let (root, vis) = tree_state(&st.fs, &st.dir);
     assert!(root.seq > first.seq && root.checkpoint > first.checkpoint);
     assert_t1(&p, st.id.0, &st.current, &vis);
@@ -222,13 +254,14 @@ fn a_start_after_a_stop_refills_the_dirty_set_from_the_log_above_k() {
     let mut st = Store::new("stopped");
     history(&mut st);
     let p = st.params();
-    st.w.shutdown().unwrap();
+    st.stop();
     st.reopen();
     st.emit(Intent::Normal, &[(7_100, Some(8.0)), (3, Some(9.0))]);
     st.emit(Intent::Revise, &[(30, Some(10.0))]);
     let copy = st.fs.snapshot();
-    st.w.shutdown().unwrap();
+    st.stop();
     let w = open(&copy, &st.clock, &st.dir);
+    w.reader().unwrap();
     w.shutdown().unwrap();
     let (_, vis) = tree_state(&copy, &st.dir);
     assert_t1(&p, st.id.0, &st.current, &vis);
@@ -246,7 +279,7 @@ fn a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_no
         ..ParameterChange::default()
     };
     st.w.set_parameters(id, &change).unwrap();
-    st.w.shutdown().unwrap();
+    st.stop();
     let (root, vis) = tree_state(&st.fs, &st.dir);
     assert!(
         root.floors.is_empty(),
@@ -257,7 +290,7 @@ fn a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_no
     st.emit(Intent::Normal, &[(2, Some(4.0))]);
     let t_r = st.clock.wall();
     st.w.retire(id, t_r).unwrap();
-    st.w.shutdown().unwrap();
+    st.stop();
     let (root, vis) = tree_state(&st.fs, &st.dir);
     let tree = st.dir.join(DIR);
     for r in root.parts.iter().filter(|r| r.seq == root.seq) {

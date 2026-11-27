@@ -649,8 +649,8 @@ impl Directories {
         wait
     }
 
-    /// Does the due work that a clean shutdown should not lose, unless the start's work is unfinished, which a
-    /// shutdown never waits for.
+    /// Does the due work that a clean shutdown should not lose; the log's own needs the start's work finished, which a
+    /// shutdown never waits for, and the hook's step does not.
     pub fn finish(&mut self, synced: Position, now: Duration, wall: i64) {
         if self.starting.is_none() {
             self.backoff.clear();
@@ -668,8 +668,8 @@ impl Directories {
             {
                 self.write_series(synced, now, wall);
             }
-            self.call(|h| h.step(synced, now, true));
         }
+        self.call(|h| h.step(synced, now, true));
     }
 
     fn call<T>(&mut self, f: impl FnOnce(&dyn SealHook) -> Option<T>) -> Option<T> {
