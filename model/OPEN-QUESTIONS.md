@@ -6565,6 +6565,16 @@ discards the tree as for a loss (Q-1429) and, as for a store with no root (Q-218
 discarded root covers nothing and the backfill rebuilds it from facts. Test:
 `turning_the_tree_on_with_its_root_behind_past_stretch_max_discards_it_and_backfills`.
 
+## Q-2470 — A series rebuild resumed after a stop
+Decided with a fix round of the tree writer (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional.
+**Scenario.** A series' rebuild publishes its newest period, then the process stops with the floor still open. A
+later fact empties a node of that period. The resumed rebuild, at a newer K, writes nothing for the empty node, so
+the stopped attempt's entry, above the floor, is visible once the floor closes (T1).
+**Decision (provisional).** The first root of a rebuild that closes floors raises each of those open floors to its
+own `seq`, so only that attempt's parts are visible when the floor closes. Checkpoints still skip a rebuilding
+series. **Pinned by.** `tree/src/write/rebuild_tests.rs`
+`t1_holds_when_a_series_rebuild_resumed_after_a_kill_finds_a_node_now_empty`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

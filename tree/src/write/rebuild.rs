@@ -161,7 +161,8 @@ fn end(r: &PartRef) -> i64 {
 impl TreeFiles {
     /// Publishes `r` one part period a root at `k`, newest first (Q-2112), so that a stop loses at most the period in
     /// hand. `cover(from)` is what `covered` gains once the periods from `from` up are published, `None` for the last
-    /// root, which also takes the retired parts and the closed floors.
+    /// root, which also takes the retired parts and the closed floors. The first root raises the floors it closes
+    /// to its own `seq`.
     pub fn rebuild_newest_first(
         &mut self,
         k: Position,
@@ -178,13 +179,16 @@ impl TreeFiles {
         } = r;
         let mut periods: Vec<_> = parts.into_iter().collect();
         let oldest = periods.first().cloned();
+        // A stopped attempt's parts sit above the open floor at an older K; an entry this attempt leaves out (a node
+        // now empty) would stay visible once the floor closes (T1).
+        let mut raise = close.clone();
         for (period, runs) in periods.drain(..).skip(1).rev() {
             let one = Rebuild {
                 parts: BTreeMap::from([(period, runs)]),
                 cover: cover(Some(period.0)),
                 ..Rebuild::default()
             };
-            self.rebuild(k, one, wall, now)?;
+            self.publish_rebuild(k, one, &std::mem::take(&mut raise), wall, now)?;
         }
         let last = Rebuild {
             parts: oldest.into_iter().collect(),
@@ -192,7 +196,7 @@ impl TreeFiles {
             cover: cover(None),
             close,
         };
-        self.rebuild(k, last, wall, now)
+        self.publish_rebuild(k, last, &raise, wall, now)
     }
 
     /// Publishes a rebuild at `k`, which must be the root's K (section 5 Rebuild): its parts, of class rebuilt and of
@@ -201,6 +205,18 @@ impl TreeFiles {
         &mut self,
         k: Position,
         r: Rebuild,
+        wall: i64,
+        now: Duration,
+    ) -> Result<(), WriteError> {
+        self.publish_rebuild(k, r, &[], wall, now)
+    }
+
+    /// [`TreeFiles::rebuild`], with the open floors of `raise` moved up to the new root's `seq`.
+    fn publish_rebuild(
+        &mut self,
+        k: Position,
+        r: Rebuild,
+        raise: &[u64],
         wall: i64,
         now: Duration,
     ) -> Result<(), WriteError> {
@@ -256,6 +272,9 @@ impl TreeFiles {
         next.covered.extend(r.cover);
         next.covered = normalise(std::mem::take(&mut next.covered));
         for f in &mut next.floors {
+            if f.rebuilding && raise.contains(&f.series) {
+                f.seq = seq;
+            }
             if r.close.contains(&f.series) {
                 f.rebuilding = false;
             }
