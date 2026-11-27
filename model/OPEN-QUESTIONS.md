@@ -5503,6 +5503,17 @@ Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/w
 **Scenario.** A count fixed in source overrides `PROPTEST_CASES`, so the deep run never reaches the property.
 **Decision (provisional).** The tree's properties take `PROPTEST_CASES`, capped at 1,024 per run.
 
+## Q-2130 — How much of a chart the tree's reads may hold from facts
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/windows/nodes.rs`
+`fetch`), provisional.
+**Scenario.** A chart over a span the tree does not cover (history before the first checkpoint, a damaged part, a
+tree discarded by a lost range) fetched every reading of that span for every charted series before folding any
+bucket, outside `ReaderConfig.memory`; the fact path it replaces folds as it streams.
+**Decision (provisional).** The fetch counts the bytes of the readings it holds and, once they pass what one pass of
+the reader's memory would be granted now (Q-2260), drops them and gives every series of the call to the fact path.
+The result is the same either way (T7). Test:
+`a_chart_over_more_uncovered_readings_than_the_memory_hint_holds_them_not_and_takes_facts`.
+
 ## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
 Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
 with 71b-4.
@@ -5548,6 +5559,16 @@ per pair, and a second lock at the acknowledgement; no bench drove `emit`.
 rate (one reading a call, 45 calls a second) and at saturation (batches of 100 back to back), and
 `scripts/bench-emit-ab.sh` runs it on a base revision and the head, alternating. The result is in
 `docs/measurements/tree-71b-3-ingest-latency.md`.
+
+## Q-2260 — The tree's fetch bounded by the memory hint, not charged
+Decided with the fix round of roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `fetch`), provisional.
+**Scenario.** Q-2130 bounds the readings a chart's fetch holds. Charging them to the accountant would hold a grant
+while the fetch's own passes ask for theirs, and an admission waits for running grants, so the fetch could wait on
+itself.
+**Decision (provisional).** The bound is the accountant's `rows_hint` taken when the fetch starts, not a grant: the
+fetch holds at most about one pass's grant beside the passes it runs. A span past the bound is read twice, once by
+the abandoned fetch and once by the fact path. Settle with Q-2072's block-level decode, which brings tree reads
+under the cap.
 
 ## Open at v0.2
 

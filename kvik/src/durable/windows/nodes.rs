@@ -154,7 +154,9 @@ pub(super) fn charts(
         }
         planned.push((k, c, buckets));
     }
-    fetch(r, v, &mut planned, wanted)?;
+    if !fetch(r, v, &mut planned, wanted)? {
+        return Ok(out);
+    }
     for (k, c, buckets) in planned {
         let mut last = if needs_last(&c.p, a, now) {
             c.prior(r, v, a)?
@@ -188,16 +190,19 @@ pub(super) fn charts(
     Ok(out)
 }
 
-/// Reads the spans `wanted` once for every chart, joined where they touch, and gives each chart its readings there.
+/// Reads the spans `wanted` once for every chart, joined where they touch, and gives each chart its readings there;
+/// `false`, holding none, once they pass what one pass of the reader's memory would be granted (Q-2130, Q-2260).
 fn fetch(
     r: &DurableReader,
     v: &View,
     planned: &mut [Planned<'_>],
     mut wanted: Vec<(i64, i64)>,
-) -> Result<(), QueryError> {
+) -> Result<bool, QueryError> {
     if planned.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
+    let budget = r.memory().rows_hint();
+    let (mut held, mut over) = (0u64, false);
     wanted.sort_unstable();
     let ranges = joined(&wanted);
     let mut ids: Vec<(u32, usize)> = planned
@@ -214,22 +219,40 @@ fn fetch(
     )?;
     for (s, e) in ranges {
         each_row(r, v, &plan, s, e - 1, |row| {
+            if over {
+                return;
+            }
             if let Ok(k) = ids.binary_search_by_key(&row.row.series_id, |(id, _)| *id) {
                 let c = &mut planned[ids[k].1].1;
-                c.fetched.extend(reading_of(c.series, &row));
+                if let Some(x) = reading_of(c.series, &row) {
+                    held = held.saturating_add(bytes_of(&x));
+                    over = held > budget;
+                    if !over {
+                        c.fetched.push(x);
+                    }
+                }
             }
         })?;
+        #[cfg(test)]
+        note_held(planned);
+        if over {
+            for (_, c, _) in planned.iter_mut() {
+                c.fetched = Vec::new();
+            }
+            return Ok(false);
+        }
     }
-    #[cfg(test)]
-    {
-        let held: u64 = planned
-            .iter()
-            .flat_map(|(_, c, _)| &c.fetched)
-            .map(bytes_of)
-            .sum();
-        FETCHED_MOST.with(|c| c.set(c.get().max(held)));
-    }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(test)]
+fn note_held(planned: &[Planned<'_>]) {
+    let held: u64 = planned
+        .iter()
+        .flat_map(|(_, c, _)| &c.fetched)
+        .map(bytes_of)
+        .sum();
+    FETCHED_MOST.with(|c| c.set(c.get().max(held)));
 }
 
 /// The bytes a fetched reading holds, its text included.
