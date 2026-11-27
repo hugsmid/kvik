@@ -219,6 +219,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1033 | §4 Resync, §11 Health; `format.md` A.16 | The registry file keeps every recovery entry; the durable deliverer takes reset points from it (decided by the lead) |
 | Q-1034 | §11 Health, `api.md` Health | A sealed segment whose body is zeroed, passed over with health `Ok` |
 | Q-1490 | `api.md` Health and statistics; Q-706 | With no consumer known, the `kvik-deliver` thread reads acknowledged batches back at most once a second (decided by the item, provisional) |
+| Q-1610 | `api.md` Health and statistics; Q-1490 | The about-one-second lag of `Stats.delivery` with no consumer is stated as current behaviour, not a promise (decided by the lead) |
+| Q-1611 | `api.md` Health and statistics; Q-1490 | `stats()` does not pump before it reads the delivery counts (decided by the lead) |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -2466,6 +2468,7 @@ return); the delivery reader's lease and position, which hold the log behind the
 busy second reads that second's batches itself; and when nothing else reads the log, damage to the newest batch is
 found up to a second later, so a replay of its readings emitted in that second is dropped as a duplicate rather than
 recorded (today the window is the thread's wake).
+**Settle by:** the owner's review of the fan-out results (step C4).
 **Provisional default: yes.** With the flag of Q-706 lowered, the thread reads back only when the timers are due, or
 a second (`IDLE_READ`, `kvik/src/durable/deliver/hub.rs`) after its last read, or at once after a seal, since the
 series directory written for a seal covers only what the read-back has folded (`format.md` A.18); once the flag is
@@ -2480,6 +2483,17 @@ the log at the first batch of the stretch, and a first consumer would read the w
 `a_consumer_taken_after_a_restart_without_one_starts_after_the_last_batch_with_nothing_skipped_or_repeated`
 (`kvik/tests/emit_without_consumers.rs`); the read at a seal by
 `a_store_directory_over_damage_no_start_has_met_is_skipped_before_the_start` (`kvik/src/durable/read/source/tests.rs`).
+
+## Q-1610 — Is the lag of the delivery counts a promise?
+Recorded by the deliver-idle review. Settled by the lead to the default.
+**Question.** Should `api.md` state the bound (about a second) by which `Stats.delivery` may lag with no consumer
+known (Q-1490) as a promise?
+**Decision: no.** `api.md` states it as the current behaviour.
+
+## Q-1611 — Should `stats()` pump before reading the delivery counts?
+Recorded by the deliver-idle review. Settled by the lead to the default.
+**Question.** Should `stats()` pump the intake before it reads `Stats.delivery`, so the counts never lag while idle?
+**Decision: no.** It would put log reads on a statistics call; the lag is bounded and documented (Q-1490).
 
 ## Q-710 — The default floor of the batch-sync interval
 
