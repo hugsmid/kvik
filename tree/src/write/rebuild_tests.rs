@@ -450,6 +450,41 @@ fn a_floor_close_publishes_one_settled_period_a_root_and_closes_with_the_last() 
 }
 
 #[test]
+fn rebuild_newest_first_covers_from_each_period_down_and_without_bound_last() {
+    let mut w = World::new();
+    let facts: Vec<(u64, i64, Option<f64>)> = (0..4)
+        .map(|d| (0, d * 8 * DAY + 10 * S, Some(d as f64)))
+        .collect();
+    w.append(&facts);
+    w.sync();
+    w.wall += 40 * DAY;
+    w.checkpoint().unwrap();
+    let root = w.files.as_ref().unwrap().root().clone();
+    let cur = w.current(root.checkpoint);
+    let r = rebuild_of(&w, &cur, [0], None, |l, a, b| set::covered(&root, l, a, b));
+    let mut want: Vec<Option<i64>> = r.parts.keys().skip(1).rev().map(|p| Some(p.0)).collect();
+    want.push(None);
+    assert!(want.len() >= 3, "{want:?}");
+    let calls = std::cell::RefCell::new(Vec::new());
+    let (wall, now) = (w.wall, w.now);
+    w.files
+        .as_mut()
+        .unwrap()
+        .rebuild_newest_first(
+            root.checkpoint,
+            r,
+            |from| {
+                calls.borrow_mut().push(from);
+                Vec::new()
+            },
+            wall,
+            now,
+        )
+        .unwrap();
+    assert_eq!(calls.into_inner(), want);
+}
+
+#[test]
 fn a_damaged_part_is_found_by_the_scrub_and_its_period_rebuilt() {
     let mut w = World::new();
     w.append(&[(0, 10 * S, Some(1.0)), (1, DAY + 10 * S, Some(2.0))]);
