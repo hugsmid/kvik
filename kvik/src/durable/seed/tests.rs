@@ -5,6 +5,7 @@
 
 mod damage;
 mod gives_way;
+mod losses;
 mod world;
 
 use std::cell::RefCell;
