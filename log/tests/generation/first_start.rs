@@ -190,6 +190,7 @@ fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_firs
             position: at(generation, 3),
             latches: Vec::new(),
             reset: None,
+            gate: None,
         };
         append(&r.fs, &dir(), STORE_ID, generation, T0, &state, None).unwrap();
         lose_unsealed(&mut r, generation, false);

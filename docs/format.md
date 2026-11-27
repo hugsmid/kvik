@@ -801,8 +801,41 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   position of the routing change that added it, 12 bytes, the position the delivery carrying the state was emitted
   at, 12 bytes, state `u8` (0 false, 1 true, 2 on change with no value, 3 on change with a value), 3 reserved bytes,
   the value `f64`, finite, for state 3, else zero); 3 the id of the last reset point the consumer confirmed (12
-  bytes, absent before any). An unknown critical field (`< 0x8000`) is a version refusal; fields for timer sequences
-  are added by roadmap 5.3. Every position a cursor file names is a source of F (`spec.md` §3 Recovery rule 3), and
+  bytes, absent before any); 4 the **gate cursor** (32 bytes, a *gate point*: tag `u8` (0 nothing confirmed yet, 1
+  a transition id, 2 a frontier), `due` presence `u8`, 2 zero bytes, `at` 12 bytes, `due` `i64` (zero when absent),
+  gate id `u32`, series id `u32`; tag 0 has every other byte zero, tag 2 has `due` present as the frontier's
+  instant and zero gate and series), present in every block written once the consumer's first watch has been
+  applied (`spec.md` §6 Gates, Resume; Q-1391). An unknown critical field (`< 0x8000`) is a version refusal; fields
+  for timer sequences are added by roadmap 5.3. Vectors: the gate point of transition `(at (0, 12), due 7,000, gate
+  4, series 9)` is `01010000 000000000c00000000000000 581b000000000000 04000000 09000000`; of the frontier `(at
+  (0, 20), now 5,000)`, `02010000 000000001400000000000000 8813000000000000 0000000000000000`.
+- **Gate checkpoint**, block type `0x31` in a cursor file: a consumer's gates engine at a frontier, from which its
+  judgement resumes (`spec.md` §6 Gates, Resume). Body, packed, little-endian: `through` (12 bytes, the last position
+  applied), `now` `i64` (the commit-clock instant reached), instance count `u32`, series count `u32`, reserved
+  `u32` zero; then each instance in `(gate, series)` order, strictly increasing: gate id `u32`, series id `u32`,
+  `set_by` (a gate point of tag 1), `crossed` `u16` (a bit per boundary), pending count `u8` (at most 16), state tag
+  `u8` (0 unknown, 1 stale, 2 level, 3 match, 4 value), the last evaluation's instant `i64`, the pending holds
+  (boundary index `u8`, first instant held `i64`, in index order), the state's byte for tags 2 (boundaries crossed)
+  and 3 (0 or 1) or its value for tag 4, then a reference presence `u8` (0 or 1) and, if 1, the value; then each
+  series in id order, strictly increasing: series id `u32`, flags `u8` (bit 0 a live-state fact, bit 1 a last
+  arrival, bit 2 the live fact is usable, bit 3 it has a revision; bits 2 and 3 only with bit 0), the last arrival
+  `i64` if bit 1, then if bit 0 the live fact: `t` `i64`, position 12 bytes, revision `u64` if bit 3, its value. A
+  value is a tag `u8` then: 0 none, 1 an `f64`, finite, 2 a boolean byte 0 or 1, 3 a length `u8` and that many
+  bytes of UTF-8 (a named state or text). Facts ahead of `now` are not held: they are read again from the log at a
+  restore. A body that breaks any of these rules, or has bytes left over, is invalid; nothing is allocated from a
+  count before it is checked against the body. A write that carries a checkpoint appends `[0x31][0x30]` in one write
+  and one `sync_data`. The file's state is the last valid `0x30` block **and** the last valid `0x31` block; a torn
+  `0x31` leaves the previous pair, a torn `0x30` after a valid `0x31` leaves the new checkpoint under the previous
+  cursor block (both are exact resume points). A `0x30` block with a gate cursor and no valid `0x31` before it is
+  damage: the gates are rebuilt from history. A file written again at 16 MiB holds one `0x31` and one `0x30`. Every
+  position a checkpoint names is a source of F. Vector (one levels instance mid-hold: gate 4 on series 9, level 0
+  set by `(0, 12)`, boundary 0 held since 4,000, evaluated at 4,500; series 9 live at `t` 4,000, position `(0, 18)`,
+  value 45.0, last arrival 4,000; frontier `(0, 20)` at 5,000), the body in hex: `000000001400000000000000
+  8813000000000000 01000000 01000000 00000000 04000000 09000000 01000000000000000c000000000000000000000000000000
+  0400000009000000 0000 01 02 9411000000000000 00a00f000000000000 00 00 09000000 07 a00f000000000000
+  a00f000000000000 000000001200000000000000 010000000000804640`. A store that holds a gate is refused by binaries
+  older than this element (unknown critical routing fields and block type, A.3; Q-1397); one without stays readable
+  by them. Every position a cursor file names is a source of F (`spec.md` §3 Recovery rule 3), and
   the file is never written naming one above the last synced mark. The header has `file_id` 0 and the generation at
   creation. The state is the last valid block;
   a torn last block leaves the previous, older state, never ahead of a confirmation. No valid header or no valid

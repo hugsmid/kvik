@@ -165,6 +165,7 @@ impl Deliverer {
                 .copied()
                 .collect(),
             reset: rt.reset,
+            gate: None,
         };
         // A cursor file never names a position above the last synced mark (`spec.md` §3 Durable mark): a write that
         // would forces a mark sync, and is skipped unless the mark synced reaches it (a writer that has stopped

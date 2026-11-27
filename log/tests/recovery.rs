@@ -870,6 +870,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
         },
         latches: Vec::new(),
         reset: None,
+        gate: None,
     };
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("alarms", 12), None).unwrap();
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("broken", 2), None).unwrap();
