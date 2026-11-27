@@ -218,3 +218,31 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn an_io_rate_of_zero_is_raised_to_the_least_floor() {
+    let cfg = ShareConfig {
+        cpu_share: 0.25,
+        io_rate: 0,
+    };
+    let mut g = Governor::new(cfg, Duration::ZERO);
+    let w = WriterState::default();
+    assert_eq!(g.admit(Duration::ZERO, Some(PIECE), &w), Verdict::Go);
+    g.worked(Duration::ZERO, MS, Some(PIECE), &w);
+    let Verdict::Wait { until, .. } = g.admit(2 * MS, Some(PIECE), &w) else {
+        panic!("an empty bucket waits");
+    };
+    assert!(until <= 2 * MS + Duration::from_secs(1), "{until:?}");
+}
+
+#[test]
+fn a_cpu_share_not_above_zero_or_not_a_number_is_refused() {
+    for cpu_share in [f64::NAN, 0.0, -0.5, f64::NEG_INFINITY] {
+        let cfg = ShareConfig {
+            cpu_share,
+            io_rate: 8 << 20,
+        };
+        assert!(cfg.check().is_err(), "{cpu_share}");
+    }
+    assert!(ShareConfig::for_cores(1).check().is_ok());
+}

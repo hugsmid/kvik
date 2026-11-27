@@ -31,6 +31,18 @@ impl ShareConfig {
     pub fn floor_rate(&self) -> u64 {
         (self.io_rate / 8).max(MIN_FLOOR)
     }
+
+    /// Refuses a `cpu_share` that is not a number or not above 0 (Q-1843).
+    pub fn check(&self) -> std::io::Result<()> {
+        if self.cpu_share > 0.0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "maintenance.cpu_share must be above 0",
+            ))
+        }
+    }
 }
 
 /// What the writer is doing, as the share reads it.
@@ -117,8 +129,12 @@ pub struct Governor {
 }
 
 impl Governor {
-    /// A governor whose first piece may be issued at once.
+    /// A governor whose first piece may be issued at once; an `io_rate` below the least floor is raised to it (Q-1843).
     pub fn new(cfg: ShareConfig, now: Duration) -> Self {
+        let cfg = ShareConfig {
+            io_rate: cfg.io_rate.max(MIN_FLOOR),
+            ..cfg
+        };
         Self {
             cfg,
             cpu_ready_at: now,

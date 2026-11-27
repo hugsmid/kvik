@@ -630,3 +630,25 @@ fn a_background_task_runs_between_creations_and_seals_and_every_call_still_lands
     assert_eq!(check_dense(acks), 300);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn a_task_whose_cpu_share_is_not_a_number_is_refused_at_start() {
+    use kvik_log::writer::share::{ShareConfig, Task};
+    let fs = MemFs::new();
+    let dir = PathBuf::from("store");
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir, Some(&new_store())).unwrap();
+    let w = LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO, T0).unwrap();
+    let task = Task {
+        task: Box::new(Counter {
+            left: 1,
+            ran: Arc::new(Mutex::new(0)),
+        }),
+        share: ShareConfig {
+            cpu_share: f64::NAN,
+            io_rate: 1 << 20,
+        },
+    };
+    let e =
+        Log::start_with_task(w, Arc::new(SystemClock::default()), None, Some(task)).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+}
