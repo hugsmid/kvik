@@ -5233,9 +5233,10 @@ property ignores reset points with nothing to forget at the start; align with th
 the same boot (the lost range takes the entry; the check answers `Unknown` on both backends, as row 7b); a fact and a
 consumer registration follow; a second power loss. The durable backend's last position is then one above the
 model's (`kvik/tests/saved_points.rs` `a_power_loss_after_a_lost_recovery_entry_keeps_the_model_s_last_position`,
-ignored while open). **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
-kept entry carries before deciding which is right; until then the history property stops restarting once an entry
-is lost.
+ignored while open). In the same histories, a consumer started at a point below the lost entry is sent the lost
+range's reset point by the durable backend and none by the model. **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
+kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
+until then the history property stops restarting and comparing deliveries once an entry is lost.
 
 ## Open at v0.2
 
@@ -5451,7 +5452,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1400 | 8.3 | Provisional: restore records are not read by the check; a point judged after a restore is `Unknown` |
 | Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
 | Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
-| Q-1631 | 5.3 step 5 | Open: recovery after a lost recovery entry, then a power loss; the history property stops restarting once an entry is lost |
+| Q-1631 | 5.3 step 5 | Open: a lost recovery entry, then a power loss or a consumer below it; the history property stops restarting and comparing deliveries once an entry is lost |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |

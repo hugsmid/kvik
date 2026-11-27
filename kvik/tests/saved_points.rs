@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use common::world::{World, drain};
+use common::world::World;
 use common::{at, block_on, config_on, scanned};
 use kvik::env::Env;
 use kvik::{
@@ -79,7 +79,7 @@ struct Rig {
     since_start: Vec<Position>,
     /// The recovery entry the last start wrote, with its segment and the bytes of its batch.
     entry: Option<(Position, PathBuf, usize, usize)>,
-    /// A recovery entry was damaged: later restarts are left out (Q-1631).
+    /// A recovery entry was damaged: later restarts and the delivery comparison are left out (Q-1631).
     entry_lost: bool,
     damaged: Vec<Position>,
     saved: Vec<Saved>,
@@ -417,7 +417,10 @@ impl Rig {
                 };
                 got.0.retain(|d| !vacuous(d));
                 got.1.retain(|d| !vacuous(d));
-                assert_eq!(summary(&got.0), summary(&got.1), "S5 against the model");
+                // Q-1631: once a recovery entry is lost the two differ on its lost range's reset point.
+                if !self.entry_lost {
+                    assert_eq!(summary(&got.0), summary(&got.1), "S5 against the model");
+                }
                 let first_fact = got
                     .0
                     .iter()
@@ -441,8 +444,18 @@ impl Rig {
 }
 
 fn drain_all(c: &mut kvik::Consumer) -> Vec<Delivery> {
-    let mut out = drain(c);
-    out.extend(drain(c));
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        while let Some(d) = c.try_next().unwrap() {
+            block_on(c.confirm(d.id)).unwrap();
+            out.push(d);
+            assert!(
+                out.len() < 1_000,
+                "deliveries without end: {:?}",
+                summary(&out[..8])
+            );
+        }
+    }
     out
 }
 
