@@ -495,14 +495,7 @@ impl<'a> RunTask<'a> {
                 .len()
                 > 1
         });
-        // Q-1840, Q-1940: the window is as many partitions as the writers' index entries and commit-time rows fit
-        // in a quarter of the cap, and their whole writers, by the writer's own figures, in half.
-        let per_file = c.bytes.len() as u64 * 2 * std::mem::size_of::<IndexEntry>() as u64
-            + batches.len() as u64 * BATCH_ROW;
-        let per_writer = per_file + 2 * PIECE as u64 + BLOCK_RESERVE;
-        let open = (self.cap / 4 / per_file.max(1))
-            .min(self.cap / 2 / per_writer)
-            .clamp(1, MAX_OPEN as u64) as usize;
+        let (open, per_writer) = window(self.cap, c.bytes.len() as u64, batches.len() as u64);
         let reserved = FIXED + c.held() + open as u64 * per_writer;
         let budget = match self.cap {
             0 => 0,
@@ -831,6 +824,17 @@ impl Background for RunTask<'static> {
     fn step(&mut self) {
         self.step_run();
     }
+}
+
+/// Partitions a window opens and what each of its writers may hold, for a census of `series` and `batches`
+/// (Q-1840, Q-1940): their index entries and commit-time rows fit a quarter of `cap`, their whole writers half.
+pub(super) fn window(cap: u64, series: u64, batches: u64) -> (usize, u64) {
+    let per_file = series * 2 * std::mem::size_of::<IndexEntry>() as u64 + batches * BATCH_ROW;
+    let per_writer = per_file + 2 * PIECE as u64 + BLOCK_RESERVE;
+    let open = (cap / 4 / per_file.max(1))
+        .min(cap / 2 / per_writer)
+        .clamp(1, MAX_OPEN as u64) as usize;
+    (open, per_writer)
 }
 
 /// The census's share of one batch: digests, counts, commit-time row, definitions, sizes and days.

@@ -424,4 +424,116 @@ mod tests {
             bytes.len()
         );
     }
+
+    /// A revision file of one series of `f64` ninths, whose value columns are compressed XOR (C.9): a full chunk, a
+    /// set-aside chunk that sorts after its first time, and a chunk of the rest.
+    fn aside_then_ninths(bodies: Vec<Vec<u8>>) -> (Vec<u8>, Identity) {
+        let (aside, n) = (4_000u64, super::super::CHUNK_ROWS as u64 + 6_000);
+        let id = Identity {
+            store_id: [5; 16],
+            generation: 1,
+            file_id: 8,
+        };
+        let d = Description {
+            class: Class::Revision,
+            level: Level::L0,
+            period_start: 0,
+            period_len: i64::MAX / 2,
+            run_id: 8,
+            run_count: 1,
+            inputs: vec![Input {
+                kind: 1,
+                file_id: 1,
+            }],
+            name_range: None,
+            positions: vec![(1, aside + n)],
+            has_entries: false,
+            has_set_aside: true,
+            complete: true,
+        };
+        let batches = vec![Batch {
+            generation: 1,
+            first_sequence: 0,
+            last_sequence: aside + n - 1,
+            received_at: 0,
+            commit_time: 0,
+        }];
+        let ninth = |i: u64| (f64::from(((i / 2) % 5) as u32) / 9.0 + 1.0).to_bits();
+        let f64_ = crate::value_type::F64;
+        let mut w = FileWriter::new(Vec::new(), id, 0, &d, batches)
+            .unwrap()
+            .with_tweaks(super::super::Tweaks {
+                bodies,
+                ..Default::default()
+            });
+        w.series(Series {
+            series_id: 1,
+            name: Some("s".into()),
+            reach: Reach::Point,
+            facts: (aside..aside + n)
+                .map(|i| Fact::value(1, (1, i), 1_000_000 + (i - aside) as i64, f64_, ninth(i)))
+                .collect(),
+            set_aside: (0..aside)
+                .map(|i| Fact::value(1, (1, i), 1_000_010 + i as i64, f64_, ninth(i)))
+                .collect(),
+        })
+        .unwrap();
+        (w.finish().unwrap().0, id)
+    }
+
+    /// The file's data block bodies in file order, each value column in compressed XOR replaced by its plain XOR
+    /// stream: a canonical body this writer does not choose (C.10).
+    fn plain_xor_bodies(bytes: &[u8], id: &Identity) -> (Vec<Vec<u8>>, usize) {
+        let mut chunks = Vec::new();
+        let file = CompactedFile::open(bytes, id, None).unwrap();
+        let mut order = file.index().unwrap();
+        order.sort_unstable_by_key(|e| e.chunk_offset);
+        let (mut out, mut changed) = (Vec::new(), 0);
+        for e in &order {
+            let d = file.directory(e).unwrap();
+            chunks.push((e.flags & SET_ASIDE != 0, d.blocks.len()));
+            for b in 0..d.blocks.len() {
+                let (block, body) = file.data_block_raw(e, &d, b).unwrap();
+                let cols = crate::block::directory(&body).unwrap();
+                let words = block.len();
+                let swapped: Vec<(u8, u8, Vec<u8>)> = cols
+                    .iter()
+                    .map(|&(c, enc, p)| {
+                        if c == crate::column::VALUE && enc == crate::encoding::XOR_ZSTD {
+                            let stream = crate::float::decompress_xor(p, words).unwrap();
+                            (c, crate::encoding::XOR, stream)
+                        } else {
+                            (c, enc, p.to_vec())
+                        }
+                    })
+                    .collect();
+                let refs: Vec<(u8, u8, &[u8])> = swapped
+                    .iter()
+                    .map(|(c, e, p)| (*c, *e, p.as_slice()))
+                    .collect();
+                let alt = crate::block::tests::rebuild(block.len() as u16, &refs);
+                if alt != body {
+                    changed += 1;
+                }
+                out.push(alt);
+            }
+        }
+        assert_eq!(chunks, [(false, 64), (true, 1), (false, 2)]);
+        (out, changed)
+    }
+
+    #[test]
+    fn a_file_keeps_its_own_xor_bodies_in_chunks_before_within_and_after_a_set_aside_chunk() {
+        let (canonical, id) = aside_then_ninths(Vec::new());
+        let (bodies, changed) = plain_xor_bodies(&canonical, &id);
+        assert!(changed >= 66, "{changed} bodies changed");
+        let (own, _) = aside_then_ninths(bodies);
+        assert_ne!(own, canonical);
+        let info = |_| SeriesInfo {
+            name: Some("s".into()),
+            reach: Reach::Point,
+        };
+        check_canonical(&own, &id, &info).unwrap();
+        check_canonical(&canonical, &id, &info).unwrap();
+    }
 }
