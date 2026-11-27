@@ -292,6 +292,18 @@ impl<'a> RunTask<'a> {
         self.peak
     }
 
+    /// The stage it is in, for a measurement's report.
+    #[cfg(test)]
+    pub(crate) fn stage(&self) -> &'static str {
+        match &self.stage {
+            Stage::Census { .. } => "census",
+            Stage::Pass { rows, .. } if !rows.collected => "collect",
+            Stage::Pass { .. } => "write",
+            Stage::Verify(_) => "verify",
+            Stage::Done => "done",
+        }
+    }
+
     /// The outcome once the run has ended.
     pub(crate) fn outcome(&mut self) -> Option<Result<Vec<Output>, RunError>> {
         self.outcome.take()
