@@ -165,6 +165,8 @@ fn before(t: &MTransition, p: &Pend) -> bool {
 pub(super) enum Feed<'a> {
     Fact(crate::gates::FactItem, bool),
     Routing(&'a Routing),
+    /// A definition, alias or retirement: the series and its names after it.
+    Define(SeriesId, Vec<String>),
     Other,
 }
 
@@ -324,6 +326,10 @@ impl Deliverer {
                     fact: f.clone(),
                     outranked: *outranked,
                 },
+                Feed::Define(series, names) => Body::Define {
+                    series: *series,
+                    names: names.clone(),
+                },
                 Feed::Routing(r) if r.consumer == name => match (r.op, &r.gate) {
                     (RouteOp::Watch, Some(g)) => match &g.spec {
                         Some(spec) => Body::Watch {
@@ -407,6 +413,7 @@ impl Deliverer {
         };
         run.ready();
         let r = f(&mut run.core, &self.history(ctx));
+        self.stats.instances_refused += run.core.take_refused();
         match r {
             Ok(ts) => {
                 if let Some(rt) = self.consumers.get_mut(name) {

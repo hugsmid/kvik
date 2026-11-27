@@ -387,10 +387,11 @@ fn a_clean_shutdown_writes_a_checkpoint_at_the_frontier() {
     block_on(s.shutdown()).unwrap();
 }
 
-/// Q-2082: a power loss's recovery entry is a reset point after the checkpoint, so the take reseeds rather than
-/// replays: the transitions handed out and never confirmed are not sent again; the resync carries state now.
+/// Q-2170 (superseding Q-2082): a power loss's recovery entry is a reset point after the checkpoint; the replay
+/// sends again the transitions handed out and never confirmed before it, reseeds there, and the resync carries the
+/// reseeded state with `set_by` none.
 #[test]
-fn a_power_loss_reseeds_the_gates_rather_than_replaying_across_its_reset_point() {
+fn a_power_loss_replays_up_to_its_reset_point_then_reseeds_there() {
     let mut w = World::quiet("gates-durable-power");
     let s = w.open();
     let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
@@ -405,7 +406,14 @@ fn a_power_loss_reseeds_the_gates_rather_than_replaying_across_its_reset_point()
     let s = w.open();
     let mut c = take(&s);
     let got = ready(&mut c);
-    assert_eq!(seen(&got), ["resync Resume [(Level(0), false)]"]);
+    assert_eq!(
+        seen(&got),
+        [
+            "Some(Unknown) r=true",
+            "Some(Level(0)) r=true",
+            "resync Resume [(Level(0), false)]"
+        ]
+    );
     assert_eq!(s.stats().delivery.gates_reseeded, 1);
     block_on(s.shutdown()).unwrap();
 }

@@ -20,6 +20,25 @@ pub(super) fn core_pos(p: LogPos) -> Position {
     Position::new(p.generation, p.sequence)
 }
 
+/// The series a definition, alias or retirement entry changes: a definition entry to the gates core (for `Each`).
+pub(super) fn defined(e: &kvik_log::entries::Entry) -> Option<u32> {
+    use kvik_log::entries::Entry;
+    match e {
+        Entry::Definition(d) => Some(d.id),
+        Entry::Alias { id, .. } | Entry::Retirement { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+/// The series' names in `view` (after its entry is applied), none once retired.
+pub(super) fn names_of(id: u32, view: &crate::durable::routing::View) -> Vec<String> {
+    view.registry
+        .get(id)
+        .filter(|s| !s.retired())
+        .map(|s| s.names.clone())
+        .unwrap_or_default()
+}
+
 /// A fact as the gates core is fed it.
 pub(super) fn fact_item(row: &kvik_log::facts::FactRow, d: &Deliverer) -> FactItem {
     let spec = d.view.registry.get(row.series_id).map(|s| &s.spec);

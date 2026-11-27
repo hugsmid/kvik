@@ -236,6 +236,10 @@ impl Deliverer {
                 },
                 _ => None,
             };
+            let define = match &item {
+                Item::Entry(e) if gating => gate_history::defined(e),
+                _ => None,
+            };
             let mut fact_outranked = false;
             match item {
                 Item::Fact(row) => {
@@ -323,7 +327,16 @@ impl Deliverer {
                     self.gate_item(p, commit, &gates::Feed::Routing(r), ctx);
                     gating = self.gating();
                 }
-                (None, None) if gating => self.gate_item(p, commit, &gates::Feed::Other, ctx),
+                (None, None) if gating => {
+                    let feed = match define {
+                        Some(id) => gates::Feed::Define(
+                            kvik_model::types::SeriesId(id),
+                            gate_history::names_of(id, &self.view),
+                        ),
+                        None => gates::Feed::Other,
+                    };
+                    self.gate_item(p, commit, &feed, ctx);
+                }
                 _ => {}
             }
         }

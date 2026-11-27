@@ -42,6 +42,8 @@ enum GateKind {
     Levels(usize),
     Set(usize),
     Change(usize),
+    /// Levels on each series a pattern selects: definitions and aliases join it (Q-1143).
+    Each(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +87,7 @@ fn gate_kind() -> impl Strategy<Value = GateKind> {
         (0usize..4).prop_map(GateKind::Levels),
         (0usize..3).prop_map(GateKind::Set),
         (0usize..3).prop_map(GateKind::Change),
+        (0usize..2).prop_map(GateKind::Each),
     ]
 }
 
@@ -102,6 +105,7 @@ fn gate_steps() -> impl Strategy<Value = Vec<Step>> {
         1 => (0usize..2).prop_map(Step::Retake),
         1 => Just(Step::Restart),
         1 => Just(Step::Define),
+        1 => Just(Step::Alias),
     ];
     prop::collection::vec(step, 1..40)
 }
@@ -178,6 +182,16 @@ fn gate(k: &GateKind, ids: &[SeriesId]) -> (String, Gate) {
         GateKind::Change(i) => (
             format!("change-{i}"),
             Gate::change(Input::value(id(*i))).deadband(20.0),
+        ),
+        GateKind::Each(i) => (
+            format!("each-{i}"),
+            Gate::levels(
+                Input::value_each(),
+                [Level::above(40.0)
+                    .clear(25.0)
+                    .hold_up(Duration::from_secs(2))],
+            )
+            .each(["site/*/power", "*/a/*"][*i]),
         ),
     }
 }
@@ -583,6 +597,16 @@ fn gate_history_on_both(history: &[Step]) -> (Vec<String>, Vec<String>) {
 #[test]
 fn an_unconfirmed_start_transition_is_replayed_after_a_restart_not_reseeded() {
     let (m, d) = gate_history_on_both(&[Step::Watch(0, GateKind::Levels(0)), Step::Restart]);
+    assert_eq!(m, d);
+}
+
+#[test]
+fn an_each_gates_instances_are_restored_from_the_checkpoint_after_a_restart_not_reseeded() {
+    let (m, d) = gate_history_on_both(&[
+        Step::Watch(1, GateKind::Each(0)),
+        Step::Drain(1, 4),
+        Step::Restart,
+    ]);
     assert_eq!(m, d);
 }
 

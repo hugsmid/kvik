@@ -218,6 +218,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
 | Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
 | Q-2087 | §6 Gates, Resume, Transitions; Q-1392 | The instant a reseed starts the gates at: the commit floor, not the head's commit time (decided by the builder, provisional) |
+| Q-2170 | §6 Gates, Resume; §4 Resync; Q-2082 | A reset point or a new generation in the judgement: a reseed entry; a replay reseeds where the reset point lies (decided by the builder, provisional) |
+| Q-2171 | §6 Gates, Resume; §8 | A new generation on the durable backend reseeds at the take, not at the generation's first position (decided by the builder, provisional) |
+| Q-2172 | §6 Gates; §4 Resync | A lost range recorded at run time, after the engine judged its facts (decided by the builder, provisional) |
+| Q-2173 | §6 Gates, One stream; `format.md` A.15; Q-1143 | An `Each` gate's refused series are not in the checkpoint (decided by the builder, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5535,7 +5539,7 @@ Decided by the builder with cond2 step 5, provisional; settle with cond2 step 6.
 point voids. Cond2 step 6 replaces this with the reseed at the reset point during the replay (design §4.4 step 5).
 Reset points below the checkpoint do not stop a replay: nothing after the checkpoint rests on them.
 **Pinned by.** `kvik/tests/gates_durable.rs`
-`a_power_loss_reseeds_the_gates_rather_than_replaying_across_its_reset_point`, and
+`a_power_loss_replays_up_to_its_reset_point_then_reseeds_there` (renamed by Q-2170), and
 `gate_deliveries_after_crashes_follow_the_rules` (a power loss ends the resume with a reset point).
 
 ## Q-2083 — Facts counted for the bound; entries of a newer format in a replay
@@ -5592,6 +5596,53 @@ floor's position (the floor's guarantee then holds: nothing later commits below 
 hold complete by then is in the resync's state, `set_by` none; nothing is sent before the resync.
 **Pinned by.** `kvik/tests/gates_durable.rs` `a_lost_cursor_file_reseeds_the_gates`,
 `a_resume_beyond_the_replay_bound_reseeds_without_replaying`.
+
+## Q-2170 — A reset point or a new generation in the judgement
+Decided by the builder with cond2 step 6, provisional. Supersedes Q-2082.
+**Scenario.** A gate has crossed a boundary with hysteresis on a value since lost (a power loss truncated it, or a
+lost range voids it), and the log now holds a recovery entry or a lost range after the checkpoint. Judged straight
+through, the instance keeps a crossing that rests on facts the log no longer holds.
+**Decision (provisional).** The judgement treats a reset point (a recovery entry at its position; a lost range not
+described by one at its last position, before the next entry and at the commit time before it) and the start of a new
+generation as a reseed entry (`gate::Entry::Reset`): every instance in force is seeded again there by the seed rule,
+as if starting, with no transition; its `set_by` is that start id, carried as none in a resync until the instance moves
+(Q-1392); the series an `Each` holds and refuses are kept, so no instance joins or leaves there. The model engine's
+gate history places these entries from its reset points; the durable replay at a take does the same where it meets
+one after the checkpoint, so it replays the transitions before the reset point rather than reseeding the whole take
+at the head. The consumer forgets ids above the resync's `forget_above` (Q-1140). Counted once per take as
+`gates_reseeded`.
+**Pinned by.** `model/tests/gate_reset.rs` (`after_a_reset_the_judgement_is_that_of_a_gate_started_there` and the
+unit cases); `kvik/src/gates/differential.rs` (resets in the core differential), `kvik/src/gates/each_tests.rs`
+`a_reset_reseeds_every_instance_without_a_transition`; `kvik/tests/gates_each.rs`
+`a_reset_point_after_the_checkpoint_reseeds_where_it_lies_after_replaying_up_to_it`.
+
+## Q-2171 — A new generation on the durable backend
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A store is restored (§8); a consumer's checkpoint is of the previous generation.
+**Decision (provisional).** The durable backend reseeds at the take, at the commit floor (Q-2087), not at the first
+position of the new generation where the model's history places its reseed entry (Q-2170). The two agree on states
+except where a hold or hysteresis spans entries between the generation's start and the take. Restores are not in the
+gate differentials; settle with the restore work if they are added.
+**Pinned by.** `kvik/src/durable/deliver/gate_resume.rs` (another generation is not replayed); no differential.
+
+## Q-2172 — A lost range recorded at run time
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A scrub finds a sealed segment damaged with no copy while the store runs; the engine has already judged
+its facts. Consumers past the range receive a plain resync (§4 Resync).
+**Decision (provisional).** The running engine keeps what it judged; a later replay from a checkpoint before the range
+reseeds there (Q-2170), as the model's history, which lists every lost range among its reset points, does. Until a
+restart the live states may rest on the lost facts. Not in the differentials.
+**Pinned by.** Nothing yet.
+
+## Q-2173 — An `Each` gate's refusals across a restore
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A full `Each` refuses a series; the consumer stops; its checkpoint holds instances only (`format.md`
+A.15, Q-2081).
+**Decision (provisional).** No format change: at restore the refusals are every series the pattern matches at the
+checkpoint's position, by the names in force there, beyond the instances (with the instances, every match: the
+invariant the core keeps). `instances_refused` counts per run: a replay counts again the refusals it judges again.
+**Pinned by.** `kvik/src/gates/differential.rs` (restores with `Each` gates); `kvik/tests/gates_each.rs`
+`each_instances_replay_after_a_restart_from_the_checkpoint`.
 
 ## Open at v0.2
 
@@ -5829,12 +5880,16 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
 | Q-2080 | cond2 review | Decided by the builder, provisional: field 4 and block 0x31; replay at the first take |
 | Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
-| Q-2082 | cond2 step 6 | Decided by the builder, provisional: reseed when a reset point follows the checkpoint |
+| Q-2082 | cond2 step 6 | Superseded by Q-2170 (cond2 step 6): the replay reseeds where the reset point lies |
 | Q-2083 | cond2 review | Decided by the builder, provisional: positions less entries; newer-format entries not fed |
 | Q-2084 | cond2 review | Decided by the builder, provisional: the start id it would have had |
 | Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
 | Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
 | Q-2087 | cond2 review | Decided by the builder, provisional: the commit floor once read through its position |
+| Q-2170 | cond2 review | Decided by the builder, provisional: a reseed entry; the replay reseeds at the reset point |
+| Q-2171 | cond2 review | Decided by the builder, provisional: reseed at the take; the differentials hold no restore |
+| Q-2172 | cond2 review | Decided by the builder, provisional: the engine keeps what it judged; reseeded at the next replay across it |
+| Q-2173 | cond2 review | Decided by the builder, provisional: recomputed at restore from the names in force |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

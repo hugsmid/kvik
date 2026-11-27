@@ -167,23 +167,28 @@ impl Snapshot {
         }
     }
 
-    /// Keeps the instances whose gate is in `defs` and reads its own series, and the series they read (G9); the
-    /// gates of `defs` without an instance are returned for a reseed. Returns the count dropped, with those gates.
+    /// Keeps the instances whose gate is in `defs` and reads its own series (any, for `Each`), and the series they read
+    /// (G9); the one-series gates of `defs` without an instance are returned for a reseed. Returns the count dropped, with those gates.
     pub fn retain_in_force(
         &mut self,
         defs: &BTreeMap<ConditionId, Gate>,
     ) -> (usize, Vec<ConditionId>) {
         let before = self.instances.len();
+        // An `Each` gate's instances are the series it held at the checkpoint; it may hold none.
         self.instances.retain(|(g, s), _| {
-            defs.get(g)
-                .is_some_and(|gate| gate.selector == Selector::Series(*s))
+            defs.get(g).is_some_and(|gate| match gate.selector {
+                Selector::Series(x) => x == *s,
+                Selector::Each(_) => true,
+            })
         });
         let dropped = before - self.instances.len();
         let read: std::collections::BTreeSet<SeriesId> =
             self.instances.keys().map(|(_, s)| *s).collect();
         self.series.retain(|s, _| read.contains(s));
         let missing = defs
-            .keys()
+            .iter()
+            .filter(|(_, gate)| matches!(gate.selector, Selector::Series(_)))
+            .map(|(g, _)| g)
             .filter(|g| !self.instances.keys().any(|(h, _)| h == *g))
             .copied()
             .collect();

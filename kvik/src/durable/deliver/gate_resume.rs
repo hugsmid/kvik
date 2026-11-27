@@ -146,9 +146,6 @@ impl Deliverer {
             return Err(NoReplay::Unusable);
         }
         let from = next(through);
-        if self.resets.range(from..).next().is_some() {
-            return Err(NoReplay::Unusable);
-        }
         // Positions after the checkpoint less those of entries: the facts, counted without reading them.
         let entries: u64 = self
             .entries
@@ -200,7 +197,7 @@ impl Deliverer {
             Core::restore(snap, restore_defs, &history).map_err(|_| NoReplay::Unusable)?;
         core.reseed(&reseed, k.at, k.now, &history)
             .map_err(|_| NoReplay::Unusable)?;
-        let reseeded = core
+        let reseeded: BTreeMap<_, _> = core
             .states()
             .into_iter()
             .filter(|((g, _), _)| missing.contains(g))
@@ -227,7 +224,13 @@ impl Deliverer {
                         }
                         let body = gate_body(name, e, &view);
                         view.apply(*p, e);
-                        body
+                        match super::gate_history::defined(e) {
+                            Some(id) => Body::Define {
+                                series: kvik_model::types::SeriesId(id),
+                                names: super::gate_history::names_of(id, &view),
+                            },
+                            None => body,
+                        }
                     }
                 };
                 let item = Item {
@@ -237,8 +240,44 @@ impl Deliverer {
                 (*p, item)
             })
             .collect();
+        // A reset point after the checkpoint reseeds every instance where it lies (design §4.4 step 5, Q-2170): at its
+        // recovery entry, or for a lost range at its last position, before the next entry and at the commit time
+        // before it, as the model's history places it.
+        let resets: Vec<LogPos> = self
+            .resets
+            .range(from..)
+            .take_while(|(p, _)| **p <= head)
+            .map(|(p, _)| *p)
+            .collect();
+        let mut items: Vec<(LogPos, Item)> = items
+            .into_iter()
+            .map(|(p, i)| match resets.binary_search(&p) {
+                Ok(_) => (
+                    p,
+                    Item {
+                        position: i.position,
+                        body: Body::Reset,
+                    },
+                ),
+                Err(_) => (p, i),
+            })
+            .collect();
+        for r in &resets {
+            if let Err(at) = items.binary_search_by_key(r, |(p, _)| *p) {
+                let item = Item {
+                    position: core_pos(*r),
+                    body: Body::Reset,
+                };
+                items.insert(at, (*r, item));
+            }
+        }
+        let mut last_commit = k.now;
         for (p, item) in items {
-            let commit = self.index.commit_time_of(p).unwrap_or(k.now);
+            let commit = match item.body {
+                Body::Reset if !self.items.contains_key(&p) => last_commit,
+                _ => self.index.commit_time_of(p).unwrap_or(k.now),
+            };
+            last_commit = last_commit.max(commit);
             let ts = core
                 .apply_batch(commit, std::slice::from_ref(&item), &history)
                 .map_err(|_| NoReplay::Unusable)?;
@@ -249,6 +288,15 @@ impl Deliverer {
         {
             out.extend(core.advance(f));
         }
+        if !resets.is_empty() && !core.states().is_empty() {
+            self.stats.gates_reseeded += 1;
+        }
+        // An instance a reset point reseeded and nothing has moved since carries `set_by` none (Q-1392).
+        let mut reseeded = reseeded;
+        reseeded.extend(core.states().into_iter().filter_map(|(key, (_, set_by))| {
+            (set_by.due.is_none() && resets.binary_search(&log_pos(set_by.at)).is_ok())
+                .then_some((key, set_by))
+        }));
         let mut run = self.replayed_run(name, core, held, confirmed, reseeded, out);
         names.append(&mut run.names);
         run.names = names;
@@ -287,7 +335,9 @@ impl Deliverer {
         let mut deferred = VecDeque::new();
         for t in out {
             let k = (t.id.condition, t.id.series);
-            run.reseeded.remove(&k);
+            if run.reseeded.get(&k).is_some_and(|r| t.id > *r) {
+                run.reseeded.remove(&k);
+            }
             run.last.insert(k, t.clone());
             if confirmed.is_none_or(|g| !covers(&g, &t.id)) {
                 deferred.push_back((t, true));

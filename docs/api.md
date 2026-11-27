@@ -429,11 +429,15 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 ### Gates
 In-store conditions on one stream (spec §6 Gates). The model backend serves them from its judgement
 (`kvik_model::gate`); the durable backend judges them in the writer's process, one engine per consumer taken in
-the run, and refuses `each` gates and window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Its cursor file holds
-the gate cursor and a checkpoint (`format.md` A.15): a second take in the same run, and the first take after a stop or
-a crash, receive the unconfirmed transitions again under their ids, flagged `replayed`; beyond `conditions.replay_max`,
-without a cursor file, or across a reset point the gates are rebuilt from history (`set_by` `None`), counted
-`gates_reseeded` (Q-2080, Q-2082). The model backend replays without bound (Q-2085).
+the run, and refuses window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Its cursor file holds the gate cursor
+and a checkpoint (`format.md` A.15): a second take in the same run, and the first take after a stop or a crash,
+receive the unconfirmed transitions again under their ids, flagged `replayed`; beyond `conditions.replay_max`, without
+a cursor file, or in another generation the gates are rebuilt from history at the take (`set_by` `None`), counted
+`gates_reseeded` (Q-2080, Q-2087). A reset point after the checkpoint (a recovery entry, a lost range) is met during
+the replay: the transitions before it are replayed, every instance is seeded again where it lies with no transition,
+and the replay goes on; the resync at the reset point carries `forget_above`, and the consumer forgets transition ids
+with `at` above it (Q-1140, Q-2170). The model backend replays without bound (Q-2085) and judges a reset point the
+same way.
 ```rust
 let id = consumer.watch("bathroom-humidity", Gate::levels(Input::value(humidity), [
         Level::above(70.0).clear(65.0).hold_up(Duration::from_secs(120)),
@@ -463,7 +467,9 @@ pub struct GateInstanceState { pub condition: GateId, pub series: SeriesId, pub 
 | Kinds | `Gate::levels(input, levels)` (1 to 16 boundaries, rising; each `above(at)`, `.clear(c)` with `c ≤ at`, `.hold_up(d)`, `.hold_down(d)`), `Gate::set(input, values)` (1 to 64, none `Absent`, numbers finite, decimal scale at most 18, text 1 to 255 bytes; `.hold_on(d)`, `.hold_off(d)`), `Gate::change(input).deadband(x)`; on any, `.stale_after(d)` and `.each(pattern)` (a name pattern, at most 256 instances, Q-1143); every duration at most ten years (`Duration`). |
 | Inputs | `Input::value(series)` or, under `.each`, the series-free `Input::value_each()`; `Input::window(series, width, aggregate)` (series-free `window_each(width, aggregate)` under `.each`; naming a series and `.each` together is refused, `GateError::Selector`) with `.min_coverage(thousandths)` (default 500) and `.cadence(d)` (default 1 s). A series by id or by name; a name resolves when the routing entry commits. |
 | Naming | A name is unique within its consumer (1–64 bytes, the series-name segment grammar). `watch` with an equal spec returns the id in force and writes nothing (a set's members compare in order, as written, Q-1811), so applications watch at every start, as `route` (Q-91 (c)); a different spec under a name in force is refused (`ConsumerError::Gate`). `watch` and `unwatch` are routing entries and take effect at their positions. |
-| Delivery | Transitions at a position follow that position's fact deliveries; timer transitions in `TransitionId` order. Each instance starts with a transition from `None` (state now at the watch or join, its holds seeded from up to twice the longest hold of history, at most 24 h, spec §6 Gates, Q-1145) and an `Each` instance that leaves ends with one to `None`. Timers run on the commit clock (provisional, Q-1393). |
+| Delivery | Transitions at a position follow that position's fact deliveries; timer transitions in `TransitionId` order. Each instance starts with a transition from `None` (state now at the watch or join, its holds seeded from up to twice the longest hold of history, at most 24 h, spec §6 Gates, Q-1145) and an `Each` instance that leaves ends with one to `None`. A series that starts to match while an `Each` holds 256
+instances is refused, counted once (`instances_refused`), and joins, with its start transition, at the first definition
+entry that finds room (Q-1143). Timers run on the commit clock (provisional, Q-1393). |
 | Resume | One gate cursor per consumer: the last confirmed `TransitionId`, or the frontier of the last confirmed resync, kept with a checkpoint at or after it (Q-1391). On resume: transitions after both, `replayed`, under their first ids, then a resync carrying `gates`. Beyond `conditions.replay_max` (default 24 h or 1,000,000 facts, measured from the checkpoint) nothing is replayed, counted as `transitions_not_replayed`. |
 | Limits and errors | 4,096 gates per consumer, 65,536 per store. New errors: `ConsumerError::Gate(GateError)` with `GateError` { `Levels`, `Set`, `Deadband`, `Duration`, `Coverage`, `Selector`, `Pattern(RouteError)`, `Name`, `NameInUse`, `NoSuchGate`, `TooMany` } (Q-1581); `set_by` is `None` after a reseed (Q-1392). Constants `MAX_GATES_PER_CONSUMER`, `MAX_GATES_PER_STORE`, `MAX_GATE_LEVELS`, `MAX_GATE_MEMBERS`, `MAX_GATE_INSTANCES`, `MAX_GATE_NAME`, `MAX_GATE_DURATION`. |
 | Raw series | A consumer watching raw series receives at attach and after a restart each watched series' latest value with its event time; deliveries carry event time (built with the public API, conditions step 3, Q-1140). |
@@ -748,7 +754,8 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //               /* gate transitions judged during a catch-up and not delivered */, gates_reseeded /* starts whose gates
 //               were rebuilt from history */, transitions_not_replayed /* resumes beyond `conditions.replay_max` */,
 //               checkpoint_mismatch /* checkpoint instances dropped or gates reseeded at a resume */, gate_errors
-//               /* gate judgements rebuilt after a failed read */ }
+//               /* gate judgements rebuilt after a failed read */, instances_refused /* series a full `Each` refused,
+//               Q-1143 */ }
 //               (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,

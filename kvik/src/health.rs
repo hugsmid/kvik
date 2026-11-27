@@ -490,6 +490,8 @@ pub struct DeliveryStats {
     pub checkpoint_mismatch: u64,
     /// Gate judgements that failed (a history read) and were rebuilt by a reseed (Q-1881).
     pub gate_errors: u64,
+    /// Series an `Each` gate at its 256 instances refused, once each time one started to match (Q-1143).
+    pub instances_refused: u64,
 }
 
 /// Per-series statistics.
