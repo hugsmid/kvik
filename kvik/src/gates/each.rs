@@ -31,7 +31,7 @@ impl Core {
                 Selector::Series(_) => None,
             })
             .collect();
-        let mut emitted = Vec::new();
+        // One series changes, and each gate gives it at most one transition, in gate order: already in id order.
         for (id, p) in each {
             // Instances and refusals hold every series the pattern matches (the invariant `reconcile` keeps), so only
             // this series' membership can change.
@@ -41,17 +41,8 @@ impl Core {
             } else {
                 wanted.remove(&series);
             }
-            self.reconcile(
-                id,
-                wanted.into_iter().collect(),
-                at,
-                now,
-                history,
-                &mut emitted,
-            )?;
+            self.reconcile(id, wanted.into_iter().collect(), at, now, history, out)?;
         }
-        emitted.sort_by_key(|t| t.id);
-        out.extend(emitted);
         Ok(())
     }
 

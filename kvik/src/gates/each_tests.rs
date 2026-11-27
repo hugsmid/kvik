@@ -3,8 +3,9 @@
 use kvik_model::gate::{ConditionId, Gate, GateState, Kind, Level, MAX_INSTANCES, Selector, judge};
 use kvik_model::types::{Quality, SECOND, SeriesId, Value};
 
-use super::Core;
+use super::differential::S;
 use super::differential::{Drive, Log, PATTERN, gate, run};
+use super::{Body, Core, FactItem, Item};
 
 fn each(levels: &[Level]) -> Gate {
     Gate {
@@ -42,6 +43,8 @@ fn a_full_each_refuses_and_counts_a_series_and_takes_it_when_another_leaves() {
     );
     log.define(3 * SECOND, SeriesId(1), &["hall/1/temp"]);
     log.define(4 * SECOND, SeriesId(n + 1), &[&room(n + 1)]);
+    // Still matching while refused: not counted again.
+    log.define(5 * SECOND, SeriesId(n + 1), &[&room(n + 1), "room/x/temp"]);
     let until = 10 * SECOND;
     let model = judge(&log.entries, until).unwrap();
     let mut core = Core::new();
@@ -117,4 +120,33 @@ fn a_reset_reseeds_every_instance_without_a_transition() {
         GateState::Level(0)
     );
     assert_eq!(got.last().unwrap().to, Some(GateState::Level(1)));
+}
+
+#[test]
+fn a_reset_reads_the_series_again_rather_than_keep_a_fact_the_log_no_longer_holds() {
+    let mut log = Log::default();
+    log.watch(
+        0,
+        ConditionId(1),
+        gate(Kind::Levels(vec![Level::at(10.0)]), None),
+    );
+    log.fact(S, SECOND, SECOND, Value::Num(12.0), Quality::Good);
+    // A fact the core judged that the log has since lost: in the items, not in the history.
+    let lost = Item {
+        position: log.next(),
+        body: Body::Fact {
+            fact: FactItem {
+                series: S,
+                t: 2 * SECOND,
+                value: Value::Num(5.0),
+                quality: Quality::Good,
+                changed_at: None,
+            },
+            outranked: false,
+        },
+    };
+    log.items.push((2 * SECOND, lost));
+    log.reset(3 * SECOND);
+    let (_, core) = run(&log, &one_batch_each(), 10 * SECOND);
+    assert_eq!(core.states()[&(ConditionId(1), S)].0, GateState::Level(1));
 }

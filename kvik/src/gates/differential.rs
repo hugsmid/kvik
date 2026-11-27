@@ -195,7 +195,7 @@ pub(super) struct Log {
 }
 
 impl Log {
-    fn next(&mut self) -> Position {
+    pub(super) fn next(&mut self) -> Position {
         self.seq += 1;
         Position::new(0, self.seq)
     }
