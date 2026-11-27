@@ -125,8 +125,12 @@ pub fn model_fault(dir: &Path, fault: ModelFault) -> bool {
     };
     shared.with(|s| {
         let known = match &fault {
-            ModelFault::PowerLoss => true,
             ModelFault::LoseCursorFile(name) => s.consumers.contains_key(name),
+            ModelFault::PowerLoss
+            | ModelFault::TimedMark
+            | ModelFault::LongSegments
+            | ModelFault::PowerLossLosing(_)
+            | ModelFault::Damage(_) => true,
         };
         if known {
             s.faults.push(fault);
