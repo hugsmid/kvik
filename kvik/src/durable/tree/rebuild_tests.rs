@@ -254,3 +254,41 @@ fn a_damaged_part_of_a_merged_day_is_rebuilt_when_late_data_arrives() {
     let (_, vis) = tree_state(&st.fs, &st.dir);
     assert_model(&st, &vis);
 }
+
+#[test]
+fn a_checkpoint_that_meets_a_damaged_part_repairs_it_at_the_same_step_not_at_the_next_scrub() {
+    let mut st = Store::new("live-damage");
+    history(&mut st);
+    let d0 = day_of(&st);
+    st.w.reader().unwrap();
+    step_until(&st, "the first day's roll-ups are written", |r| {
+        set::covered(r, 4, d0, d0 + DAY)
+    });
+    let root = newest_root(&st.fs, &st.dir);
+    let bad = *root
+        .parts
+        .iter()
+        .find(|p| p.period_start <= d0 && d0 < p.period_start + p.period_len as i64)
+        .unwrap();
+    let path = st
+        .dir
+        .join(DIR)
+        .join(part_name(root.header.generation, bad.file_id));
+    st.fs
+        .poke(&path, (bad.byte_len / 2) as usize, &[0xff, 0x00, 0xff]);
+    let late = (st.clock.wall().0 - (d0 + 13 * 3_600_000_000_000)) / 1_000_000_000;
+    st.emit(
+        Intent::Normal,
+        &[(u64::try_from(late).unwrap(), Some(42.0))],
+    );
+    let steps = advance_until(&st, "the damaged part is replaced", true, |r| {
+        r.checkpoint > root.checkpoint && !r.parts.iter().any(|x| x.file_id == bad.file_id)
+    });
+    assert!(
+        steps <= 2,
+        "repaired by the checkpoint's step: {steps} steps"
+    );
+    st.stop();
+    let (_, vis) = tree_state(&st.fs, &st.dir);
+    assert_model(&st, &vis);
+}

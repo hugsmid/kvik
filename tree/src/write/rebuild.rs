@@ -326,8 +326,9 @@ impl TreeFiles {
 
     /// The roll-up entries a checkpoint of `entries` must also write (section 5 step 3, T2): each roll-up span over a
     /// changed quarter-hour entry that is covered, recomputed from the visible children overlaid by `entries`; an
-    /// empty marker where no child is left.
-    pub fn ancestors<F>(&self, entries: &Runs, params: F) -> Result<Runs, WriteError>
+    /// empty marker where no child is left. A span over a part that will not load is marked stale, and those parts
+    /// are returned for a repair at the same cut (Q-2111).
+    pub fn ancestors<F>(&self, entries: &Runs, params: F) -> Result<(Runs, Vec<u64>), WriteError>
     where
         F: Fn(u64) -> Option<Params>,
     {
@@ -335,7 +336,7 @@ impl TreeFiles {
         let mut pairs = rollups(&root.levels);
         pairs.reverse();
         let Some(base) = cover_levels(&root.levels).last().copied() else {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), Vec::new()));
         };
         let mut affected: BTreeSet<Key> = BTreeSet::new();
         for ((s, level), es) in entries {
@@ -354,7 +355,7 @@ impl TreeFiles {
             }
         }
         if affected.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), Vec::new()));
         }
         let spans: Vec<(i64, u64)> = affected
             .iter()
@@ -363,7 +364,18 @@ impl TreeFiles {
         let mut view = root.clone();
         view.parts
             .retain(|r| spans.iter().any(|&(s, l)| period_overlaps(r, s, l)));
-        let parts = self.load_all(&view.parts)?;
+        let mut parts = Vec::new();
+        let mut damaged = Vec::new();
+        view.parts.retain(|r| match self.load(r) {
+            Some(p) => {
+                parts.push(p);
+                true
+            }
+            None => {
+                damaged.push(*r);
+                false
+            }
+        });
         let series: BTreeSet<u64> = affected.iter().map(|k| k.0).collect();
         let mut work: BTreeMap<Key, Entry> = set::visible(&view, &parts)
             .map_err(set::MergeError::from)?
@@ -407,7 +419,17 @@ impl TreeFiles {
                         .range((s, child.id, x)..(s, child.id, end))
                         .map(|(_, e)| e)
                         .collect();
-                    let e = if children.is_empty() {
+                    let e = if damaged
+                        .iter()
+                        .any(|r| period_overlaps(r, x, parent.width as u64))
+                    {
+                        Entry {
+                            start: x,
+                            stale: true,
+                            as_of: children.iter().map(|c| c.as_of).max().unwrap_or_default(),
+                            node: None,
+                        }
+                    } else if children.is_empty() {
                         Entry {
                             start: x,
                             stale: false,
@@ -426,6 +448,6 @@ impl TreeFiles {
                 }
             }
         }
-        Ok(out)
+        Ok((out, damaged.iter().map(|r| r.file_id).collect()))
     }
 }

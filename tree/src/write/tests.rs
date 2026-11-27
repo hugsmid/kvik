@@ -151,7 +151,7 @@ impl World {
         }
         let (wall, now) = (self.wall, self.now);
         let files = self.files.as_mut().expect("started");
-        let ups = files.ancestors(&entries, |_| Some(params()))?;
+        let (ups, _) = files.ancestors(&entries, |_| Some(params()))?;
         entries.extend(ups);
         files.checkpoint(k, self.synced, entries, rebuilding, wall, now)?;
         self.dirty.retain(|_, p| *p > k);

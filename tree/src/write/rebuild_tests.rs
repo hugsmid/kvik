@@ -383,6 +383,47 @@ fn merges_write_rollups_that_equal_a_rebuild_and_late_facts_recompute_them() {
 }
 
 #[test]
+fn a_checkpoint_over_a_damaged_part_marks_its_rollups_stale_and_a_repair_restores_t3() {
+    let mut w = World::new();
+    let facts: Vec<(u64, i64, Option<f64>)> = (0..200)
+        .map(|i| (0, i as i64 * 600 * S, Some(i as f64)))
+        .collect();
+    w.append(&facts);
+    w.sync();
+    w.checkpoint().unwrap();
+    merge(&mut w, 20).unwrap();
+    let f = w.files.as_ref().unwrap();
+    let bad = *f
+        .root()
+        .parts
+        .iter()
+        .find(|p| p.period_start <= 0 && 0 < p.period_start + p.period_len as i64)
+        .unwrap();
+    let path = f.dir().join(part_name(1, bad.file_id));
+    let mid = (bad.byte_len / 2) as usize;
+    let byte = w.fs.read(&path).unwrap()[mid];
+    w.fs.poke(&path, mid, &[byte ^ 0x5a]);
+    w.renamed.insert(path.clone(), w.fs.read(&path).unwrap());
+    w.append(&[(0, 5 * QUARTER + 7 * S, Some(-9.0))]);
+    w.sync();
+    w.checkpoint().expect("a checkpoint past the damaged part");
+    let f = w.files.as_ref().unwrap();
+    let mut root = f.root().clone();
+    root.parts.retain(|p| p.file_id != bad.file_id);
+    let parts: Vec<Part> = root.parts.iter().map(|r| f.load(r).unwrap()).collect();
+    let vis = visible(&root, &parts).unwrap();
+    let day = vis.get(&(0, 4, 0)).expect("the day's roll-up");
+    assert!(
+        day.stale && day.node.is_none(),
+        "the day over the damaged part is stale"
+    );
+    assert_eq!(f.scrub(), vec![bad.file_id]);
+    repair(&mut w).unwrap();
+    w.check();
+    t3(&w);
+}
+
+#[test]
 fn a_damaged_part_is_found_by_the_scrub_and_its_period_rebuilt() {
     let mut w = World::new();
     w.append(&[(0, 10 * S, Some(1.0)), (1, DAY + 10 * S, Some(2.0))]);

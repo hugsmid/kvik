@@ -280,10 +280,14 @@ impl Job {
                 .map(|f| f.series),
         );
         let mut entries = entries(r, v, &keys, &skip, &root.levels.clone())?;
-        let ups = files
+        let (ups, damaged) = files
             .ancestors(&entries, params_at(v))
             .map_err(|e| e.to_string())?;
         entries.extend(ups);
+        // Q-2111: the stale spans over a damaged part are rebuilt by the repair this step's maintenance runs.
+        if !damaged.is_empty() {
+            st.scrub_due = None;
+        }
         let rebuilding: BTreeSet<u64> = rebuild.iter().map(|&s| u64::from(s)).collect();
         files
             .checkpoint(k, synced, entries, &rebuilding, wall, now)

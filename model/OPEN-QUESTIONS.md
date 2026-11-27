@@ -5419,9 +5419,32 @@ period in the data therefore reads all older facts in one rebuild, which is stil
 Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
 **Scenario.** Section 7 has the writer's scrub find a damaged part and rebuild its period, without a cadence; reading
 every live part costs a pass over the tree.
-**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge that meets
-a damaged input runs it at once. The rebuild covers the part's period widened to every live part it overlaps, which it
+**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge or a
+checkpoint that meets a damaged input runs it at once (Q-2111). The rebuild covers the part's period widened to every live part it overlaps, which it
 retires, so that it is the whole truth of that period.
+
+## Q-2110 — T8 over the files on disk after a fallback start
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`), provisional.
+**Scenario.** A partial power loss leaves a newer root that the start refuses and leaves on disk; the start continues
+from an older root with a lower K. A rebuild or merge publishes at the root's K, so a repair or merge as the first
+publish after such a start writes a root of higher `seq` and lower K than the refused file.
+**Decision (provisional).** The job takes a checkpoint at the cut, at or above any root's K (T5), before any rebuild or
+merge, and the tree tests follow that order. A start does not remove a refused newer root.
+
+## Q-2111 — A checkpoint that meets a damaged part
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `ancestors`, `kvik/src/durable/tree/job.rs`),
+provisional.
+**Scenario.** Late data into a merged day makes the checkpoint recompute the day's roll-ups from the live parts over it.
+A damaged one failed the checkpoint, and maintenance (scrub, repair, merges) runs only after a checkpoint, so the tree
+stalled for good. A repair cannot run first: it publishes at the root's K, below the cut.
+**Decision (provisional).** The checkpoint goes through: each roll-up span over a part that will not load is written as
+a stale marker (readers take facts), and the job's maintenance at the same step runs the repair, whose widened period
+rewrites those spans from facts at the same cut.
+
+## Q-2113 — Case counts of the tree's properties
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/write/tests.rs`), provisional.
+**Scenario.** A count fixed in source overrides `PROPTEST_CASES`, so the deep run never reaches the property.
+**Decision (provisional).** The tree's properties take `PROPTEST_CASES`, capped at 1,024 per run.
 
 ## Open at v0.2
 
