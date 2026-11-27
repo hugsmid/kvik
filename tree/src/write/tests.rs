@@ -422,7 +422,7 @@ fn run(ops: &[Op]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases.min(1024), ..ProptestConfig::default() })]
 
     #[test]
     fn t1_t5_t6_t8_hold_over_histories_with_a_stop_at_any_write_step(ops in prop::collection::vec(op(), 1..30)) {

@@ -320,7 +320,7 @@ fn run(ops: &[Op]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases.min(1024), ..ProptestConfig::default() })]
 
     #[test]
     fn t3_holds_over_histories_with_merges_rebuilds_damage_and_stops(ops in prop::collection::vec(op(), 1..40)) {
