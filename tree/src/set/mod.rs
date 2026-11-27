@@ -81,9 +81,20 @@ pub fn covered(root: &Root, level: u8, from: i64, to: i64) -> bool {
 /// `covered`, empty markers left out. Parts the root does not list are ignored.
 pub fn visible(root: &Root, parts: &[Part]) -> Result<BTreeMap<Key, Seen>, SetError> {
     let live = live_parts(root, parts)?;
-    let won = overlay(root, &live)?;
-    Ok(won
-        .into_iter()
+    Ok(seen(root, overlay(root, &live)?))
+}
+
+/// The entries of `visible(R)` of one series, from the root's live parts (a reader's state, design section 6).
+pub fn visible_of(
+    root: &Root,
+    live: &[&Part],
+    series: u64,
+) -> Result<BTreeMap<Key, Seen>, SetError> {
+    Ok(seen(root, overlay_of(root, live, Some(series))?))
+}
+
+fn seen(root: &Root, won: BTreeMap<Key, (u64, crate::part::Entry)>) -> BTreeMap<Key, Seen> {
+    won.into_iter()
         .filter_map(|(k, (_, e))| {
             let (series, level, start) = k;
             let width = width(&root.levels, level)?;
@@ -99,7 +110,7 @@ pub fn visible(root: &Root, parts: &[Part]) -> Result<BTreeMap<Key, Seen>, SetEr
                 },
             ))
         })
-        .collect())
+        .collect()
 }
 
 pub(crate) fn live_parts<'a>(root: &Root, parts: &'a [Part]) -> Result<Vec<&'a Part>, SetError> {
@@ -120,9 +131,27 @@ pub(crate) fn overlay(
     root: &Root,
     parts: &[&Part],
 ) -> Result<BTreeMap<Key, (u64, crate::part::Entry)>, SetError> {
+    overlay_of(root, parts, None)
+}
+
+/// [`overlay`] over the runs of `series` alone, or of every series.
+fn overlay_of(
+    root: &Root,
+    parts: &[&Part],
+    series: Option<u64>,
+) -> Result<BTreeMap<Key, (u64, crate::part::Entry)>, SetError> {
     let mut won: BTreeMap<Key, (u64, crate::part::Entry, bool)> = BTreeMap::new();
     for p in parts {
-        for run in &p.runs {
+        let runs = match series {
+            // Runs are in ascending `(series, level)`.
+            Some(s) => {
+                let lo = p.runs.partition_point(|r| r.series < s);
+                let hi = p.runs.partition_point(|r| r.series <= s);
+                &p.runs[lo..hi]
+            }
+            None => &p.runs[..],
+        };
+        for run in runs {
             if !above_floors(root, run.series, p.seq) {
                 continue;
             }

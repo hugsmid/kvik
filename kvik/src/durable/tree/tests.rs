@@ -29,7 +29,7 @@ struct Store {
     current: BTreeMap<i64, Option<f64>>,
 }
 
-fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
+pub(super) fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
     let mut env = Env::test(clock.clone());
     env.fs = Arc::new(fs.clone());
     env.background_timers = false;
@@ -39,7 +39,7 @@ fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
     Writer::open(&config).unwrap()
 }
 
-fn wait(e: Emitted) {
+pub(super) fn wait(e: Emitted) {
     if let Emitted::Queued(mut q) = e {
         let mut cx = Context::from_waker(Waker::noop());
         loop {

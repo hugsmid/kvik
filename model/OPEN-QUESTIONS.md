@@ -5387,6 +5387,35 @@ start opened it only to learn whether the store held a series.
 **Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
 if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
 
+## Q-2070 — The stretch limit counted in log positions
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.
+**Scenario.** Design section 6 stops a reader using the tree when its stretch (K, P] is longer than 64 MiB of log,
+but a reader cannot count log bytes between two positions without reading them.
+**Decision (provisional).** The limit is 2^20 positions (about 20 to 190 MiB at the measured 21 to 184 bytes a
+reading); past it the read takes facts. Settle with the lifetime bench's log bytes a reading.
+
+## Q-2071 — A fixed step off the quarter-hours
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of`), provisional.
+**Scenario.** Design section 6 folds the partial quarter-hours of each bucket of a `Step` that is not a multiple of
+15 minutes from facts; that is two fact reads a bucket, up to 2,000 a chart.
+**Decision (provisional).** Such a chart, and any step below 15 minutes, is read from facts whole; results are
+equal either way (T7). Revisit with the 1-minute level (Q-1420).
+
+## Q-2072 — Whole parts decoded and kept by a reader
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `Cache`), provisional.
+**Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
+`Part::decode` decodes a whole part, every series in it.
+**Decision (provisional).** A reader decodes each listed part whole once, keeps it while a root lists it and does
+not count it against `ReaderConfig.memory`; a block-level decode through the part's directory, counted in the cap,
+follows if stores with many series show it (measured in `docs/measurements/tree-reads.md`).
+
+## Q-2073 — `tree_damaged` without an interface
+Decided with roadmap 7.1b step 5, provisional.
+**Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
+change in 7.1b.
+**Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
+count reaches `ReaderState` or health with the scrub's report.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

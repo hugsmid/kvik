@@ -51,7 +51,7 @@ fn parse_part(name: &str) -> Option<(u32, u64)> {
     })?
 }
 
-fn parse_root(name: &str) -> Option<u64> {
+pub(crate) fn parse_root(name: &str) -> Option<u64> {
     let hex = name.strip_prefix("root-")?.strip_suffix(".kvr")?;
     (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok())?
 }

@@ -260,6 +260,7 @@ pub(crate) use many::{buckets_of, distinct, window_of};
 #[cfg(test)]
 pub(crate) mod indexed;
 mod many;
+pub(crate) mod nodes;
 mod stream;
 #[cfg(test)]
 pub(crate) use stream::ChunkOverride;
