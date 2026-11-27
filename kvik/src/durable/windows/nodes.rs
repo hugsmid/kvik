@@ -197,13 +197,7 @@ fn fetch(
         return Ok(());
     }
     wanted.sort_unstable();
-    let mut ranges: Vec<(i64, i64)> = Vec::new();
-    for (s, e) in wanted {
-        match ranges.last_mut() {
-            Some(l) if s <= l.1 => l.1 = l.1.max(e),
-            _ => ranges.push((s, e)),
-        }
-    }
+    let ranges = joined(&wanted);
     let mut ids: Vec<(u32, usize)> = planned
         .iter()
         .enumerate()
@@ -426,6 +420,18 @@ fn told(
     }
 }
 
+/// Sorted spans joined where they overlap or touch.
+fn joined(sorted: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for &(s, e) in sorted {
+        match out.last_mut() {
+            Some(l) if s <= l.1 => l.1 = l.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
 /// Pushes a stored piece; empty nodes side by side are one empty piece, as the empty node is the merge's identity.
 fn push_stored<'w>(out: &mut Vec<Piece<'w>>, node: Option<&'w kt::Node>, s: i64, e: i64) {
     match (out.last_mut(), node) {
@@ -441,5 +447,18 @@ fn push_facts(out: &mut Vec<Piece<'_>>, s: i64, e: i64) {
     match out.last_mut() {
         Some(Piece::Facts(_, end)) if *end == s => *end = e,
         _ => out.push(Piece::Facts(s, e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::joined;
+
+    #[test]
+    fn joined_spans_keep_a_long_span_that_holds_a_shorter_one_and_join_touching_ones() {
+        assert_eq!(
+            joined(&[(0, 100), (10, 20), (100, 120), (130, 140)]),
+            [(0, 120), (130, 140)]
+        );
     }
 }

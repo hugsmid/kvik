@@ -5402,12 +5402,13 @@ Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of
 equal either way (T7). Revisit with the 1-minute level (Q-1420).
 
 ## Q-2072 — Whole parts decoded and kept by a reader
-Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `Cache`), provisional.
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::window`), provisional.
 **Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
 `Part::decode` decodes a whole part, every series in it.
-**Decision (provisional).** A reader decodes each listed part whole once, keeps it while a root lists it and does
-not count it against `ReaderConfig.memory`; a block-level decode through the part's directory, counted in the cap,
-follows if stores with many series show it (measured in `docs/measurements/tree-reads.md`).
+**Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
+it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
+peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
+through the part's directory, counted in the cap, follows if stores with many series show it.
 
 ## Q-2073 — `tree_damaged` without an interface
 Decided with roadmap 7.1b step 5, provisional.
@@ -5415,6 +5416,13 @@ Decided with roadmap 7.1b step 5, provisional.
 change in 7.1b.
 **Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
 count reaches `ReaderState` or health with the scrub's report.
+
+## Q-2074 — The visible entries formed per call
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
+**Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
+years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
+**Decision (provisional).** Kept for 7.1b; the fix is to look entries up in the parts directly (each part's runs are
+sorted) or to keep the visible entries per root. Q-1424's nested ladder stays unbuilt: it cuts merges, not this.
 
 ## Open at v0.2
 
