@@ -194,10 +194,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (decided by the lead, provisional) |
 | Q-1393 | §6 Gates, Clock; `api.md` Gates | The clock live gate timers run on (OWNER) |
 | Q-1560 | §6 Gates, Transitions; Q-1390 | Facts inside the seed's look-back that were never the live value: what the seed reads (decided by the lead, provisional) |
-| Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
 | Q-1880 | §6 Gates; Q-1560 | What the gates core's history reads must return, and what they cost (decided by the lead, provisional) |
 | Q-1881 | §6 Gates; Q-1880 | How a failed or short history read reaches the gates core (decided by the lead, provisional) |
 | Q-1882 | §6 Gates; Q-1560 | Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start (decided by the lead, provisional) |
+| Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5297,16 +5297,6 @@ and its `t` is at or after the look-back's start; that stays late, never early, 
 `a_future_fact_taking_effect_inside_the_look_back_holds_from_its_t`,
 `a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
 
-## Q-1561 — Arrivals inside the seed
-Decided by the lead with cond2 step 1's fix round, provisional, to the review's default.
-**Scenario.** A series silent since commit 1 (value 50), `stale_after` 8 s, hold 5 s, watched at 100: inside the
-seed its facts count as arriving at the look-back's start, so the hold completes in the seed; the start is `Stale`
-and the next reading gives `Level(1)` at once. A gate watched at the look-back's start would hold again from that
-reading; one watched all along gives `Level(1)` at once, as the seed does.
-**Decision (provisional).** Keep: inside the seed the facts before the look-back arrive at its start. It agrees with
-a gate watched all along; spec §6 Gates, Transitions says so.
-**Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
-
 ## Q-1880 — What the gates core's history reads must return, and what they cost
 Decided by the lead with cond2 step 2's fix round, provisional, to the review's default; moves Q-1560's costing.
 **Scenario.** The core holds one live fact per series (G9's bound), so three things it cannot answer go to
@@ -5344,6 +5334,16 @@ as an arrival at `from` or not.
 and with no live fact at `from` its holds and crossings stay empty either way, so transitions and states are the
 same. The real `History` takes whichever read is cheaper.
 **Pinned by.** Nothing can: the tests' double's choice is an equivalent mutant.
+
+## Q-1561 — Arrivals inside the seed
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default.
+**Scenario.** A series silent since commit 1 (value 50), `stale_after` 8 s, hold 5 s, watched at 100: inside the
+seed its facts count as arriving at the look-back's start, so the hold completes in the seed; the start is `Stale`
+and the next reading gives `Level(1)` at once. A gate watched at the look-back's start would hold again from that
+reading; one watched all along gives `Level(1)` at once, as the seed does.
+**Decision (provisional).** Keep: inside the seed the facts before the look-back arrive at its start. It agrees with
+a gate watched all along; spec §6 Gates, Transitions says so.
+**Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
 
 ## Open at v0.2
 
