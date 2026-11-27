@@ -62,3 +62,48 @@ fn a_transition_deferred_while_behind_is_delivered_once_after_later_batches_judg
     let (got, dropped) = run("deferred-then-later-batches", 2);
     assert_eq!((got.len(), dropped), (1, 0), "{got:#?}");
 }
+
+/// Q-2250, Q-2293: confirming the one transition outstanding while a later one is deferred keeps the held checkpoint
+/// before the deferred one, so a crash then delivers it after the restart.
+#[test]
+fn a_transition_deferred_behind_a_confirmed_one_comes_after_a_crash() {
+    let mut w = common::world::World::quiet("deferred-behind-confirmed");
+    let mut config = w.config();
+    config.limits.consumer_queue = 2;
+    let s = block_on(Store::open(config.clone())).unwrap();
+    let a = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let b = block_on(s.define_series(gauge("hall/air/temperature"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![b])))).unwrap();
+    block_on(c.watch("a", Gate::change(Input::value(a)).deadband(5.0))).unwrap();
+    while let Some(d) = c.try_next().unwrap() {
+        block_on(c.confirm(d.id)).unwrap();
+    }
+    let at = |v: f64, id| kvik::Reading::new(id, w.clock.wall(), Value::F64(v));
+    w.clock.advance(Duration::from_secs(1));
+    block_on(s.emit(&[at(10.0, a)])).unwrap();
+    for k in 0..4 {
+        w.clock.advance(Duration::from_secs(1));
+        block_on(s.emit(&[at(f64::from(k), b)])).unwrap();
+    }
+    w.clock.advance(Duration::from_secs(1));
+    block_on(s.emit(&[at(50.0, a)])).unwrap();
+    let first = c.try_next().unwrap().unwrap();
+    assert!(
+        matches!(&first.kind, kvik::DeliveryKind::Transition(t) if t.to == Some(kvik::GateState::Value(Value::F64(10.0)))),
+        "{first:?}"
+    );
+    block_on(c.confirm(first.id)).unwrap();
+    w.crash(s, vec![c], false);
+    let s = block_on(Store::open(config)).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let to: Vec<_> = common::world::drain(&mut c)
+        .into_iter()
+        .filter_map(|d| match d.kind {
+            kvik::DeliveryKind::Transition(t) => Some(t.to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(to, [Some(kvik::GateState::Value(Value::F64(50.0)))]);
+    block_on(s.shutdown()).unwrap();
+}
