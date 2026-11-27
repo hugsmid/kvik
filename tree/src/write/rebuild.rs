@@ -159,6 +159,42 @@ fn end(r: &PartRef) -> i64 {
 }
 
 impl TreeFiles {
+    /// Publishes `r` one part period a root at `k`, newest first (Q-2112), so that a stop loses at most the period in
+    /// hand. `cover(from)` is what `covered` gains once the periods from `from` up are published, `None` for the last
+    /// root, which also takes the retired parts and the closed floors.
+    pub fn rebuild_newest_first(
+        &mut self,
+        k: Position,
+        r: Rebuild,
+        cover: impl Fn(Option<i64>) -> Vec<Covered>,
+        wall: i64,
+        now: Duration,
+    ) -> Result<(), WriteError> {
+        let Rebuild {
+            parts,
+            retire,
+            close,
+            ..
+        } = r;
+        let mut periods: Vec<_> = parts.into_iter().collect();
+        let oldest = periods.first().cloned();
+        for (period, runs) in periods.drain(..).skip(1).rev() {
+            let one = Rebuild {
+                parts: BTreeMap::from([(period, runs)]),
+                cover: cover(Some(period.0)),
+                ..Rebuild::default()
+            };
+            self.rebuild(k, one, wall, now)?;
+        }
+        let last = Rebuild {
+            parts: oldest.into_iter().collect(),
+            retire,
+            cover: cover(None),
+            close,
+        };
+        self.rebuild(k, last, wall, now)
+    }
+
     /// Publishes a rebuild at `k`, which must be the root's K (section 5 Rebuild): its parts, of class rebuilt and of
     /// one new `seq`, the parts it retires, its `covered` ranges and its closed floors, in one root.
     pub fn rebuild(
@@ -209,10 +245,12 @@ impl TreeFiles {
         }
         let mut next = self.root.clone();
         next.parts.retain(|p| !r.retire.contains(&p.file_id));
-        next.retired.extend(r.retire.iter().map(|&file_id| Retired {
-            file_id,
-            retired_at: wall,
-        }));
+        let live = |id: &&u64| self.root.parts.iter().any(|p| p.file_id == **id);
+        next.retired
+            .extend(r.retire.iter().filter(live).map(|&file_id| Retired {
+                file_id,
+                retired_at: wall,
+            }));
         next.retired.sort_by_key(|x| x.file_id);
         next.retired.dedup_by_key(|x| x.file_id);
         next.covered.extend(r.cover);
@@ -364,6 +402,7 @@ impl TreeFiles {
         let mut view = root.clone();
         view.parts
             .retain(|r| spans.iter().any(|&(s, l)| period_overlaps(r, s, l)));
+        // Whole parts are read and decoded; a part directory read (roadmap 7.1b step 5) narrows this.
         let mut parts = Vec::new();
         let mut damaged = Vec::new();
         view.parts.retain(|r| match self.load(r) {

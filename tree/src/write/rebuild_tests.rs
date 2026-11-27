@@ -81,7 +81,7 @@ fn close_floors(w: &mut World) -> Result<(), WriteError> {
     w.files
         .as_mut()
         .unwrap()
-        .rebuild(root.checkpoint, r, wall, now)
+        .rebuild_newest_first(root.checkpoint, r, |_| Vec::new(), wall, now)
 }
 
 /// After a checkpoint, as the job takes one before any repair or merge (Q-2110), damages one live part; the scrub
@@ -424,6 +424,32 @@ fn a_checkpoint_over_a_damaged_part_marks_its_rollups_stale_and_a_repair_restore
 }
 
 #[test]
+fn a_floor_close_publishes_one_settled_period_a_root_and_closes_with_the_last() {
+    let mut w = World::new();
+    let facts: Vec<(u64, i64, Option<f64>)> = (0..4)
+        .map(|d| (0, d * 8 * DAY + 10 * S, Some(d as f64)))
+        .collect();
+    w.append(&facts);
+    w.sync();
+    w.wall += 40 * DAY;
+    w.checkpoint_with(&BTreeSet::from([0])).unwrap();
+    let seq = w.files.as_ref().unwrap().root().seq;
+    close_floors(&mut w).unwrap();
+    let root = w.files.as_ref().unwrap().root().clone();
+    let periods: BTreeSet<i64> = root
+        .parts
+        .iter()
+        .filter(|p| p.class == part::Class::Rebuilt)
+        .map(|p| p.period_start)
+        .collect();
+    assert!(periods.len() >= 2, "{periods:?}");
+    assert_eq!(root.seq, seq + periods.len() as u64);
+    assert!(root.floors.iter().all(|f| !f.rebuilding));
+    w.check();
+    t3(&w);
+}
+
+#[test]
 fn a_damaged_part_is_found_by_the_scrub_and_its_period_rebuilt() {
     let mut w = World::new();
     w.append(&[(0, 10 * S, Some(1.0)), (1, DAY + 10 * S, Some(2.0))]);
@@ -482,6 +508,33 @@ fn a_rebuild_off_the_roots_k_is_refused() {
         matches!(r, Err(WriteError::NotAtCheckpoint { .. })),
         "{r:?}"
     );
+}
+
+#[test]
+fn a_rebuild_records_only_live_parts_as_retired() {
+    let mut w = World::new();
+    w.append(&[(0, 0, Some(1.0))]);
+    w.sync();
+    w.checkpoint().unwrap();
+    let f = w.files.as_ref().unwrap();
+    let k = f.root().checkpoint;
+    let live = f.root().parts[0].file_id;
+    let (wall, now) = (w.wall, w.now);
+    let r = Rebuild {
+        retire: vec![live, live + 1000],
+        ..Rebuild::default()
+    };
+    w.files.as_mut().unwrap().rebuild(k, r, wall, now).unwrap();
+    let ids: Vec<u64> = w
+        .files
+        .as_ref()
+        .unwrap()
+        .root()
+        .retired
+        .iter()
+        .map(|x| x.file_id)
+        .collect();
+    assert_eq!(ids, vec![live]);
 }
 
 #[test]

@@ -5412,8 +5412,9 @@ Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job/maintain.rs` `backf
 the walk cannot tell when it has passed the oldest fact.
 **Decision (provisional).** The first range is from the start of today's UTC day upwards; then each settled period
 below (days, weeks, 13 and 52 weeks as alignment allows). A period holding no fact of any served series ends the walk:
-the same rebuild takes everything below it and the quarter-hour level is then covered without bound. A gap of a whole
-period in the data therefore reads all older facts in one rebuild, which is still each fact once.
+the same rebuild takes everything below it and the quarter-hour level is then covered without bound. The first range
+and each unsettled day count, so one idle day ends the walk: a gap of a whole period in the data therefore reads all
+older facts at once, which is still each fact once, and publishes them one settled period a root (Q-2112).
 
 ## Q-2063 — The scrub's cadence
 Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
@@ -5440,6 +5441,14 @@ stalled for good. A repair cannot run first: it publishes at the root's K, below
 **Decision (provisional).** The checkpoint goes through: each roll-up span over a part that will not load is written as
 a stale marker (readers take facts), and the job's maintenance at the same step runs the repair, whose widened period
 rewrites those spans from facts at the same cut.
+
+## Q-2112 — The size of one rebuild
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional; settle with 72-2.
+**Scenario.** A floor close and the end of a backfill walk rebuild a series' whole range. Published as one root, a
+stop loses all of it and every part is held until that publish.
+**Decision (provisional).** Both publish one settled period a root at the same K, newest first; the floor closes and
+the unbounded cover is added with the last, so a stop loses at most one period and the next step resumes below what
+is covered. The facts are still read and folded in one pass; streaming that fold is left to 72-2.
 
 ## Q-2113 — Case counts of the tree's properties
 Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/write/tests.rs`), provisional.

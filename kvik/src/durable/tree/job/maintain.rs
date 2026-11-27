@@ -1,6 +1,7 @@
 //! Maintenance at a checkpoint's cut (design 7.1b section 5 Rebuild and Merges, section 7): open floors closed by a
 //! rebuild of their series, damaged parts' periods rebuilt, backfill toward full `covered` (newest first), and the
-//! merges due. Every rebuild is one root at the checkpoint's K, so a stop loses at most the one in hand.
+//! merges due. Each root a rebuild publishes holds at most one settled period at the checkpoint's K (Q-2112), so a
+//! stop loses at most the one in hand.
 
 use std::time::Duration;
 
@@ -66,7 +67,9 @@ impl Job {
             };
             let mut rb = rebuild_of(r, v, &scope, &open)?;
             rb.close = open;
-            files.rebuild(v.cut().durable, rb, wall, now).map_err(err)?;
+            files
+                .rebuild_newest_first(v.cut().durable, rb, |_| Vec::new(), wall, now)
+                .map_err(err)?;
         }
         if scrub_due.is_none_or(|d| d <= now) {
             repair(files, r, v, wall, now)?;
@@ -200,7 +203,7 @@ fn backfill_next(root: &Root, wall: i64) -> Option<(Option<i64>, Option<i64>)> {
 }
 
 /// One backfill rebuild of `[a, b)` that extends `covered`; a range with no fact ends the walk, taking everything
-/// below it in the same rebuild (Q-2062).
+/// below it one settled period a root (Q-2062, Q-2112).
 fn backfill(
     files: &mut TreeFiles,
     r: &DurableReader,
@@ -223,9 +226,13 @@ fn backfill(
         };
         Ok((rebuild_of(r, v, &scope, &ids)?, cover))
     };
-    let (mut rb, mut cover) = attempt(a)?;
+    let (mut rb, cover) = attempt(a)?;
     if rb.parts.is_empty() && a.is_some() {
-        (rb, cover) = attempt(None)?;
+        let (rb, _) = attempt(None)?;
+        let cover = |from| backfill_cover(&root.levels, from, b, wall, &POLICY);
+        return files
+            .rebuild_newest_first(v.cut().durable, rb, cover, wall, now)
+            .map_err(err);
     }
     rb.cover = cover;
     files.rebuild(v.cut().durable, rb, wall, now).map_err(err)
