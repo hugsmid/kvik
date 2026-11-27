@@ -254,10 +254,20 @@ fn a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_no
     );
     assert!(!vis.is_empty());
     st.reopen();
+    st.emit(Intent::Normal, &[(2, Some(4.0))]);
     let t_r = st.clock.wall();
     st.w.retire(id, t_r).unwrap();
     st.w.shutdown().unwrap();
     let (root, vis) = tree_state(&st.fs, &st.dir);
+    let tree = st.dir.join(DIR);
+    for r in root.parts.iter().filter(|r| r.seq == root.seq) {
+        let path = tree.join(part_name(root.header.generation, r.file_id));
+        let part = Part::decode(&read_file(&st.fs, &path).unwrap()).unwrap();
+        assert!(
+            part.runs.iter().all(|x| x.series != u64::from(id.0)),
+            "no node of a series being rebuilt is written"
+        );
+    }
     assert_eq!(root.floors.len(), 1);
     assert!(root.floors[0].rebuilding && root.floors[0].series == u64::from(id.0));
     assert!(

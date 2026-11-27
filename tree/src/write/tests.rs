@@ -560,6 +560,7 @@ fn a_root_of_another_reset_stamp_or_above_the_mark_is_not_continued() {
     w.append(&[(0, 0, Some(1.0))]);
     w.sync();
     w.checkpoint().unwrap();
+    let copy = Arc::new(w.fs.snapshot());
     let mut other = id();
     other.reset = ResetStamp {
         sequence: 1,
@@ -588,7 +589,7 @@ fn a_root_of_another_reset_stamp_or_above_the_mark_is_not_continued() {
         1,
         "the next root's name is past every root on disk"
     );
-    let fs = Arc::new(w.fs.snapshot());
+    let fs = copy;
     let (_, r) = TreeFiles::start(
         fs,
         &w.dir,
@@ -730,4 +731,24 @@ fn a_removal_a_reader_refuses_is_tried_again() {
         w.fs.read(&w.dir.join(DIR).join(part_name(1, id0)))
             .is_none()
     );
+}
+
+#[test]
+fn a_failed_directory_sync_fails_the_checkpoint_and_the_renamed_root_becomes_the_root() {
+    let mut w = World::new();
+    w.append(&[(0, 0, Some(1.0))]);
+    w.sync();
+    w.fs.fail_nth(FaultOp::SyncDir, "tree", 0, io::ErrorKind::Other);
+    let r = w.checkpoint();
+    assert!(matches!(r, Err(WriteError::Io { op: "sync", .. })), "{r:?}");
+    assert_eq!(
+        w.files.as_ref().unwrap().root().seq,
+        1,
+        "a reader may already hold it"
+    );
+    assert_eq!(w.dirty.len(), 1, "the job is not done");
+    w.check();
+    w.checkpoint().unwrap();
+    assert_eq!(w.files.as_ref().unwrap().root().seq, 2);
+    w.check();
 }
