@@ -467,6 +467,7 @@ fn a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap() {
     h.seal(seg(0, 1, 1, 10))
         .copy(1)
         .push(Body::Publish(kvik_files::record::Publish {
+            layouts: Vec::new(),
             published: vec![comp.clone()],
             retired: Vec::new(),
         }))

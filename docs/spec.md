@@ -728,8 +728,22 @@ rules, identities and resume.
 - Current facts and revisions go to **separate chunks**. A revision chunk holds only facts outranked by a fact within
   the same compaction's inputs, so the current view never needs revision chunks. A current chunk may hold facts
   outranked later or by a fact in another file; readers resolve the current view across current chunks by rank.
+- **Partitions (level L0).** A compaction of log segments places each reading in a file of its `t`'s UTC day, or of
+  its week (weeks counted from the epoch's day 0) once that week's merge is published or the day ended more than 14
+  days before the run's last commit time; a non-fact entry goes to the current file of its batch's commit time.
+  Within a file's period the rows of a key are ranked as §2.2 ranks them and the highest goes to the current file.
+  Compaction stalls, and never skips, at a segment it cannot take whole: one not sealed whole or disagreeing with its
+  seal, one holding an element this version does not know or bytes it would not write, a batch whose commit time is
+  below an earlier batch's of its generation, or a time whose period leaves `i64` (Q-799, Q-809, Q-811, Q-1411).
 - Procedure: write new file → verify (fact count, per-series checksum of facts, each chunk's summary equals the
-  summary recomputed from the input facts assigned to it) → publish.
+  summary recomputed from the input facts assigned to it) → publish: each output renamed from its `.tmp` name to its
+  final name, `data/` synced, then one publish record naming every output with its layout, synced. A start removes
+  temporary outputs, and removes a compacted file no valid record names only once it knows the manifest valid; a
+  rebuild discards such a file only when nothing names any file of its run, its inputs are local and the run's
+  files fail against them, and otherwise keeps it (compaction design §3.5, Q-1851). The writer refuses a publish
+  record that breaks the catalogue's rule for compacted files, leaves it undecided or gives a compacted file no
+  layout (Q-2120, Q-2121); a start that finds the rule undecided or broken opens
+  and holds runs, merges, removals and releases (compaction design §3.4, Q-1850, Q-1852).
 - **Manifest:** append-only, checksummed records, each with an epoch. One record may add files, retire files and
   move files between tiers **atomically**. An epoch never lists two live compacted files holding the same position. A log segment holds the same positions as
   the chunks compacted from it until it leaves (§8). Tier

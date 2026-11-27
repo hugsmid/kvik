@@ -67,10 +67,12 @@ mod read;
 pub mod reseal;
 mod source;
 mod stats;
+mod stream;
 mod times;
+mod tweaks;
 mod write;
 
-pub use canonical::{CanonicalError, SeriesInfo, check_canonical};
+pub use canonical::{CanonicalCheck, CanonicalError, SeriesInfo, check_canonical};
 pub use desc::{Class, Description, Input, Level};
 pub use error::{Fault, FileElement, FileError};
 pub use index::{IndexObject, extract};

@@ -47,6 +47,7 @@ mod pacing;
 mod queue;
 pub mod recovery;
 mod seg_index;
+pub mod share;
 pub mod sources;
 mod threads;
 
@@ -70,7 +71,7 @@ pub use maint::{
 pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
-pub use threads::{Clock, Log, Pending, Room, SubmitError, SystemClock, Watch};
+pub use threads::{Clock, Log, MaintWaits, Pending, Room, SubmitError, SystemClock, Watch};
 
 use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};
@@ -597,6 +598,7 @@ pub struct LogWriter {
     budget: Budget,
     /// Times batch syncs for the interval; with none, the interval stays at `min_sync_interval`.
     sync_clock: Option<Arc<dyn Clock>>,
+    sync_signal: Option<Arc<share::SyncSignal>>,
     pace: SyncPace,
     fault: Option<Fault>,
     halt: Arc<Halt>,
@@ -733,6 +735,7 @@ impl LogWriter {
             intervals: r.intervals,
             budget: Budget::default(),
             sync_clock: None,
+            sync_signal: None,
             pace: SyncPace::default(),
             fault: r.fault,
             halt,
@@ -854,6 +857,11 @@ impl LogWriter {
     /// [`Log::start`] passes its clock.
     pub fn set_sync_clock(&mut self, clock: Arc<dyn Clock>) {
         self.sync_clock = Some(clock);
+    }
+
+    /// Marks each commit sync for the maintenance share (compaction design §4).
+    pub(crate) fn set_sync_signal(&mut self, signal: Arc<share::SyncSignal>) {
+        self.sync_signal = Some(signal);
     }
 
     /// The batch-sync interval in force: `min_sync_interval` before the first sample (Q-712).
@@ -1419,7 +1427,14 @@ impl LogWriter {
             .or(self.open.as_ref())
             .expect("a segment in use");
         let before = self.sync_clock.as_ref().map(|c| c.monotonic());
-        if let Err(e) = seg.file.sync_data() {
+        if let Some(s) = &self.sync_signal {
+            s.begin();
+        }
+        let synced = seg.file.sync_data();
+        if let Some(s) = &self.sync_signal {
+            s.end();
+        }
+        if let Err(e) = synced {
             self.fail(FaultOp::Sync, &path, &e);
             return Some(Self::unknown(calls));
         }

@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use super::super::directories::Directories;
 use super::super::maint::{describe_sealed_until, directory_record};
+use super::super::share::{Background, Governor, Next, Task, Verdict};
 use super::super::{
     CallSource, CommitError, Done, Fault, FaultOp, LogWriter, Wait, create_segment,
     seal_segment_described,
 };
-use super::{Shared, SharedSource, lock};
+use super::{MaintWaits, Shared, SharedSource, lock};
 
 /// Hands requests and seal jobs to `kvik-maint` and takes its results.
 fn exchange(s: &Shared, w: &mut LogWriter) {
@@ -31,10 +32,12 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     let mut work = false;
     if let Some(req) = w.segment_request(s.clock.wall()) {
         m.request = Some(req);
+        m.requested_at = Some(now);
         work = true;
     }
     let jobs = w.take_seal_jobs(now);
     work |= !jobs.is_empty();
+    m.job_times.extend(jobs.iter().map(|_| now));
     m.jobs.extend(jobs);
     if !s.stopping.load(Ordering::SeqCst)
         && let Some(id) = w.take_unlisted(now)
@@ -133,6 +136,9 @@ pub(super) fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, L
             s.clock.wall(),
             &mut SharedSource::new(s),
         );
+        if s.sync.take_wake() {
+            s.maint_cv.notify_all();
+        }
         // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
         // published before any call of this step completes, so a caller that holds its acknowledgement sees them.
         exchange(s, &mut w);
@@ -219,9 +225,11 @@ impl Drop for MaintGuard<'_> {
     }
 }
 
-pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
+pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>, task: Option<Task>) {
     let _guard = MaintGuard(s);
-    let mut next: Option<Duration> = dirs.as_ref().map(|_| Duration::ZERO);
+    let mut dirs_next: Option<Duration> = dirs.as_ref().map(|_| Duration::ZERO);
+    let mut task = task.map(|t| Stepper::new(t, s.clock.monotonic()));
+    let mut task_next: Option<Duration> = task.as_ref().map(|_| Duration::ZERO);
     loop {
         let mut m = lock(&s.maint);
         loop {
@@ -233,6 +241,10 @@ pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
                 break;
             }
             let now = s.clock.monotonic();
+            let next = match (dirs_next, task_next) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             match next {
                 Some(t) if t <= now => break,
                 Some(t) => {
@@ -241,6 +253,10 @@ pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
                         .wait_timeout(m, t - now)
                         .unwrap_or_else(PoisonError::into_inner)
                         .0;
+                    // A returning commit sync wakes a task that waits for one.
+                    if task.as_ref().is_some_and(|t| t.on_sync) {
+                        task_next = task_next.map(|t| t.min(s.clock.monotonic()));
+                    }
                 }
                 None => m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner),
             }
@@ -248,26 +264,41 @@ pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
             m.request = None;
+            m.requested_at = None;
             m.jobs.clear();
+            m.job_times.clear();
             m.describe = None;
             if m.stop {
                 return;
             }
-            next = None;
+            dirs_next = None;
+            task_next = None;
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
             drop(m);
             continue;
         }
+        let now = s.clock.monotonic();
         if let Some(req) = m.request.take() {
+            let waited = m.requested_at.take().map(|t| now.saturating_sub(t));
             drop(m);
+            if let Some(d) = waited {
+                MaintWaits::push(&mut lock(&s.waits).creation, d);
+            }
             let r = create_segment(&*s.fs, &req, &s.halt);
             lock(&s.maint).created = Some(r);
         } else if let Some(job) = m.jobs.pop_front() {
+            let waited = m.job_times.pop_front().map(|t| now.saturating_sub(t));
             drop(m);
+            if let Some(d) = waited {
+                MaintWaits::push(&mut lock(&s.waits).seal, d);
+            }
             let r = seal_segment_described(&*s.fs, &job, &s.halt);
             if let (Some(d), Ok(sealed)) = (dirs.as_mut(), &r) {
                 d.sealed(directory_record(&job, sealed, true));
-                next = Some(Duration::ZERO);
+                dirs_next = Some(Duration::ZERO);
+            }
+            if r.is_ok() && task.is_some() {
+                task_next = Some(Duration::ZERO);
             }
             lock(&s.maint).results.push((job, r));
         } else if let Some((dir, id)) = m.describe.take() {
@@ -285,14 +316,74 @@ pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
                     d.finish(synced, s.clock.monotonic(), s.clock.wall());
                     return;
                 }
-                next = run_directories(s, d);
+                if dirs_next.is_some_and(|t| t <= now) {
+                    dirs_next = run_directories(s, d);
+                }
             }
             if stop {
                 return;
             }
+            if let Some(t) = task.as_mut()
+                && task_next.is_some_and(|n| n <= now)
+            {
+                task_next = Some(t.turn(s));
+            }
             continue;
         }
         s.wake_writer();
+    }
+}
+
+/// A background task, its governor and whether it waits for a commit sync to return.
+struct Stepper {
+    task: Box<dyn Background>,
+    governor: Governor,
+    on_sync: bool,
+}
+
+/// How long an idle task waits before it is asked again, when no seal comes first.
+const IDLE_RECHECK: Duration = Duration::from_secs(1);
+
+impl Stepper {
+    fn new(t: Task, now: Duration) -> Self {
+        Self {
+            task: t.task,
+            governor: Governor::new(t.share, now),
+            on_sync: false,
+        }
+    }
+
+    /// Runs one step if the share admits it; returns when to come back.
+    fn turn(&mut self, s: &Shared) -> Duration {
+        let now = s.clock.monotonic();
+        let piece = match self.task.next() {
+            Next::Idle => {
+                self.on_sync = false;
+                s.sync.want(false);
+                return now + IDLE_RECHECK;
+            }
+            Next::Cpu => None,
+            Next::Device(n) => Some(n),
+        };
+        let pressure = lock(&s.front).waiting.is_some();
+        let state = s.sync.state(pressure);
+        match self.governor.admit(now, piece, &state) {
+            Verdict::Go => {
+                self.on_sync = false;
+                s.sync.want(false);
+                self.task.step();
+                let end = s.clock.monotonic();
+                self.governor
+                    .worked(now, end, piece, &s.sync.state(pressure));
+                lock(&s.waits).steps += 1;
+                end
+            }
+            Verdict::Wait { until, on_sync } => {
+                self.on_sync = on_sync;
+                s.sync.want(on_sync);
+                until
+            }
+        }
     }
 }
 

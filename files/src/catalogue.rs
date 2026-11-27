@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 
 use crate::desc::{FileDescription, FileRef, kind};
+use crate::layout::CompactedLayout;
 use crate::record::{AckedLoss, Body, Rebuild, Record, RecordError, record_type};
 use crate::restore::RestoreRecord;
 use crate::tier::{CopyVerified, DeepCopy};
@@ -130,6 +131,8 @@ pub struct Catalogue {
     rebuild_acks: BTreeSet<u64>,
     floors: BTreeMap<u8, u64>,
     restores: Vec<RestoreRecord>,
+    /// Publish record field 3 of each compacted file that has one (Q-1850).
+    layouts: BTreeMap<FileRef, CompactedLayout>,
     last_epoch: u64,
     generation: u32,
 }
@@ -160,7 +163,16 @@ impl Catalogue {
             });
         }
         match &r.body {
-            Body::Publish(p) => self.check_publish(&p.published, &p.retired),
+            Body::Publish(p) => {
+                if let Some(l) = p
+                    .layouts
+                    .iter()
+                    .find(|l| self.layouts.get(&l.file_ref()).is_some_and(|k| k != *l))
+                {
+                    return Err(CatalogueError::Conflict(l.file_ref()));
+                }
+                self.check_publish(&p.published, &p.retired)
+            }
             Body::Sealed(s) => self.check_publish(s, &[]),
             b @ Body::Other {
                 record_type: record_type::RESTORE,
@@ -208,6 +220,11 @@ impl Catalogue {
                 }
             }
             Body::Publish(p) => {
+                for l in &p.layouts {
+                    self.layouts
+                        .entry(l.file_ref())
+                        .or_insert_with(|| l.clone());
+                }
                 for d in &p.published {
                     self.files
                         .entry(d.file_ref())
@@ -401,6 +418,11 @@ impl Catalogue {
                     .any(|(a, b)| *a <= l.record.first && l.record.last <= *b)
             });
         }
+    }
+
+    /// Publish record field 3 of a compacted file, where a record gave it.
+    pub fn layout(&self, f: FileRef) -> Option<&CompactedLayout> {
+        self.layouts.get(&f)
     }
 
     /// Every file a record names, by identity.

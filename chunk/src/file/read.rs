@@ -200,7 +200,24 @@ impl<S: ReadAt> CompactedFile<S> {
         Layout::of(&id, &self.description, &self.trailer)
     }
 
-    fn index_block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
+    /// The number of index blocks the root names.
+    pub(crate) fn index_blocks(&self) -> usize {
+        self.index.records.len()
+    }
+
+    /// The entries the root lists, bounded by the room the file has for them.
+    pub(crate) fn listed_entries(&self) -> usize {
+        let listed: u64 = self
+            .index
+            .records
+            .iter()
+            .map(|r| u64::from(r.entry_count))
+            .sum();
+        let room = self.src.len() / super::parts::ENTRY_LEN as u64;
+        usize::try_from(listed.min(room)).unwrap_or(0)
+    }
+
+    pub(crate) fn index_block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
         let (entries, skipped) = self.index.block(&self.src, i)?;
         self.skip(skipped);
         let at = self.index.base + self.index.records[i].offset;
@@ -231,7 +248,8 @@ impl<S: ReadAt> CompactedFile<S> {
 
     /// Every index entry, in index order.
     pub fn index(&self) -> Result<Vec<IndexEntry>, FileError> {
-        let mut out = Vec::with_capacity(self.trailer.chunk_count.min(1 << 16) as usize);
+        // Exact when the root is honest; never more entries than the file has room for.
+        let mut out = Vec::with_capacity(self.listed_entries());
         for i in 0..self.index.records.len() {
             out.extend(self.index_block(i)?);
         }
@@ -322,17 +340,30 @@ impl<S: ReadAt> CompactedFile<S> {
         let d = self.directory(e)?;
         let mut out = Vec::with_capacity(e.row_count as usize);
         for i in 0..d.blocks.len() {
-            let b = self.data_block(e, &d, i)?;
-            for fact in facts_of(e.series_id, &b) {
+            out.extend(self.read_block(e, &d, i)?);
+        }
+        Ok(out)
+    }
+
+    /// The facts of data block `i` of a chunk, with their batches' receive and commit times.
+    pub fn read_block(
+        &self,
+        e: &IndexEntry,
+        d: &Directory,
+        i: usize,
+    ) -> Result<Vec<TimedFact>, FileError> {
+        let b = self.data_block(e, d, i)?;
+        facts_of(e.series_id, &b)
+            .into_iter()
+            .map(|fact| {
                 let batch = self.batch(fact.position)?;
-                out.push(TimedFact {
+                Ok(TimedFact {
                     fact,
                     received_at: batch.received_at,
                     commit_time: batch.commit_time,
-                });
-            }
-        }
-        Ok(out)
+                })
+            })
+            .collect()
     }
 
     /// Commit-times block `i`, bound to its directory record: the generation, the first and last row's sequences

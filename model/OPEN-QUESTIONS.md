@@ -190,6 +190,34 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1201 | §4 Consumers; `api.md` Memory | Records held for a consumer not taken in this run (settled by the owner) |
 | Q-1202 | §4 Resync; `api.md` Consumers | `CursorBehindLog` on the durable backend (settled by the owner) |
 | Q-1203 | `api.md` Live reads; Q-1011, Q-1118 | A fan-out round that fails after taking events (settled by the owner) |
+| Q-1410 | §7; Q-801, Q-811 | Roadmap 6.2a2 in two parts (provisional) |
+| Q-1411 | §7; Q-809 | Unknown elements in a run's inputs, found by canonical form |
+| Q-1412 | §7; `format-compacted.md` B.1 | The name and reach a compacted file gives a series (provisional) |
+| Q-1413 | §7, §8 Restore step 1; Q-796 | A non-fact entry set aside beyond a restored end (provisional) |
+| Q-1414 | §7, §9 row 10 | Where a run's outputs wait before publishing (provisional) |
+| Q-1530 | `format-compacted.md` B.1 Canonical writing; Q-811 | A chunk the streaming writer holds whole (provisional) |
+| Q-1531 | compaction design §4; `api.md` Threads; Q-721 | The governor's details and the background task's hook (provisional) |
+| Q-1532 | compaction design §3.2 step 2; Q-800, Q-1410 | The per-series digest stays SHA-256 (provisional) |
+| Q-1533 | compaction design §4; `api.md` Threads; Q-801 | The background task stays on `kvik-maint`: the gate for a fourth thread passes (provisional) |
+| Q-1534 | compaction design §4; Q-1531 | A whole input segment held and scanned as one step (provisional) |
+| Q-1535 | compaction design §3.1, §4; `format-compacted.md` B.1 | Count passes ahead of write passes (provisional) |
+| Q-1536 | compaction design §4 Memory | Index entries and a window's entries counted, not spilled (provisional) |
+| Q-1537 | compaction design §4 Memory | A series too large for one pass taken a range of `t` at a time (provisional) |
+| Q-1840 | compaction design §4 Memory; Q-1536 | The window when index entries or commit-time rows would not fit (provisional) |
+| Q-1841 | compaction design §4 Memory | What "counted" means for the cap (provisional) |
+| Q-1843 | compaction design §4; Q-1531 | A share configured as 0 or not a number (provisional) |
+| Q-1940 | compaction design §4 Memory; Q-1840 | A window's writers reserved by the writer's own figures; a file's index written a block a step (provisional) |
+| Q-1842 | compaction design §4; Q-1533, Q-1534 | The longest step the run may take (provisional) |
+| Q-1990 | compaction design §4; Q-1842 | The run's steps and their device calls (provisional) |
+| Q-1850 | `format.md` A.14 `0x21`; compaction design §2, §3.4; Q-792 | Publish record field 3, the layout, and records without it (provisional) |
+| Q-1851 | compaction design §3.5; `spec.md` §7 Manifest step 2 | The rebuild's verdict on outputs no valid record names (provisional) |
+| Q-1852 | compaction design §3.4, §3.5 | A merge's counts after a rebuild restates a retirement without its layout (provisional) |
+| Q-1853 | compaction design §5, §6 (6.3e); `api.md` Threads; Q-1531 | Publish built over the manifest's writer, not yet started by the running store (provisional) |
+| Q-1854 | compaction design §3.5 | The rebuild's verifier compacts the inputs again (provisional) |
+| Q-2120 | compaction design §3.4; Q-1850 | When publish records without field 3 stop being accepted (provisional) |
+| Q-2121 | compaction design §3.4 | Whether a new record may leave the rule undecided (provisional) |
+| Q-2122 | compaction design §3.5; Q-1851 | What a rebuild's held file holds (provisional) |
+| Q-2125 | compaction design §3.5; Q-1853 | Publish after an unsure record (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3266,7 +3294,8 @@ its blocks follow each other in a fixed order.
 length 0 or one whose end leaves `i64`, a run count of 0, or names out of order are invalid.
 (j) The reader records the ignorable elements it skips (`Ignored`), and the canonical checks do not judge a file
 holding any, so a scrub by an older binary does not call a newer minor version's file damaged.
-**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate:
+**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate (the first part moved to
+6.2a2b by Q-1410; the second built by 6.2a2 as a stall, `Cause::CommitTimeDecreases`):
 - the writer takes a series' facts whole and the canonical check holds every fact of the file as decoded rows (80
   bytes a fact; about 175 MB for 2,000,000 facts). Section 4's caps (32 MiB minimal, 256 MiB desktop) need a writer
   that takes a series' rows in order a block at a time and a canonical check that reads from a `ReadAt` and compares
@@ -5485,6 +5514,198 @@ later recovery writes an entry that carries the new stamp, after which the same 
 higher than unknown's nothing. **Decided by the lead, 27 November:** allowed; unknown already told the holder to
 start again as if it kept no position, so "never rises" holds only until a point answers unknown
 (`kvik/tests/saved_points.rs`, the history property).
+## Q-1410 — Roadmap 6.2a2 in two parts
+Decided with roadmap 6.2a2, provisional.
+**Scenario.** As designed, 6.2a2 holds the run, its verification and the L0 planner, and also the governor, the
+stepping on `kvik-maint`, the measured gate for a fourth thread (Q-801), the streaming writer and canonical check
+within the memory cap (Q-811), the 16-partition bound and the digest's measured cost: about 5,000 lines.
+**Decision (provisional).** 6.2a2 builds the run, the verification, the planner, the model's placement and the
+stalls; its outputs are verified and left unpublished, and nothing outside its tests calls it. Roadmap 6.2a2b builds
+the governor, the background-task trait and the stepping, the gate of Q-801, the streaming writer and canonical check
+with the 16-partition bound, and the digest's cost on a core without SHA instructions (the digest function stays
+provisional until then, Q-800). 6.3e follows 6.2a2b. Reason: the design allows the governor to be cut out as its own
+item; the run is testable alone, and the memory work changes the writer's signatures, which belongs with the cap it
+serves.
+**Pinned by.** `kvik/src/durable/compact/tests.rs`.
+
+## Q-1411 — Unknown elements in a run's inputs, found by canonical form
+Decided with roadmap 6.2a2.
+**Scenario.** The log's decoders skip unknown ignorable columns and fields without a trace, so a run that rearranged
+their batches would drop them (Q-809).
+**Decision.** A batch that holds a skipped block, an ignored entry, or does not decode to exactly its canonical
+blocks (`BatchContent::decode_canonical`) stalls the run with the cause "unknown". A writer of this version writes only
+canonical batches (`format.md` A.4), so the stall arises only where something would be dropped or another writer
+made the bytes; both are lossless.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_segment_with_a_block_of_unknown_type_stalls`.
+
+## Q-1412 — The name and reach a compacted file gives a series
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** `format-compacted.md` B.1 orders a file's series by the name in force at the file's greatest position;
+the durable store holds only the registry as of now.
+**Decision (provisional).** The definition's name (field 2), not an alias, from the last definition entry of the
+run's inputs at or below the file's greatest position, else from the registry the caller passes as in force below the
+run's first position; the reach from the same definition's kind and interval (`format.md` A.8). Until 6.3e wires the
+run into the store, its caller passes the current registry, which differs only for a series defined again after the
+run's inputs.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_definition_in_the_inputs_names_its_series_only_in_files_ending_after_it`,
+`an_interval_definition_gives_its_reach`.
+
+## Q-1413 — A non-fact entry set aside beyond a restored end
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.2c.
+**Scenario.** Set-aside facts go to set-aside chunks of a revision file (Q-796); a compacted file's entries are in
+its current file, with no way to mark one set aside.
+**Decision (provisional).** A run whose inputs hold a set-aside non-fact entry stalls (cause "set-aside entry"):
+lossless, and rare (a restore whose generation wrote entries past the restored end). 6.2c gives the entries a mark or
+a rule.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_set_aside_entry_stalls`.
+
+## Q-1414 — Where a run's outputs wait before publishing
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §3.2 of the compaction design renames outputs to their final names just before the publish record;
+publishing is roadmap 6.3e.
+**Decision (provisional).** A run writes, syncs and verifies its outputs under their `.tmp` names in `data/` and
+leaves them there; the outputs carry the writer's current generation and consecutive `file_id`s the caller gives,
+the first being the run id. 6.3e renames, publishes, and discards unpublished outputs at start (§9 row 10).
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `every_input_position_lands_in_exactly_one_output_where_the_model_places_it`.
+
+## Q-1530 — A chunk the streaming writer holds whole
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** B.1 orders a series' chunks by first `t`, then least position. A writer that takes a series' rows a block at a time (Q-811) cannot place a chunk while a later chunk could still sort before it: when every row of the chunk so far shares one `t` (a chunk boundary inside a run of one key, revision files only) or a set-aside chunk shares its first `t`.
+**Decision (provisional).** `FileWriter::push` streams a chunk block by block once a row with a greater `t` has arrived, no set-aside chunk shares its first `t` and no chunk is held; otherwise it holds the chunk's rows whole and writes the held chunks in B.1 order once the next chunk's first `t` is greater. Set-aside facts, which only a restore makes, come whole with the series. Held rows count against the maintenance cap (`FileWriter::held_rows`). Reason: the format is unchanged, the bytes equal the whole-series writer's, and the held case needs more than 4,096 revisions of one key or a restore.
+**Pinned by.** `chunk/src/file/stream.rs` tests (`a_streamed_revision_series_writes_the_bytes_of_the_whole_one`, `a_chunk_boundary_inside_one_key_orders_chunks_by_least_position`).
+
+## Q-1531 — The governor's details and the background task's hook
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §4 of the compaction design gives the governor's two limits and its idle preference but not: when a returned sync counts, what a sync or a rename costs, how an idle task is asked again, or how a task reaches `kvik-maint` before 6.3e wires compaction in.
+**Decision (provisional).** `kvik_log::writer::share::Governor`: after a step that worked `w` the next waits `w × (1 − share) / share`, rounded up to the nanosecond; the byte bucket refills at `io_rate` (the floor rate under the writer's pressure flag, which is ingest waiting) and holds one 128 KiB piece. A device call goes at the first of: no commit sync in flight; a commit sync returned since the governor last looked (each return counts once, and one seen while the step waited for CPU or bytes is spent); or the floor's deadline, a piece's time at the floor rate from when the call was first asked for. A sync or a rename costs no bytes and takes a piece's deadline. The writer marks each commit sync and wakes `kvik-maint` when a waiting task asked to hear of a return. A task with nothing due is asked again after a seal or after a second. Creation ahead, seals and descriptions always go before a step. `Log::start_with_task` takes the task (hidden from the documentation until 6.3e wires compaction in); `Log::maint_waits` reports how long creations and seals waited for `kvik-maint`, for the gate of Q-801.
+**Pinned by.** `log/src/writer/share/tests.rs`; `log/tests/threads.rs` `a_background_task_runs_between_creations_and_seals_and_every_call_still_lands`.
+
+## Q-1532 — The per-series digest stays SHA-256
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §3.2 step 2 left the digest function open until its cost was measured on a core without SHA instructions: a cheaper keyed 128-bit hash takes its place if the digest dominates a run.
+**Decision (provisional).** The digest stays the first 16 bytes of SHA-256 of the fact's tuple. Measured (`kvik/src/durable/compact/tests.rs` `measure_the_digest_against_the_run`, one core of a shared 4-core cloud machine, 40,000 facts, three runs each): with SHA instructions the digests of the input and output sides take 220–254 ns a fact of a 1.70–1.83 µs run (13–14 %); with the portable SHA-256 (`--cfg sha2_backend="soft"`) 681–700 ns of 2.24–2.34 µs (30–31 %). It does not dominate, so the guard against mistakes keeps a standard function; the file's own SHA-256 (step 5) is paid either way. Reason: below half of the run on the slower path, and a keyed hash would need a key kept with the outputs.
+**Pinned by.** `kvik/src/durable/compact/tests/verify.rs` (each check fails on its own mutant); the figures in `docs/measurements/6.2a2b-maintenance-gate.md`.
+
+## Q-1533 — The background task stays on `kvik-maint`: the gate for a fourth thread passes
+Decided with roadmap 6.2a2b, provisional. To be settled by the owner with roadmap 6.3e.
+**Scenario.** Q-801 moves the background task to a fourth thread, `kvik-background`, if a running job adds more than a fifth of the class's commit-latency target at p99 to creation ahead or to a seal: 10 ms on the minimal SSD row, 50 ms on the SD row.
+**Decision (provisional).** It stays a stepped task on `kvik-maint`; the thread list of `api.md` is unchanged. Measured by `scripts/maint-gate.sh` (`log/examples/maint_gate.rs`), one core of a shared 4-core cloud machine, a sleep in every sync standing in for the device, 1,000 readings a second, 64 KiB segments, 60 s, a task of block encodes, 128 KiB writes and a sync each 1 MiB: at 2 ms a sync and 8 MiB/s the p99 added delay is 2.1 ms to creation and 1.9 ms to a seal (bound 10 ms); at 25 ms a sync and 1 MiB/s, 22.1 ms and 19.3 ms (bound 50 ms). The added delay is one step's device call, as §4 predicts. Commit p99 with the task against without: 12.4 against 12.1 ms and 71.6 against 72.3 ms. The samples are few (25 to 35 creations, 23 to 33 seals a run, so p99 is the largest) and the device is simulated; a run on real SSD and card hardware is owed with the benchmark kit.
+**Restated with the real run (6.2a2b review, third fix round).** With the compaction run itself as the task (many-series shape, `real_run_gate`), the added p99 delay is −0.03 ms to creation and −0.60 ms to a seal at 2 ms a sync and 8 MiB/s, with a whole run through verification inside the 180 s; 0.41 ms to a seal at 25 ms and 1 MiB/s (census and collect only in 120 s). The gate passes with the real task; the task stays on `kvik-maint`. Four steps of 945,728 took 10 ms or more (Q-1842).
+**Pinned by.** `docs/measurements/6.2a2b-maintenance-gate.md`; `kvik/src/durable/compact/tests/gate.rs`.
+
+## Q-1534 — A whole input segment held and scanned as one step
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §4 bounds a step at one block decoded and one device call, and counts decoded rows against `maintenance.memory`. The log's scan and its seal checks (file CRC, segment index, batch order) take a segment's bytes whole.
+**Decision (provisional).** A run reads each input in 128 KiB steps into one buffer, then scans it and checks its seal as one CPU step, then decodes one batch a step; the buffer is counted against the cap and freed at the segment's end, and each pass reads the segment again. `compaction.run_bytes` (a quarter of the cap) bounds the buffer except for a single segment larger than that, which a run still takes whole. Reason: a scan over a `ReadAt` is a change to the log's reader that no promise needs before 6.2c's budget benchmarks; the scan of a 16 MiB segment is a few milliseconds.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `each_step_declares_at_most_one_piece_of_device_work`.
+
+## Q-1535 — Count passes ahead of write passes
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** B.1 puts a file's description, with its positions per generation, its flags and the run's file count, before its data. Which rows of a partition are current and which revisions is known only once every row of a key is seen, so a run that takes series in groups cannot describe a file before its last group.
+**Decision (provisional).** After the census, a run makes count passes over every window of at most 16 partitions and every group of series, then the same passes again to write. A run that fits one window and one group counts and writes from the same rows in one pass. Each file is given only the commit-time rows of batches it holds. Reason: the format is unchanged and the outputs are byte for byte those of the whole-in-memory run; the doubled reads fall on runs that do not fit the cap, which a 16 MiB segment on the minimal class does.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_stepped_run_writes_the_whole_runs_bytes_with_any_number_of_passes`, `a_backfill_over_more_than_sixteen_partitions_takes_several_windows`.
+
+## Q-1536 — Index entries and a window's entries counted, not spilled
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §4 sends a writer's index entries past a quarter of the cap to a spill file. A window's non-fact entries are written after every series of their file, and verification reads a file's index whole.
+**Decision (provisional).** Index entries (96 bytes a chunk), a window's entries and the census (24 bytes a series, a commit-time row a batch, a day a partition) are counted against the cap, not spilled; group sizes leave room for them. Reason: at 100,000 series one file's index is about 9.6 MiB, inside the minimal cap with one window open; the spill file and its merge belong with 6.2c's merges, which need it for many inputs.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes`.
+
+## Q-1537 — A series too large for one pass taken a range of `t` at a time
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** Series go to passes in name order, in groups whose rows fit half of what the cap leaves; a full segment of one series does not fit one group.
+**Decision (provisional).** A series larger than a group is split into up to 64 ranges of `t` of equal width between its least and greatest `t`, taken in order by successive passes, with its writers' series left open between them; its set-aside facts go with the first range. A range holds whole keys, so ranking is unchanged. When a series is renamed in the inputs, every series is one group, since each file then orders its series by its own names (Q-1412). Reason: equal widths fit readings at a steady rate; a series whose rows bunch in a narrow range of `t`, or a rename, can still pass the cap, which 6.2c's benchmarks are to show or rule out.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes` (one series, 350,000 facts).
+
+## Q-1840 — The window when index entries or commit-time rows would not fit
+Decided with the review of roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** A window is 16 partitions; with 12,000 series a day on each of 16 days, or 17,000 batches each with facts on 15 days, the writers' index entries (96 bytes a chunk) and commit-time rows of a whole window pass the minimal cap although each file alone fits (Q-1536).
+**Decision (provisional).** After the census, a window is the most partitions, at most 16 and at least one, for which `series × 2 files × 96 bytes` plus a commit-time row a batch, for each file, fits a quarter of the cap. Reason: more passes, the same bytes.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes` (series-by-days, batches-by-days).
+
+## Q-1841 — What "counted" means for the cap
+Decided with the review of roadmap 6.2a2b, provisional. To be settled with its fix round.
+**Scenario.** §4 says the memory is counted by the task and never exceeded; the task's own tally left out verification's indexes, vectors' spare capacity and sort scratch, and the allocator measured 46 MiB against a 32 MiB cap.
+**Decision (provisional).** The cap bounds allocated bytes. The tally counts capacities, not lengths, and maps at about half full; sorts are unstable, so hold no scratch. A test holds both the allocator's peak, less what the test held before the run, and the tally to the cap on the heaviest shapes, in a process of its own.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`.
+
+## Q-1843 — A share configured as 0 or not a number
+Decided with the review of roadmap 6.2a2b, provisional. To be settled with its fix round.
+**Scenario.** With an `io_rate` of 0 and an empty byte bucket the governor's wait is infinite and converting it panics; a `cpu_share` that is not a number passes the clamp and then waits 0.
+**Decision (provisional).** An `io_rate` below the least floor (128 KiB/s) is raised to it; a `cpu_share` not above 0, or not a number, is refused when the task starts.
+**Pinned by.** `log/src/writer/share/tests.rs` `an_io_rate_of_zero_is_raised_to_the_least_floor`, `a_cpu_share_not_above_zero_or_not_a_number_is_refused`; `log/tests/threads.rs` `a_task_whose_cpu_share_is_not_a_number_is_refused_at_start`.
+
+## Q-1940 — A window's writers reserved by the writer's own figures; a file's index written a block a step
+Decided with the fix round of roadmap 6.2a2b's review, provisional. To be settled by roadmap 6.2c.
+**Scenario.** The group budget reserved 64 KiB for a writer's block being built, while the writer counts a block of rows at their longest text (4,096 × (fact + 255 bytes)) and a commit-time row at its own size; with many batches the tally passed the cap. Finishing a file encoded its whole index into the sink in one step, holding the index twice (19 MiB at 100,000 series), and the canonical check held a name for every series and read the index three times.
+**Decision (provisional).** A writer is reserved as `FileWriter::held_bytes` counts it, and a window also holds no more writers than fit half the cap. `FileWriter::finish_step` writes the commit-time table, then one index block a step, then the trailer, so the sink holds one index block between drains; `finish` is the same steps run together, and the bytes are unchanged. Verification lends the registry to each step of the canonical check (`CanonicalCheck::step_with`), reads a chunk's directory when the chunk is reached, and passes the check's index to the content phase. Reason: each removes a copy of a per-series structure without changing a byte written.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`, `a_window_of_writers_at_their_fullest_holds_at_most_half_the_cap`.
+
+## Q-1990 — The run's steps and their device calls
+Decided with the third fix round of roadmap 6.2a2b's review, provisional. To be settled before roadmap 6.2c, with Q-1842.
+**Scenario.** §4 allows a step one blocking device call. Opening a segment, preparing an output (its directory, the removal of a stale copy, its creation) and syncing the data directory each shared a step with other calls, and some were declared CPU-only; verification read a block's header, body and directory, and the comparing sink's window, in separate calls, up to 26 in a step.
+**Decision (provisional).** In the census and the passes every call is a step of its own and declared as device work: a segment is opened a step before its first read, an output's directory, removal and creation are a step each, and the directory sync is declared `Device(0)`. Verification makes at most one call a step, of at most the bytes declared: its sources share an allowance of one call a step; a read the windows do not cover takes it, and a read after it, or one larger than declared, fails with `WouldBlock`, and the step is taken again in the next, which declares that read's size. Each step reads before it changes anything: the canonical check reads the index and commit times a block a step, a series' set-aside blocks before it takes any, and writes the tail an index block a step; its comparing sink reads only the bytes it compares, mostly from the reader's windows, and keeps bytes it cannot read yet for the next step; the current file's rows are read a block a step as the revision rows need them. Windows read during a step that is taken again are kept until it completes, then the last two.
+**Pinned by.** `kvik/src/durable/compact/tests/steps.rs` `each_step_makes_at_most_one_device_call_of_at_most_its_declared_bytes`, `outputs_are_synced_every_mebibyte_at_their_end_and_the_directory_before_verification`; `chunk/src/file/canonical.rs` `a_check_whose_reads_each_wait_once_compares_every_byte_and_reaches_the_plain_verdict`.
+
+## Q-1842 — The longest step the run may take
+Raised by roadmap 6.2a2b's review (S3), provisional. To be settled before roadmap 6.2c, with Q-1534; owner sees it with Q-1533.
+**Scenario.** §4 bounds a step at one block and one device call; the gate's bound is 10 ms added at p99 on the minimal SSD row, and a minimal-class core is several times slower than the one measured.
+**Decision (provisional).** The gate applies to the real task, measured with `RunTask` on the heavy shapes. Measured on one core of a shared cloud machine (many-series, `real_run_gate`): 4 of 945,728 steps at 10 ms or more: two in the census (21.8 ms, the whole-segment scan of Q-1534) and two in the write passes (20.4 ms, by reading the sorts of a pass's rows and the plan, `task/passes.rs` `place`, `task/census.rs`); verification's longest is 5.8 ms. The added p99 delay stays below 1 ms, so the gate passes, but the 10 ms bound for a single step is not met. Recommended: bound the census scan by Q-1534's piece and sort a bounded slice a step; if a step cannot be cut, state its bound here. Roadmap 6.3e split `task.rs` along census, passes and verification without changing a step, so both cuts are new stepping (a stepped scan of a segment, a sort spread over steps) and move to roadmap 6.2c with Q-1534. If the bound is not met on the minimal class, the task moves to `kvik-background` (Q-801).
+**Pinned by.** `docs/measurements/6.2a2b-maintenance-gate.md`.
+
+## Q-1850 — Publish record field 3, the layout, and records without it
+Decided with roadmap 6.3e, provisional. To be settled by the owner with Q-792.
+**Scenario.** The compaction design adds a repeated field 3 to the publish record: one layout per published compacted file, in the order of field 1, so that the catalogue checks counts and finds C(g) without opening files (§3.4). Q-792 asks the owner to accept it as an addition inside version 1. Publish records written before it (by tests, and by a rebuild restating a file whose layout it cannot read) have none.
+**Decision (provisional).** Field 3 is laid out as `format.md` A.14 now states (`kvik_files::layout::CompactedLayout`) and is decoded strictly. A record carries a layout for every published compacted file or for none. The catalogue's rule covers the files that have a layout; a file without one is outside rules 1, 3 and 4 and is counted only as naming its inputs (rule 2, C(g)). The writer refuses a new record that publishes a compacted file without one (Q-2120). Reason: no released version wrote a publish record, so a record without field 3 comes only from tests or a restatement; refusing it would refuse every manifest the 6.3a tests write.
+**Pinned by.** `files/tests/records.rs` `a_publish_record_refuses_layouts_that_are_not_one_per_compacted_file_in_order`; `files/src/layout.rs` tests; `files/tests/compaction_rule.rs`.
+
+## Q-1851 — The rebuild's verdict on outputs no valid record names
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5 discards an output no valid record names only when nothing names any file of its run, its inputs are local and pass their checksums, and the run's files fail against them; otherwise it is live if it verifies or an input is not at hand, and kept and held where neither can be said. The rebuild's verifier judged one output at a time and an output was either published or discarded.
+**Decision (provisional).** The rebuild groups the outputs no valid record names into runs by shared inputs (a log segment is the input of one run, rule 1; a compacted file of one merge) and asks the verifier once per run, with the run's local files and inputs; it answers holds, fails or cannot say (`kvik_files::rebuild::Verdict`). A run one of whose files shares an input with a file a valid record names (published, retired or as an input) is never discarded: a failure counts as cannot say. Cannot say with every input at hand puts the file in `RebuildPlan::held`: it stays on disk, unlisted, and is not removed by the start's clean-up. With an input not at hand the file is published without a verdict, as before. Reason: a run's files are published by one record, so a sibling a valid record names proves that record existed; and an output alone cannot be checked for counts against inputs it shares with its siblings.
+**Pinned by.** `files/tests/unnamed_outputs.rs`; `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1852 — A merge's counts after a rebuild restates a retirement without its layout
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** A run's publish record is corrupt and a later merge, whose record is valid, retired the run's files. The rebuild restates the retirement from the merge record, which carries no layout of a retired file, so rule 3 cannot compare the merge's counts with its inputs'.
+**Decision (provisional).** The rule is undecided, naming the inputs; the catalogue holds runs, merges, removals and releases until a copy of the corrupt record is supplied (§3.4). C(g) still follows the retired files' inputs. *Alternative:* read the retired files' layouts from the files where they are still local. Reason: the hold is what §3.4 prescribes for an undecidable check, and merges, which make the case reachable, are roadmap 6.2c.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_corrupt_record_rebuilt_at_any_epoch_keeps_the_rule_and_c_g`.
+
+## Q-1853 — Publish built over the manifest's writer, not yet started by the running store
+Decided with roadmap 6.3e, provisional. To be settled by the roadmap item that gives the running store its manifest writer.
+**Scenario.** 6.3e wires compaction into `kvik-maint` with C(E) cached in the log directory's root and the upload driver's additions. The running store does not write the manifest yet: `StartOptions::recorder` and `sealed` are refused until roadmap 6.3c, nothing appends sealed-segment records, so the planner, which takes only listed segments, never has a run to make.
+**Decision (provisional).** Publish, the start's clean-up of `data/` and the rebuild's verdict are built over `kvik_files::appender::Appender` and tested on the in-memory file system at every file operation (`kvik/src/durable/compact/publish.rs`). The maintenance thread is unchanged; the task, C(E) in the root, the upload driver's additions and the removal of retired inputs (none exist before merges, roadmap 6.2c) come with the item that starts the store's manifest writer. Readers ignore chunks until roadmap 6.2b1, so a cut answers the same before and after a publish by construction. Row 6.3e's test "the same cut answers the same before and after a publish" is owed by roadmap 6.2b1, when readers use chunks. Reason: wiring a task that can never plan a run adds a maintenance-thread change with nothing to test.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1854 — The rebuild's verifier compacts the inputs again
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5's rebuild judges a set of outputs no valid record names against their inputs with the checks of §3.2, which a run makes as it reads its inputs.
+**Decision (provisional).** The verifier compacts the run's input segments again into `.tmp` files, with the run's generation, run id (its first `file_id`) and the `created_at` read from a found output, then compares each found output's SHA-256 with that of the file of the same identity, and removes what it wrote. A found file that differs, or has no counterpart, fails the run; matching files fewer than the run made cannot be judged; an input that is not local, a merge's outputs or a run that stalls cannot be judged either. Reason: a run is deterministic (Q-1535), so equality of bytes is every check of §3.2 at once; a run made under a later week rule or registry fails and is discarded only when its inputs are local, so their positions are compacted again and nothing is lost.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_set_of_outputs_is_judged_against_its_inputs_by_compacting_them_again`, `a_corrupt_run_record_whose_outputs_fail_against_local_inputs_discards_them`.
+
+## Q-2120 — When publish records without field 3 stop being accepted
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** With the catalogue broken by rule 2, a new record publishing a compacted file without field 3 was accepted, after which the state read as holding and C(g) moved; a second run over a compacted segment without field 3 was accepted and the state still held, as files without a layout are outside rules 1, 3 and 4 (Q-1850).
+**Decision (provisional).** The writer refuses a new record (`old_epoch` none) that publishes a compacted file without a layout (`AppendError::Unlaid`), before the hold and the rule are judged. A restated record (`old_epoch` set) may still have none and is judged on the state. The generated histories of `kvik-files`' tests give their records layouts. Reason: `publish()` always writes layouts, so only tests wrote such records, and accepting them let a record end a hold or break rule 1 unseen.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_new_record_publishing_a_compacted_file_without_a_layout_is_refused_while_broken`, `a_second_run_without_a_layout_over_a_compacted_segment_is_refused`.
+
+## Q-2121 — Whether a new record may leave the rule undecided
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** From a state that holds, a laid-out run naming a segment no record lists was appended; the state was then undecided and every later publish was refused as held until a sealed-segment record listed the segment, and rule 3 was never checked for the run.
+**Decision (provisional).** The writer refuses a new publish record unless the state after it holds (`AppendError::Undecided`, naming the files the catalogue lacks). Reason: §3.4 makes the writer's check a guard against its own mistakes; the state before is known to hold at that point, so the only source of an undecided state is the record.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_run_naming_an_unlisted_segment_is_refused_from_a_state_that_holds`.
+
+## Q-2122 — What a rebuild's held file holds
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** `RebuildPlan::held` lists outputs that can be neither published nor discarded, said to hold runs, merges, removals and releases; only the start's clean-up took the list. With a held file on disk the planner would compact its segments again, and a copy of the corrupt record arriving later would then name two runs for one segment (rule 1, a hold with no end).
+**Decision (provisional).** The appender carries the held files (`Appender::hold_unlocated`, called by `rebuild_manifest`): while a record has not named one, `Appender::compaction` is undecided and names it, so one accessor answers for both holds and new publish records are refused as held. A carried copy of the corrupt record that names the file ends its hold. The hold lasts for the run of the process; the driver (Q-1853) consults `compaction()` before planning a run and keeps the held files out of a later start's clean-up while the rebuild is provisional. Reason: §3.5 keeps such a file and holds as for an unlocated one; carrying it in the appender's judgement needs no new record.
+**Pinned by.** `files/tests/unnamed_outputs.rs` `a_held_output_holds_compaction_in_the_rebuilt_appender_until_a_copy_of_its_record_names_it`.
+
+## Q-2125 — Publish after an unsure record
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** A failed sync leaves the appender faulted, the record possibly on disk and the outputs under their final names. A second publish of the same segments with the same first `file_id` renamed its outputs over them, was refused by the faulted appender, and its clean-up removed the final names, so a durable record could name absent files.
+**Decision (provisional).** The appender's fault ends compaction for the run of the process: `publish` refuses (`PublishError::Refused(AppendError::ReadOnly)`) before any rename when the appender is faulted; the next start finds the record or not and cleans up as §3.5 says. Reason: only the next start can tell whether the unsure record is on disk.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_publish_after_an_unsure_record_leaves_the_outputs_that_record_may_name`.
 
 ## Open at v0.2
 
@@ -5499,7 +5720,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. The owner's rulings of 2026-11-26 settled Q-1200 to Q-1203, recorded by the review of conditions and fan-out.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. Roadmap 6.2a2 (the compaction run) recorded and decided Q-1410 to Q-1414, all but Q-1411 provisional. Roadmap 6.2a2b (the maintenance share, the streaming writer and check, the stepped run) recorded and decided Q-1530 to Q-1537, provisional; its review recorded Q-1840, Q-1841 and Q-1843 with their proposals applied, and its fix round Q-1940. The owner's rulings of 2026-11-26 settled Q-1200 to Q-1203, recorded by the review of conditions and fan-out.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -5642,7 +5863,15 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
 | Q-854 | 9.0b2 | The lease records the highest epoch read; decided by the lead at 9.0b1's review, to be confirmed at the re-check |
-| Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
+| Q-811 | 6.2a2b | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; the stall on decreasing commit times is built by 6.2a2; open for the memory of the writer and the canonical check (Q-1410) |
+| Q-1410 | 6.2a2b | Roadmap 6.2a2 in two parts: the governor, stepping, gate of Q-801, streaming writer and digest cost in 6.2a2b; provisional |
+| Q-1412 | 6.3e | The name and reach of a series in a compacted file, from the definition in force at its greatest position; provisional |
+| Q-1413 | 6.2c | A set-aside non-fact entry stalls a run; provisional |
+| Q-1414 | 6.3e | Unpublished outputs wait under `.tmp` names in `data/`; provisional |
+| Q-1530 | 6.2c | The streaming writer holds a chunk only while its place is undecided; provisional |
+| Q-1531 | 6.3e | Governor details and the hook for a background task; provisional |
+| Q-1532 | 6.3e | The digest stays SHA-256: 13 % of a run with SHA instructions, 30 % without; provisional |
+| Q-1533 | 6.3e | The gate passes on simulated devices: the task stays on `kvik-maint`; owner to confirm; provisional |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 | Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give, which 9.0c adds a case of (a registry file that could not be written, Q-1001); for review |
