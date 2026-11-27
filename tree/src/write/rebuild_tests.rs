@@ -84,8 +84,10 @@ fn close_floors(w: &mut World) -> Result<(), WriteError> {
         .rebuild(root.checkpoint, r, wall, now)
 }
 
-/// Damages one live part, then the scrub finds it and its period is rebuilt from facts.
+/// After a checkpoint, as the job takes one before any repair or merge (Q-2110), damages one live part; the scrub
+/// finds it and its period is rebuilt from facts.
 fn damage(w: &mut World, pick: usize) -> Result<bool, WriteError> {
+    w.checkpoint()?;
     let f = w.files.as_ref().unwrap();
     let root = f.root().clone();
     if root.parts.is_empty() {
@@ -254,7 +256,10 @@ fn op() -> impl Strategy<Value = Op> {
 fn perform(w: &mut World, a: &Act) -> Result<(), WriteError> {
     match a {
         Act::Checkpoint => w.checkpoint(),
-        Act::Merge(days) => merge(w, *days).map(|_| ()),
+        Act::Merge(days) => {
+            w.checkpoint()?;
+            merge(w, *days).map(|_| ())
+        }
         Act::Rebuild(s) => rebuild_series(w, *s),
     }
 }
