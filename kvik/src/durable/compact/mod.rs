@@ -1,9 +1,13 @@
 //! Compaction of sealed log segments into compacted segments, level L0 (`spec.md` §7; roadmap 6.2a2): the planner,
 //! the run and its verification. Outputs are left unpublished, as `.tmp` files under `data/`; publishing them is
-//! roadmap 6.3e, and the governor, the stepping and the memory cap are roadmap 6.2a2b (Q-1410).
+//! roadmap 6.3e. The run is a background task stepped within the maintenance share and memory cap (roadmap 6.2a2b).
 
 mod plan;
+#[cfg(test)]
+mod reference;
 mod run;
+mod segment;
+mod task;
 mod verify;
 
 #[cfg(test)]

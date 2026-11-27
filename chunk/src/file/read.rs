@@ -322,17 +322,30 @@ impl<S: ReadAt> CompactedFile<S> {
         let d = self.directory(e)?;
         let mut out = Vec::with_capacity(e.row_count as usize);
         for i in 0..d.blocks.len() {
-            let b = self.data_block(e, &d, i)?;
-            for fact in facts_of(e.series_id, &b) {
+            out.extend(self.read_block(e, &d, i)?);
+        }
+        Ok(out)
+    }
+
+    /// The facts of data block `i` of a chunk, with their batches' receive and commit times.
+    pub fn read_block(
+        &self,
+        e: &IndexEntry,
+        d: &Directory,
+        i: usize,
+    ) -> Result<Vec<TimedFact>, FileError> {
+        let b = self.data_block(e, d, i)?;
+        facts_of(e.series_id, &b)
+            .into_iter()
+            .map(|fact| {
                 let batch = self.batch(fact.position)?;
-                out.push(TimedFact {
+                Ok(TimedFact {
                     fact,
                     received_at: batch.received_at,
                     commit_time: batch.commit_time,
-                });
-            }
-        }
-        Ok(out)
+                })
+            })
+            .collect()
     }
 
     /// Commit-times block `i`, bound to its directory record: the generation, the first and last row's sequences

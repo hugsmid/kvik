@@ -293,6 +293,11 @@ impl<W: Write> FileWriter<W> {
         self
     }
 
+    /// The sink.
+    pub fn sink(&self) -> &W {
+        &self.out
+    }
+
     /// The sink, for a caller that drains what is written as it goes.
     pub fn sink_mut(&mut self) -> &mut W {
         &mut self.out
@@ -306,6 +311,14 @@ impl<W: Write> FileWriter<W> {
     /// Data blocks written so far.
     pub fn data_blocks(&self) -> usize {
         self.data_blocks
+    }
+
+    /// Bytes the writer holds besides its sink: index entries, commit-time rows and the open series' rows.
+    pub fn held_bytes(&self) -> u64 {
+        let fact = std::mem::size_of::<Fact>() as u64;
+        (self.index.len() * std::mem::size_of::<IndexEntry>()) as u64
+            + (self.batches.len() * (std::mem::size_of::<Batch>() + 8)) as u64
+            + self.held_rows() as u64 * (fact + 255)
     }
 
     fn put(&mut self, bytes: &[u8]) -> io::Result<()> {

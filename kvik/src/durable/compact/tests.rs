@@ -1,4 +1,5 @@
 mod plan;
+mod task;
 mod verify;
 
 use std::collections::{BTreeMap, BTreeSet};
