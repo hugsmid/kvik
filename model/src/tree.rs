@@ -269,18 +269,51 @@ impl SeriesTree {
     pub fn core(&self, start: Nanos, end: Nanos) -> Node {
         let mut parts: Vec<Node> = Vec::new();
         let mut t = start;
-        while t < end {
-            if t % MINUTE != 0 || t + MINUTE > end {
-                let to = (floor_to(t, MINUTE) + MINUTE).min(end);
+        let mut stop = end;
+        // Spans holding neither a reading nor a stored node are empty, so the walk covers only the data's extent.
+        if start < end {
+            let mut lo: Option<Nanos> = self.readings.range(start..end).next().map(|(t, _)| *t);
+            let mut hi: Option<Nanos> = self
+                .readings
+                .range(start..end)
+                .next_back()
+                .map(|(t, _)| floor_to(*t, MINUTE).saturating_add(MINUTE));
+            for (l, nodes) in self.levels.iter().enumerate() {
+                let first = nodes.range(..end).next().map(|(k, _)| *k);
+                let last = nodes
+                    .range(..end)
+                    .next_back()
+                    .map(|(k, _)| k.saturating_add(LEVELS[l]));
+                lo = lo.into_iter().chain(first).min();
+                hi = hi.into_iter().chain(last).max();
+            }
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => {
+                    let lead = floor_to(lo.max(start), MINUTE);
+                    if lead > start {
+                        parts.push(direct(&self.params, start, lead, &[]));
+                        t = lead;
+                    }
+                    stop = hi.min(end);
+                }
+                _ => stop = start,
+            }
+        }
+        while t < stop {
+            if t % MINUTE != 0 || t + MINUTE > stop {
+                let to = (floor_to(t, MINUTE) + MINUTE).min(stop);
                 parts.push(direct(&self.params, t, to, &self.raw(t, to)));
                 t = to;
-            } else if t % QUARTER == 0 && t + QUARTER <= end {
+            } else if t % QUARTER == 0 && t + QUARTER <= stop {
                 parts.push(self.node(1, t));
                 t += QUARTER;
             } else {
                 parts.push(self.node(0, t));
                 t += MINUTE;
             }
+        }
+        if stop < end {
+            parts.push(direct(&self.params, stop.max(start), end, &[]));
         }
         let mut n = merge_all(&self.params, start, parts.iter());
         n.end = end.max(start);

@@ -77,9 +77,9 @@ pub fn exact_ns(ns: i128) -> Exact {
     Exact::from_integer(num_bigint::BigInt::from(ns))
 }
 
-/// Floor of `t` to a multiple of `step` (works for negative times).
+/// Floor of `t` to a multiple of `step` (works for negative times); saturates at `Nanos::MIN`.
 pub fn floor_to(t: Nanos, step: Nanos) -> Nanos {
-    t.div_euclid(step) * step
+    t.div_euclid(step).saturating_mul(step)
 }
 
 /// Series identifier, assigned once by the registry and never reused.
@@ -360,5 +360,17 @@ impl Fact {
     /// Whether this fact takes part in summaries (§2.3: bad quality is excluded).
     pub fn summarised(&self) -> bool {
         self.quality != Quality::Bad
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_to_saturates_at_the_first_instant() {
+        assert_eq!(floor_to(Nanos::MIN, 60), Nanos::MIN);
+        assert_eq!(floor_to(Nanos::MIN + 1, 60), Nanos::MIN);
+        assert_eq!(floor_to(-1, 60), -60);
     }
 }

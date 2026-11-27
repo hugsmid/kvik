@@ -35,6 +35,7 @@ impl LogReader {
         lost: &dyn Fn(u64, u64, u64) -> bool,
     ) -> Result<Lookup, ReaderError> {
         let mark = self.read_mark()?;
+        self.caches.keep_maps_under(mark.stamp, mark.generation);
         let lease_kept = self.keep_alive().is_ok();
         let mut out = Lookup {
             facts: Vec::new(),

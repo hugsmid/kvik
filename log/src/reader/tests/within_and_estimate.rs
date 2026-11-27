@@ -163,3 +163,126 @@ fn room_for_the_expected_facts_is_taken_at_once_so_a_budget_doubling_overflows_h
     assert_eq!(expected.facts.capacity() as u64, n);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn a_second_lookup_above_a_position_inside_a_mapped_batch_keeps_the_rest_of_that_batch() {
+    let (fs, log) = store(40);
+    let wanted = [Wanted {
+        series_id: 3,
+        from: i64::MIN,
+        to: i64::MAX,
+    }];
+    let mut r = reader(&fs, 3);
+    let whole = r.lookup(&wanted, &|_, _, _| false).unwrap();
+    // A revision call holds series 3 twice: at t = call, then at t = 0 later in the same batch.
+    let splits: Vec<Position> = whole
+        .facts
+        .iter()
+        .filter(|f| f.row.t % 5 == 4)
+        .map(|f| f.position)
+        .collect();
+    assert_eq!(splits.len(), 8);
+    for above in splits {
+        let got = r
+            .lookup_within(
+                &wanted,
+                &|_, _, _| false,
+                Within {
+                    above: Some(above),
+                    ..Within::default()
+                },
+            )
+            .unwrap();
+        assert!(got.complete[0] && !got.overflowed);
+        let expected: Vec<_> = whole
+            .facts
+            .iter()
+            .filter(|f| f.position > above)
+            .cloned()
+            .collect();
+        assert_eq!(got.facts, expected, "above {above:?}");
+    }
+    log.shutdown().unwrap();
+}
+
+#[test]
+fn a_lookup_from_a_sealed_segments_last_time_of_the_series_reads_that_segment() {
+    let (fs, log) = store(200);
+    let all = Wanted {
+        series_id: 11,
+        from: i64::MIN,
+        to: i64::MAX,
+    };
+    let mut r = reader(&fs, 3);
+    let whole = r.lookup(&[all], &|_, _, _| false).unwrap();
+    let from = r
+        .sealed_max_t(all.series_id)
+        .expect("a sealed segment holding the series");
+    let got = reader(&fs, 4)
+        .lookup(&[Wanted { from, ..all }], &|_, _, _| false)
+        .unwrap();
+    assert!(got.complete[0]);
+    let expected: Vec<_> = whole
+        .facts
+        .iter()
+        .filter(|f| f.row.t >= from)
+        .cloned()
+        .collect();
+    assert_eq!(got.facts.first().map(|f| f.row.t), Some(from));
+    assert_eq!(got.facts, expected);
+    log.shutdown().unwrap();
+}
+
+#[test]
+fn a_lookup_under_a_new_reset_stamp_or_generation_drops_the_segment_maps_and_one_under_the_same_keeps_them()
+ {
+    let (fs, log) = store(40);
+    log.shutdown().unwrap();
+    let path = Path::new("s")
+        .join(crate::store::LOG_DIR)
+        .join(crate::store::MARK);
+    let wanted = [Wanted {
+        series_id: 3,
+        from: i64::MIN,
+        to: i64::MAX,
+    }];
+    let moved: [fn(crate::mark::MarkSlot) -> crate::mark::MarkSlot; 3] = [
+        |m| m,
+        |m| crate::mark::MarkSlot {
+            stamp: crate::mark::ResetStamp {
+                sequence: m.last_sequence,
+                nonce: 7,
+            },
+            ..m
+        },
+        |m| crate::mark::MarkSlot {
+            generation: m.generation + 1,
+            ..m
+        },
+    ];
+    let original = fs.read(&path).unwrap();
+    for (k, change, at) in (0..6).map(|i| (i / 2, moved[i / 2], i % 2 == 1)) {
+        fs.poke(&path, 0, &original);
+        let mut r = reader(&fs, 3);
+        r.lookup(&wanted, &|_, _, _| false).unwrap();
+        assert!(r.caches.maps_held() > 0);
+        let (_, m) = crate::mark::read_mark(&fs.read(&path).unwrap(), &[1; 16])
+            .unwrap()
+            .unwrap();
+        let next = crate::mark::MarkSlot {
+            counter: m.counter + 1,
+            ..change(m)
+        };
+        fs.poke(&path, 0, &crate::mark::encode_mark_file([Some(next), None]));
+        if at {
+            r.lookup_at(&[], &|_, _, _| false).unwrap();
+        } else {
+            r.lookup(&[], &|_, _, _| false).unwrap();
+        }
+        assert_eq!(
+            r.caches.maps_held() > 0,
+            k == 0,
+            "change {k}, lookup_at {at}"
+        );
+    }
+}
