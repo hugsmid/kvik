@@ -359,11 +359,14 @@ fn a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_
     drop(c);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     let mut again = Vec::new();
+    let mut resyncs = 0;
     while let Some(d) = c.try_next().unwrap() {
-        if let kvik::DeliveryKind::Transition(t) = &d.kind
-            && confirmed.contains(&t.id)
-        {
-            again.push((t.name.clone(), t.id, d.flags.replayed));
+        match &d.kind {
+            kvik::DeliveryKind::Transition(t) if confirmed.contains(&t.id) => {
+                again.push((t.name.clone(), t.id, d.flags.replayed));
+            }
+            kvik::DeliveryKind::Resync(_) => resyncs += 1,
+            _ => {}
         }
         block_on(c.confirm(d.id)).unwrap();
     }
@@ -371,6 +374,8 @@ fn a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_
         again.is_empty(),
         "confirmed transitions delivered again: {again:#?}"
     );
+    // The resync that ends the resume ends the quiet catch-up too (Q-2002).
+    assert_eq!(resyncs, 1);
     block_on(s.shutdown()).unwrap();
 }
 
