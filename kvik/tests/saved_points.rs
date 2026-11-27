@@ -443,6 +443,16 @@ impl Rig {
     }
 }
 
+impl Drop for Rig {
+    /// A history that panics still shuts its durable store, whose threads otherwise keep the world's files alive.
+    fn drop(&mut self) {
+        if let Some(d) = self.d.take() {
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on(d.shutdown())));
+        }
+    }
+}
+
 fn drain_all(c: &mut kvik::Consumer) -> Vec<Delivery> {
     let mut out = Vec::new();
     for _ in 0..2 {
@@ -486,7 +496,11 @@ fn run(steps: &[Step], seen: &mut Seen) {
 /// as a lost range, saves, checks and starts at saved points.
 #[test]
 fn saved_points_follow_the_model_over_power_losses_and_damage() {
-    let mut runner = TestRunner::default();
+    // Each shrink step replays a whole history; bounded so a failure ends in minutes.
+    let mut runner = TestRunner::new(ProptestConfig {
+        max_shrink_iters: 64,
+        ..ProptestConfig::default()
+    });
     let seen = std::cell::RefCell::new(Seen::default());
     runner
         .run(&proptest::collection::vec(arb_step(), 1..40), |steps| {
