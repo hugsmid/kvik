@@ -102,3 +102,44 @@ fn read(
 
 /// Items read per part of the pass.
 const PART: usize = 1 << 14;
+
+#[cfg(test)]
+mod tests {
+    use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
+
+    use super::*;
+
+    fn fact(t: i64) -> Item {
+        Item::Fact(FactRow {
+            series_id: 1,
+            t,
+            quality: Quality::Good,
+            flags: FactFlags::default(),
+            value: Value::F64(0),
+            changed_at: None,
+        })
+    }
+
+    fn p(s: u64) -> LogPos {
+        LogPos {
+            generation: 1,
+            sequence: s,
+        }
+    }
+
+    #[test]
+    fn take_keeps_items_above_after_and_at_or_below_upto_only() {
+        let mut s = Stretch::default();
+        let items: Vec<Item> = (0..5).map(|i| fact(i * QUARTER)).collect();
+        s.take(p(10), &items, p(11), p(13));
+        let got: Vec<(Key, LogPos)> = s.keys.into_iter().collect();
+        assert_eq!(got, [((1, 2 * QUARTER), p(12)), ((1, 3 * QUARTER), p(13))]);
+    }
+
+    #[test]
+    fn take_leaves_out_facts_whose_quarter_hour_does_not_fit() {
+        let mut s = Stretch::default();
+        s.take(p(1), &[fact(i64::MIN + 1), fact(i64::MAX), fact(0)], p(0), p(9));
+        assert_eq!(s.keys.into_keys().collect::<Vec<_>>(), [(1, 0)]);
+    }
+}

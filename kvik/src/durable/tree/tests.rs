@@ -407,3 +407,47 @@ fn failing_tree_writes_degrade_health_with_tree_behind_and_never_stop_ingest() {
     assert!(st.fs.read(&st.dir.join(DIR).join(root_name(1))).is_none());
     st.w.shutdown().unwrap();
 }
+
+#[test]
+fn an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds() {
+    let mut st = Store::new("unsynced");
+    st.emit(Intent::Normal, &[(10, Some(1.0))]);
+    let r = st.w.reader().unwrap();
+    st.clock.advance(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(300));
+    st.emit(Intent::Normal, &[(1, Some(2.0))]);
+    let synced = st.w.log().as_ref().unwrap().stats().mark_synced;
+    let v = r.snapshot().unwrap();
+    assert!(v.cut().durable > synced, "the commit is above the synced mark");
+    let _ = r.end(v);
+    let job = st.w.tree.clone().unwrap();
+    job.step(synced, Duration::from_secs(1 << 30), false);
+    assert_eq!(job.behind(), None);
+    st.w.shutdown().unwrap();
+}
+
+fn emit_at(st: &Store, t: i64) {
+    let r = Reading::new(st.id, crate::time::Timestamp(t), Value::F64(1.0));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        st.w.emit(&[r], Intent::Normal, true).map(wait)
+    }));
+    assert!(out.is_ok(), "emit panicked at {t}");
+}
+
+#[test]
+fn a_reading_at_the_least_instants_is_taken_and_checkpointed() {
+    let st = Store::new("least");
+    emit_at(&st, i64::MIN + 1);
+    emit_at(&st, i64::MIN);
+    st.stop();
+}
+
+#[test]
+fn a_reading_at_the_greatest_instant_is_taken_and_checkpointed() {
+    let st = Store::new("greatest");
+    emit_at(&st, i64::MAX);
+    emit_at(&st, i64::MAX - QUARTER_NS);
+    st.stop();
+}
+
+const QUARTER_NS: i64 = kvik_tree::set::QUARTER;
