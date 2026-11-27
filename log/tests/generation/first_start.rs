@@ -253,6 +253,7 @@ fn a_cursor_naming_a_position_makes_a_start_with_no_mark_and_no_segment_a_recove
             position: at(generation, 3),
             latches: Vec::new(),
             reset: None,
+            gate: None,
         };
         append(&r.fs, &dir(), STORE_ID, generation, T0, &state, None).unwrap();
         lose_unsealed(&mut r, generation, false);

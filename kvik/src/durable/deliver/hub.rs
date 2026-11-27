@@ -185,7 +185,7 @@ impl Hub {
                     }
                     read_at = Instant::now();
                     sealed = now_sealed;
-                                        let (r, next) = hub.run(|d, c| {
+                    let (r, next) = hub.run(|d, c| {
                         d.pump(c);
                         if due {
                             d.tick(c);

@@ -13,8 +13,8 @@ use common::{block_on, start};
 use kvik::env::{Env, ManualClock};
 use kvik::{
     Backend, Condition, ConditionState, Consumer, Delivery, DeliveryId, DeliveryKind, Funnel,
-    FunnelId, Gate, Input, Level, Outcome, Position, Reading, ResetStamp, ResyncCause, SavedPoint, Select,
-    SeriesId, Start, Store, StoreConfig, TransitionCause, Value,
+    FunnelId, Gate, Input, Level, Outcome, Position, Reading, ResetStamp, ResyncCause, SavedPoint,
+    Select, SeriesId, Start, Store, StoreConfig, TransitionCause, Value,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -643,6 +643,7 @@ fn gate_history_on_both(history: &[Step]) -> (Vec<String>, Vec<String>) {
     let m = run(
         model,
         &|| block_on(Store::open(m_config.clone())).unwrap(),
+        &|_| unreachable!("gate histories lose no cursor"),
         &m_clock,
         history,
     );
@@ -652,7 +653,13 @@ fn gate_history_on_both(history: &[Step]) -> (Vec<String>, Vec<String>) {
         kvik::ConditionsConfig::default()
             .replay_max(kvik::ReplayMax::new(Duration::from_secs(1 << 30), u64::MAX)),
     );
-    let d = run(w.open(), &|| w.open(), &w.clock, history);
+    let d = run(
+        w.open(),
+        &|| w.open(),
+        &|_| unreachable!("gate histories lose no cursor"),
+        &w.clock,
+        history,
+    );
     (m, d)
 }
 

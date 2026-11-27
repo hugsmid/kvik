@@ -66,9 +66,10 @@ impl Model {
         let named = declared
             || self.disk.registered.contains(&id)
             || v.routes.values().any(|r| match r {
-                RouteChange::Add { consumer, .. } | RouteChange::Remove { consumer, .. } => {
-                    *consumer == id
-                }
+                RouteChange::Add { consumer, .. }
+                | RouteChange::Remove { consumer, .. }
+                | RouteChange::Watch { consumer, .. }
+                | RouteChange::Unwatch { consumer, .. } => *consumer == id,
             });
         let lost = matches!(v.consumers[i].mode, Mode::Dormant) && named;
         self.restart_at(i, p, session);
