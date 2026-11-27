@@ -5307,6 +5307,19 @@ would otherwise be merged again at every pass, since its roll-ups can never be c
 **Pinned by.** `tests/plan.rs` `a_day_past_its_late_window_gets_its_day_part_with_rollups`,
 `without_rollup_levels_a_day_never_waits_for_a_day_part`, `the_planner_reads_level_widths_from_the_table`.
 
+## Q-1670 — A merge that leaves out a sibling of its own `seq`
+Raised by the re-check of roadmap 7.1b step 1; decided with step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** Inputs A (`seq` 100, series 0 to 100) and B (`seq` 107, series 0 to 50); B's split sibling C (`seq`
+107, series 51 to 100) is not taken. The output takes `seq` 107 and series 0 to 100, overlaps C in period and series,
+and a root listing both is refused (T.12).
+**Options.** (a) A merge takes every live part of its output's `seq` that overlaps its output in period and series,
+and never writes an empty merged part; (b) overlay order `(seq, file_id)` and no refusal.
+**Decision (provisional).** (a): the merge refuses a live part outside it whose `seq` lies in the inputs' range and
+whose period and series range overlap theirs (Q-1554), which covers the sibling; it writes a part only for a period
+that keeps an entry; the planner's runs and whole-period merges take such siblings.
+**Pinned by.** `tests/plan.rs` `a_merge_must_take_the_overlapping_siblings_of_its_output_seq`,
+`the_planner_takes_a_delta_run_with_its_same_seq_siblings`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

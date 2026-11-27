@@ -430,3 +430,49 @@ fn a_merge_drops_minute_entries_ending_at_the_cut_and_keeps_later_ones() {
         .collect();
     assert_eq!(kept, vec![T0 + MINUTE]);
 }
+
+fn series_part(file_id: u64, seq: u64, series: u64) -> Part {
+    let mut p = quarter_part(file_id, seq, file_id as i64);
+    p.runs[0].series = series;
+    p
+}
+
+#[test]
+fn a_merge_must_take_the_overlapping_siblings_of_its_output_seq() {
+    let mut wide = series_part(1, 100, 0);
+    let mut far = wide.runs[0].clone();
+    far.series = 100;
+    wide.runs.push(far);
+    let parts = [wide, series_part(2, 107, 10), series_part(3, 107, 60)];
+    let day = vec![(T0, DAY as u64)];
+    let sib = try_merge(&parts, vec![1, 2], day.clone(), false);
+    assert_eq!(sib, Err(MergeError::Interleaved(3)));
+    let out = try_merge(&parts, vec![1, 2, 3], day.clone(), false).unwrap();
+    assert_eq!(out[0].seq, 107);
+    let apart = [
+        series_part(1, 100, 0),
+        series_part(2, 107, 10),
+        series_part(3, 107, 200),
+    ];
+    let mut r = listed(&apart);
+    r.parts[0].greatest_series = 50;
+    let plan = Plan {
+        inputs: vec![1, 2],
+        periods: day,
+        rollups: false,
+        minute_from: i64::MIN,
+    };
+    let out = merge(&r, &apart, &plan, &part_header(0), |_| None).unwrap();
+    assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn the_planner_takes_a_delta_run_with_its_same_seq_siblings() {
+    let mut parts = deltas(3, T0);
+    let mut sib = pref(4, 2, Class::Delta, T0 + 2 * HOUR, HOUR);
+    sib.least_series = 60;
+    sib.greatest_series = 90;
+    parts.push(sib);
+    let p = plan(&root_with(parts, Vec::new()), T0 + 6 * HOUR, &POLICY);
+    assert_eq!(p[0].inputs, vec![1, 2, 3, 4]);
+}
