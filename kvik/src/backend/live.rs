@@ -83,7 +83,7 @@ impl Session {
     }
 
     pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError> {
-        let until = Instant::now() + timeout;
+        let until = crate::time::deadline(timeout);
         loop {
             let shared = self.shared.clone();
             let b = shared.with(|s| self.batch(s)).map_err(Error::query)?;

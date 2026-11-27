@@ -166,6 +166,8 @@ pub(crate) struct Collector {
     bytes: u64,
     cap: (u64, u64),
     whole: bool,
+    /// Whether it took any event; one that did not can be dropped.
+    taken: bool,
     /// The series of its facts, and whether it holds an entry, a void or a gap.
     series: BTreeSet<u32>,
     other: bool,
@@ -202,6 +204,7 @@ impl Collector {
 
     /// Takes what a part of the refresh read, and the ranges its pass found lost.
     pub(crate) fn events(&mut self, events: &[ReadEvent], found: &[Find]) {
+        self.taken |= !events.is_empty() || !found.is_empty();
         for e in events {
             match e {
                 ReadEvent::Batch(b) => {
@@ -232,9 +235,22 @@ impl Collector {
         }
     }
 
+    /// The collector of a round that failed (Q-1203): the log reader never returns what it took again, so one that
+    /// took events ends as not whole and every session is told `Lagged`; one that took none is dropped.
+    pub(crate) fn failed(mut self) -> Option<Collector> {
+        if !self.taken {
+            return None;
+        }
+        self.whole = false;
+        self.pieces.retain(Piece::kept_when_trimmed);
+        (self.rows, self.bytes) = (0, 0);
+        Some(self)
+    }
+
     /// Positions found lost by another read of the process (Q-938).
     pub(crate) fn gap(&mut self, first: LogPos, last: LogPos) {
         if first <= last {
+            self.taken = true;
             self.push(Piece::Gap(first, last));
         }
     }
@@ -308,6 +324,7 @@ impl Hub {
             bytes: 0,
             cap,
             whole: true,
+            taken: false,
             series: BTreeSet::new(),
             other: false,
             #[cfg(test)]

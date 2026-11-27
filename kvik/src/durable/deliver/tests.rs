@@ -325,6 +325,70 @@ mod bounded {
         assert!(d.head.sequence > 3 * 7_200);
     }
 
+    /// Q-1201: a consumer not taken in this run pins no records, whatever its cursor; its take reads the log again.
+    #[test]
+    fn a_consumer_not_taken_in_this_run_holds_no_records() {
+        use crate::consume::{Funnel, Select, Start};
+        let env = Env::test(ManualClock::new(Timestamp(T0 + 100 * S)));
+        let dir = "untaken";
+        let config = || {
+            StoreConfig::new(dir, "Etc/UTC")
+                .create_if_missing(true)
+                .env(env.clone())
+        };
+        let s = block_on(Store::open(config())).unwrap();
+        block_on(s.define_series(gauge("a/b/one"))).unwrap();
+        let c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+        block_on(c.route(Funnel::facts(Select::All))).unwrap();
+        for k in 0..20 {
+            let r = Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64));
+            block_on(s.emit(&[r])).unwrap();
+        }
+        block_on(s.shutdown()).unwrap();
+        drop((c, s));
+        let store_id = kvik_log::store::read_descriptor(&*env.fs, Path::new(dir))
+            .unwrap()
+            .store_id;
+        let clocks = Clocks::new(env.clock.clone());
+        let mut d = Deliverer::open(
+            Path::new(dir),
+            &env,
+            &clocks,
+            store_id,
+            4_096,
+            64,
+            usize::MAX,
+            Arc::default(),
+            None,
+            0,
+        )
+        .unwrap();
+        let generation = d.head.generation;
+        d.finish(Path::new(dir), &env, generation);
+        let s = block_on(Store::open(config())).unwrap();
+        for k in 20..40 {
+            let r = Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64));
+            block_on(s.emit(&[r])).unwrap();
+        }
+        let now = T0 + 100 * S;
+        let ctx = Ctx {
+            watch: None,
+            env: &env,
+            dir: Path::new(dir),
+            clocks: &clocks,
+            now,
+            wall: now,
+            mono: 0,
+        };
+        let head = d.head;
+        d.pump(&ctx);
+        assert!(d.head > head, "the new facts were taken");
+        assert!(d.consumers["c"].cursor < head);
+        assert!(!d.consumers["c"].attached);
+        assert!(d.items.is_empty(), "{} records held", d.items.len());
+        block_on(s.shutdown()).unwrap();
+    }
+
     #[test]
     fn no_registry_file_is_made_while_a_batch_up_to_its_position_waits() {
         let (env, dir) = store();

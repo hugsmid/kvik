@@ -217,7 +217,7 @@ impl Runner {
                 let silent = history.since_arrival.unwrap_or(0);
                 State::StaleFor {
                     last_arrival: mono - silent,
-                    fired: silent >= staleness + n,
+                    fired: silent >= staleness.saturating_add(*n),
                 }
             }
         };
@@ -311,7 +311,7 @@ impl Runner {
         if let (Condition::StaleFor { staleness, n }, State::StaleFor { fired, .. }) =
             (&self.cond, &mut self.state)
         {
-            let stale = since_effect.is_none_or(|x| x >= staleness + n);
+            let stale = since_effect.is_none_or(|x| x >= staleness.saturating_add(*n));
             if stale && !*fired {
                 *fired = true;
                 return vec![Event::Fired];
@@ -342,7 +342,7 @@ impl Runner {
                     last_arrival,
                     fired,
                 },
-            ) if !*fired && mono - *last_arrival >= staleness + n => {
+            ) if !*fired && mono - *last_arrival >= staleness.saturating_add(*n) => {
                 *fired = true;
                 return vec![Event::Fired];
             }
