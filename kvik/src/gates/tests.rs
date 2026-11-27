@@ -145,13 +145,29 @@ fn a_watch_mid_event_seeds_its_hold_from_the_look_back() {
 }
 
 #[test]
-fn the_seed_stands_in_the_live_fact_when_the_look_back_has_no_value() {
+fn the_seed_starts_from_the_live_fact_in_force_at_the_look_back_start() {
     let mut log = Log::default();
     log.fact(S, SECOND, SECOND, num(7.0), Quality::Good);
     log.watch(30 * SECOND, ConditionId(1), hold_up(5));
     let (got, _) = run(&log, &one_batch_each(), 60 * SECOND);
     assert_eq!(got[0].to, Some(GateState::Level(1)));
     assert_eq!(got, judge(&log.entries, 60 * SECOND).unwrap().transitions);
+}
+
+#[test]
+fn a_backfill_inside_the_look_back_that_was_never_live_seeds_nothing() {
+    let level = gate(
+        Kind::Levels(vec![Level::at(10.0).hold(5 * SECOND, 5 * SECOND)]),
+        None,
+    );
+    let mut log = Log::default();
+    log.fact(S, 50 * SECOND, 50 * SECOND, num(5.0), Quality::Good);
+    log.fact(S, 92 * SECOND, 40 * SECOND, num(50.0), Quality::Good);
+    log.watch(100 * SECOND, ConditionId(1), level);
+    let (got, _) = run(&log, &one_batch_each(), 120 * SECOND);
+    let moves: Vec<_> = got.iter().map(|t| (t.from.clone(), t.to.clone())).collect();
+    assert_eq!(moves, [(None, Some(GateState::Level(0)))]);
+    assert_eq!(got, judge(&log.entries, 120 * SECOND).unwrap().transitions);
 }
 
 #[test]

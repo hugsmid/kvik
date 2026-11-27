@@ -3,6 +3,7 @@
 //! the same log. No clock and no files: facts it cannot hold are read through [`History`].
 
 mod engine;
+#[cfg(test)]
 mod replay;
 mod rules;
 mod seed;
@@ -16,6 +17,7 @@ mod tests;
 use std::collections::BTreeMap;
 
 pub(crate) use engine::Core;
+#[cfg(test)]
 pub(crate) use replay::Replay;
 
 use kvik_model::gate::ConditionId;
@@ -99,14 +101,18 @@ pub(crate) struct SeriesState {
 pub(crate) trait History {
     /// The state of `series` at `now` over the facts at or before `through`.
     fn series(&self, series: SeriesId, now: Nanos, through: Position) -> SeriesState;
+    /// The series' state the seed starts from (Q-1560): its facts committed before `from` (and at or
+    /// before `through`) taken as committed at `from`, so any usable one in effect by then is an arrival
+    /// at `from`.
+    fn at_look_back(&self, series: SeriesId, from: Nanos, through: Position) -> SeriesState;
     /// Facts of `series` committed at or after `from`, at or before `through`, in position order, each
-    /// with its batch's commit time.
+    /// with its batch's commit time and whether it is outranked.
     fn facts_since(
         &self,
         series: SeriesId,
         from: Nanos,
         through: Position,
-    ) -> Vec<(Nanos, Position, FactItem)>;
+    ) -> Vec<(Nanos, Position, FactItem, bool)>;
 }
 
 /// A batch or call the core refuses.

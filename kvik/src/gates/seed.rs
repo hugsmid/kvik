@@ -1,14 +1,14 @@
-//! A starting instance's hold seeded from history (Q-1145 (b), Q-1390).
+//! A starting instance's hold seeded from history (Q-1145 (b), Q-1390, Q-1560).
 
 use kvik_model::gate::{ConditionId, Gate};
-use kvik_model::types::{DAY, Nanos, Position, Quality, SeriesId};
+use kvik_model::types::{DAY, Nanos, Position, SeriesId};
 
 use super::rules::{Inst, longest_hold};
-use super::{Body, Core, FactItem, History, Item, Replay};
+use super::{Body, Core, History, Item};
 
-/// The instance a gate starting at `now` (entry at `at`) has after being judged, emitting nothing, from
-/// the look-back `[now − min(2L, 24 h), now)` over the series' facts committed inside it; when none has a
-/// usable value, the live-state fact at `now` stands in from the look-back's start. `None` when `L` is 0.
+/// The instance a gate starting at `now` (entry at `at`) has after being judged, emitting nothing, as the
+/// same gate watched at the look-back's start `now − min(2L, 24 h)`: from the series' state there, then
+/// over the facts committed inside the look-back. `None` when `L` is 0.
 pub(super) fn seed(
     gate: &Gate,
     id: ConditionId,
@@ -22,24 +22,8 @@ pub(super) fn seed(
         return None;
     }
     let from = now.saturating_sub(longest.saturating_mul(2).min(DAY));
-    let inside = history.facts_since(s, from, at);
-    let mut feed = Vec::with_capacity(inside.len() + 1);
-    if !inside.iter().any(|(_, _, f)| f.usable())
-        && let Some(l) = history.series(s, now, at).live
-    {
-        let fact = FactItem {
-            series: s,
-            t: l.t,
-            value: l.value,
-            quality: Quality::Good,
-            changed_at: l.changed_at,
-        };
-        feed.push((from, l.position, fact));
-    }
-    feed.extend(inside);
-    // The look-back is judged on its own: outranking, arrivals and staleness see only its facts.
-    let mut replay = Replay::default();
     let mut core = Core::unseeded();
+    core.series.insert(s, history.at_look_back(s, from, at));
     let watch = Item {
         position: Position::ORIGIN,
         body: Body::Watch {
@@ -47,14 +31,13 @@ pub(super) fn seed(
             gate: gate.clone(),
         },
     };
-    core.apply_batch(from, &[watch], &replay).ok()?;
-    for (commit, position, fact) in feed {
-        let outranked = replay.push(commit, position, fact.clone());
+    core.apply_batch(from, &[watch], history).ok()?;
+    for (commit, position, fact, outranked) in history.facts_since(s, from, at) {
         let item = Item {
             position,
             body: Body::Fact { fact, outranked },
         };
-        core.apply_batch(commit, &[item], &replay).ok()?;
+        core.apply_batch(commit, &[item], history).ok()?;
     }
     core.advance(now);
     core.instances.remove(&(id, s))
