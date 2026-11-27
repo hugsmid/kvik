@@ -432,8 +432,10 @@ In-store conditions on one stream (spec §6 Gates). The model backend serves the
 the run, and refuses window inputs `NotSupportedYet` for now (Q-1140, Q-1583). Its cursor file holds the gate cursor
 and a checkpoint (`format.md` A.15): a second take in the same run, and the first take after a stop or a crash,
 receive the unconfirmed transitions again under their ids, flagged `replayed`; beyond `conditions.replay_max`, without
-a cursor file, or in another generation the gates are rebuilt from history at the take (`set_by` `None`), counted
-`gates_reseeded` (Q-2080, Q-2087). A reset point after the checkpoint (a recovery entry, a lost range) is met during
+a cursor file, or in another generation the gates are rebuilt from history at the take (`set_by` `None` until a
+transition moves the instance, across later restarts too), counted `gates_reseeded` (Q-2080, Q-2087, Q-2160). A
+consumer that watched and stopped before its first cursor write has no cursor file: its gates are rebuilt at the next
+start, so its start transitions never arrive and the resync carries their states. A reset point after the checkpoint (a recovery entry, a lost range) is met during
 the replay: the transitions before it are replayed, every instance is seeded again where it lies with no transition,
 and the replay goes on; the resync at the reset point carries `forget_above`, and the consumer forgets transition ids
 with `at` above it (Q-1140, Q-2170). The model backend replays without bound (Q-2085) and judges a reset point the

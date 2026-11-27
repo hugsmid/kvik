@@ -133,6 +133,7 @@ fn levels_mid_hold() -> Checkpoint {
                 gate: 4,
                 series: 9,
             },
+            reseeded: false,
             crossed: 0,
             pending: vec![(0, 4_000)],
             reference: None,
@@ -241,6 +242,23 @@ fn checkpoint_vector_matches_format_md_and_round_trips() {
         )
     );
     assert_eq!(checkpoint::decode_body(&body), Some(levels_mid_hold()));
+}
+
+#[test]
+fn a_reseeded_instance_sets_byte_2_of_its_set_by_and_round_trips() {
+    let mut c = levels_mid_hold();
+    c.instances[0].reseeded = true;
+    let body = checkpoint::encode_body(&c).unwrap();
+    let plain = checkpoint::encode_body(&levels_mid_hold()).unwrap();
+    assert_eq!(hex(&body[40..44]), "01000100");
+    assert_eq!((&body[..42], &body[43..]), (&plain[..42], &plain[43..]));
+    assert_eq!(checkpoint::decode_body(&body), Some(c));
+    let mut bad = body.clone();
+    bad[42] = 2;
+    assert_eq!(checkpoint::decode_body(&bad), None);
+    bad[42] = 0;
+    bad[43] = 1;
+    assert_eq!(checkpoint::decode_body(&bad), None);
 }
 
 fn with_checkpoint(fs: &MemFs, dir: &Path, c: &Checkpoint, g: GateCursor, end: Option<u64>) -> u64 {

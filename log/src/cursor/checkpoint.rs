@@ -107,6 +107,8 @@ pub struct CheckpointInstance {
     pub state: CheckpointState,
     /// The transition that set it.
     pub set_by: GateId,
+    /// Set by a reseed: `set_by` is the start id no delivery carried, and a resync reports none (Q-2160).
+    pub reseeded: bool,
     /// Boundaries crossed, a bit each.
     pub crossed: u16,
     /// Boundaries whose far side holds, by index, with the first instant it held (index order, at most 16).
@@ -285,7 +287,9 @@ pub fn encode_body(c: &Checkpoint) -> Option<Vec<u8>> {
     for i in &c.instances {
         out.extend_from_slice(&i.gate.to_le_bytes());
         out.extend_from_slice(&i.series.to_le_bytes());
+        let point = out.len();
         put_point(&mut out, &GateCursor::Transition(i.set_by));
+        out[point + 2] = u8::from(i.reseeded);
         let pending = u8::try_from(i.pending.len())
             .ok()
             .filter(|n| *n <= MAX_PENDING)?;
@@ -356,7 +360,13 @@ pub fn decode_body(b: &[u8]) -> Option<Checkpoint> {
     for _ in 0..n_inst {
         let head = r.take(8)?;
         let (gate, series) = (u32_at(head, 0), u32_at(head, 4));
-        let GateCursor::Transition(set_by) = point_at(r.take(GATE_POINT_LEN)?)? else {
+        let mut point = <[u8; GATE_POINT_LEN]>::try_from(r.take(GATE_POINT_LEN)?).ok()?;
+        let reseeded = match point[2] {
+            b @ 0..=1 => b == 1,
+            _ => return None,
+        };
+        point[2] = 0;
+        let GateCursor::Transition(set_by) = point_at(&point)? else {
             return None;
         };
         let fixed = r.take(4)?;
@@ -396,6 +406,7 @@ pub fn decode_body(b: &[u8]) -> Option<Checkpoint> {
             series,
             state,
             set_by,
+            reseeded,
             crossed,
             pending,
             reference,

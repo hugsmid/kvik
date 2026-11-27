@@ -197,12 +197,17 @@ impl Deliverer {
             Core::restore(snap, restore_defs, &history).map_err(|_| NoReplay::Unusable)?;
         core.reseed(&reseed, k.at, k.now, &history)
             .map_err(|_| NoReplay::Unusable)?;
-        let reseeded: BTreeMap<_, _> = core
-            .states()
-            .into_iter()
-            .filter(|((g, _), _)| missing.contains(g))
-            .map(|(key, (_, set_by))| (key, set_by))
-            .collect();
+        let mut reseeded: BTreeMap<_, _> = self.consumers[name]
+            .checkpoint
+            .as_ref()
+            .map(Snapshot::reseeded_in)
+            .unwrap_or_default();
+        reseeded.extend(
+            core.states()
+                .into_iter()
+                .filter(|((g, _), _)| missing.contains(g))
+                .map(|(key, (_, set_by))| (key, set_by)),
+        );
         let mut out = Vec::new();
         let items: Vec<(LogPos, Item)> = self
             .items
@@ -292,7 +297,6 @@ impl Deliverer {
             self.stats.gates_reseeded += 1;
         }
         // An instance a reset point reseeded and nothing has moved since carries `set_by` none (Q-1392).
-        let mut reseeded = reseeded;
         reseeded.extend(core.states().into_iter().filter_map(|(key, (_, set_by))| {
             (set_by.due.is_none() && resets.binary_search(&log_pos(set_by.at)).is_ok())
                 .then_some((key, set_by))
@@ -335,9 +339,6 @@ impl Deliverer {
         let mut deferred = VecDeque::new();
         for t in out {
             let k = (t.id.condition, t.id.series);
-            if run.reseeded.get(&k).is_some_and(|r| t.id > *r) {
-                run.reseeded.remove(&k);
-            }
             run.last.insert(k, t.clone());
             if confirmed.is_none_or(|g| !covers(&g, &t.id)) {
                 deferred.push_back((t, true));
@@ -395,7 +396,7 @@ impl Deliverer {
                 .all(|t| after(&t.id, snap.frontier())),
             "G5: the checkpoint is after an unconfirmed transition"
         );
-        Some(snap.to_checkpoint())
+        Some(snap.to_checkpoint(&run.reseeded))
     }
 }
 

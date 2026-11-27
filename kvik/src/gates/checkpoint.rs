@@ -64,8 +64,12 @@ fn value_in(v: &CheckpointValue) -> Value {
 }
 
 impl Snapshot {
-    /// The checkpoint that holds this snapshot.
-    pub fn to_checkpoint(&self) -> Checkpoint {
+    /// The checkpoint that holds this snapshot; an instance whose `set_by` is its id in `reseeded` is flagged as
+    /// set by a reseed (Q-2160).
+    pub fn to_checkpoint(
+        &self,
+        reseeded: &BTreeMap<(ConditionId, SeriesId), TransitionId>,
+    ) -> Checkpoint {
         Checkpoint {
             through: pos_out(self.frontier.at),
             now: self.frontier.now,
@@ -83,6 +87,7 @@ impl Snapshot {
                         GateState::Value(v) => CheckpointState::Value(value_out(v)),
                     },
                     set_by: id_out(&i.set_by),
+                    reseeded: reseeded.get(&(*g, *s)) == Some(&i.set_by),
                     crossed: i.crossed,
                     pending: i.pending.clone(),
                     reference: i.reference.as_ref().map(value_out),
@@ -156,6 +161,15 @@ impl Snapshot {
                 now: c.now,
             },
         }
+    }
+
+    /// The instances a checkpoint flags as set by a reseed, with the id each was set by.
+    pub fn reseeded_in(c: &Checkpoint) -> BTreeMap<(ConditionId, SeriesId), TransitionId> {
+        c.instances
+            .iter()
+            .filter(|i| i.reseeded)
+            .map(|i| ((ConditionId(i.gate), SeriesId(i.series)), id_in(&i.set_by)))
+            .collect()
     }
 
     /// An empty core's snapshot at a frontier: the resume point of a consumer whose gates all came after it.

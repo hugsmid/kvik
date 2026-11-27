@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,8 +11,9 @@ use std::time::Duration;
 use common::block_on;
 use common::world::{World, gauge, ready, resync};
 use kvik::{
-    ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Funnel, Gate, Health, Input, Level,
-    Reading, ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store, TransitionId, Value,
+    ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Funnel, Gate, GateId, GateState,
+    Health, Input, Level, Reading, ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store,
+    TransitionId, Value,
 };
 use kvik_log::fs::FaultOp;
 use proptest::prelude::*;
@@ -203,6 +204,40 @@ fn a_lost_cursor_file_reseeds_the_gates() {
         ["resync NoCursor [(Level(1), false)]"]
     );
     assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-2160: a reseeded instance keeps `set_by` none through a confirmation and a clean restart; the checkpoint carries
+/// "set by a reseed" rather than the start id no delivery carried.
+#[test]
+fn a_reseeded_gate_keeps_set_by_none_after_a_restart() {
+    let (w, _) = confirmed_twice("gates-durable-reseed-restart");
+    w.fs.poke(&cursor_path(&w), 0, &[0; 16]);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    assert_eq!(seen(&got), ["resync NoCursor [(Level(1), false)]"]);
+    block_on(c.confirm(got[0].id)).unwrap();
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    assert_eq!(seen(&got), ["resync Resume [(Level(1), false)]"]);
+    assert_eq!(s.stats().delivery.gates_reseeded, 0);
+    block_on(c.confirm(got[0].id)).unwrap();
+    let id = SeriesId(1);
+    emit(&w, &s, id, 50.0);
+    let got = ready(&mut c);
+    assert_eq!(seen(&got), ["Some(Level(0)) r=false"]);
+    block_on(c.confirm(got[0].id)).unwrap();
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(0), true)]"]);
     block_on(s.shutdown()).unwrap();
 }
 
@@ -472,11 +507,17 @@ struct Track {
     confirmed: BTreeSet<TransitionId>,
     /// Ids handed out in this run, in order, with whether a confirmation was attempted through them.
     run: Vec<(TransitionId, bool)>,
+    /// Per instance, the state the consumer last learnt, from a new transition or a resync.
+    known: BTreeMap<(GateId, SeriesId), GateState>,
+    /// Every transition ever handed out, with the state it set.
+    set: BTreeMap<TransitionId, Option<GateState>>,
 }
 
 impl Track {
     /// Checks and records what a drain gave (G6): an id seen before comes `replayed`; none a returned confirmation
-    /// covers comes again. A resync's `forget_above` makes the consumer forget ids above it (Q-1140).
+    /// covers comes again; a new transition starts from the state last learnt (G7, nothing lost between a checkpoint
+    /// and the head); a resync's `set_by` is none or an id handed out, and its state is what that id set (Q-2160). A
+    /// resync's `forget_above` makes the consumer forget ids above it (Q-1140).
     fn take(&mut self, got: &[kvik::Delivery]) -> Result<(), TestCaseError> {
         for d in got {
             match &d.kind {
@@ -491,6 +532,20 @@ impl Track {
                         "{:?} came twice without `replayed`",
                         t.id
                     );
+                    let key = (t.id.condition, t.id.series);
+                    if !self.delivered.contains(&t.id) {
+                        prop_assert_eq!(
+                            t.from.as_ref(),
+                            self.known.get(&key),
+                            "{:?} does not start from the state last learnt",
+                            t.id
+                        );
+                        match &t.to {
+                            Some(st) => self.known.insert(key, st.clone()),
+                            None => self.known.remove(&key),
+                        };
+                    }
+                    self.set.insert(t.id, t.to.clone());
                     self.delivered.insert(t.id);
                     self.run.push((t.id, false));
                 }
@@ -500,6 +555,22 @@ impl Track {
                         self.delivered.retain(keep);
                         self.confirmed.retain(keep);
                         self.run.retain(|(id, _)| keep(id));
+                    }
+                    for g in &r.gates {
+                        if let Some(id) = g.set_by {
+                            let Some(to) = self.set.get(&id) else {
+                                prop_assert!(false, "a resync names {:?}, never handed out", id);
+                                unreachable!()
+                            };
+                            prop_assert_eq!(
+                                to.as_ref(),
+                                Some(&g.state),
+                                "{:?} set another state",
+                                id
+                            );
+                            SET_BY_CHECKED.fetch_add(1, Ordering::SeqCst);
+                        }
+                        self.known.insert((g.condition, g.series), g.state.clone());
                     }
                 }
                 _ => {}
@@ -591,68 +662,113 @@ fn resume(s: &Store, track: &mut Track) -> Result<Consumer, TestCaseError> {
 /// replayed.
 #[test]
 fn gate_deliveries_after_crashes_follow_the_rules() {
-    let cases = (ProptestConfig::default().cases / 4).max(16);
+    let cases = ProptestConfig::default().cases;
     TestRunner::new(ProptestConfig {
         cases,
         failure_persistence: None,
         ..ProptestConfig::default()
     })
     .run(&prop::collection::vec(op(), 1..30), |history| {
-        let mut w = World::quiet(&format!("gates-crashes-{}", next_id()));
-        let mut s = w.open();
-        let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
-        let mut c = take(&s);
-        let mut track = Track::default();
-        for op in &history {
-            match op {
-                Op::Emit(v) => {
-                    let _ = block_on(s.emit(&[Reading::new(
-                        id,
-                        w.clock.wall(),
-                        Value::F64(f64::from(v % 9) * 15.0),
-                    )]));
-                }
-                Op::Advance(secs) => {
-                    w.clock.advance(Duration::from_secs(*secs));
-                    let _ = s.tick();
-                }
-                Op::Watch(k) => {
-                    let (name, g) = gate_of(*k, id);
-                    let _ = block_on(c.watch(&name, g));
-                }
-                Op::Drain(n) => drain(&mut c, *n, &mut track)?,
-                Op::Restart => {
-                    drop(c);
-                    block_on(s.shutdown()).unwrap();
-                    drop(s);
-                    s = w.open();
-                    c = resume(&s, &mut track)?;
-                }
-                Op::Crash {
-                    ops,
-                    n,
-                    power,
-                    seed,
-                } => {
-                    w.fs.crash_after(usize::from(*ops));
-                    let _ = block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(90.0))]));
-                    let _ = drain(&mut c, usize::from(*n), &mut track);
-                    w.stop(s, vec![c], power.then_some(Some(*seed)));
-                    s = w.open();
-                    c = resume(&s, &mut track)?;
-                }
-            }
-        }
-        drop(c);
-        block_on(s.shutdown()).unwrap();
-        Ok(())
+        crash_history(&format!("gates-crashes-{}", next_id()), &history)
     })
     .unwrap();
+    // Measured at 1,024 cases: one replay checked per 22 histories, 0.8 `set_by` checks per history.
+    let replays = REPLAYS_CHECKED.load(Ordering::SeqCst);
+    let set_by = SET_BY_CHECKED.load(Ordering::SeqCst);
     assert!(
-        REPLAYS_CHECKED.load(Ordering::SeqCst) > 0,
-        "no history replayed a transition handed out and never confirmed"
+        replays >= u64::from(cases / 64).max(1) && set_by >= u64::from(cases / 4).max(1),
+        "too few checks reached: {replays} replays, {set_by} resync states over {cases} histories"
     );
 }
+
+/// A counterexample of the crash property: a change gate's start transition, confirmed, comes again after three
+/// crashes in a row.
+#[test]
+fn a_confirmed_start_transition_does_not_come_again_after_three_crashes() {
+    crash_history(
+        "gates-crashes-1",
+        &[
+            Op::Watch(2),
+            Op::Emit(234),
+            Op::Crash {
+                ops: 4,
+                n: 3,
+                power: false,
+                seed: 3234967676062204739,
+            },
+            Op::Crash {
+                ops: 9,
+                n: 1,
+                power: false,
+                seed: 11671242142942996712,
+            },
+            Op::Crash {
+                ops: 23,
+                n: 2,
+                power: false,
+                seed: 835036862739102843,
+            },
+            Op::Emit(107),
+            Op::Drain(1),
+        ],
+    )
+    .unwrap();
+}
+
+/// Runs one history of the crash property.
+fn crash_history(name: &str, history: &[Op]) -> Result<(), TestCaseError> {
+    let mut w = World::quiet(name);
+    let mut s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    let mut track = Track::default();
+    for op in history {
+        match op {
+            Op::Emit(v) => {
+                let _ = block_on(s.emit(&[Reading::new(
+                    id,
+                    w.clock.wall(),
+                    Value::F64(f64::from(v % 9) * 15.0),
+                )]));
+            }
+            Op::Advance(secs) => {
+                w.clock.advance(Duration::from_secs(*secs));
+                let _ = s.tick();
+            }
+            Op::Watch(k) => {
+                let (name, g) = gate_of(*k, id);
+                let _ = block_on(c.watch(&name, g));
+            }
+            Op::Drain(n) => drain(&mut c, *n, &mut track)?,
+            Op::Restart => {
+                drop(c);
+                block_on(s.shutdown()).unwrap();
+                drop(s);
+                s = w.open();
+                c = resume(&s, &mut track)?;
+            }
+            Op::Crash {
+                ops,
+                n,
+                power,
+                seed,
+            } => {
+                w.fs.crash_after(usize::from(*ops));
+                let _ = block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(90.0))]));
+                let _ = drain(&mut c, usize::from(*n), &mut track);
+                w.stop(s, vec![c], power.then_some(Some(*seed)));
+                s = w.open();
+                c = resume(&s, &mut track)?;
+            }
+        }
+    }
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    Ok(())
+}
+
+/// Resync states whose `set_by` the crash property compared with the state that transition set.
+static SET_BY_CHECKED: AtomicU64 = AtomicU64::new(0);
 
 /// Transitions the crash property saw replayed after a crash, so a run that never reaches that check fails.
 static REPLAYS_CHECKED: AtomicU64 = AtomicU64::new(0);

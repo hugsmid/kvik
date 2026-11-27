@@ -120,7 +120,7 @@ impl Deliverer {
         }
         rt.dirty = true;
         rt.gate_dirty |= gate.is_some();
-        let transition = matches!(gate, Some(super::gates::GatePoint::Transition(_)));
+        let gated = gate.is_some();
         if let Some(g) = gate {
             self.gate_confirm(name, g);
         }
@@ -135,9 +135,9 @@ impl Deliverer {
             }
             return Ok(r.map(|_| ()));
         }
-        // A latch whose state changed, or a confirmed gate transition, is written at once (Q-132, spec §6 Gates),
-        // anything else at most once a second.
-        let due = if latch_changed || transition {
+        // A latch whose state changed, or a gate confirmation (a transition, or a resync's frontier over replayed
+        // ones), is written at once (Q-132, spec §6 Gates, Q-2220), anything else at most once a second.
+        let due = if latch_changed || gated {
             Due::Now
         } else {
             Due::Timed

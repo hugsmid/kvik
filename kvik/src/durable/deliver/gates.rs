@@ -50,7 +50,9 @@ pub(super) struct GateRun {
     emitted: BTreeMap<Key, GateState>,
     /// Per instance, the transition that set its state now.
     pub(super) last: BTreeMap<Key, MTransition>,
-    /// Instances a reseed set and nothing has moved since: their `set_by` is none (Q-1392).
+    /// The id each reseeded instance was set by: while its `set_by` is still that id it reports none (Q-1392), and
+    /// a checkpoint flags it (Q-2160). Never pruned: a reseed id names the frontier it started at, so no later
+    /// transition has it, and the held snapshot may be older than the core.
     pub(super) reseeded: BTreeMap<Key, TransitionId>,
     /// The highest id handed out: one at or below it comes again flagged `replayed`.
     seen: Option<TransitionId>,
@@ -111,9 +113,7 @@ impl GateRun {
     }
 
     fn note(&mut self, t: &MTransition) {
-        let k = (t.id.condition, t.id.series);
-        self.reseeded.remove(&k);
-        self.last.insert(k, t.clone());
+        self.last.insert((t.id.condition, t.id.series), t.clone());
     }
 
     /// Each instance's state now as a resync carries it.
