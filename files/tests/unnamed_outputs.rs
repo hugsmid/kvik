@@ -3,11 +3,17 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
+use kvik_files::compaction::Judgement;
 use kvik_files::desc::{FileClass, FileDescription, FileRef};
 use kvik_files::layout::CompactedLayout;
-use kvik_files::rebuild::{LocalFile, Place, RebuildInput, RebuildPlan, Verdict, Verifier, plan};
+use kvik_files::rebuild::{
+    Answer, Finality, LocalFile, LocalState, Place, RebuildInput, RebuildPlan, Verdict, Verifier,
+    plan, rebuild_manifest, resolve,
+};
 use kvik_files::record::{Body, Publish, Record};
-use support::rebuild::image_with_corrupt;
+use support::rebuild::{NOW, gap, image_with_corrupt};
 use support::*;
 
 /// Holds for a whole run whose files are not listed bad, fails a run with a bad file, cannot say for part of a run.
@@ -215,4 +221,52 @@ fn a_run_record_corrupt_after_its_input_segments_were_released_keeps_its_files_l
     );
     assert!(live(&p, &c.a) && live(&p, &c.b));
     assert!(p.discard.is_empty() && p.held.is_empty());
+}
+
+#[test]
+fn a_held_output_holds_compaction_in_the_rebuilt_appender_until_a_copy_of_its_record_names_it() {
+    let c = case();
+    let records = [
+        Record::new(1, 0, T0, Body::Sealed(c.segs.clone())),
+        c.run.clone(),
+        Record::new(3, 0, T0, Body::Empty),
+    ];
+    let h = History {
+        records: records.to_vec(),
+        ..History::default()
+    };
+    let (bytes, img) = image_with_corrupt(&h, &[1]);
+    let fs = fs_with(&bytes);
+    let files: Vec<_> = c
+        .segs
+        .iter()
+        .map(|s| file(s, None))
+        .chain([file(&c.a, Some(laid(&c.a, 7, 2)))])
+        .collect();
+    let state = LocalState {
+        files: &files,
+        losses: &[],
+        lease_epoch: 0,
+        mark_file_id: 0,
+    };
+    let v = RunVerifier { bad: Vec::new() };
+    let (mut app, p) =
+        rebuild_manifest(&fs, &dir(), STORE_ID, state, &v, Finality::Provisional, NOW).unwrap();
+    assert_eq!(p.held, vec![c.a.file_ref()]);
+    assert_eq!(
+        app.compaction(),
+        &Judgement::Undecided(BTreeSet::from([c.a.file_ref()]))
+    );
+    app.append(Body::Sealed(vec![segment(3, 21, 30)]), T0)
+        .unwrap();
+    assert!(app.compaction().holds_compaction());
+    let copy = c.run.encode().unwrap();
+    resolve(
+        &mut app,
+        gap(&img.corrupt[0]),
+        &Answer::HoldsNone,
+        &Answer::Holds(copy),
+    )
+    .unwrap();
+    assert_eq!(app.compaction(), &Judgement::Holds);
 }

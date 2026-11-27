@@ -194,6 +194,8 @@ pub struct Appender {
     dropped_tail: u64,
     /// The catalogue's rule as last judged: at open, and after each publish, sealed-segment or carried record.
     compaction: Judgement,
+    /// Outputs a rebuild could neither publish nor discard, until a record names them (§3.5, Q-2122).
+    unlocated: BTreeSet<FileRef>,
 }
 
 pub(crate) fn read_file(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
@@ -316,6 +318,7 @@ impl Appender {
             generation: image.records.last().map_or(0, |p| p.record.generation),
             compaction: judge(&catalogue),
             catalogue,
+            unlocated: BTreeSet::new(),
             faulted: false,
             rebuild,
             pending,
@@ -375,7 +378,7 @@ impl Appender {
         self.end += bytes.len() as u64;
         self.catalogue.apply(&r)?;
         if matches!(r.body, Body::Publish(_) | Body::Sealed(_)) || r.old_epoch.is_some() {
-            self.compaction = judge(&self.catalogue);
+            self.rejudge();
         }
         self.synced = r.epoch;
         self.next_epoch = next;
@@ -448,6 +451,27 @@ impl Appender {
     /// merges, removals and releases (compaction design §3.4).
     pub fn compaction(&self) -> &Judgement {
         &self.compaction
+    }
+
+    /// Holds runs, merges, removals and releases while a record has not named `files`: a rebuild's
+    /// [`crate::rebuild::RebuildPlan::held`] (compaction design §3.5, Q-2122).
+    pub fn hold_unlocated(&mut self, files: impl IntoIterator<Item = FileRef>) {
+        self.unlocated.extend(files);
+        self.rejudge();
+    }
+
+    fn rejudge(&mut self) {
+        let c = &self.catalogue;
+        self.unlocated.retain(|f| c.file(*f).is_none());
+        self.compaction = match judge(c) {
+            Judgement::Holds if self.unlocated.is_empty() => Judgement::Holds,
+            Judgement::Holds => Judgement::Undecided(self.unlocated.clone()),
+            Judgement::Undecided(mut u) => {
+                u.extend(self.unlocated.iter().copied());
+                Judgement::Undecided(u)
+            }
+            b @ Judgement::Broken(_) => b,
+        };
     }
 
     /// The fold of every record, those appended in this run included.

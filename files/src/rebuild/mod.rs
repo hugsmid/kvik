@@ -152,7 +152,7 @@ pub struct RebuildPlan {
     /// (`spec.md` §9 row 10), once the rebuilt manifest is synced and nothing holds removals.
     pub discard: Vec<FileRef>,
     /// Outputs no valid record names that can be neither published nor discarded (compaction design §3.5): kept,
-    /// unlisted, holding runs, merges, removals and releases until the record or the file is supplied.
+    /// unlisted, and held through [`crate::appender::Appender::hold_unlocated`] until a record names them (Q-2122).
     pub held: Vec<FileRef>,
     /// Files under `quarantine/`: never live.
     pub quarantined: Vec<FileRef>,
