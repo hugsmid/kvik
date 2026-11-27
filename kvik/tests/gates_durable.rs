@@ -206,6 +206,27 @@ fn a_lost_cursor_file_reseeds_the_gates() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Q-2160: a reseeded instance keeps `set_by` none through a confirmation and a clean restart; the checkpoint carries
+/// "set by a reseed" rather than the start id no delivery carried.
+#[test]
+fn a_reseeded_gate_keeps_set_by_none_after_a_restart() {
+    let (w, _) = confirmed_twice("gates-durable-reseed-restart");
+    w.fs.poke(&cursor_path(&w), 0, &[0; 16]);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    assert_eq!(seen(&got), ["resync NoCursor [(Level(1), false)]"]);
+    block_on(c.confirm(got[0].id)).unwrap();
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(1), false)]"]);
+    assert_eq!(s.stats().delivery.gates_reseeded, 0);
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Failure table, "failed write or sync at a cursor write": `confirm` returns the error, the store goes read-only and
 /// nothing further is delivered. At the next start (no power loss) a failed write leaves the last synced checkpoint,
 /// so the start transitions come again; a failed sync leaves the written pair in the page cache, confirmed.
