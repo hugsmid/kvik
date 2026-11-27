@@ -204,6 +204,18 @@ fn only_a_holder_of_the_oldest_round_counts_down_and_a_start_above_it_stops_hold
 }
 
 #[test]
+fn a_start_above_the_oldest_round_drops_it_when_no_subscriber_holds_it_any_more() {
+    let hub = Hub::default();
+    let cap = (100, 1 << 20);
+    let (sub, _) = hub.subscribe(cap, Duration::ZERO);
+    hub.start(sub, 0, cap);
+    let seq = round(&hub, vec![fact(1, 1)]);
+    assert_eq!(hub.held().2, 1);
+    hub.start(sub, seq, cap);
+    assert_eq!(hub.held(), (0, 0, 0));
+}
+
+#[test]
 fn a_failed_round_told_only_of_a_gap_is_kept_not_whole_with_the_gap() {
     let hub = Hub::default();
     hub.subscribe((100, 1 << 20), Duration::ZERO);

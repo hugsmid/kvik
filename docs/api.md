@@ -45,8 +45,9 @@ store.shutdown().await?;                               // final sync, checkpoint
 `Store::open` runs recovery and returns only when the log is consistent. It fails if another writer holds the
 directory, also in the same process (`OpenError::Locked`), if the store id of a file does not match, or if a file has
 a newer major format version or an unknown critical element. It also resumes a directory part-way through a restore
-(roadmap 8.3). A checksum-valid batch in an unsealed segment whose content does not decode is not recorded as a loss:
-the start is refused with `OpenError::Corrupt`.
+(roadmap 8.3). A checksum-valid batch in an unsealed segment whose content does not decode does not refuse the start: it
+is handled as any other damage there (spec §3 Recovery rules 1 to 3), so below the durable mark its positions are a
+recorded loss (`data_lost`).
 
 `time_zone` is the site zone at creation; at every later open it must equal the zone in force after resolving links,
 else `OpenError::SiteZoneMismatch`. The zone is changed by `store.set_site_zone(zone, effective_from).await` (a
