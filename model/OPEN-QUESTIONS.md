@@ -190,8 +190,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1201 | §4 Consumers; `api.md` Memory | Records held for a consumer not taken in this run (settled by the owner) |
 | Q-1202 | §4 Resync; `api.md` Consumers | `CursorBehindLog` on the durable backend (settled by the owner) |
 | Q-1203 | `api.md` Live reads; Q-1011, Q-1118 | A fan-out round that fails after taking events (settled by the owner) |
-| Q-1390 | §6 Gates, Transitions; Q-1145 | The seed at a gate's start: how far back, and the value before the first reading (settled by the owner: the default) |
-| Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (settled by the owner: the default) |
+| Q-1390 | §6 Gates, Transitions; Q-1145 | The seed at a gate's start: how far back, and the value before the first reading (decided by the lead, provisional; amended by Q-1560) |
+| Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (decided by the lead, provisional) |
+| Q-1393 | §6 Gates, Clock; `api.md` Gates | The clock live gate timers run on (OWNER) |
+| Q-1560 | §6 Gates, Transitions; Q-1390 | Facts inside the seed's look-back that were never the live value: what the seed reads (decided by the lead, provisional) |
+| Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
 | Q-1580 | `format.md` A.6 | The routing field ids of a watch and an unwatch, and the member value form (decided by the lead, provisional; settle with conditions step 4) |
 | Q-1581 | `api.md` Gates | The gate interface as built: `Transition` without flags, `TransitionCause`, `gates()`, two more `GateError`s (decided by the lead, provisional; settle with conditions step 4) |
 | Q-1582 | §6 Gates; Q-1140 | Entries other than facts, definitions and the consumer's own gates move the judgement's frontier (decided by the lead, provisional; settle with conditions step 4) |
@@ -5150,9 +5153,9 @@ above its level for an hour.
 side and rises after the hold; (b) judge the holds over the facts before the start (the history is in the store).
 **Decision.** (b): a gate added mid-event seeds its holds from history, by the rule of Q-1390. (a) was the lead's
 provisional choice; it remains only for gates with no hold, which read no history.
-**Pinned by.** `tests/gates.rs` `a_hold_is_seeded_from_before_the_watch_so_a_value_long_above_starts_crossed`,
-`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now_judged_from_history`;
-`tests/gate_seed.rs` `a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+**Pinned by.** `tests/gate_seed.rs` `a_hold_is_seeded_from_before_the_watch_so_a_value_long_above_starts_crossed`,
+`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now_judged_from_history`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
 
 ## Q-1146 — Holds across `Unknown` and `Stale`
 Decided by the lead with the gates model, provisional.
@@ -5231,26 +5234,26 @@ over, since a carried collector grows without bound while the fault lasts. A rou
 **Pinned by.** `kvik/src/durable/read/live/lags.rs` `a_round_failing_after_taking_events_lags_the_tail_it_took_them_for`.
 
 ## Q-1390 — The seed at a gate's start
-Settled by the owner, 26 November, to the provisional default.
+Decided by the lead with cond2 step 1, provisional, to the design's default; what the seed reads amended by Q-1560.
 **Scenario.** Q-1145 (b) seeds a starting gate's holds from history; the rule must be a function of the log, cheap
 at a watch, and say what the value was before the first reading it reads.
 **Decision.** With `L` the gate's longest hold, the look-back is `[T − min(2L, 24 h), T)`, `T` the start's commit
 time. The instance is judged, emitting nothing, as if watched at the look-back's start with boundaries uncrossed,
-over the series' facts committed inside it before the start entry; when none of them has a value, the series'
-live-state fact at `T` stands in from the look-back's start. Then the start transition (from none to the state at
+over the series' state then and its facts committed inside the look-back before the start entry (Q-1560). Then the start transition (from none to the state at
 `T`, evaluated with the live-state value then) is emitted at the start's position. `2L`, so that a series
 reporting at least once per `L` completes a hold that truly held; a value first read inside the look-back later
 than `T − L` completes its hold late, never early. Gates with no hold read nothing. Staleness is judged at `T` from
-the series' arrivals; inside the seed the stand-in fact counts as arriving at the look-back's start. A window input
-in the seed sees only the facts the seed reads.
-**Pinned by.** `tests/gates.rs` `a_seed_reads_twice_the_longest_hold_back_and_counts_from_the_first_reading_inside`,
+the series' arrivals; inside the seed the facts before the look-back count as arriving at its start (Q-1561). A
+window input in the seed sees the series' facts as the seed reads them.
+**Pinned by.** `tests/gate_seed.rs` `a_seed_reads_twice_the_longest_hold_back_and_counts_from_the_first_reading_inside`,
 `a_value_that_rose_shortly_before_the_watch_completes_its_hold_late_never_early`, `the_look_back_is_at_most_a_day`,
 `a_gate_without_holds_reads_no_history_so_its_boundaries_start_uncrossed`,
-`a_series_joining_an_each_is_seeded_from_its_history_at_the_join`; `tests/gate_seed.rs`
+`a_series_joining_an_each_is_seeded_from_its_history_at_the_join`, `a_fact_committed_at_the_look_backs_start_is_read`,
+`the_longest_hold_counts_hold_down`, `a_sets_longest_hold_counts_hold_off`,
 `a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
 
 ## Q-1391 — Durable resume state for gates
-Settled by the owner, 26 November, to the provisional default.
+Decided by the lead with cond2 step 1, provisional, to the design's default.
 **Scenario.** A consumer's gates must resume exactly after a crash. Per-instance latches cost a record per instance
 on every confirmation, and a bound measured from the cursor refuses the replay of a consumer whose gates have been
 quiet for longer than `replay_max.span`.
@@ -5264,6 +5267,46 @@ equals the per-instance latch filter); `tests/gates.rs`
 `the_replay_bound_counts_facts_and_time_from_the_checkpoint_not_the_gate_cursor`,
 `a_frontier_gate_cursor_covers_timer_transitions_due_by_its_instant_only`; `tests/gate_edges.rs`
 `the_replay_bound_runs_from_the_checkpoint_not_from_an_old_gate_cursor`.
+
+## Q-1393 — The clock live gate timers run on
+Open, for the owner.
+**Scenario.** A gate's holds and staleness are timers. On the commit clock a forward step of the host clock
+completes holds and fires staleness at once, and a quiet store fires no timer until its writer's commit clock
+reaches the deadline; on the host clock live and replay can disagree.
+**Options.** (a) The commit clock, as for replay: a timer due at `d` fires once every batch committed before `d` is
+judged and the writer's commit clock has reached `d`, a backward step pausing timers; (b) the host clock live and
+the commit clock on replay, accepting that they can differ.
+**Provisional default.** (a), the commit clock, so live and replay agree (spec §6 Gates, Clock).
+**Pinned by.** none yet: the model judges on the commit clock only; the engine's live timers are cond2's.
+
+## Q-1560 — Facts inside the seed's look-back that were never the live value
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default; amends Q-1390.
+**Scenario.** Level 10, holds 5 s both ways; the live value is 5 (`t` 50, committed at 50); a backfill for `t` 40
+with value 50 commits at 92; the gate is watched at 100. Seeded from the facts committed inside the look-back
+alone, on an empty series, the backfill is the live value and the gate starts crossed, then falls at 105; the same
+gate watched at 90 stays at `Level(0)`. A fact outranked at its `t` (lower `changed_at`) does the same.
+**Decision (provisional).** The seed judges the series' true live state over the look-back: every fact of the series
+committed before the look-back counts as committed at its start, in position order, then the facts committed inside
+it before the start entry. A backfilled or outranked fact is never the live value, and the stand-in of Q-1390 is
+no longer needed. The engine then needs the live fact as of the look-back's start (one read by position), to be
+costed in cond2 step 2. **Fallback** if that read is too dear: count an inside fact only when it is not outranked
+and its `t` is at or after the look-back's start; that stays late, never early, except against future facts.
+**Pinned by.** `tests/gate_seed.rs` `a_backfill_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`an_outranked_fact_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`a_backfill_before_a_late_rise_does_not_start_the_hold_early`,
+`a_bad_fact_inside_the_look_back_leaves_the_earlier_live_value_in_the_seed`,
+`a_future_fact_taking_effect_inside_the_look_back_holds_from_its_t`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+
+## Q-1561 — Arrivals inside the seed
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default.
+**Scenario.** A series silent since commit 1 (value 50), `stale_after` 8 s, hold 5 s, watched at 100: inside the
+seed its facts count as arriving at the look-back's start, so the hold completes in the seed; the start is `Stale`
+and the next reading gives `Level(1)` at once. A gate watched at the look-back's start would hold again from that
+reading; one watched all along gives `Level(1)` at once, as the seed does.
+**Decision (provisional).** Keep: inside the seed the facts before the look-back arrive at its start. It agrees with
+a gate watched all along; spec §6 Gates, Transitions says so.
+**Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
 
 ## Q-1580 — The routing fields of a watch and an unwatch
 Decided by the lead, provisional (settle with conditions step 4).
@@ -5534,8 +5577,11 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
 | Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
 | Q-1149 | conditions step 3 | Decided by the lead, provisional: durations at most ten years, refused beyond |
-| Q-1390 | cond2 step 1 | Settled by the owner: look-back `min(2L, 24 h)`, the live fact standing in when none inside has a value |
-| Q-1391 | cond2 step 1 | Settled by the owner: one gate cursor and a checkpoint; the bound from the checkpoint |
+| Q-1390 | cond2 step 1 | Decided by the lead, provisional: look-back `min(2L, 24 h)`, the series' state at its start (Q-1560) |
+| Q-1391 | cond2 step 1 | Decided by the lead, provisional: one gate cursor and a checkpoint; the bound from the checkpoint |
+| Q-1393 | cond2 step 2 | Open, for the owner: the commit clock as the provisional default |
+| Q-1560 | cond2 step 2 | Decided by the lead, provisional: the series' true live state; the read costed in step 2, else the fallback |
+| Q-1561 | cond2 step 2 | Decided by the lead, provisional: facts before the look-back arrive at its start (kept) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -5874,8 +5920,6 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
 | Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
 | Q-1145 | A gate's state when it starts | §6 Gates, Transitions (ruled by the owner, 2026-11-26: (b), seeded from history) |
-| Q-1390 | The seed at a gate's start | §6 Gates, Transitions (ruled by the owner, 2026-11-26: the provisional default) |
-| Q-1391 | Durable resume state for gates | §6 Gates, Resume; `api.md` Gates (ruled by the owner, 2026-11-26: the provisional default) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

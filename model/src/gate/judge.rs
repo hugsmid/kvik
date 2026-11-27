@@ -29,7 +29,7 @@ pub fn judge(history: &[Entry], until: Nanos) -> Result<Judgement, GateError> {
         seeding: true,
         ..Judge::default()
     };
-    j.run(history, until)?;
+    j.run(history, until, None)?;
     j.out.transitions.sort_by_key(|t| t.id);
     for w in j.gates.values() {
         for (s, i) in &w.instances {
@@ -107,8 +107,13 @@ struct Judge<'a> {
 }
 
 impl Judge<'_> {
-    fn run(&mut self, entries: &[Entry], until: Nanos) -> Result<(), GateError> {
-        let mut last: Option<(Position, Nanos)> = None;
+    /// Applies `entries` after the entry at `last`, if any, already applied.
+    fn run(
+        &mut self,
+        entries: &[Entry],
+        until: Nanos,
+        mut last: Option<(Position, Nanos)>,
+    ) -> Result<(), GateError> {
         for (index, e) in entries.iter().enumerate() {
             if let Some((p, c)) = last
                 && (e.position() <= p || e.commit_time() < c)
@@ -128,10 +133,10 @@ impl Judge<'_> {
         Ok(())
     }
 
-    /// An instance starting at `now` judged, emitting nothing, from the look-back
-    /// `[now − min(2L, 24 h), now)`, `L` the gate's longest hold (Q-1145 (b), Q-1390). The seed reads the
-    /// series' facts committed inside it before the entry being applied; when none has a value, the
-    /// series' live-state fact at `now` stands in from the look-back's start.
+    /// An instance starting at `now` judged, emitting nothing, as the same gate watched at the look-back's
+    /// start `now − min(2L, 24 h)`, `L` the gate's longest hold (Q-1145 (b), Q-1390, Q-1560): every fact
+    /// of the series committed before the look-back counts as committed at its start, then those committed
+    /// inside it before the entry being applied.
     fn seed(&self, id: ConditionId, s: SeriesId, now: Nanos) -> Option<Instance> {
         let w = self.gates.get(&id)?;
         let longest = longest_hold(&w.gate.kind);
@@ -139,18 +144,38 @@ impl Judge<'_> {
             return None;
         }
         let from = now.saturating_sub(longest.saturating_mul(2).min(DAY));
-        let inside: Vec<&Entry> = self.history[..self.index]
-            .iter()
-            .filter(|e| {
-                matches!(e, Entry::Fact { commit_time, fact }
-                    if fact.series == s && *commit_time >= from)
-            })
-            .collect();
+        let mut inner = Judge::default();
+        let sd = self.data(s);
+        inner.series.insert(
+            s,
+            SeriesData {
+                names: sd.names.clone(),
+                params: sd.params,
+                ..SeriesData::default()
+            },
+        );
+        let mut inside = Vec::new();
+        for e in &self.history[..self.index] {
+            if let Entry::Fact { commit_time, fact } = e
+                && fact.series == s
+            {
+                if *commit_time >= from {
+                    inside.push(e.clone());
+                } else {
+                    // No gate is watched yet, so this only builds the series' state at `from`.
+                    inner
+                        .apply(&Entry::Fact {
+                            commit_time: from,
+                            fact: fact.clone(),
+                        })
+                        .expect("a fact never fails to apply");
+                }
+            }
+        }
         let gate = Gate {
             selector: Selector::Series(s),
             ..w.gate.clone()
         };
-        let mut inner = Judge::default();
         inner
             .apply(&Entry::Watch {
                 position: Position::ORIGIN,
@@ -158,19 +183,10 @@ impl Judge<'_> {
                 id,
                 gate,
             })
-            .ok()?;
-        let mut entries = Vec::new();
-        let any_value = inside
-            .iter()
-            .any(|e| matches!(e, Entry::Fact { fact, .. } if usable(fact)));
-        if !any_value && let Some(f) = self.series.get(&s).and_then(|sd| sd.live(now)) {
-            entries.push(Entry::Fact {
-                commit_time: from,
-                fact: f.clone(),
-            });
-        }
-        entries.extend(inside.into_iter().cloned());
-        inner.run(&entries, now).ok()?;
+            .expect("the gate was validated when watched");
+        inner
+            .run(&inside, now, Some((Position::ORIGIN, from)))
+            .expect("history entries are in order");
         inner.gates.remove(&id)?.instances.remove(&s)
     }
 
