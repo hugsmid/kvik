@@ -1873,6 +1873,16 @@ struct Rig {
     model: kvik::StoreConfig,
 }
 
+#[test]
+fn a_model_fault_naming_an_unknown_consumer_is_refused() {
+    let rig = Rig::new(Backend::Model, "fault-unknown");
+    drop(rig.open());
+    assert!(!kvik::model_fault(
+        &rig.model.dir,
+        kvik::ModelFault::LoseCursorFile("nobody".into())
+    ));
+}
+
 impl Rig {
     fn new(b: Backend, name: &str) -> Rig {
         let w = World::new(name);
@@ -1940,6 +1950,9 @@ fn cursor_of(s: &Store, name: &str) -> Position {
     s.consumer_stats(name).unwrap().cursor
 }
 
+/// Q-131: a new consumer is sent no resync and starts after the position before its start: the last position for
+/// `start: now`, the position before the first fact at or after T for `start: time`, and for `start: position` the
+/// saved point, kept or void above the position a later reset kept.
 #[test]
 fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync() {
     for b in BACKENDS {
@@ -2002,6 +2015,9 @@ fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync_on(b
     block_on(s.shutdown()).unwrap();
 }
 
+/// Q-131: a consumer whose cursor file is unreadable at the start is named in the recovery entry and, when taken, is
+/// first sent a resync of cause `NoCursor` carrying each funnel's state, a transition since its latch is lost, with
+/// `forget_above` the position before its start, by start kind.
 #[test]
 fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
     for b in BACKENDS {

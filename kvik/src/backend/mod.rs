@@ -102,7 +102,7 @@ impl Shared {
 pub enum ModelFault {
     /// The machine loses power: what the mark had not synced is lost and the next start is a new boot.
     PowerLoss,
-    /// The named consumer's cursor file is missing or unreadable.
+    /// The named consumer's cursor file is unreadable. A missing file is not modelled (Q-1620).
     LoseCursorFile(String),
     /// From this open on the mark is synced only where the model must (Q-630), as on the durable backend with a long
     /// `log.mark_sync` interval.
@@ -116,14 +116,23 @@ pub enum ModelFault {
     Damage(Position),
 }
 
-/// Queues a fault for the next open of the in-memory store of `dir`. False if no such store exists.
+/// Queues a fault for the next open of the in-memory store of `dir`. False if no such store exists or the fault
+/// names a consumer the store does not know.
 #[doc(hidden)]
 pub fn model_fault(dir: &Path, fault: ModelFault) -> bool {
     let Some(shared) = lock(&STORES).get(dir).cloned() else {
         return false;
     };
-    shared.with(|s| s.faults.push(fault));
-    true
+    shared.with(|s| {
+        let known = match &fault {
+            ModelFault::PowerLoss => true,
+            ModelFault::LoseCursorFile(name) => s.consumers.contains_key(name),
+        };
+        if known {
+            s.faults.push(fault);
+        }
+        known
+    })
 }
 
 /// Finds the in-memory store of a directory, for a reader.

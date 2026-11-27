@@ -1200,7 +1200,6 @@ fn recovery_generator_coverage() {
     );
     assert!(seen.reassigned > 7 && seen.forget_resyncs > 1500 && seen.forced_syncs > 30);
     assert!(seen.behind_resyncs > 200);
-    eprintln!("starts {} no-cursor {}", seen.starts, seen.no_cursor);
     assert!(seen.starts > 100 && seen.no_cursor > 10);
     assert!(seen.stale > 60 && seen.gaps > 7 && seen.rule_1_resets > 180);
     assert!(seen.flagged_kept > 20 && seen.written_resets > 20);

@@ -127,7 +127,8 @@ Model backend:
 Durable backend, besides windowed operators in funnels:
 
 - **Every start kind:** a new consumer starts after the position before `start` with no resync; one whose cursor
-  file was missing or unreadable at the start is first sent a resync of the added cause `ResyncCause::NoCursor`
+  file was unreadable at the start (a missing file of a consumer never routed starts it as new on the durable
+  backend; the model does not model that, Q-1620) is first sent a resync of the added cause `ResyncCause::NoCursor`
   carrying each funnel's state, whose `forget_above` is that position (spec §4 Resync, Q-131); nothing further is
   delivered until it is confirmed. An unknown saved point is `ConsumerError::UnknownPoint`.
 - **Cursor files are written at most once a second** (spec §4 Consumer state), and at once when a confirmation

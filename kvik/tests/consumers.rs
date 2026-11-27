@@ -10,8 +10,8 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::block_on;
 use common::world::{World, drain, gauge, num, ready, resync};
-use common::{at, block_on};
 use kvik::env::{Fs, OpenMode};
 use kvik::{
     Condition, ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryKind,
@@ -309,118 +309,6 @@ fn stamp0(position: Position) -> SavedPoint {
         position,
         stamp: ResetStamp::default(),
     }
-}
-
-fn cursor(s: &Store, name: &str) -> Position {
-    s.consumer_stats(name).unwrap().cursor
-}
-
-/// Q-131: a new consumer is sent no resync and starts after the position before its start: the last position for
-/// `start: now`, the position before the first fact at or after T for `start: time`, and for `start: position` the
-/// saved point, kept or void above the position a later reset kept.
-#[test]
-fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync() {
-    let mut w = World::new("start-kinds");
-    let s = w.open();
-    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
-    let ps = four_facts(&w, &s, g, 1.0);
-    let mut now = new_consumer(&s, "now", Select::None);
-    assert!(cursor(&s, "now") >= ps[3]);
-    let time = block_on(s.consumer("time", Start::Time(at(2)), Select::None)).unwrap();
-    assert!(ps[1] <= cursor(&s, "time") && cursor(&s, "time") < ps[2]);
-    let kept = block_on(s.consumer("kept", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
-    assert_eq!(cursor(&s, "kept"), ps[1]);
-    // Facts after the start are delivered once routed.
-    block_on(now.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
-    let p = block_on(s.emit(&[num(g, 9, 9.0)])).unwrap().last().unwrap();
-    let ds = drain(&mut now);
-    assert!(matches!(&ds[..], [d] if matches!(&d.kind, DeliveryKind::Fact(f) if f.position == p)));
-    // A point above what a power loss kept is void above the position the recovery entry kept.
-    let durable = s.stats().log.durable;
-    let beyond = Position {
-        generation: durable.generation,
-        sequence: durable.sequence + 3,
-    };
-    w.crash(s, vec![now, time, kept], true);
-    let s = w.open();
-    let mut void =
-        block_on(s.consumer("void", Start::Position(stamp0(beyond)), Select::None)).unwrap();
-    assert_eq!(cursor(&s, "void"), durable);
-    // The recovery entry above it is a reset point for it, as for a cursor there (`spec.md` §4 Resync).
-    let d = void.try_next().unwrap().unwrap();
-    let r = resync(&d).unwrap();
-    assert_eq!(
-        (r.cause, r.forget_above),
-        (ResyncCause::ResetPoint, Some(durable))
-    );
-    assert!(r.funnels.is_empty());
-    let _kept2 =
-        block_on(s.consumer("kept-again", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
-    assert_eq!(cursor(&s, "kept-again"), ps[1]);
-    block_on(s.shutdown()).unwrap();
-}
-
-/// Q-131: a consumer whose cursor file is unreadable at the start is named in the recovery entry and, when taken, is
-/// first sent a resync of cause `NoCursor` carrying each funnel's state, a transition since its latch is lost, with
-/// `forget_above` the position before its start, by start kind.
-#[test]
-fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
-    let w = World::new("lost-cursor");
-    let s = w.open();
-    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
-    let names = ["now", "time", "pos"];
-    let mut cs: Vec<Consumer> = names
-        .iter()
-        .map(|n| new_consumer(&s, n, Select::None))
-        .collect();
-    let mut ids = Vec::new();
-    for c in &cs {
-        ids.push(block_on(c.route(condition(g))).unwrap());
-    }
-    let ps = four_facts(&w, &s, g, 20.0);
-    for c in &mut cs {
-        let ds = drain(c);
-        assert!(ds.iter().any(
-            |d| matches!(&d.kind, DeliveryKind::Trigger(t) if t.state == ConditionState::True)
-        ));
-    }
-    block_on(s.shutdown()).unwrap();
-    drop((cs, s));
-    for n in names {
-        let path = w
-            .path_with(Path::new("cursors").join(format!("{n}.cur")))
-            .unwrap();
-        w.fs.poke(&path, 0, &[0; 16]);
-    }
-    // A clean start writes no recovery entry (`spec.md` §3 Recovery rule 3), but the consumers are known from their
-    // routing changes and are treated as having no cursor.
-    let s = w.open();
-    let starts = [
-        Start::Now,
-        Start::Time(at(2)),
-        Start::Position(stamp0(ps[0])),
-    ];
-    for ((n, start), id) in names.iter().zip(starts).zip(&ids) {
-        let mut c = block_on(s.consumer(n, start, Select::None)).unwrap();
-        let ds = ready(&mut c);
-        let d: &Delivery = &ds[0];
-        let r = resync(d).unwrap();
-        assert_eq!(r.cause, ResyncCause::NoCursor, "{n}");
-        assert!(r.last);
-        let forget = r.forget_above.unwrap();
-        match *n {
-            "now" => assert!(forget >= ps[3]),
-            "time" => assert!(ps[1] <= forget && forget < ps[2], "{forget:?} {ps:?}"),
-            _ => assert_eq!(forget, ps[0]),
-        }
-        let f = r.funnels.iter().find(|f| f.funnel == *id).unwrap();
-        assert_eq!(f.condition, Some(ConditionState::True));
-        assert!(f.transition, "no latch to compare");
-        assert_eq!(ds.len(), 1, "nothing before it is confirmed");
-        block_on(c.confirm(d.id)).unwrap();
-        assert_eq!(cursor(&s, n), d.position);
-    }
-    block_on(s.shutdown()).unwrap();
 }
 
 /// Q-1450: a lost consumer taken again before it confirms its `NoCursor` resync is sent it again, with the same

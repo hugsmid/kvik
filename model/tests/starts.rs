@@ -261,18 +261,43 @@ fn a_lost_consumer_taken_again_before_confirming_is_sent_no_cursor_again() {
     m.lose_cursor_file(C).unwrap();
     m.restart();
     m.start_consumer(C, Start::Now).unwrap();
-    assert_eq!(
-        take(&mut m)[0].resync().unwrap().cause,
-        ResyncCause::NoCursor
-    );
+    let first = take(&mut m)[0].resync().unwrap().forget_above;
+    assert!(first.is_some());
     facts(&mut m, s, 10, 1.0);
     m.reconnect(C).unwrap();
     let got = take(&mut m);
     let r = got[0].resync().expect("the resync is sent again");
     assert_eq!(r.cause, ResyncCause::NoCursor);
+    assert_eq!(r.forget_above, first, "the same forget_above is sent again");
     assert_eq!(
         got.len(),
         1,
         "nothing above forget_above before the confirmation"
+    );
+    m.confirm(C, got[0].position).unwrap();
+    m.reconnect(C).unwrap();
+    assert!(
+        take(&mut m)
+            .iter()
+            .all(|e| e.resync().is_none_or(|r| r.cause != ResyncCause::NoCursor)),
+        "a confirmed consumer is not sent the resync again"
+    );
+}
+
+#[test]
+fn a_consumer_started_never_routed_and_losing_its_cursor_is_sent_no_cursor_with_no_series_state() {
+    let (mut m, s) = model(Selection::Series(Default::default()));
+    m.start_consumer(C, Start::Now).unwrap();
+    facts(&mut m, s, 0, 1.0);
+    m.drain().unwrap();
+    m.crash();
+    m.lose_cursor_file(C).unwrap();
+    m.restart();
+    m.start_consumer(C, Start::Now).unwrap();
+    let r = take(&mut m)[0].resync().expect("a resync").clone();
+    assert_eq!(r.cause, ResyncCause::NoCursor);
+    assert!(
+        r.funnels.iter().all(|f| f.live.is_empty()),
+        "no series state"
     );
 }
