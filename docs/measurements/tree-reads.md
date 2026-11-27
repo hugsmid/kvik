@@ -22,7 +22,7 @@ cargo run --release -p kvik --example tree_reads -- --dir <scratch> --shape day3
   first refresh, the first chart (cold reader, warm page cache), then the best of three more (one at ten years
   before). Bytes read are the process's `rchar`; peak is its `VmHWM`, the whole process, not a per-query count.
 - Before is the base commit of this step (587c7ce), the same example with `--merge` left out, on the same stores.
-  After is this step's head (unmerged figures from an earlier commit of this step, before facts were read in one pass
+  After is this step's head (unmerged figures from 6f344af, the commit of this step before facts were read in one pass
   for all series). Machine: shared cloud virtual machine, four cores, 15 GB. Single runs; two runs of one build
   differed by up to 25 % on first reads and 10 % warm.
 
