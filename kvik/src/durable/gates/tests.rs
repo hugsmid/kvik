@@ -508,6 +508,8 @@ fn a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history(
         clock.advance(Duration::from_secs(60));
         emit(&w, &clock, s, v);
     }
+    clock.advance(Duration::from_secs(40 * 86_400));
+    emit(&w, &clock, s, 60.0);
     clock.advance(Duration::from_secs(3 * 86_400));
     emit(&w, &clock, s, 72.0);
     clock.advance(Duration::from_secs(1));
@@ -525,7 +527,9 @@ fn a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history(
     let facts = |w: &Writer| w.hub().unwrap().run(|d, _| d.gate_facts_read());
     let before = facts(&w);
     w.take_consumer("c", Start::Now, &Select::None).unwrap();
-    assert_eq!(facts(&w) - before, 2);
+    // The day before the take (2 facts), then 16 days for the live fact at the look-back's start (3); not the 5
+    // older ones.
+    assert_eq!(facts(&w) - before, 5);
     let mut states = Vec::new();
     while let Some(d) = w.poll_delivery("c", None).unwrap() {
         if let crate::consume::DeliveryKind::Resync(r) = &d.kind {
@@ -571,4 +575,44 @@ fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
         w.confirm("c", d.id).unwrap();
     }
     assert_eq!(gates, 4);
+}
+
+const DAY_SECS: i64 = 86_400;
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+    /// Q-2001: over histories spanning months, with backfills, future facts and bad facts, the bounded reads answer
+    /// as the whole series does.
+    #[test]
+    fn bounded_history_reads_answer_as_the_whole_series_does(
+        facts in proptest::collection::vec(
+            (0i64..4, -40i64..2, 0u8..4, 0u8..3),
+            1..24,
+        ),
+        look_back in 0i64..2,
+    ) {
+        let (w, _config, clock) = open_clocked("gates-bounded-history");
+        let s = gauge(&w, "hall/air/humidity");
+        w.take_consumer("c", Start::Now, &Select::None).unwrap();
+        for (advance, t_days, v, q) in facts {
+            clock.advance(Duration::from_secs((advance * 7 * DAY_SECS) as u64 + 1));
+            // Mostly now; else backfilled up to 40 days or a day ahead.
+            let t = match t_days {
+                d if d >= 0 => clock.wall().0 + d * DAY_SECS * 1_000_000_000 / 2,
+                d if d > -10 => clock.wall().0,
+                d => clock.wall().0 + d * DAY_SECS * 1_000_000_000,
+            };
+            let quality = if q == 0 { crate::types::Quality::Bad } else { crate::types::Quality::Good };
+            emit_all(
+                &w,
+                &[crate::types::Reading::new(s, crate::time::Timestamp(t), Value::F64(f64::from(v)))
+                    .with_quality(quality)],
+            );
+        }
+        let now = clock.wall().0;
+        let from = now - [240, DAY_SECS + 5][look_back as usize] * 1_000_000_000;
+        let differs = w.hub().unwrap().run(move |d, _| d.gate_history_differs(kvik_model::types::SeriesId(s.0), now, from));
+        proptest::prop_assert!(differs.is_none(), "{}", differs.unwrap_or_default());
+    }
 }
