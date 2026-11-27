@@ -5237,6 +5237,13 @@ ignored while open). In the same histories, a consumer started at a point below 
 range's reset point by the durable backend and none by the model. **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
 kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
 until then the history property stops restarting and comparing deliveries once an entry is lost.
+Traced at the end of the ignored history: the consumer start synced both marks to the fact, so the second power loss
+loses nothing on the model, which then writes no recovery entry (last position 3, the fact); the history's power loss
+zeroes the fact's bytes on the durable backend anyway, which grows the recorded loss over them (§3 Recovery rule 2)
+and writes an entry at 4. §3 Recovery rule 3 has a start on another boot write an entry unless it adopts one, and the
+last kept batch is a fact, so the model is the backend at fault on the last position; the history also cuts a batch
+the mark was synced past, which no power loss does. Both are to be ruled, with a fault on each backend that loses the
+same bytes, before step 5 compares whole histories.
 
 ## Q-1621 — A start whose position the synced mark cannot reach
 
@@ -5471,7 +5478,7 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
 | Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
 | Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
-| Q-1631 | 5.3 step 5 | Open: a lost recovery entry, then a power loss or a consumer below it; the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-1631 | 5.3 step 5, before it compares whole histories | Open: the model is wrong on the last position (no recovery entry on another boot after a lost entry, against §3 Recovery rule 3), and the history cuts a batch the mark was synced past; until ruled the history property stops restarting and comparing deliveries once an entry is lost |
 | Q-2010 | 5.3 step 2 | Decided by the lead: a point that answered unknown may later answer void above |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
