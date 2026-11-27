@@ -249,10 +249,8 @@ impl Model {
                     batches += 1;
                 }
             }
+            // Recorded damage lies below the synced mark, so none is truncated here.
             file.batches.truncate(keep);
-            self.disk
-                .recorded_damage
-                .retain(|(f, b), _| *f != id || *b < keep);
             self.unflag_from(id, keep);
         }
         (batches, torn)
