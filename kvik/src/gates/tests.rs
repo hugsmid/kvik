@@ -4,10 +4,10 @@ use kvik_model::gate::{
     Cause, ConditionId, Gate, GateState, Input, Kind, Level, Selector, TimerKind, Window, judge,
 };
 use kvik_model::summary::Aggregate;
-use kvik_model::types::{Position, Quality, SECOND, SeriesId, Value};
+use kvik_model::types::{Nanos, Position, Quality, SECOND, SeriesId, Value};
 
 use super::differential::{Drive, Log, S, gate, run};
-use super::{Body, Core, CoreError, Item, Replay};
+use super::{Body, Core, CoreError, FactItem, History, HistoryError, Item, Replay, SeriesState};
 
 const T: SeriesId = SeriesId(2);
 
@@ -316,4 +316,100 @@ fn a_second_watch_of_an_id_an_unwatch_of_an_unknown_id_and_a_refused_gate_are_er
         ))
     );
     assert_eq!(core.states().len(), 1);
+}
+
+/// A [`Replay`] whose read named `fail` fails.
+struct Failing<'a> {
+    replay: &'a Replay,
+    fail: &'static str,
+}
+
+impl Failing<'_> {
+    fn check(&self, read: &'static str) -> Result<(), HistoryError> {
+        if self.fail == read {
+            Err(HistoryError(read.into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl History for Failing<'_> {
+    fn series(
+        &self,
+        s: SeriesId,
+        now: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError> {
+        self.check("series")?;
+        self.replay.series(s, now, through)
+    }
+
+    fn at_look_back(
+        &self,
+        s: SeriesId,
+        from: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError> {
+        self.check("at_look_back")?;
+        self.replay.at_look_back(s, from, through)
+    }
+
+    fn facts_since(
+        &self,
+        s: SeriesId,
+        from: Nanos,
+        through: Position,
+    ) -> Result<Vec<(Nanos, Position, FactItem, bool)>, HistoryError> {
+        self.check("facts_since")?;
+        self.replay.facts_since(s, from, through)
+    }
+}
+
+#[test]
+fn a_failed_history_read_fails_the_call_and_a_watch_adds_nothing() {
+    let mut log = Log::default();
+    log.fact(S, SECOND, SECOND, num(1.0), Quality::Good);
+    log.watch(10 * SECOND, ConditionId(1), hold_up(5));
+    log.fact(S, 11 * SECOND, SECOND, num(9.0), Quality::Bad);
+    let batch = |k: usize| (log.items[k].0, [log.items[k].1.clone()]);
+    let failing = |fail| Failing {
+        replay: &log.replay,
+        fail,
+    };
+    let mut core = Core::new();
+    let (c, items) = batch(0);
+    core.apply_batch(c, &items, &log.replay).expect("fact");
+    let (c, items) = batch(1);
+    for read in ["series", "at_look_back", "facts_since"] {
+        let mut attempt = core.clone();
+        assert_eq!(
+            attempt.apply_batch(c, &items, &failing(read)),
+            Err(CoreError::History(HistoryError(read.into()))),
+            "{read}"
+        );
+        let added = (
+            &attempt.defs,
+            &attempt.series,
+            &attempt.readers,
+            &attempt.instances,
+        );
+        assert_eq!(
+            added,
+            (&core.defs, &core.series, &core.readers, &core.instances),
+            "{read}"
+        );
+    }
+    core.apply_batch(c, &items, &log.replay).expect("watch");
+    let (c, items) = batch(2);
+    assert_eq!(
+        core.clone().apply_batch(c, &items, &failing("series")),
+        Err(CoreError::History(HistoryError("series".into()))),
+        "the fallback read"
+    );
+    let defs = [(ConditionId(1), hold_up(5))].into();
+    assert_eq!(
+        Core::restore(core.snapshot(), defs, &failing("series")),
+        Err(CoreError::History(HistoryError("series".into())))
+    );
 }

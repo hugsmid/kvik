@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use kvik_model::types::{Nanos, Position, SeriesId};
 
-use super::{FactItem, Held, History, SeriesState};
+use super::{FactItem, Held, History, HistoryError, SeriesState};
 
 /// Facts in position order with their batches' commit times and whether each is outranked.
 #[derive(Clone, Debug, Default)]
@@ -69,7 +69,12 @@ impl Replay {
 }
 
 impl History for Replay {
-    fn series(&self, series: SeriesId, now: Nanos, through: Position) -> SeriesState {
+    fn series(
+        &self,
+        series: SeriesId,
+        now: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError> {
         let mut current: BTreeMap<Nanos, Held> = BTreeMap::new();
         let mut arrivals: Vec<Nanos> = Vec::new();
         for (commit, position, f, outranked) in self.of(series, through) {
@@ -85,14 +90,19 @@ impl History for Replay {
             current.insert(f.t, held(*position, f));
         }
         let (live, ahead) = live_and_ahead(&current, now);
-        SeriesState {
+        Ok(SeriesState {
             live,
             last_arrival: arrivals.into_iter().filter(|a| *a <= now).max(),
             ahead,
-        }
+        })
     }
 
-    fn at_look_back(&self, series: SeriesId, from: Nanos, through: Position) -> SeriesState {
+    fn at_look_back(
+        &self,
+        series: SeriesId,
+        from: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError> {
         let mut current: BTreeMap<Nanos, Held> = BTreeMap::new();
         let mut arrived = false;
         for (_, position, f, _) in self
@@ -103,11 +113,11 @@ impl History for Replay {
             current.insert(f.t, held(*position, f));
         }
         let (live, ahead) = live_and_ahead(&current, from);
-        SeriesState {
+        Ok(SeriesState {
             live,
             last_arrival: arrived.then_some(from),
             ahead,
-        }
+        })
     }
 
     fn facts_since(
@@ -115,10 +125,11 @@ impl History for Replay {
         series: SeriesId,
         from: Nanos,
         through: Position,
-    ) -> Vec<(Nanos, Position, FactItem, bool)> {
-        self.of(series, through)
+    ) -> Result<Vec<(Nanos, Position, FactItem, bool)>, HistoryError> {
+        Ok(self
+            .of(series, through)
             .filter(|(c, _, _, _)| *c >= from)
             .cloned()
-            .collect()
+            .collect())
     }
 }

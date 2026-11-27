@@ -97,25 +97,48 @@ pub(crate) struct SeriesState {
     pub ahead: BTreeMap<Nanos, Held>,
 }
 
-/// The log reads the core needs and cannot answer from what it holds.
+/// The log reads the core needs and cannot answer from what it holds (Q-1880: contract and cost).
+///
+/// Every read is as of a position `through`, not the log's head: during a batch it sees the batch in flight up
+/// to and including the item being applied. A read that fails fails the core's call (Q-1881); one that cannot
+/// reach as far back as asked returns what it reached, and its caller counts the seed as shortened.
 pub(crate) trait History {
-    /// The state of `series` at `now` over the facts at or before `through`.
-    fn series(&self, series: SeriesId, now: Nanos, through: Position) -> SeriesState;
+    /// The state of `series` at `now` over the facts at or before `through`. Its `last_arrival` counts a usable
+    /// fact's commit time even when a later fact replaced it at its `t`, and a fact committed ahead of its `t`
+    /// at that `t` unless replaced before then (Q-1200), so it needs commit times.
+    fn series(
+        &self,
+        series: SeriesId,
+        now: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError>;
     /// The series' state the seed starts from (Q-1560): its facts committed before `from` (and at or
     /// before `through`) taken as committed at `from`, so any usable one in effect by then is an arrival
-    /// at `from`.
-    fn at_look_back(&self, series: SeriesId, from: Nanos, through: Position) -> SeriesState;
+    /// at `from` (one still ahead there may count or not: Q-1882).
+    fn at_look_back(
+        &self,
+        series: SeriesId,
+        from: Nanos,
+        through: Position,
+    ) -> Result<SeriesState, HistoryError>;
     /// Facts of `series` committed at or after `from`, at or before `through`, in position order, each
     /// with its batch's commit time and whether it is outranked.
+    #[allow(clippy::type_complexity)]
     fn facts_since(
         &self,
         series: SeriesId,
         from: Nanos,
         through: Position,
-    ) -> Vec<(Nanos, Position, FactItem, bool)>;
+    ) -> Result<Vec<(Nanos, Position, FactItem, bool)>, HistoryError>;
 }
 
-/// A batch or call the core refuses.
+/// A history read that failed (Q-1881).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("history read failed: {0}")]
+pub(crate) struct HistoryError(pub String);
+
+/// A batch or call the core refuses. Any error part-way through a batch is fatal to the core: the items
+/// before it stay applied and their transitions are dropped, so the caller restores from its checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CoreError {
     /// A watch under an id in force, or an unwatch of an id not in force.
@@ -127,4 +150,7 @@ pub(crate) enum CoreError {
     /// A gate whose parameters the model refuses.
     #[error("gate {0:?} refused: {1}")]
     Invalid(ConditionId, kvik_model::gate::GateError),
+    /// A history read failed (Q-1881).
+    #[error(transparent)]
+    History(#[from] HistoryError),
 }

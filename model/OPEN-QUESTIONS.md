@@ -195,6 +195,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1393 | §6 Gates, Clock; `api.md` Gates | The clock live gate timers run on (OWNER) |
 | Q-1560 | §6 Gates, Transitions; Q-1390 | Facts inside the seed's look-back that were never the live value: what the seed reads (decided by the lead, provisional) |
 | Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
+| Q-1880 | §6 Gates; Q-1560 | What the gates core's history reads must return, and what they cost (decided by the lead, provisional) |
+| Q-1881 | §6 Gates; Q-1880 | How a failed or short history read reaches the gates core (decided by the lead, provisional) |
+| Q-1882 | §6 Gates; Q-1560 | Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start (decided by the lead, provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5304,6 +5307,44 @@ reading; one watched all along gives `Level(1)` at once, as the seed does.
 a gate watched all along; spec §6 Gates, Transitions says so.
 **Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
 
+## Q-1880 — What the gates core's history reads must return, and what they cost
+Decided by the lead with cond2 step 2's fix round, provisional, to the review's default; moves Q-1560's costing.
+**Scenario.** The core holds one live fact per series (G9's bound), so three things it cannot answer go to
+`History`: the series' state at a watch, the fallback when a bad or valueless fact replaces the live one at its
+`t` (spec §2.3), and the seed's look-back (Q-1390, Q-1560). The rules that matter were only in the tests' double.
+**Decision (provisional).** (1) `series(now, through)` is the state over the log through a position, not at its
+head: live, `through` is the item being applied, so the read sees the batch in flight, the triggering fact and
+earlier facts of the same batch included. (2) Its `last_arrival` counts the commit time of a usable fact even when
+a later fact replaced it at its `t`, and a fact committed ahead of its `t` counts at its `t` unless replaced before
+then: commit times are needed, which a latest-value index does not hold. (3) `at_look_back` is the state as of a
+commit time, every earlier usable fact in effect by then arriving at `from`; whether one still ahead at `from`
+counts there is Q-1882. (4) The fallback runs on the commit path, once per bad fact that lands on the live `t`.
+Costed in cond2 step 4 against the hot log and compacted segments, with the real `History` checked against the
+tests' double over the same generated logs. If `series` through a past position is too dear for replay, step 5
+replays from the checkpoint's held series states and reads only facts ahead.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_bad_fact_replacing_the_live_one_falls_back_to_the_older_value`,
+`the_seed_starts_from_the_live_fact_in_force_at_the_look_back_start`; the core's differential
+(`kvik/src/gates/differential.rs`).
+
+## Q-1881 — How a failed or short history read reaches the gates core
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** The seed's read may not reach the look-back's start (compacted away), and any read may fail (damage,
+I/O). The design seeds over what was read and counts `seeds_shortened`, and abandons a replay whose read fails.
+**Decision (provisional).** `History`'s reads are fallible: a failed read is `CoreError::History`, the call fails,
+and the core is not used again (any `CoreError` part-way through a batch is fatal to it; the caller restores from
+its checkpoint). A watch reads before it changes anything, so a failed read there adds nothing of the gate. A
+short read is not an error: `History` returns what it reached and its caller counts `seeds_shortened`.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_failed_history_read_fails_the_call_and_a_watch_adds_nothing`.
+
+## Q-1882 — Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** A usable fact committed before the look-back's start with `t` beyond it. `at_look_back` may count it
+as an arrival at `from` or not.
+**Decision (provisional).** Either: a seeded instance's state is never read (the start evaluation recomputes it),
+and with no live fact at `from` its holds and crossings stay empty either way, so transitions and states are the
+same. The real `History` takes whichever read is cheaper.
+**Pinned by.** Nothing can: the tests' double's choice is an equivalent mutant.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5529,8 +5570,11 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1390 | cond2 step 1 | Decided by the lead, provisional: look-back `min(2L, 24 h)`, the series' state at its start (Q-1560) |
 | Q-1391 | cond2 step 1 | Decided by the lead, provisional: one gate cursor and a checkpoint; the bound from the checkpoint |
 | Q-1393 | cond2 step 2 | Open, for the owner: the commit clock as the provisional default |
-| Q-1560 | cond2 step 2 | Decided by the lead, provisional: the series' true live state; the read costed in step 2, else the fallback |
+| Q-1560 | cond2 step 4 | Decided by the lead, provisional: the series' true live state; the read costed in step 4 (Q-1880), else the fallback |
 | Q-1561 | cond2 step 2 | Decided by the lead, provisional: facts before the look-back arrive at its start (kept) |
+| Q-1880 | cond2 step 4 | Decided by the lead, provisional: the four rules as the contract; costed in step 4 against the hot log and compacted segments |
+| Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
+| Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

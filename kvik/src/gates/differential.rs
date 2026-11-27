@@ -402,7 +402,7 @@ pub(super) fn run(log: &Log, drive: &Drive, until: Nanos) -> (Vec<Transition>, C
         }
         if pick(&drive.restores, batch) {
             let defs = defs_through(&log.items[..end]);
-            core = Core::restore(core.snapshot(), defs, &log.replay);
+            core = Core::restore(core.snapshot(), defs, &log.replay).expect("history in memory");
         }
         start = end;
         batch += 1;

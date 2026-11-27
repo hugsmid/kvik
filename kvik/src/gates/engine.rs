@@ -139,7 +139,7 @@ impl Core {
             let at = item.position;
             match &item.body {
                 Body::Fact { fact, outranked } => {
-                    self.fact(fact, *outranked, at, commit, history, &mut out);
+                    self.fact(fact, *outranked, at, commit, history, &mut out)?;
                 }
                 Body::Watch { id, gate } => self.watch(*id, gate, at, commit, history, &mut out)?,
                 Body::Unwatch { id } => self.unwatch(*id)?,
@@ -157,9 +157,9 @@ impl Core {
         now: Nanos,
         history: &dyn History,
         out: &mut Vec<Transition>,
-    ) {
+    ) -> Result<(), CoreError> {
         let Some(st) = self.series.get_mut(&fact.series) else {
-            return;
+            return Ok(());
         };
         bring_up(st, now);
         if !outranked {
@@ -183,7 +183,7 @@ impl Core {
                 } else if !usable && live_t == Some(fact.t) {
                     // The live fact itself was replaced by one without a usable value: the live state
                     // falls back to an older fact the core does not hold.
-                    st.live = history.series(fact.series, now, at).live;
+                    st.live = history.series(fact.series, now, at)?.live;
                 }
             }
         }
@@ -195,6 +195,7 @@ impl Core {
         for id in ids {
             out.extend(self.evaluate(id, fact.series, now, at, None, cause.clone()));
         }
+        Ok(())
     }
 
     fn watch(
@@ -216,21 +217,27 @@ impl Core {
         if self.defs.contains_key(&id) {
             return Err(CoreError::Id(id));
         }
+        // Every read before any change, so a failed read adds nothing of the gate (Q-1881).
+        let state = if self.series.contains_key(&s) {
+            None
+        } else {
+            Some(history.series(s, now, at)?)
+        };
+        let seeded = if self.seeding {
+            seed::seed(gate, id, s, now, at, history)?
+        } else {
+            None
+        };
         self.defs.insert(id, gate.clone());
-        self.series
-            .entry(s)
-            .or_insert_with(|| history.series(s, now, at));
+        if let Some(st) = state {
+            self.series.insert(s, st);
+        }
         self.readers.entry(s).or_default().insert(id);
         let start = TransitionId {
             at,
             due: None,
             condition: id,
             series: s,
-        };
-        let seeded = if self.seeding {
-            seed::seed(gate, id, s, now, at, history)
-        } else {
-            None
         };
         let inst = match seeded {
             Some(i) => Inst { set_by: start, ..i },

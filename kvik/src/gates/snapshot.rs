@@ -7,7 +7,7 @@ use kvik_model::types::SeriesId;
 
 use super::engine::{Frontier, bring_up};
 use super::rules::Inst;
-use super::{Core, History, SeriesState};
+use super::{Core, CoreError, History, SeriesState};
 
 /// A core's instances and series at its frontier. Facts ahead are not kept: [`Core::restore`] reads them
 ///
@@ -45,14 +45,14 @@ impl Core {
         snap: Snapshot,
         defs: BTreeMap<ConditionId, Gate>,
         history: &dyn History,
-    ) -> Self {
+    ) -> Result<Self, CoreError> {
         let Snapshot {
             mut series,
             instances,
             frontier,
         } = snap;
         for (s, st) in &mut series {
-            st.ahead = history.series(*s, frontier.now, frontier.at).ahead;
+            st.ahead = history.series(*s, frontier.now, frontier.at)?.ahead;
         }
         let mut core = Core {
             defs,
@@ -66,6 +66,6 @@ impl Core {
             core.readers.entry(k.1).or_default().insert(k.0);
             core.reschedule(k);
         }
-        core
+        Ok(core)
     }
 }
