@@ -11,7 +11,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use kvik_chunk::file::{
-    Batch, Class, Description, Fact, FileWriter, Identity, Input, Level, Position, SeriesInfo,
+    Batch, CHUNK_ROWS, Class, Description, Fact, FileWriter, Identity, IndexEntry, Input, Level,
+    Position, SeriesInfo,
 };
 use kvik_log::content::Item;
 use kvik_log::entries::{Definition, Entry};
@@ -28,6 +29,8 @@ use super::{
 
 /// Partitions one pass writes at most (§3.1 Bounded outputs).
 const MAX_OPEN: usize = 16;
+/// What a writer holds for a commit-time row (Q-1840).
+const BATCH_ROW: u64 = 40;
 /// Bytes written to an output between its syncs (compaction design §4).
 const SYNC_EVERY: u64 = 1 << 20;
 /// What a writer's block being built may hold beyond its sink.
@@ -63,6 +66,9 @@ struct Meta {
     set_aside: bool,
     entries: bool,
     used: Vec<u64>,
+    /// Its series (a series' set-aside rows counted again) and rows, so its writer's index is allocated once.
+    series: u64,
+    rows: u64,
 }
 
 impl Meta {
@@ -82,9 +88,10 @@ struct Census {
     expect: Expect,
     batches: BTreeMap<Position, Batch>,
     defs: BTreeMap<u32, Vec<(Position, Definition)>>,
-    /// Each series' row bytes and least and greatest `t`.
-    bytes: BTreeMap<u32, (u64, i64, i64)>,
-    days: BTreeSet<i64>,
+    /// Each series' row bytes, rows and least and greatest `t`.
+    bytes: BTreeMap<u32, (u64, u64, i64, i64)>,
+    /// Rows a day.
+    days: BTreeMap<i64, u64>,
     /// Digests of positions inside two inputs' ranges, so a position met twice is compared and kept once.
     dups: BTreeMap<Position, u128>,
     /// Times whose period may leave `i64`, decided once the last commit time is known.
@@ -93,15 +100,25 @@ struct Census {
     segment: (u64, BTreeMap<u32, u64>),
 }
 
+/// What a `BTreeMap` of `n` entries allocates: nodes are about half full after ordered inserts (Q-1841).
+fn tree<K, V>(n: usize) -> u64 {
+    (n * (2 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) + 16)) as u64
+}
+
 impl Census {
     fn held(&self) -> u64 {
-        (self.batches.len() * 48
-            + self.expect.sums.len() * 24
-            + self.expect.anchors.facts.len() * 16
-            + self.bytes.len() * 32
-            + self.days.len() * 16
-            + self.dups.len() * 32
-            + self.defs.values().map(|d| d.len() * 192).sum::<usize>()) as u64
+        tree::<Position, Batch>(self.batches.len())
+            + tree::<u32, u128>(self.expect.sums.len())
+            + tree::<u32, u64>(self.expect.anchors.facts.len() + self.segment.1.len())
+            + tree::<u32, (u64, u64, i64, i64)>(self.bytes.len())
+            + tree::<i64, u64>(self.days.len())
+            + tree::<Position, u128>(self.dups.len())
+            + tree::<u32, Vec<()>>(self.defs.len())
+            + self
+                .defs
+                .values()
+                .map(|d| d.len() as u64 * 192)
+                .sum::<u64>()
     }
 }
 
@@ -111,6 +128,8 @@ impl Census {
 struct Group {
     series: Range<usize>,
     t: Option<TRange>,
+    /// Its rows; for a range of `t`, a share of the series' rows with a quarter to spare.
+    rows: u64,
 }
 
 /// One range of `t` of a series split across passes.
@@ -159,6 +178,10 @@ struct Plan {
     order: BTreeMap<u32, usize>,
     groups: Vec<Group>,
     windows: Vec<Range<usize>>,
+    /// Rows a period.
+    period_rows: Vec<u64>,
+    /// Rows each window and group took in its count pass, so its write pass holds them exactly.
+    taken: BTreeMap<(usize, usize), usize>,
     passes: Vec<Pass>,
     metas: BTreeMap<(usize, u8), Meta>,
     files: Vec<(usize, u8)>,
@@ -169,13 +192,14 @@ struct Plan {
 
 impl Plan {
     fn held(&self) -> u64 {
-        (self.batches.len() * 48
-            + self.order.len() * 16
+        (self.batches.capacity() * std::mem::size_of::<Batch>()) as u64
+            + tree::<u32, usize>(self.order.len())
+            + tree::<(usize, u8), Meta>(self.metas.len())
             + self
                 .metas
                 .values()
-                .map(|m| 96 + m.used.len() * 8)
-                .sum::<usize>()) as u64
+                .map(|m| tree::<u32, u64>(m.positions.len()) + m.used.capacity() as u64 * 8)
+                .sum::<u64>()
     }
 
     fn period_of(&self, t: i64, weeks: &BTreeSet<i64>) -> Option<usize> {
@@ -211,8 +235,9 @@ struct Rows {
     rows: Vec<PRow>,
     collected: bool,
     opened: bool,
-    /// What `rows` costs, kept as they are taken.
+    /// What `rows` costs: its capacity and the texts' bytes (Q-1841).
     bytes: u64,
+    text: u64,
     next: usize,
 }
 
@@ -389,13 +414,13 @@ impl<'a> RunTask<'a> {
             }
             Stage::Pass { .. } => self.pass_step(),
             Stage::Verify(check) => {
-                let census = &self.census;
+                let Census { expect, defs, .. } = &mut self.census;
                 let input = self.input;
                 let infos = |s: u32, g: Position| -> SeriesInfo {
-                    let (name, reach) = info(&input, &census.defs, s, g);
+                    let (name, reach) = info(&input, defs, s, g);
                     SeriesInfo { name, reach }
                 };
-                match check.step(&input, &census.expect, &infos)? {
+                match check.step(&input, expect, &infos)? {
                     None => Ok(None),
                     Some(out) => {
                         debug_assert_eq!(out.len(), check.files().len());
@@ -436,12 +461,17 @@ impl<'a> RunTask<'a> {
             return Err(self.stall_at(p, Cause::PeriodOutOfRange));
         }
         let c = &self.census;
-        let periods: BTreeSet<(i64, i64)> = c
-            .days
-            .iter()
-            .filter_map(|d| period(d.checked_mul(DAY)?, last_commit_time, weeks))
-            .collect();
-        let periods: Vec<(i64, i64)> = periods.into_iter().collect();
+        let mut by_period: BTreeMap<(i64, i64), u64> = BTreeMap::new();
+        for (d, n) in &c.days {
+            if let Some(p) = d
+                .checked_mul(DAY)
+                .and_then(|t| period(t, last_commit_time, weeks))
+            {
+                *by_period.entry(p).or_default() += n;
+            }
+        }
+        let periods: Vec<(i64, i64)> = by_period.keys().copied().collect();
+        let period_rows: Vec<u64> = by_period.into_values().collect();
         let mut named: Vec<(Option<String>, u32)> = c
             .bytes
             .keys()
@@ -463,7 +493,13 @@ impl<'a> RunTask<'a> {
                 .len()
                 > 1
         });
-        let reserved = FIXED + c.held() + 2 * MAX_OPEN as u64 * (PIECE as u64 + BLOCK_RESERVE);
+        // Q-1840: the window is as many partitions as the writers' index entries and commit-time rows fit in a
+        // quarter of the cap.
+        let per_file = c.bytes.len() as u64 * 2 * std::mem::size_of::<IndexEntry>() as u64
+            + batches.len() as u64 * BATCH_ROW;
+        let open = (self.cap / 4 / per_file.max(1)).clamp(1, MAX_OPEN as u64) as usize;
+        let reserved =
+            FIXED + c.held() + open as u64 * (2 * (PIECE as u64 + BLOCK_RESERVE) + per_file);
         let budget = match self.cap {
             0 => 0,
             cap => (cap.saturating_sub(reserved) / 2).max(MIN_GROUP),
@@ -471,7 +507,7 @@ impl<'a> RunTask<'a> {
         let mut groups: Vec<Group> = Vec::new();
         let mut size = 0u64;
         for (i, (_, s)) in named.iter().enumerate() {
-            let (b, lo, hi) = c.bytes[s];
+            let (b, n, lo, hi) = c.bytes[s];
             if !renamed && b > budget {
                 let parts = (i128::from(b) / i128::from(budget.max(1)) + 1).min(MAX_SPLIT);
                 let width = ((i128::from(hi) - i128::from(lo)) / parts + 1).max(1);
@@ -486,6 +522,7 @@ impl<'a> RunTask<'a> {
                             first: at == i128::from(lo),
                             last: end > i128::from(hi),
                         }),
+                        rows: n.div_ceil(parts as u64) + n.div_ceil(4 * parts as u64),
                     });
                     at = end;
                 }
@@ -495,12 +532,14 @@ impl<'a> RunTask<'a> {
             match groups.last_mut() {
                 Some(g) if g.t.is_none() && (renamed || size + b <= budget) => {
                     g.series.end = i + 1;
+                    g.rows += n;
                     size += b;
                 }
                 _ => {
                     groups.push(Group {
                         series: i..i + 1,
                         t: None,
+                        rows: n,
                     });
                     size = b;
                 }
@@ -510,11 +549,12 @@ impl<'a> RunTask<'a> {
             groups.push(Group {
                 series: 0..0,
                 t: None,
+                rows: 0,
             });
         }
         let windows: Vec<Range<usize>> = (0..periods.len())
-            .step_by(MAX_OPEN)
-            .map(|s| s..(s + MAX_OPEN).min(periods.len()))
+            .step_by(open)
+            .map(|s| s..(s + open).min(periods.len()))
             .collect();
         let mut passes = Vec::new();
         if windows.len() * groups.len() == 1 {
@@ -557,6 +597,8 @@ impl<'a> RunTask<'a> {
                 .collect(),
             groups,
             windows,
+            period_rows,
+            taken: BTreeMap::new(),
             passes,
             metas: BTreeMap::new(),
             files: Vec::new(),
@@ -564,7 +606,7 @@ impl<'a> RunTask<'a> {
             renamed,
         });
         self.census.bytes = BTreeMap::new();
-        self.census.days = BTreeSet::new();
+        self.census.days = BTreeMap::new();
         Ok(())
     }
 
@@ -605,8 +647,24 @@ impl<'a> RunTask<'a> {
         let first_of_window = pass.group == 0;
         let last_of_window = pass.group + 1 == plan.groups.len();
         if !rows.collected {
+            if rows.seg == 0 && rows.segment.is_none() && rows.rows.capacity() == 0 {
+                let want = match plan.taken.get(&(pass.window, pass.group)) {
+                    Some(&n) => n as u64,
+                    None => {
+                        let in_window: u64 = plan.period_rows[window.clone()].iter().sum();
+                        let most = self.cap / std::mem::size_of::<PRow>() as u64;
+                        group.rows.min(in_window).min(most)
+                    }
+                };
+                rows.rows.reserve_exact(usize::try_from(want).unwrap_or(0));
+                rows.bytes = (rows.rows.capacity() * std::mem::size_of::<PRow>()) as u64;
+            }
             let Some(c) = self.segments.get(rows.seg) else {
                 rows.collected = true;
+                if pass.count {
+                    plan.taken
+                        .insert((pass.window, pass.group), rows.rows.len());
+                }
                 place(plan, &mut rows.rows, &mut self.entries, pass.count);
                 if pass.count && pass.window + 1 == plan.windows.len() && last_of_window {
                     plan.files = plan.metas.keys().copied().collect();
@@ -627,7 +685,7 @@ impl<'a> RunTask<'a> {
                     rows.seg += 1;
                 }
                 Event::Batch(d) => {
-                    rows.bytes += collect(
+                    rows.text += collect(
                         plan,
                         self.input.weeks_merged,
                         &window,
@@ -636,7 +694,9 @@ impl<'a> RunTask<'a> {
                         d,
                         &mut rows.rows,
                         &mut self.entries,
-                    )
+                    );
+                    rows.bytes =
+                        (rows.rows.capacity() * std::mem::size_of::<PRow>()) as u64 + rows.text;
                 }
             }
             return Ok(None);
@@ -835,8 +895,8 @@ fn take(c: &mut Census, s: &Segment, d: Decoded) -> Result<(), RunError> {
             Some((sid, text)) => {
                 let sum = c.expect.sums.entry(sid).or_default();
                 *sum = sum.wrapping_add(digest);
-                let e = c.bytes.entry(sid).or_insert((0, when, when));
-                *e = (e.0 + row_cost(text), e.1.min(when), e.2.max(when));
+                let e = c.bytes.entry(sid).or_insert((0, 0, when, when));
+                *e = (e.0 + row_cost(text), e.1 + 1, e.2.min(when), e.3.max(when));
             }
             None => c.expect.entries = c.expect.entries.wrapping_add(digest),
         }
@@ -845,7 +905,11 @@ fn take(c: &mut Census, s: &Segment, d: Decoded) -> Result<(), RunError> {
         {
             c.extreme.push((p, when));
         } else {
-            c.days.insert(when.div_euclid(DAY));
+            if series.is_some() {
+                *c.days.entry(when.div_euclid(DAY)).or_default() += 1;
+            } else {
+                c.days.entry(when.div_euclid(DAY)).or_default();
+            }
         }
     }
     Ok(())
@@ -914,7 +978,7 @@ fn collect(
     }
     rows[before..]
         .iter()
-        .map(|r| row_cost(r.fact.text.capacity()))
+        .map(|r| r.fact.text.capacity() as u64)
         .sum()
 }
 
@@ -926,7 +990,8 @@ fn place(
     entries: &mut BTreeMap<usize, Vec<(Position, Entry)>>,
     count: bool,
 ) {
-    rows.sort_by(|a, b| {
+    // Unstable sorts hold no scratch; their keys end in the position, so equal keys are the same row met twice.
+    rows.sort_unstable_by(|a, b| {
         (a.aside, a.fact.series_id, a.fact.t, rank(&a.fact)).cmp(&(
             b.aside,
             b.fact.series_id,
@@ -945,7 +1010,7 @@ fn place(
         rows[i].class = if top { CURRENT } else { REVISION };
     }
     for e in entries.values_mut() {
-        e.sort_by_key(|x| x.0);
+        e.sort_unstable_by_key(|x| x.0);
         e.dedup_by_key(|x| x.0);
     }
     if count {
@@ -971,7 +1036,7 @@ fn place(
             }
         }
     }
-    rows.sort_by(|a, b| {
+    rows.sort_unstable_by(|a, b| {
         (
             a.period,
             a.class,
@@ -989,6 +1054,18 @@ fn place(
                 b.fact.position,
             ))
     });
+    if count {
+        let mut last = None;
+        for r in rows.iter() {
+            let m = plan.metas.get_mut(&(r.period, r.class)).expect("held");
+            m.rows += 1;
+            let run = Some((r.period, r.class, r.order, r.aside));
+            if last != run {
+                m.series += 1;
+                last = run;
+            }
+        }
+    }
 }
 
 /// Orders a pass's rows by each file's own names, which differ between files when a series is renamed in the inputs.
@@ -1027,7 +1104,7 @@ fn by_file_names(
     for r in rows.iter_mut() {
         r.order = order[&(r.period, r.class, r.fact.series_id)];
     }
-    rows.sort_by(|a, b| {
+    rows.sort_unstable_by(|a, b| {
         (
             a.period,
             a.class,
@@ -1087,7 +1164,8 @@ fn open_output(input: &RunInput<'_>, plan: &Plan, i: usize) -> Result<Open, RunE
         })
         .map(|(_, b)| *b)
         .collect();
-    let w = FileWriter::new(Vec::new(), id, input.created_at, &description, batches)?;
+    let mut w = FileWriter::new(Vec::new(), id, input.created_at, &description, batches)?;
+    w.reserve_index(usize::try_from(meta.series + meta.rows / CHUNK_ROWS as u64).unwrap_or(0));
     let data = input.dir.join(DATA_DIR);
     input.fs.create_dir_all(&data)?;
     let path = tmp_path(input.dir, &id);

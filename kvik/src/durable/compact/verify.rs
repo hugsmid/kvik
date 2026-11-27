@@ -241,8 +241,6 @@ pub(super) struct Check {
     held: Option<Held>,
     j: usize,
     phase: Phase,
-    sums: BTreeMap<u32, u128>,
-    facts: BTreeMap<u32, u64>,
     positions: u64,
     entries: u128,
     out: Vec<Output>,
@@ -256,8 +254,6 @@ impl Check {
             held: Held::new(ranges),
             j: 0,
             phase: Phase::Open,
-            sums: BTreeMap::new(),
-            facts: BTreeMap::new(),
             positions: 0,
             entries: 0,
             out: Vec::new(),
@@ -269,7 +265,8 @@ impl Check {
         &self.files
     }
 
-    /// Bytes it holds: its sums and counts by series, the open file's index and a block of each of two files.
+    /// Bytes it holds: the open file's index, the position bits and a block of each of two files; the sums and counts
+    /// it takes from are the census's.
     pub(super) fn held(&self) -> u64 {
         let index = match &self.phase {
             Phase::Content { order, .. } => {
@@ -281,7 +278,7 @@ impl Check {
             .held
             .as_ref()
             .map_or(0, |h| 8 * h.bits.len() + 32 * h.spans.len());
-        40 * self.sums.len() as u64 + index + bits as u64 + 2 * PIECE as u64
+        index + bits as u64 + 2 * PIECE as u64
     }
 
     /// The size of the next step's device call.
@@ -292,11 +289,12 @@ impl Check {
         }
     }
 
-    /// One step; the verified outputs once every check has passed.
+    /// One step; the verified outputs once every check has passed. Each row is taken off `expect`'s sums and counts,
+    /// which end at zero when the outputs hold what the inputs promised.
     pub(super) fn step(
         &mut self,
         input: &RunInput<'_>,
-        expect: &Expect,
+        expect: &mut Expect,
         infos: &dyn Fn(u32, Position) -> SeriesInfo,
     ) -> Result<Option<Vec<Output>>, VerifyError> {
         let Some(w) = self.files.get(self.j).cloned() else {
@@ -428,9 +426,10 @@ impl Check {
                         }
                     }
                     self.positions += 1;
-                    *self.facts.entry(f.series_id).or_default() += 1;
-                    let s = self.sums.entry(f.series_id).or_default();
-                    *s = s.wrapping_add(fact_digest(f, r.received_at, r.commit_time));
+                    let n = expect.anchors.facts.entry(f.series_id).or_default();
+                    *n = n.wrapping_sub(1);
+                    let s = expect.sums.entry(f.series_id).or_default();
+                    *s = s.wrapping_sub(fact_digest(f, r.received_at, r.commit_time));
                 }
             }
             Phase::Hash { src, at, hash } => {
@@ -456,13 +455,13 @@ impl Check {
     }
 
     fn totals(&mut self, expect: &Expect) -> Result<Vec<Output>, VerifyError> {
-        if self.positions != expect.anchors.positions || self.facts != expect.anchors.facts {
+        if self.positions != expect.anchors.positions
+            || expect.anchors.facts.values().any(|&n| n != 0)
+        {
             return Err(VerifyError::Counts);
         }
-        for (s, sum) in &expect.sums {
-            if self.sums.get(s) != Some(sum) {
-                return Err(VerifyError::Checksum(Some(*s)));
-            }
+        if let Some((s, _)) = expect.sums.iter().find(|(_, sum)| **sum != 0) {
+            return Err(VerifyError::Checksum(Some(*s)));
         }
         if self.entries != expect.entries {
             return Err(VerifyError::Checksum(None));

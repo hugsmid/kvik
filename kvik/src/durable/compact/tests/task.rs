@@ -333,20 +333,27 @@ fn allocated_peaks() {
         let base = heap.current_usage();
         heap.reset_peak_usage();
         let mut task = RunTask::new(input(&dir, &set_aside, &weeks), cands, MINIMAL_MEMORY);
-        let mut top = (0usize, "");
-        while !task.step_run() {
-            let u = heap.current_usage().saturating_sub(base);
-            if u > top.0 {
-                top = (u, task.stage());
+        let mut stages: Vec<(&str, usize)> = Vec::new();
+        let mut real = 0;
+        loop {
+            let stage = task.stage();
+            let before = heap.peak_usage();
+            heap.reset_peak_usage();
+            let done = task.step_run();
+            let p = heap.peak_usage().saturating_sub(base);
+            real = real.max(p).max(before.saturating_sub(base));
+            match stages.iter_mut().find(|s| s.0 == stage) {
+                Some(s) => s.1 = s.1.max(p),
+                None => stages.push((stage, p)),
+            }
+            if done {
+                break;
             }
         }
-        let real = heap.peak_usage().saturating_sub(base) as u64;
+        let real = real as u64;
         let counted = task.peak();
         task.outcome().unwrap().unwrap();
-        eprintln!(
-            "{tag}: allocated {real}, counted {counted}, largest after a step {} in {}",
-            top.0, top.1
-        );
+        eprintln!("{tag}: allocated {real}, counted {counted}, by stage {stages:?}");
         if real > MINIMAL_MEMORY || counted > MINIMAL_MEMORY {
             over.push((tag, real, counted));
         }

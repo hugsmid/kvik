@@ -313,11 +313,16 @@ impl<W: Write> FileWriter<W> {
         self.data_blocks
     }
 
+    /// Reserves room for `n` more index entries, so that the index is allocated once.
+    pub fn reserve_index(&mut self, n: usize) {
+        self.index.reserve_exact(n);
+    }
+
     /// Bytes the writer holds besides its sink: index entries, commit-time rows and the open series' rows.
     pub fn held_bytes(&self) -> u64 {
         let fact = std::mem::size_of::<Fact>() as u64;
-        (self.index.len() * std::mem::size_of::<IndexEntry>()) as u64
-            + (self.batches.len() * (std::mem::size_of::<Batch>() + 8)) as u64
+        (self.index.capacity() * std::mem::size_of::<IndexEntry>()) as u64
+            + (self.batches.capacity() * (std::mem::size_of::<Batch>() + 8)) as u64
             + self.held_rows() as u64 * (fact + 255)
     }
 
