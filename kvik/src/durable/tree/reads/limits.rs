@@ -75,3 +75,53 @@ fn a_chart_over_more_uncovered_readings_than_the_memory_hint_holds_them_not_and_
     );
     assert_t7_on(&r, &rig, &[(now - 8 * 24 * HOUR, now)]);
 }
+
+/// The stored nodes one hourly chart over the last 40 hours uses.
+fn nodes_used(rig: &Rig) -> u64 {
+    let ids: Vec<SeriesId> = rig.ids.iter().map(|(id, _)| *id).collect();
+    let now = rig.now();
+    let before = NODES_USED.with(std::cell::Cell::get);
+    buckets_of(
+        &rig.reader(),
+        &ids,
+        TimeRange::new(Timestamp(now - 40 * HOUR), Timestamp(now)),
+        Resolution::Step(Duration::from_secs(3_600)),
+    )
+    .unwrap();
+    NODES_USED.with(std::cell::Cell::get) - before
+}
+
+#[test]
+fn a_newer_root_of_another_generation_store_or_reset_or_with_k_past_the_cut_is_passed_over_for_the_fit_one()
+ {
+    let mut rig = Rig::new("unfit-roots");
+    let first: Vec<(i64, u8)> = (0..1_500i64)
+        .map(|k| (k * 89 * super::S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    rig.checkpoint();
+    let fit = rig.newest_root();
+    assert!(nodes_used(&rig) > 0);
+    let unfit: [(&str, fn(&mut kvik_tree::root::Root)); 4] = [
+        ("another generation", |r| r.header.generation += 1),
+        ("another store", |r| r.header.store_id = [0xee; 16]),
+        ("another reset", |r| {
+            r.reset = kvik_log::mark::ResetStamp {
+                sequence: 1,
+                nonce: 99,
+            }
+        }),
+        ("K past the cut", |r| r.checkpoint.sequence += 1 << 40),
+    ];
+    for (why, alter) in unfit {
+        let mut r = fit.clone();
+        r.covered = Vec::new();
+        alter(&mut r);
+        rig.publish(r);
+        assert!(nodes_used(&rig) > 0, "{why}: passed over");
+    }
+    let mut r = fit;
+    r.covered = Vec::new();
+    rig.publish(r);
+    assert_eq!(nodes_used(&rig), 0, "a fit root covering nothing is taken");
+}

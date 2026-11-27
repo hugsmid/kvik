@@ -140,6 +140,16 @@ impl Cache {
     }
 }
 
+/// Whether `r` may serve `cut`: of its store, generation and reset stamp, with K at or below P (T7's precondition).
+fn fits(r: &Root, store_id: [u8; 16], cut: &Cut) -> bool {
+    let p = cut.durable;
+    r.header.generation == p.generation
+        && r.header.store_id == store_id
+        && r.reset == cut.stamp
+        && r.checkpoint <= p
+        && r.checkpoint.generation == p.generation
+}
+
 /// The tree for `cut`, if one may serve it.
 pub(crate) fn at_cut(
     cache: &Mutex<Cache>,
@@ -149,15 +159,8 @@ pub(crate) fn at_cut(
     cut: &Cut,
 ) -> Option<Arc<TreeAt>> {
     let p = cut.durable;
-    let usable = |r: &Root| {
-        r.header.generation == p.generation
-            && r.header.store_id == store_id
-            && r.reset == cut.stamp
-            && r.checkpoint <= p
-            && r.checkpoint.generation == p.generation
-    };
     let mut c = lock(cache);
-    let root = newest_root(&*env.fs, dir, usable)?;
+    let root = newest_root(&*env.fs, dir, |r| fits(r, store_id, cut))?;
     if p.sequence.saturating_sub(root.checkpoint.sequence) > STRETCH_MAX {
         return None;
     }
@@ -193,4 +196,66 @@ pub(crate) fn at_cut(
         parts: c.parts.clone(),
         stretch,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use kvik_log::mark::ResetStamp;
+
+    use super::*;
+
+    #[test]
+    fn a_root_fits_a_cut_only_with_its_store_generation_and_stamp_and_k_at_or_below_p() {
+        let at = |generation, sequence| LogPos {
+            generation,
+            sequence,
+        };
+        let stamp = ResetStamp {
+            sequence: 5,
+            nonce: 9,
+        };
+        let cut = Cut {
+            id: 1,
+            epoch: 1,
+            durable: at(2, 100),
+            stamp,
+        };
+        let fit = Root {
+            header: kvik_log::header::FileHeader::new(kvik_tree::root::KIND, 2, 3, 0, [7; 16]),
+            seq: 3,
+            checkpoint: at(2, 100),
+            reset: stamp,
+            next_file_id: 9,
+            floor: 0,
+            levels: kvik_tree::LEVELS.to_vec(),
+            parts: Vec::new(),
+            covered: Vec::new(),
+            floors: Vec::new(),
+            retired: Vec::new(),
+        };
+        assert!(fits(&fit, [7; 16], &cut));
+        assert!(!fits(&fit, [8; 16], &cut), "another store");
+        let unfit: [(&str, fn(&mut Root)); 5] = [
+            ("another generation", |r| r.header.generation = 3),
+            ("another stamp", |r| r.reset.nonce = 10),
+            ("K past P", |r| r.checkpoint.sequence = 101),
+            ("K of an earlier generation", |r| {
+                r.checkpoint = LogPos {
+                    generation: 1,
+                    sequence: 50,
+                }
+            }),
+            ("K of a later generation", |r| {
+                r.checkpoint = LogPos {
+                    generation: 3,
+                    sequence: 1,
+                }
+            }),
+        ];
+        for (why, alter) in unfit {
+            let mut r = fit.clone();
+            alter(&mut r);
+            assert!(!fits(&r, [7; 16], &cut), "{why}");
+        }
+    }
 }

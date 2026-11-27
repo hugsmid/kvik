@@ -5514,6 +5514,13 @@ the reader's memory would be granted now (Q-2260), drops them and gives every se
 The result is the same either way (T7). Test:
 `a_chart_over_more_uncovered_readings_than_the_memory_hint_holds_them_not_and_takes_facts`.
 
+## Q-2131 — The case count and shard of the generated T7 property
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round
+(`kvik/src/durable/tree/reads.rs`), provisional.
+**Scenario.** The property fixed 24 cases in source, so `PROPTEST_CASES` never reached it, and no deep shard ran it.
+**Decision (provisional).** It takes `PROPTEST_CASES`, 24 when unset, at most 1,024 a run as Q-2113 caps the tree's
+other properties; the shard `kvik-tree-reads` runs `durable::tree::reads::`.
+
 ## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
 Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
 with 71b-4.

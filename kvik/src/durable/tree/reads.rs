@@ -180,9 +180,14 @@ impl Rig {
     /// Publishes a copy of the newest root covering only `covered`, as a later root.
     fn narrow(&self, covered: Vec<Covered>) {
         let mut r = self.newest_root();
-        r.seq += 1;
-        r.header.file_id = r.seq;
         r.covered = covered;
+        self.publish(r);
+    }
+
+    /// Publishes `r` as the root after the newest on disk.
+    fn publish(&self, mut r: Root) {
+        r.seq = self.newest_root().seq + 1;
+        r.header.file_id = r.seq;
         self.write(&root_name(r.seq), &r.encode().unwrap());
     }
 
@@ -561,7 +566,11 @@ fn a_roll_up_with_a_dirty_or_uncovered_quarter_hour_serves_its_clean_ones_and_eq
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+    // Q-2131: 24 cases unless `PROPTEST_CASES` says otherwise, at most 1,024 a run (Q-2113).
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(24).min(1024),
+        ..ProptestConfig::default()
+    })]
 
     /// T7 on generated histories: readings at any spacing and quality, late readings and revisions, one or two
     /// checkpoints, a stretch above K, and optionally a covered list with holes.
