@@ -46,6 +46,8 @@ fn ceil_q(t: i64) -> i64 {
 thread_local! {
     /// Stored nodes this thread's chart reads have used.
     pub(crate) static NODES_USED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The most bytes of readings this thread's chart reads have held fetched at once.
+    pub(crate) static FETCHED_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 enum Piece<'a> {
@@ -218,7 +220,25 @@ fn fetch(
             }
         })?;
     }
+    #[cfg(test)]
+    {
+        let held: u64 = planned
+            .iter()
+            .flat_map(|(_, c, _)| &c.fetched)
+            .map(bytes_of)
+            .sum();
+        FETCHED_MOST.with(|c| c.set(c.get().max(held)));
+    }
     Ok(())
+}
+
+/// The bytes a fetched reading holds, its text included.
+fn bytes_of(r: &Reading) -> u64 {
+    let text = match &r.1 {
+        kt::Value::Text(t) => t.capacity(),
+        _ => 0,
+    };
+    (std::mem::size_of::<Reading>() + text) as u64
 }
 
 impl<'w> Chart<'w> {

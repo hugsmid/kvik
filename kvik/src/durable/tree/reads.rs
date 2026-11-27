@@ -25,6 +25,8 @@ use crate::series::{IntervalLength, Kind, SeriesSpec, StateValues, Timing, Value
 use crate::time::{TimeRange, Timestamp};
 use crate::types::{Intent, Quality, Reading, SeriesId, Value};
 
+mod limits;
+
 const S: i64 = 1_000_000_000;
 const MIN: i64 = 60 * S;
 const HOUR: i64 = 60 * MIN;
