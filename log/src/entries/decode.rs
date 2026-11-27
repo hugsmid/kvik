@@ -769,11 +769,11 @@ fn gate_value(p: &Parsed<'_>, v: &[u8]) -> Option<GateValue> {
             }
             GateValue::F64(x)
         }
-        (2, 9) => GateValue::Decimal {
+        (2, 9) if rest[8] <= MAX_SCALE => GateValue::Decimal {
             units: u64_at(rest, 0) as i64,
             scale: rest[8],
         },
-        (3, 4) => GateValue::State(u32_at(rest, 0)),
+        (3, 4) if (u32_at(rest, 0) as usize) < MAX_STATE_NAMES => GateValue::State(u32_at(rest, 0)),
         (4, 1) if rest[0] <= 1 => GateValue::Bool(rest[0] == 1),
         (5, 1..=255) => GateValue::Text(p.own(std::str::from_utf8(rest).ok()?)),
         _ => return None,

@@ -331,8 +331,8 @@ fn route_operator() -> impl Strategy<Value = RouteOperator> {
 fn gate_value() -> impl Strategy<Value = GateValue> {
     prop_oneof![
         level().prop_map(GateValue::F64),
-        (any::<i64>(), any::<u8>()).prop_map(|(units, scale)| GateValue::Decimal { units, scale }),
-        any::<u32>().prop_map(GateValue::State),
+        (any::<i64>(), 0u8..=18).prop_map(|(units, scale)| GateValue::Decimal { units, scale }),
+        (0u32..65_536).prop_map(GateValue::State),
         any::<bool>().prop_map(GateValue::Bool),
         "[a-z ]{1,40}".prop_map(GateValue::Text),
     ]

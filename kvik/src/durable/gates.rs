@@ -129,7 +129,8 @@ pub(crate) fn gate_out(spec: &GateSpec) -> Gate {
                         units: *units,
                         scale: *scale,
                     },
-                    GateValue::State(i) => Value::State(u16::try_from(*i).unwrap_or(u16::MAX)),
+                    // Field 74 holds an index below 65,536 (Q-1810).
+                    GateValue::State(i) => Value::State(*i as u16),
                     GateValue::Bool(b) => Value::Bool(*b),
                     GateValue::Text(t) => Value::Text(t.clone()),
                 })

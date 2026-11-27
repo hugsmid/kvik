@@ -300,6 +300,7 @@ impl Gate {
                 let bad = |v: &Value| match v {
                     Value::Absent => true,
                     Value::F64(x) => !x.is_finite(),
+                    Value::Decimal { scale, .. } => *scale > kvik_log::facts::MAX_SCALE,
                     Value::Text(t) => t.is_empty() || t.len() > 255,
                     _ => false,
                 };
@@ -336,7 +337,8 @@ pub enum GateError {
     /// Levels: none, more than 16, not finite, not rising, or a clear level above its boundary.
     #[error("levels must be 1 to 16 finite boundaries, rising, each clear at or below its level")]
     Levels,
-    /// Set: empty, more than 64 values, or holding `Absent`, a non-finite number or text not of 1 to 255 bytes.
+    /// Set: empty, more than 64 values, or holding `Absent`, a non-finite number, a decimal of scale above 18 or text
+    /// not of 1 to 255 bytes.
     #[error("a set holds 1 to 64 values, none absent")]
     Set,
     /// A dead-band negative or not finite.
