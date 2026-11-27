@@ -5530,8 +5530,9 @@ Decided by the builder with cond2 step 5, provisional; settle with cond2 step 6.
 **Decision (provisional).** The take reseeds rather than replays: the replay would judge across positions the reset
 point voids. Cond2 step 6 replaces this with the reseed at the reset point during the replay (design §4.4 step 5).
 Reset points below the checkpoint do not stop a replay: nothing after the checkpoint rests on them.
-**Pinned by.** `kvik/tests/gates_durable.rs` `gate_deliveries_after_crashes_follow_the_rules` (a power loss ends
-the resume with a reset point).
+**Pinned by.** `kvik/tests/gates_durable.rs`
+`a_power_loss_reseeds_the_gates_rather_than_replaying_across_its_reset_point`, and
+`gate_deliveries_after_crashes_follow_the_rules` (a power loss ends the resume with a reset point).
 
 ## Q-2083 — Facts counted for the bound; entries of a newer format in a replay
 Decided by the builder with cond2 step 5, provisional.
@@ -5573,7 +5574,8 @@ transition judged and not confirmed, whether queued, deferred while behind, or d
 engine now. The held snapshot stays until all of them are confirmed: a consumer always one transition behind keeps an
 old checkpoint, whose replay may outgrow the bound (then reseeded, counted). A confirmed transition writes the cursor
 file at once.
-**Pinned by.** `kvik/tests/gates_durable.rs`.
+**Pinned by.** `kvik/tests/gates_durable.rs`, `a_clean_shutdown_writes_a_checkpoint_at_the_frontier` and
+`the_replay_bound_counts_facts_from_the_checkpoint_not_the_cursor` among them.
 
 ## Q-2087 — The instant a reseed starts the gates at
 Decided by the builder with cond2 step 5, provisional.

@@ -11,8 +11,8 @@ use std::time::Duration;
 use common::block_on;
 use common::world::{World, gauge, ready, resync};
 use kvik::{
-    ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Gate, Health, Input, Level, Reading,
-    ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store, TransitionId, Value,
+    ConditionsConfig, Consumer, ConsumerError, DeliveryKind, Funnel, Gate, Health, Input, Level,
+    Reading, ReplayMax, ResyncCause, Select, SeriesId, Span, Start, Store, TransitionId, Value,
 };
 use kvik_log::fs::FaultOp;
 use proptest::prelude::*;
@@ -332,6 +332,84 @@ fn a_clock_stepped_back_across_a_restart_does_not_shorten_a_hold() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// A consumer of the humidity facts with the levels gate, its start transitions confirmed, then `n` facts that move
+/// no gate delivered and confirmed within `conditions.checkpoint_interval`: its cursor runs ahead of its checkpoint.
+fn cursor_ahead(name: &str, n: u32) -> (World, Store, Consumer) {
+    let mut w = World::quiet(name);
+    w.conditions = Some(
+        ConditionsConfig::default()
+            .replay_max(ReplayMax::new(Duration::from_secs(24 * 3_600), 2))
+            .checkpoint_interval(Duration::from_secs(3_600)),
+    );
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.route(Funnel::facts(Select::Ids(vec![id])))).unwrap();
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    emit(&w, &s, id, 50.0);
+    let got = ready(&mut c);
+    block_on(c.confirm(got.last().unwrap().id)).unwrap();
+    for k in 0..n {
+        w.clock.advance(Duration::from_secs(1));
+        emit(&w, &s, id, 51.0 + f64::from(k));
+        let got = ready(&mut c);
+        block_on(c.confirm(got.last().unwrap().id)).unwrap();
+    }
+    (w, s, c)
+}
+
+/// `conditions.replay_max` counts the facts after the checkpoint, not after the cursor: with the cursor ahead of an
+/// older checkpoint, more facts than the bound between them reseed though none follow the cursor.
+#[test]
+fn the_replay_bound_counts_facts_from_the_checkpoint_not_the_cursor() {
+    let (mut w, s, c) = cursor_ahead("gates-durable-bound-from-checkpoint", 4);
+    w.crash(s, vec![c], false);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(0), false)]"]);
+    assert_eq!(s.stats().delivery.transitions_not_replayed, 1);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-2086: the last cursor write of a clean shutdown carries a checkpoint at the engine's frontier, so the next start
+/// replays from there, inside the bound, however long ago the previous checkpoint was.
+#[test]
+fn a_clean_shutdown_writes_a_checkpoint_at_the_frontier() {
+    let (w, s, c) = cursor_ahead("gates-durable-shutdown-checkpoint", 4);
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let mut c = take(&s);
+    assert_eq!(seen(&ready(&mut c)), ["resync Resume [(Level(0), true)]"]);
+    let d = s.stats().delivery;
+    assert_eq!((d.transitions_not_replayed, d.gates_reseeded), (0, 0));
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-2082: a power loss's recovery entry is a reset point after the checkpoint, so the take reseeds rather than
+/// replays: the transitions handed out and never confirmed are not sent again; the resync carries state now.
+#[test]
+fn a_power_loss_reseeds_the_gates_rather_than_replaying_across_its_reset_point() {
+    let mut w = World::quiet("gates-durable-power");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("hall/air/humidity"))).unwrap();
+    let mut c = take(&s);
+    block_on(c.watch("humidity", humidity(id))).unwrap();
+    emit(&w, &s, id, 50.0);
+    assert_eq!(
+        seen(&ready(&mut c)),
+        ["Some(Unknown) r=false", "Some(Level(0)) r=false"]
+    );
+    w.crash(s, vec![c], true);
+    let s = w.open();
+    let mut c = take(&s);
+    let got = ready(&mut c);
+    assert_eq!(seen(&got), ["resync Resume [(Level(0), false)]"]);
+    assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    block_on(s.shutdown()).unwrap();
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     Emit(u8),
@@ -339,10 +417,11 @@ enum Op {
     Watch(u8),
     Drain(usize),
     Restart,
-    /// The process stops after this many more file operations, in an emit and a drain; with `power`, the power goes
-    /// too (a partial loss chosen by `seed`).
+    /// The process stops after this many more file operations, in an emit and a drain confirming through its `n`th
+    /// delivery; with `power`, the power goes too (a partial loss chosen by `seed`).
     Crash {
         ops: u8,
+        n: u8,
         power: bool,
         seed: u64,
     },
@@ -355,7 +434,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0u8..3).prop_map(Op::Watch),
         5 => (0usize..6).prop_map(Op::Drain),
         1 => Just(Op::Restart),
-        2 => (0u8..24, any::<bool>(), any::<u64>()).prop_map(|(ops, power, seed)| Op::Crash { ops, power, seed }),
+        2 => (0u8..24, 0u8..6, any::<bool>(), any::<u64>())
+            .prop_map(|(ops, n, power, seed)| Op::Crash { ops, n, power, seed }),
     ]
 }
 
@@ -540,10 +620,15 @@ fn gate_deliveries_after_crashes_follow_the_rules() {
                     s = w.open();
                     c = resume(&s, &mut track)?;
                 }
-                Op::Crash { ops, power, seed } => {
+                Op::Crash {
+                    ops,
+                    n,
+                    power,
+                    seed,
+                } => {
                     w.fs.crash_after(usize::from(*ops));
                     let _ = block_on(s.emit(&[Reading::new(id, w.clock.wall(), Value::F64(90.0))]));
-                    let _ = drain(&mut c, usize::MAX, &mut track);
+                    let _ = drain(&mut c, usize::from(*n), &mut track);
                     w.stop(s, vec![c], power.then_some(Some(*seed)));
                     s = w.open();
                     c = resume(&s, &mut track)?;
