@@ -10,9 +10,10 @@ use km::summary::Params;
 use kvik_model as km;
 use kvik_tree as kt;
 use kvik_tree::part::{Entry, Part};
+use kvik_tree::root::Root;
 use kvik_tree::set::{QUARTER, Tile, cover_by, covered, served, visible_entries};
 
-use super::super::read::source::{Plan, each_row, search_back_each};
+use super::super::read::source::{each_row, search_back_each};
 use super::super::read::view::View;
 use super::super::reader::DurableReader;
 use super::super::reader::facts::plan;
@@ -54,110 +55,185 @@ enum Piece<'a> {
 }
 
 /// One series' chart read from the tree.
-struct Chart<'a> {
-    r: &'a DurableReader,
-    v: &'a View,
-    tree: &'a TreeAt,
-    root: &'a kvik_tree::root::Root,
-    series: &'a Series,
+struct Chart<'w> {
+    tree: &'w TreeAt,
+    root: &'w Root,
+    series: &'w Series,
     id: u32,
     p: Params,
     np: kt::Params,
     now: i64,
-    vis: BTreeMap<(u8, i64), &'a Entry>,
-    plan: Plan,
+    vis: BTreeMap<(u8, i64), &'w Entry>,
+    /// The current readings of the spans fetched for it, in `t` order.
+    fetched: Vec<Reading>,
 }
 
-/// The chart of `series` over `[a, b)` at `step` from the tree, or `None` when the tree cannot serve it: a step off
+/// A chart to evaluate: its place among the series asked for, and each bucket's evaluation and pieces.
+type Planned<'w> = (usize, Chart<'w>, Vec<(Eval, Vec<Piece<'w>>)>);
+
+/// How a bucket is evaluated: as an interval series' credit, wholly ahead of `now`, or up to its credit limit.
+enum Eval {
+    Interval,
+    Future,
+    Point(i64),
+}
+
+/// The charts of `series` over `[a, b)` at `step` from the tree; `None` for a series the tree cannot serve: a step off
 /// the quarter-hours, a series that stores no 15-minute level, is not served or was changed in the stretch, or an
-/// automatic resolution that may give raw facts.
+/// automatic resolution that may give raw facts. The facts every chart needs are read once for them all.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn chart(
+pub(super) fn charts(
     r: &DurableReader,
     v: &View,
     tree: &TreeAt,
     w: &Window,
-    series: &Series,
+    series: &[&Series],
     (a, b, step): (i64, i64, i64),
     max: Option<usize>,
     now: i64,
-) -> Result<Option<ChartData>, QueryError> {
-    let id = series.def.id;
-    let p = params(&series.def);
-    if step % QUARTER != 0 || !p.stores(1) || !served(&w.root, u64::from(id)) || tree.changed(id) {
-        return Ok(None);
+) -> Result<Vec<Option<ChartData>>, QueryError> {
+    let mut out: Vec<Option<ChartData>> = vec![None; series.len()];
+    if step % QUARTER != 0 {
+        return Ok(out);
     }
     let live: Vec<&Part> = w.live.iter().map(|p| &**p).collect();
-    let Ok(vis) = visible_entries(&w.root, &live, u64::from(id)) else {
-        return Ok(None);
-    };
-    let c = Chart {
-        r,
-        v,
-        tree,
-        root: &w.root,
-        series,
-        id,
-        np: fold::node_params(&p),
-        p,
-        now,
-        vis,
-        plan: plan(r, v, &[SeriesId(id)], ReadView::Current)?,
-    };
-    if let Some(max) = max
-        && c.readings_at_most(ceil_q(a), floor_q(b), max)
-    {
-        return Ok(None);
-    }
-    let names = &series.def.state_names;
-    let mut last = if needs_last(&c.p, a, now) {
-        c.prior(a)?
-    } else {
-        None
-    };
-    let mut buckets = Vec::new();
-    for (lo, hi) in rules::bucket_spans(a, b, step) {
-        let node = if c.p.interval.is_some() {
-            let limit = match c.p.timing {
-                // A reading is credited once its interval has ended; every one of a quarter-hour has by its end.
-                Timing::Observed => floor_q(now),
-                Timing::Scheduled | Timing::Forecast => i64::MAX,
-            };
-            c.core(lo, hi, limit)?
-        } else if c.p.wholly_future(lo, now) {
-            kt::Node::empty(c.np.kind, lo, hi)
-        } else {
-            let until = c.p.credit_limit(hi, now).max(lo);
-            let core = c.core(lo, until, until)?;
-            let before = last.clone();
-            if let Some(l) = &core.last {
-                last = Some(l.clone());
-            }
-            let mut n = kt::with_stretches(&c.np, core, before.as_ref(), until);
-            n.end = hi;
-            n
+    let spans: Vec<(i64, i64)> = rules::bucket_spans(a, b, step).collect();
+    let mut planned: Vec<Planned<'_>> = Vec::new();
+    let mut wanted: Vec<(i64, i64)> = Vec::new();
+    for (k, s) in series.iter().enumerate() {
+        let id = s.def.id;
+        let p = params(&s.def);
+        if !p.stores(1) || !served(&w.root, u64::from(id)) || tree.changed(id) {
+            continue;
+        }
+        let Ok(vis) = visible_entries(&w.root, &live, u64::from(id)) else {
+            continue;
         };
-        let node = fold::model_node(node, names);
-        buckets.push(rules::bucket(&series.spec, &node, lo, hi, false));
+        let c = Chart {
+            tree,
+            root: &w.root,
+            series: s,
+            id,
+            np: fold::node_params(&p),
+            p,
+            now,
+            vis,
+            fetched: Vec::new(),
+        };
+        if let Some(max) = max
+            && c.readings_at_most(ceil_q(a), floor_q(b), max)
+        {
+            continue;
+        }
+        let limit = match c.p.timing {
+            // A reading is credited once its interval has ended; every one of a quarter-hour has by its end.
+            Timing::Observed => floor_q(now),
+            Timing::Scheduled | Timing::Forecast => i64::MAX,
+        };
+        let mut buckets = Vec::with_capacity(spans.len());
+        for &(lo, hi) in &spans {
+            let (eval, pieces) = if c.p.interval.is_some() {
+                (Eval::Interval, c.pieces(lo, hi, limit))
+            } else if c.p.wholly_future(lo, now) {
+                (Eval::Future, Vec::new())
+            } else {
+                let until = c.p.credit_limit(hi, now).max(lo);
+                (Eval::Point(until), c.pieces(lo, until, until))
+            };
+            for piece in &pieces {
+                if let Piece::Facts(s, e) = piece {
+                    wanted.push((c.reach(*s), *e));
+                }
+            }
+            buckets.push((eval, pieces));
+        }
+        if needs_last(&c.p, a, now) && floor_q(a) < a {
+            wanted.push((floor_q(a), a));
+        }
+        planned.push((k, c, buckets));
     }
-    Ok(Some(ChartData::Buckets {
-        step: convert::dur(i128::from(step)),
-        buckets,
-    }))
+    fetch(r, v, &mut planned, wanted)?;
+    for (k, c, buckets) in planned {
+        let mut last = if needs_last(&c.p, a, now) {
+            c.prior(r, v, a)?
+        } else {
+            None
+        };
+        let mut out_buckets = Vec::with_capacity(spans.len());
+        for (&(lo, hi), (eval, pieces)) in spans.iter().zip(buckets) {
+            let node = match eval {
+                Eval::Interval => c.core(lo, hi, pieces),
+                Eval::Future => kt::Node::empty(c.np.kind, lo, hi),
+                Eval::Point(until) => {
+                    let core = c.core(lo, until, pieces);
+                    let before = last.clone();
+                    if let Some(l) = &core.last {
+                        last = Some(l.clone());
+                    }
+                    let mut n = kt::with_stretches(&c.np, core, before.as_ref(), until);
+                    n.end = hi;
+                    n
+                }
+            };
+            let node = fold::model_node(node, &c.series.def.state_names);
+            out_buckets.push(rules::bucket(&c.series.spec, &node, lo, hi, false));
+        }
+        out[k] = Some(ChartData::Buckets {
+            step: convert::dur(i128::from(step)),
+            buckets: out_buckets,
+        });
+    }
+    Ok(out)
 }
 
-impl Chart<'_> {
-    /// Whether the clean nodes of `[from, to)` hold at most `max` readings, so that the facts may be fewer than an
-    /// automatic resolution's most points; a fact gives at most one reading, so more readings mean more facts.
+/// Reads the spans `wanted` once for every chart, joined where they touch, and gives each chart its readings there.
+fn fetch(
+    r: &DurableReader,
+    v: &View,
+    planned: &mut [Planned<'_>],
+    mut wanted: Vec<(i64, i64)>,
+) -> Result<(), QueryError> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+    wanted.sort_unstable();
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in wanted {
+        match ranges.last_mut() {
+            Some(l) if s <= l.1 => l.1 = l.1.max(e),
+            _ => ranges.push((s, e)),
+        }
+    }
+    let mut ids: Vec<(u32, usize)> = planned
+        .iter()
+        .enumerate()
+        .map(|(i, (_, c, _))| (c.id, i))
+        .collect();
+    ids.sort_unstable();
+    let plan = plan(
+        r,
+        v,
+        &ids.iter().map(|(id, _)| SeriesId(*id)).collect::<Vec<_>>(),
+        ReadView::Current,
+    )?;
+    for (s, e) in ranges {
+        each_row(r, v, &plan, s, e - 1, |row| {
+            if let Ok(k) = ids.binary_search_by_key(&row.row.series_id, |(id, _)| *id) {
+                let c = &mut planned[ids[k].1].1;
+                c.fetched.extend(reading_of(c.series, &row));
+            }
+        })?;
+    }
+    Ok(())
+}
+
+impl<'w> Chart<'w> {
+    /// Whether the nodes of the whole quarter-hours `[from, to)` hold at most `max` readings, so that the facts may be
+    /// fewer than an automatic resolution's most points. A node's count stays a lower bound on its span's facts at any
+    /// later cut, dirty or stale included: a fact gives at most one reading, and a `t` once held keeps a fact.
     fn readings_at_most(&self, from: i64, to: i64, max: usize) -> bool {
         let mut n: u64 = 0;
-        for ((_, start), seen) in self.vis.range((LEVEL, from)..(LEVEL, to)) {
-            if start.saturating_add(QUARTER) > to
-                || seen.stale
-                || self.tree.dirty(self.id, *start, start + QUARTER)
-            {
-                continue;
-            }
+        for seen in self.vis.range((LEVEL, from)..(LEVEL, to)).map(|(_, e)| e) {
             n = n.saturating_add(seen.node.as_ref().map_or(0, |x| x.count));
             if n > max as u64 {
                 return false;
@@ -166,8 +242,8 @@ impl Chart<'_> {
         true
     }
 
-    /// The core of `[lo, end)`: nodes for the whole quarter-hours ending at or before `limit`, facts elsewhere.
-    fn core(&self, lo: i64, end: i64, limit: i64) -> Result<kt::Node, QueryError> {
+    /// The pieces of `[lo, end)`: nodes for the whole quarter-hours ending at or before `limit`, facts elsewhere.
+    fn pieces(&self, lo: i64, end: i64, limit: i64) -> Vec<Piece<'w>> {
         let (qlo, x) = (ceil_q(lo), floor_q(end.min(limit)));
         let mut pieces = Vec::new();
         if qlo >= x {
@@ -177,6 +253,19 @@ impl Chart<'_> {
             self.tiles(&mut pieces, qlo, x);
             push_facts(&mut pieces, x, end);
         }
+        pieces
+    }
+
+    /// Where the readings a facts piece `[s, …)` folds begin: an interval series' readings reach back into it.
+    fn reach(&self, s: i64) -> i64 {
+        match self.p.interval {
+            Some(_) => fold::reach(&self.p, s),
+            None => s,
+        }
+    }
+
+    /// The core of `[lo, end)`, the merge of its pieces.
+    fn core(&self, lo: i64, end: i64, pieces: Vec<Piece<'w>>) -> kt::Node {
         let mut core: Option<kt::Node> = None;
         for piece in pieces {
             let folded;
@@ -191,7 +280,7 @@ impl Chart<'_> {
                     &folded
                 }
                 Piece::Facts(s, e) => {
-                    folded = self.folded(s, e)?;
+                    folded = self.folded(s, e);
                     &folded
                 }
             };
@@ -200,10 +289,10 @@ impl Chart<'_> {
                 None => n.clone(),
             });
         }
-        Ok(core.unwrap_or_else(|| kt::Node::empty(self.np.kind, lo, end)))
+        core.unwrap_or_else(|| kt::Node::empty(self.np.kind, lo, end))
     }
 
-    fn tiles<'a>(&'a self, out: &mut Vec<Piece<'a>>, from: i64, to: i64) {
+    fn tiles(&self, out: &mut Vec<Piece<'w>>, from: i64, to: i64) {
         let tiles = cover_by(self.root, u64::from(self.id), from, to, |level, start| {
             self.vis.get(&(level, start)).copied()
         });
@@ -225,11 +314,7 @@ impl Chart<'_> {
                             }
                         }
                     } else {
-                        out.push(Piece::Stored(
-                            seen.and_then(|s| s.node.as_ref()),
-                            start,
-                            end,
-                        ));
+                        push_stored(out, seen.and_then(|s| s.node.as_ref()), start, end);
                     }
                 }
                 Tile::Facts { start, end } => push_facts(out, start, end),
@@ -237,7 +322,7 @@ impl Chart<'_> {
         }
     }
 
-    fn quarter<'a>(&'a self, out: &mut Vec<Piece<'a>>, q: i64) {
+    fn quarter(&self, out: &mut Vec<Piece<'w>>, q: i64) {
         let seen = self.vis.get(&(LEVEL, q)).copied();
         if !covered(self.root, LEVEL, q, q + QUARTER)
             || seen.is_some_and(|s| s.stale)
@@ -245,54 +330,46 @@ impl Chart<'_> {
         {
             push_facts(out, q, q + QUARTER);
         } else {
-            out.push(Piece::Stored(
-                seen.and_then(|s| s.node.as_ref()),
-                q,
-                q + QUARTER,
-            ));
+            push_stored(out, seen.and_then(|s| s.node.as_ref()), q, q + QUARTER);
         }
     }
 
-    /// The current readings of `[from, to)` in `t` order.
-    fn readings(&self, from: i64, to: i64) -> Result<Vec<Reading>, QueryError> {
-        let mut out = Vec::new();
-        each_row(self.r, self.v, &self.plan, from, to - 1, |s| {
-            out.extend(reading_of(self.series, &s));
-        })?;
-        Ok(out)
+    /// The fetched readings of `[from, to)`, in `t` order.
+    fn readings(&self, from: i64, to: i64) -> &[Reading] {
+        let lo = self.fetched.partition_point(|r| r.0 < from);
+        let hi = self.fetched.partition_point(|r| r.0 < to);
+        &self.fetched[lo..hi.max(lo)]
     }
 
     /// `[s, e)` folded from facts as the fact path folds it: a fold of the point readings in it, or the credit of the
     /// interval readings that reach it and are ready.
-    fn folded(&self, s: i64, e: i64) -> Result<kt::Node, QueryError> {
+    fn folded(&self, s: i64, e: i64) -> kt::Node {
         if self.p.interval.is_none() {
-            return Ok(kt::fold(&self.np, s, e, &self.readings(s, e)?));
+            return kt::fold(&self.np, s, e, self.readings(s, e));
         }
         let ready = |t: i64| self.p.timing != Timing::Observed || self.p.ready_at(t) <= self.now;
-        let rs: Vec<Reading> = self
-            .readings(fold::reach(&self.p, s), e)?
-            .into_iter()
-            .filter(|(t, _)| ready(*t))
-            .collect();
+        let rs = self
+            .readings(self.reach(s), e)
+            .iter()
+            .filter(|(t, _)| ready(*t));
         let mut n = kt::Node::empty(self.np.kind, s, e);
-        kt::credit_intervals(&self.np, &mut n, &rs, s, e);
-        Ok(n)
+        kt::credit_intervals(&self.np, &mut n, rs, s, e);
+        n
     }
 
     /// The last reading before `a`: from the facts of its quarter-hour before it, then the nearest stored node before
     /// that when every quarter-hour between is covered and clean; else the fact path's search back.
-    fn prior(&self, a: i64) -> Result<Option<Reading>, QueryError> {
+    fn prior(&self, r: &DurableReader, v: &View, a: i64) -> Result<Option<Reading>, QueryError> {
         let qa = floor_q(a);
-        if qa < a
-            && let Some(r) = self.readings(qa, a)?.pop()
-        {
-            return Ok(Some(r));
+        if let Some(found) = self.readings(qa, a).last() {
+            return Ok(Some(found.clone()));
         }
         if let Some(found) = self.prior_node(qa) {
             return Ok(found);
         }
         let states = self.series.def.state_names.len();
-        let found = search_back_each(self.r, self.v, &self.plan, a - 1, &|f| readable(states, f))?;
+        let plan = plan(r, v, &[SeriesId(self.id)], ReadView::Current)?;
+        let found = search_back_each(r, v, &plan, a - 1, &|f| readable(states, f))?;
         Ok(found
             .into_iter()
             .next()
@@ -300,29 +377,60 @@ impl Chart<'_> {
             .and_then(|f| reading(states, f)))
     }
 
-    /// `Some` with the last reading before `qa` when the tree alone tells it.
+    /// `Some` with the last reading before `qa` when the tree alone tells it: from the chart's window, else, when the
+    /// window holds no node before `qa`, from every part before it.
     fn prior_node(&self, qa: i64) -> Option<Option<Reading>> {
-        let root = self.root;
-        let found = self.vis.range((LEVEL, i64::MIN)..(LEVEL, qa)).next_back();
-        let from = match found {
-            Some(((_, start), _)) => *start,
-            None => {
-                // No node before: no reading, if the covered range reaches back to the first quarter-hour.
-                let c = root
-                    .covered
-                    .iter()
-                    .find(|c| c.level == LEVEL && c.from < qa && qa <= c.to)?;
-                (c.from <= ceil_q(i64::MIN)).then_some(c.from)?
-            }
-        };
-        if !covered(root, LEVEL, from, qa) || self.tree.dirty(self.id, from, qa) {
-            return None;
+        if self
+            .vis
+            .range((LEVEL, i64::MIN)..(LEVEL, qa))
+            .next()
+            .is_some()
+        {
+            return told(self.root, &self.vis, qa, |a, b| {
+                self.tree.dirty(self.id, a, b)
+            });
         }
-        match found {
-            Some((_, seen)) if seen.stale => None,
-            Some((_, seen)) => Some(seen.node.as_ref().and_then(|n| n.last.clone())),
-            None => Some(None),
+        let w = self.tree.window(i64::MIN, qa);
+        let live: Vec<&Part> = w.live.iter().map(|p| &**p).collect();
+        let vis = visible_entries(&w.root, &live, u64::from(self.id)).ok()?;
+        told(&w.root, &vis, qa, |a, b| self.tree.dirty(self.id, a, b))
+    }
+}
+
+/// The last reading before `qa` from the nearest node before it, when every quarter-hour between is covered and
+/// clean; with no node before, no reading when the covered range reaches back to the first quarter-hour.
+fn told(
+    root: &Root,
+    vis: &BTreeMap<(u8, i64), &Entry>,
+    qa: i64,
+    dirty: impl Fn(i64, i64) -> bool,
+) -> Option<Option<Reading>> {
+    let found = vis.range((LEVEL, i64::MIN)..(LEVEL, qa)).next_back();
+    let from = match found {
+        Some(((_, start), _)) => *start,
+        None => {
+            let c = root
+                .covered
+                .iter()
+                .find(|c| c.level == LEVEL && c.from < qa && qa <= c.to)?;
+            (c.from <= ceil_q(i64::MIN)).then_some(c.from)?
         }
+    };
+    if !covered(root, LEVEL, from, qa) || dirty(from, qa) {
+        return None;
+    }
+    match found {
+        Some((_, seen)) if seen.stale => None,
+        Some((_, seen)) => Some(seen.node.as_ref().and_then(|n| n.last.clone())),
+        None => Some(None),
+    }
+}
+
+/// Pushes a stored piece; empty nodes side by side are one empty piece, as the empty node is the merge's identity.
+fn push_stored<'w>(out: &mut Vec<Piece<'w>>, node: Option<&'w kt::Node>, s: i64, e: i64) {
+    match (out.last_mut(), node) {
+        (Some(Piece::Stored(None, _, end)), None) if *end == s => *end = e,
+        _ => out.push(Piece::Stored(node, s, e)),
     }
 }
 

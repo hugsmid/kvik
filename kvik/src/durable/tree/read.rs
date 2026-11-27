@@ -59,9 +59,12 @@ pub(crate) struct Window {
 }
 
 impl TreeAt {
-    /// The tree over the UTC days that hold `[from, to)`.
+    /// The tree over the UTC days that hold `[from, to)`; from the first instant when `from` is `i64::MIN`.
     pub(crate) fn window(&self, from: i64, to: i64) -> Window {
-        let from = from - from.rem_euclid(DAY);
+        let from = match from {
+            i64::MIN => i64::MIN,
+            f => f - f.rem_euclid(DAY),
+        };
         let to = to.saturating_add(DAY - 1);
         let to = to - to.rem_euclid(DAY);
         let mut p = lock(&self.parts);

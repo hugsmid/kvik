@@ -492,6 +492,72 @@ fn a_second_process_reads_through_merges_and_roll_ups_and_equals_the_fact_path()
     assert_eq!(other.tree_counts().damaged, 0);
 }
 
+#[test]
+fn a_reader_whose_cut_moves_takes_readings_since_its_last_read_as_dirty() {
+    let mut rig = Rig::new("moving-cut");
+    let first: Vec<(i64, u8)> = (0..1_500i64)
+        .map(|k| (k * 97 * S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    rig.checkpoint();
+    assert!(assert_t7(&rig, &ranges(rig.now())) > 0);
+    let late: Vec<(i64, u8)> = (0..40i64)
+        .map(|k| (2 * HOUR + k * 1_777 * S, 200))
+        .collect();
+    rig.emit(Intent::Normal, &late);
+    assert_t7(&rig, &ranges(rig.now()));
+}
+
+#[test]
+fn a_roll_up_with_a_dirty_or_uncovered_quarter_hour_serves_its_clean_ones_and_equals_the_fact_path()
+{
+    let mut rig = Rig::new("rollup-dirty");
+    let first: Vec<(i64, u8)> = (0..3_000i64)
+        .map(|k| (k * 71 * S, (k % 251) as u8))
+        .collect();
+    history(&mut rig, &first, &[], true);
+    rig.checkpoint();
+    let params = rig.node_params();
+    let now = rig.now();
+    rig.w.shutdown().unwrap();
+    assert!(rig.merge_all(&params, now + 30 * 24 * HOUR) > 0);
+    // A quarter-hour of a rolled-up day not covered at 15 minutes, its day and two hours still covered.
+    let day = (now - 30 * HOUR) - (now - 30 * HOUR).rem_euclid(24 * HOUR);
+    let hole = day + 10 * HOUR + 15 * MIN;
+    let mut covered = Vec::new();
+    for c in rig.newest_root().covered {
+        if c.level == 2 && c.from <= hole && hole < c.to {
+            covered.push(Covered { to: hole, ..c });
+            covered.push(Covered {
+                from: hole + 15 * MIN,
+                ..c
+            });
+        } else {
+            covered.push(c);
+        }
+    }
+    rig.narrow(covered);
+    rig.w = open(&rig.fs, &rig.clock, &rig.dir);
+    let mut env = crate::env::Env::test(rig.clock.clone());
+    env.fs = Arc::new(rig.fs.clone());
+    env.background_timers = false;
+    let hour = Duration::from_secs(3_600);
+    let other = Arc::new(DurableReader::open(&rig.dir, &env, hour, hour).unwrap());
+    // Readings in the stretch inside that day, not in the hole.
+    rig.emit(
+        Intent::Normal,
+        &[
+            (now - (day + 3 * HOUR + 7 * S), 9),
+            (now - (day + 17 * HOUR), 231),
+        ],
+    );
+    let range = [
+        (day - 24 * HOUR, day + 48 * HOUR),
+        (day + 7 * MIN, day + 24 * HOUR - 3 * S),
+    ];
+    assert!(assert_t7_on(&other, &rig, &range) > 0);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
