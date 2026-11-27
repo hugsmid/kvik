@@ -176,12 +176,18 @@ impl Deliverer {
             .unwrap_or_default()
     }
 
-    /// A core for `name` with its gates in force started at the head by the seed rule (cond2 design §3.3, reseed).
-    fn reseeded(&mut self, name: &str, ctx: &Ctx<'_>) -> Option<GateRun> {
+    /// A core for `name` with its gates in force started at `at`, committed at `commit`, by the seed rule (cond2
+    /// design §3.3, reseed).
+    fn reseeded(
+        &mut self,
+        name: &str,
+        at: LogPos,
+        commit: Nanos,
+        ctx: &Ctx<'_>,
+    ) -> Option<GateRun> {
         let gates = self.gates_in_force(name);
         let mut core = Core::new();
-        let at = core_pos(self.head);
-        let r = core.reseed(&gates, at, self.last_commit_time, &self.history(ctx));
+        let r = core.reseed(&gates, core_pos(at), commit, &self.history(ctx));
         if r.is_err() {
             self.stats.gate_errors += 1;
             core = Core::new();
@@ -239,7 +245,7 @@ impl Deliverer {
             .get(name)
             .is_some_and(|r| !r.gates.is_empty());
         if in_force && !has {
-            let run = self.reseeded(name, ctx);
+            let run = self.reseeded(name, self.head, self.last_commit_time, ctx);
             if let Some(rt) = self.consumers.get_mut(name) {
                 rt.gates = run;
             }
@@ -295,7 +301,7 @@ impl Deliverer {
             };
             #[cfg(test)]
             let fail = self.gate_fail_at == Some(p);
-            self.gate_call(&name, ctx, |core, h| {
+            self.gate_call(&name, (p, commit), ctx, |core, h| {
                 #[cfg(test)]
                 if fail {
                     return Err(crate::gates::CoreError::Id(ConditionId(u32::MAX)));
@@ -320,7 +326,8 @@ impl Deliverer {
         self.gate_floor = Some(f);
         let names = self.gate_names();
         for name in names {
-            self.gate_call(&name, ctx, |core, _| Ok(core.advance(f)));
+            let at = (self.head, self.last_commit_time);
+            self.gate_call(&name, at, ctx, |core, _| Ok(core.advance(f)));
         }
     }
 
@@ -351,11 +358,13 @@ impl Deliverer {
             .collect()
     }
 
-    /// Runs one core call for `name` and queues what it emits. A failed call rebuilds the core by a reseed at the
-    /// head (Q-1881): what it would have emitted is lost, counted.
+    /// Runs one core call for `name` on the item at `at.0` (committed at `at.1`), or the head for a timer, and
+    /// queues what it emits. A failed call rebuilds the core by a reseed there (Q-1881): what it would have emitted
+    /// is lost, counted; the item's deliveries are already queued, so the catch-up starts after it.
     fn gate_call(
         &mut self,
         name: &str,
+        at: (LogPos, Nanos),
         ctx: &Ctx<'_>,
         f: impl FnOnce(
             &mut Core,
@@ -378,7 +387,7 @@ impl Deliverer {
             }
             Err(_) => {
                 self.stats.gate_errors += 1;
-                let mut fresh = self.reseeded(name, ctx).expect("a run");
+                let mut fresh = self.reseeded(name, at.0, at.1, ctx).expect("a run");
                 fresh.seen = run.seen;
                 fresh.names.extend(run.names);
                 fresh.outstanding = run.outstanding;
@@ -389,7 +398,7 @@ impl Deliverer {
                 fresh.failed = true;
                 if let Some(rt) = self.consumers.get_mut(name) {
                     rt.gates = Some(fresh);
-                    rt.behind.get_or_insert(next(self.head));
+                    rt.behind.get_or_insert(next(at.0));
                 }
             }
         }
