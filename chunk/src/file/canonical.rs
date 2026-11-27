@@ -541,6 +541,10 @@ mod tests {
     /// A revision file of one series of `f64` ninths, whose value columns are compressed XOR (C.9): a full chunk, a
     /// set-aside chunk that sorts after its first time, and a chunk of the rest.
     fn aside_then_ninths(bodies: Vec<Vec<u8>>) -> (Vec<u8>, Identity) {
+        aside_then_ninths_reaching(bodies, Reach::Point)
+    }
+
+    fn aside_then_ninths_reaching(bodies: Vec<Vec<u8>>, reach: Reach) -> (Vec<u8>, Identity) {
         let (aside, n) = (4_000u64, super::super::CHUNK_ROWS as u64 + 6_000);
         let id = Identity {
             store_id: [5; 16],
@@ -582,7 +586,7 @@ mod tests {
         w.series(Series {
             series_id: 1,
             name: Some("s".into()),
-            reach: Reach::Point,
+            reach,
             facts: (aside..aside + n)
                 .map(|i| Fact::value(1, (1, i), 1_000_000 + (i - aside) as i64, f64_, ninth(i)))
                 .collect(),
@@ -703,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn a_check_whose_reads_each_wait_once_reaches_the_verdict_of_one_that_never_waits() {
+    fn a_check_whose_reads_each_wait_once_compares_every_byte_and_reaches_the_plain_verdict() {
         let (canonical, id) = aside_then_ninths(Vec::new());
         let (bodies, _) = plain_xor_bodies(&canonical, &id);
         let (own, _) = aside_then_ninths(bodies);
@@ -714,12 +718,26 @@ mod tests {
             name: Some("s".into()),
             reach: Reach::Point,
         };
-        for bytes in [&canonical, &own, &damaged] {
+        let (reaching, _) = aside_then_ninths_reaching(Vec::new(), Reach::Fixed(1));
+        for (bytes, most_wait) in [
+            (&canonical, true),
+            (&own, true),
+            (&damaged, true),
+            (&reaching, false),
+        ] {
             let plain = check_canonical(bytes, &id, &info).map_err(|e| e.to_string());
             let (shy, waited) = shy_check(bytes, &id);
             assert_eq!(shy, plain);
-            assert!(waited > 60, "{waited} steps waited");
+            assert!(
+                waited > if most_wait { 60 } else { 0 },
+                "{waited} steps waited"
+            );
         }
         assert!(check_canonical(&damaged, &id, &info).is_err());
+        CompactedFile::open(reaching.as_slice(), &id, None).unwrap();
+        match check_canonical(&reaching, &id, &info) {
+            Err(CanonicalError::Bytes(at)) => assert!(at < reaching.len() as u64, "{at}"),
+            r => panic!("{r:?}"),
+        }
     }
 }
