@@ -872,8 +872,21 @@ impl RWorld {
                 seen.losses.insert(key, (l.first, l.last));
             }
         }
+        // A loss folded into a lower identity stays listed as one it absorbed (§8 Acknowledging a loss, Q-1108).
+        let absorbed: BTreeSet<_> = losses
+            .iter()
+            .flat_map(|l| {
+                l.absorbed
+                    .iter()
+                    .map(move |i| (*i, l.kind == LossKind::PossibleLoss))
+            })
+            .collect();
         for key in seen.losses.keys().filter(|_| self.checks.inv27) {
-            prop_assert!(keys.contains(key), "loss {:?} no longer listed", key);
+            prop_assert!(
+                keys.contains(key) || absorbed.contains(key),
+                "loss {:?} no longer listed",
+                key
+            );
         }
         seen.possible = seen.possible.max(
             losses
