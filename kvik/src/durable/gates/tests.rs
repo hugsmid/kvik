@@ -580,7 +580,6 @@ fn a_reseed_reads_a_series_from_the_log_once_for_all_its_gates() {
 const DAY_SECS: i64 = 86_400;
 
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
     /// Q-2001: over histories spanning months, with backfills, future facts and bad facts, the bounded reads answer
     /// as the whole series does.
@@ -595,14 +594,17 @@ proptest::proptest! {
         let (w, _config, clock) = open_clocked("gates-bounded-history");
         let s = gauge(&w, "hall/air/humidity");
         w.take_consumer("c", Start::Now, &Select::None).unwrap();
+        let mut last_t = clock.wall().0;
         for (advance, t_days, v, q) in facts {
             clock.advance(Duration::from_secs((advance * 7 * DAY_SECS) as u64 + 1));
-            // Mostly now; else backfilled up to 40 days or a day ahead.
+            // Mostly now; else a replacement at the last fact's `t`, backfilled up to 40 days, or a day ahead.
             let t = match t_days {
+                -1 => last_t,
                 d if d >= 0 => clock.wall().0 + d * DAY_SECS * 1_000_000_000 / 2,
                 d if d > -10 => clock.wall().0,
                 d => clock.wall().0 + d * DAY_SECS * 1_000_000_000,
             };
+            last_t = t;
             let quality = if q == 0 { crate::types::Quality::Bad } else { crate::types::Quality::Good };
             emit_all(
                 &w,

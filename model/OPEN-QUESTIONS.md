@@ -230,7 +230,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-2250 | §4.3 held snapshot; G5 | When a run takes the snapshot that becomes `held`: only with nothing outstanding and nothing deferred (decided by the lead, provisional; settle with cond2 step 5) |
 | Q-2251 | §6 Gates, Resume; Q-2003 | Deferred transitions older than a dropped one, delivered after the resync that ended the quiet (decided by the lead, provisional; settle with cond2 step 5) |
 | Q-2270 | §6 Gates, Resume; Q-1396, Q-2002 | The checkpoint while a quiet catch-up ends with a resync (decided at merge) |
-| Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (open, for the lead) |
+| Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (ruled by the lead: built with step 6, Q-2295) |
+| Q-2295 | §6 Gates; Q-1880, Q-2001, Q-2271 | How the durable gate history read is bounded: event-time windows and when they answer exactly |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5484,8 +5485,8 @@ decision scanned the whole log per read, twice per gate at every reseed, under t
 (`format.md` A.8; a segment without one is scanned) and judges them by the double's own rules (`Replay`), so the two
 cannot differ; the gate differential checks it end to end. One read per series and position serves a whole core
 call, so a reseed reads each watched series once for all its gates. A read that cannot read every place that may
-hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; still
-unbounded in time. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
+hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; bounded in
+time by Q-2295. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
 summaries) is a merge condition on cond2 step 5, which builds it with replay.
 **Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`;
 `kvik/src/durable/gates/tests.rs` `a_reseed_reads_a_series_from_the_log_once_for_all_its_gates`.
@@ -5761,6 +5762,27 @@ with the series' state there from the summaries) a merge condition on step 5. St
 `conditions.replay_max`, but each history read still takes all of a series' facts at or before its position.
 **Default (provisional).** Merge step 5 without it; the bounded read lands with step 6, measured in its bench notes;
 Q-2001 keeps its text until then.
+**Ruling.** The lead: build it with step 6. Built as Q-2295.
+
+## Q-2295 — How the durable gate history read is bounded
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** Q-2001's reads took every fact of a series at or before their position, so a reseed or a watch on a
+series with years of history read all of it. The design's bound (positions from `commit_at(T − 2L)`, the state there
+from the summaries) needs a per-series state at a position that the summaries do not keep.
+**Decision (provisional).** A read takes the series' facts with `t` from whole days before the time asked about,
+through the segment indexes bounded to positions at or below the read's: 1 day (covers the longest look-back), then
+16, then 256, then the whole series. A window answers only where the facts it omits (all with `t` before it) cannot
+change the answer: the series' state needs a usable fact in effect then inside the window and a last arrival not
+in the window (any is above every omitted one); the look-back's start needs a usable fact in effect then; the
+facts since a time need the window's first commit before it (the seed asks for them after the look-back's start,
+whose answer needs that already). A window is
+refused when a fact before it was committed after its first (a backfill it cannot see, found by a position-bounded
+probe that keeps no facts); one with nothing before it is the whole series. So the answers equal the whole series'
+(Q-1880's rules unchanged), and a series reporting at least daily is read for a day, not its history. A series quiet
+for longer than the windows, or with backfills older than them, is still read whole.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`bounded_history_reads_answer_as_the_whole_series_does` (property: months of history, backfills, future and bad
+facts) and `a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history`.
 
 ## Open at v0.2
 
@@ -6014,7 +6036,8 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-2173 | cond2 review | Decided by the builder, provisional: recomputed at restore from the names in force |
 | Q-2220 | cond2 review | Decided in the fix round: every gate confirmation written at once |
 | Q-2270 | cond2 review | Decided at merge: the highest dropped id holds the checkpoint until the gate cursor covers it |
-| Q-2271 | cond2 step 6 | Open, for the lead: step 5 merges without the bounded read; it lands with step 6 |
+| Q-2271 | cond2 step 6 | Ruled by the lead: built with step 6 (Q-2295) |
+| Q-2295 | cond2 step 6 | Decided by the builder, provisional: event-time windows of 1, 16, 256 days, exact or widened |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

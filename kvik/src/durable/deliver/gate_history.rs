@@ -77,7 +77,6 @@ const WINDOWS: [i64; 3] = [1, 16, 256];
 /// The series' facts with `t` at or after `lo`, the commit time of the first of them, and whether they are all it has.
 struct Window {
     replay: Replay,
-    lo: Nanos,
     first_commit: Nanos,
     whole: bool,
 }
@@ -143,7 +142,6 @@ impl<'a> LogHistory<'a> {
             }
             Rc::new(Window {
                 replay,
-                lo,
                 first_commit: facts.first().map_or(i64::MIN, |f| f.received_at),
                 whole,
             })
@@ -152,26 +150,6 @@ impl<'a> LogHistory<'a> {
             .borrow_mut()
             .insert((series, through, lo), w.clone());
         Ok(w)
-    }
-
-    /// Whether a fact with `t` before `lo` may have been committed at or after `from`.
-    fn before_committed_from(
-        &self,
-        series: SeriesId,
-        through: Position,
-        lo: Nanos,
-        from: Nanos,
-    ) -> bool {
-        let Some(mut reader) = self.d.local() else {
-            return true;
-        };
-        let above = self.d.index.commit_at(from.saturating_sub(1));
-        OnLog {
-            reader: &mut reader,
-            lost: &self.d.damaged,
-            latch: &self.d.latch,
-        }
-        .any(series.0, i64::MIN, lo - 1, above, log_pos(through))
     }
 
     /// The first window before `x` whose facts answer exactly (`exact`), else the whole series.
@@ -239,8 +217,8 @@ impl Deliverer {
 
 // What a window omits is facts with `t` before `lo`, each committed at or before its first fact (else no window).
 // They change no answer about a time at or after `lo` once the window holds a usable fact in effect then; nor the
-// last arrival once the window's is at or after both `lo` and its first commit; nor the facts committed from a
-// time after its first commit, or after which none of them was committed.
+// last arrival once the window has one; nor the facts committed from a
+// time after its first commit (the seed asks for those after the look-back's start, which needs one anyway).
 impl History for LogHistory<'_> {
     fn series(
         &self,
@@ -253,12 +231,8 @@ impl History for LogHistory<'_> {
             through,
             now,
             |r| r.series(series, now, through),
-            |st, w| {
-                st.live.is_some()
-                    && st
-                        .last_arrival
-                        .is_some_and(|a| a >= w.lo && a >= w.first_commit)
-            },
+            // Every arrival in the window is at or after its `lo` and its first commit, so above any it omits.
+            |st, _| st.live.is_some() && st.last_arrival.is_some(),
         )
     }
 
@@ -288,9 +262,7 @@ impl History for LogHistory<'_> {
             through,
             from,
             |r| r.facts_since(series, from, through),
-            |_, w| {
-                w.first_commit < from || !self.before_committed_from(series, through, w.lo, from)
-            },
+            |_, w| w.first_commit < from,
         )
     }
 
