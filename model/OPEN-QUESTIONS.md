@@ -202,6 +202,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1850 | `format.md` A.14 `0x21`; compaction design §2, §3.4; Q-792 | Publish record field 3, the layout, and records without it (provisional) |
 | Q-1851 | compaction design §3.5; `spec.md` §7 Manifest step 2 | The rebuild's verdict on outputs no valid record names (provisional) |
 | Q-1852 | compaction design §3.4, §3.5 | A merge's counts after a rebuild restates a retirement without its layout (provisional) |
+| Q-1853 | compaction design §5, §6 (6.3e); `api.md` Threads; Q-1531 | Publish built over the manifest's writer, not yet started by the running store (provisional) |
+| Q-1854 | compaction design §3.5 | The rebuild's verifier compacts the inputs again (provisional) |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -5326,6 +5328,18 @@ Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
 **Scenario.** A run's publish record is corrupt and a later merge, whose record is valid, retired the run's files. The rebuild restates the retirement from the merge record, which carries no layout of a retired file, so rule 3 cannot compare the merge's counts with its inputs'.
 **Decision (provisional).** The rule is undecided, naming the inputs; the catalogue holds runs, merges, removals and releases until a copy of the corrupt record is supplied (§3.4). C(g) still follows the retired files' inputs. *Alternative:* read the retired files' layouts from the files where they are still local. Reason: the hold is what §3.4 prescribes for an undecidable check, and merges, which make the case reachable, are roadmap 6.2c.
 **Pinned by.** `files/tests/compaction_rule.rs` `a_corrupt_record_rebuilt_at_any_epoch_keeps_the_rule_and_c_g`.
+
+## Q-1853 — Publish built over the manifest's writer, not yet started by the running store
+Decided with roadmap 6.3e, provisional. To be settled by the roadmap item that gives the running store its manifest writer.
+**Scenario.** 6.3e wires compaction into `kvik-maint` with C(E) cached in the log directory's root and the upload driver's additions. The running store does not write the manifest yet: `StartOptions::recorder` and `sealed` are refused until roadmap 6.3c, nothing appends sealed-segment records, so the planner, which takes only listed segments, never has a run to make.
+**Decision (provisional).** Publish, the start's clean-up of `data/` and the rebuild's verdict are built over `kvik_files::appender::Appender` and tested on the in-memory file system at every file operation (`kvik/src/durable/compact/publish.rs`). The maintenance thread is unchanged; the task, C(E) in the root, the upload driver's additions and the removal of retired inputs (none exist before merges, roadmap 6.2c) come with the item that starts the store's manifest writer. Readers ignore chunks until roadmap 6.2b1, so a cut answers the same before and after a publish by construction. Reason: wiring a task that can never plan a run adds a maintenance-thread change with nothing to test.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1854 — The rebuild's verifier compacts the inputs again
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5's rebuild judges a set of outputs no valid record names against their inputs with the checks of §3.2, which a run makes as it reads its inputs.
+**Decision (provisional).** The verifier compacts the run's input segments again into `.tmp` files, with the run's generation, run id (its first `file_id`) and the `created_at` read from a found output, then compares each found output's SHA-256 with that of the file of the same identity, and removes what it wrote. A found file that differs, or has no counterpart, fails the run; matching files fewer than the run made cannot be judged; an input that is not local, a merge's outputs or a run that stalls cannot be judged either. Reason: a run is deterministic (Q-1535), so equality of bytes is every check of §3.2 at once; a run made under a later week rule or registry fails and is discarded only when its inputs are local, so their positions are compacted again and nothing is lost.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_set_of_outputs_is_judged_against_its_inputs_by_compacting_them_again`, `a_corrupt_run_record_whose_outputs_fail_against_local_inputs_discards_them`.
 
 ## Open at v0.2
 

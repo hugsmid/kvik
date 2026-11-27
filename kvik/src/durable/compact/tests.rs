@@ -1,4 +1,5 @@
 mod plan;
+mod publish;
 mod run;
 mod task;
 mod verify;

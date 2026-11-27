@@ -16,7 +16,8 @@
 
 mod by_id;
 mod clock;
-// Wired into the maintenance loop with publishing (roadmap 6.3e); until then only its tests call it.
+// Wired into the maintenance loop once the running store writes the manifest (Q-1853); until then only its tests
+// call it.
 #[cfg_attr(not(test), allow(dead_code))]
 mod compact;
 mod completion;
