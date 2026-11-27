@@ -851,7 +851,7 @@ impl Background for RunTask<'static> {
                     Next::Cpu
                 }
             }
-            Stage::Verify(c) => Next::Device(c.next_bytes()),
+            Stage::Verify(c) => c.next_bytes().map_or(Next::Cpu, Next::Device),
             Stage::Done => Next::Idle,
             Stage::Census { .. } => Next::Cpu,
         }

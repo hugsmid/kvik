@@ -56,15 +56,19 @@ pub fn check_canonical(
 
 /// The canonical checks a data block at a time (Q-811): the file is read through a [`ReadAt`] series by series and
 /// written again into a sink that compares as it goes, holding a series' set-aside facts, one block and a bit per
-/// position.
+/// position. Each step makes its reads before it changes anything, so a step whose read fails with
+/// [`std::io::ErrorKind::WouldBlock`] can be taken again; the sink keeps what it could not yet compare until the next
+/// step.
 pub struct CanonicalCheck<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> {
     file: CompactedFile<S>,
     writer: Option<FileWriter<Compare<S>>>,
     registry: Option<R>,
-    /// Chunks in file order; directories are read as their chunk is reached.
+    /// Chunks in file order once read; directories are read as their chunk is reached.
     order: Vec<IndexEntry>,
     batches: Vec<Batch>,
     held: Vec<Vec<u64>>,
+    /// The next index and commit-times block to read, until the writer starts.
+    opening: Option<(usize, usize)>,
     /// The next chunk and data block.
     at: (usize, usize),
     /// The number of the next chunk's first data block, in write order.
@@ -74,44 +78,49 @@ pub struct CanonicalCheck<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> {
     series_end: Option<usize>,
     /// Blocks of the open series' set-aside chunks, read when it opened, by chunk.
     aside_blocks: Vec<(usize, usize)>,
+    end: End,
+}
+
+/// What is left once every chunk is checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    Entries,
+    Tail,
+    Verdict,
 }
 
 impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
-    /// Opens the file through the reader's checks and starts the writer.
+    /// Opens the file through the reader's checks; the index and commit times are read a block a step.
     pub fn new(src: S, id: &Identity, registry: R) -> Result<Self, CanonicalError> {
-        let file = CompactedFile::open(src.clone(), id, None)?;
-        let mut order = file.index()?;
-        order.sort_unstable_by_key(|e| e.chunk_offset);
-        let batches = file.batches()?;
-        let compare = Compare {
-            source: src,
-            at: 0,
-            first_difference: None,
-            window: Vec::new(),
-            window_at: 0,
-        };
-        let mut writer = FileWriter::new(
-            compare,
-            *id,
-            file.header().created_at,
-            file.description(),
-            batches.clone(),
-        )?;
-        writer.reserve_index(order.len());
-        let held = vec![Vec::new(); batches.len()];
-        Ok(Self {
+        Ok(Self::from_file(
+            CompactedFile::open(src, id, None)?,
+            registry,
+        ))
+    }
+
+    /// [`Self::new`] for a file the caller has opened.
+    pub fn from_file(file: CompactedFile<S>, registry: R) -> Self {
+        let order = Vec::with_capacity(file.listed_entries());
+        Self {
             file,
-            writer: Some(writer),
+            writer: None,
             registry: Some(registry),
             order,
-            batches,
-            held,
+            batches: Vec::new(),
+            held: Vec::new(),
+            opening: Some((0, 0)),
             at: (0, 0),
             next_block: 0,
             dir: None,
             series_end: None,
             aside_blocks: Vec::new(),
-        })
+            end: End::Entries,
+        }
+    }
+
+    /// The file and its index in file order, for a caller that reads the file again after the check.
+    pub fn into_parts(self) -> (CompactedFile<S>, Vec<IndexEntry>) {
+        (self.file, self.order)
     }
 
     /// The file's index in file order, for a caller that reads the file again after the check.
@@ -119,11 +128,15 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
         self.order
     }
 
-    /// Bytes it holds besides the file's blocks: its index, the writer's and the position bits.
+    /// Bytes it holds besides the file's blocks: its index, the writer's, the position bits and what the sink has
+    /// yet to compare.
     pub fn held_bytes(&self) -> u64 {
         let entry = std::mem::size_of::<IndexEntry>() as u64;
         self.order.capacity() as u64 * entry
-            + self.writer.as_ref().map_or(0, FileWriter::held_bytes)
+            + self
+                .writer
+                .as_ref()
+                .map_or(0, |w| w.held_bytes() + w.sink().pending.capacity() as u64)
             + (self.batches.capacity() * std::mem::size_of::<Batch>()) as u64
             + self
                 .held
@@ -142,7 +155,11 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
             .batches
             .partition_point(|b| (b.generation, b.last_sequence) < p);
         let Some(b) = self.batches.get(i).filter(|b| b.holds(p.0, p.1)) else {
-            self.file.batch(p)?;
+            if let Err(e) = self.file.batch(p)
+                && !blocked(&e)
+            {
+                return Err(e.into());
+            }
             return Err(CanonicalError::Positions);
         };
         let k = (p.1 - b.first_sequence) as usize;
@@ -157,7 +174,49 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
         Ok(())
     }
 
-    /// Opens the series of the chunk at `i`: its run of chunks, and its set-aside facts read whole.
+    /// One block of the index or commit times, or the writer's start once both are read.
+    fn open_step(&mut self, (i, t): (usize, usize)) -> Result<(), CanonicalError> {
+        if i < self.file.index_blocks() {
+            let b = self.file.index_block(i)?;
+            self.order.extend(b);
+            self.opening = Some((i + 1, t));
+            return Ok(());
+        }
+        if t < self.file.times_directory().len() {
+            let rows = self.file.times_block(t)?;
+            self.batches.extend_from_slice(rows);
+            self.opening = Some((i, t + 1));
+            return Ok(());
+        }
+        self.order.sort_unstable_by_key(|e| e.chunk_offset);
+        let compare = Compare {
+            source: self.file.source().clone(),
+            at: 0,
+            first_difference: None,
+            pending: Vec::new(),
+        };
+        let h = self.file.header();
+        let id = Identity {
+            store_id: h.store_id,
+            generation: h.generation,
+            file_id: h.file_id,
+        };
+        let mut writer = FileWriter::new(
+            compare,
+            id,
+            h.created_at,
+            self.file.description(),
+            self.batches.clone(),
+        )?;
+        writer.reserve_index(self.order.len());
+        self.held = vec![Vec::new(); self.batches.len()];
+        self.writer = Some(writer);
+        self.opening = None;
+        Ok(())
+    }
+
+    /// Opens the series of the chunk at `i`: its run of chunks, and its set-aside facts read whole, all read before
+    /// any is taken.
     fn open_series(
         &mut self,
         i: usize,
@@ -171,24 +230,33 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
         let last_aside = (i..end)
             .rev()
             .find(|&k| self.order[k].flags & SET_ASIDE != 0);
-        let mut aside = Vec::new();
-        self.aside_blocks.clear();
-        let mut first = self.next_block;
+        let mut read = Vec::new();
         for k in i..last_aside.map_or(i, |k| k + 1) {
             let e = self.order[k];
             let d = self.file.directory(&e)?;
+            let mut blocks = Vec::new();
             if e.flags & SET_ASIDE != 0 {
                 for b in 0..d.blocks.len() {
-                    let (block, body) = self.file.data_block_raw(&e, &d, b)?;
+                    blocks.push(self.file.data_block_raw(&e, &d, b)?);
+                }
+            }
+            read.push((k, d.blocks.len(), e.flags & SET_ASIDE != 0, blocks));
+        }
+        let mut aside = Vec::new();
+        self.aside_blocks.clear();
+        let mut first = self.next_block;
+        for (k, n, set_aside, blocks) in read {
+            if set_aside {
+                for (b, (block, body)) in blocks.into_iter().enumerate() {
                     for f in facts_of(id, &block) {
                         self.hold(f.position)?;
                         aside.push(f);
                     }
                     self.writer().offer_body(first + b, body);
                 }
-                self.aside_blocks.push((k, d.blocks.len()));
+                self.aside_blocks.push((k, n));
             }
-            first += d.blocks.len();
+            first += n;
         }
         let info = registry(id);
         self.writer()
@@ -210,9 +278,16 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
         &mut self,
         registry: &dyn Fn(u32) -> SeriesInfo,
     ) -> Result<bool, CanonicalError> {
+        if let Some(w) = self.writer.as_mut() {
+            w.sink_mut().settle().map_err(FileError::from)?;
+        }
+        if let Some(at) = self.opening {
+            self.open_step(at)?;
+            return Ok(false);
+        }
         let (i, b) = self.at;
         if i == self.order.len() {
-            return self.finish().map(|()| true);
+            return self.finish_step();
         }
         if self.series_end.is_none() {
             self.open_series(i, registry)?;
@@ -223,19 +298,19 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
             if self.dir.is_none() {
                 self.dir = Some(self.file.directory(&e)?);
             }
-            let d = self.dir.take().expect("read above");
-            if b < d.blocks.len() {
-                let (block, body) = self.file.data_block_raw(&e, &d, b)?;
+            let d = self.dir.as_ref().expect("read above");
+            let n = d.blocks.len();
+            if b < n {
+                let (block, body) = self.file.data_block_raw(&e, d, b)?;
                 self.writer().offer_body(first + b, body);
                 for f in facts_of(e.series_id, &block) {
                     self.hold(f.position)?;
                     self.writer().push(f)?;
                 }
-                self.dir = Some(d);
                 self.at.1 += 1;
                 return Ok(false);
             }
-            self.next_block += d.blocks.len();
+            self.next_block += n;
         } else {
             self.next_block += self
                 .aside_blocks
@@ -252,66 +327,101 @@ impl<S: ReadAt + Clone, R: Fn(u32) -> SeriesInfo> CanonicalCheck<S, R> {
         Ok(false)
     }
 
-    fn finish(&mut self) -> Result<(), CanonicalError> {
-        let mut entries = Vec::new();
-        for r in self.file.entries()? {
-            if matches!(r.entry, kvik_log::entries::Entry::Ignored { .. }) {
-                return Err(CanonicalError::Unknown(self.file.ignored()));
+    /// The entries, then the tail an index block a step, then the verdict once the sink has compared every byte.
+    fn finish_step(&mut self) -> Result<bool, CanonicalError> {
+        match self.end {
+            End::Entries => {
+                let rows = self.file.entries()?;
+                let mut entries = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if matches!(r.entry, kvik_log::entries::Entry::Ignored { .. }) {
+                        return Err(CanonicalError::Unknown(self.file.ignored()));
+                    }
+                    self.hold(r.position)?;
+                    entries.push((r.position, r.entry));
+                }
+                if !self.file.ignored().is_empty() {
+                    return Err(CanonicalError::Unknown(self.file.ignored()));
+                }
+                self.writer().entries(&entries)?;
+                self.end = End::Tail;
             }
-            self.hold(r.position)?;
-            entries.push((r.position, r.entry));
+            End::Tail => {
+                if self.writer().finish_step()? {
+                    self.end = End::Verdict;
+                }
+            }
+            End::Verdict => {
+                let len = self.file.source().len();
+                let c = self.writer().sink();
+                return match c.first_difference {
+                    None if c.at == len => Ok(true),
+                    None => Err(CanonicalError::Bytes(c.at.min(len))),
+                    Some(at) => Err(CanonicalError::Bytes(at)),
+                };
+            }
         }
-        if !self.file.ignored().is_empty() {
-            return Err(CanonicalError::Unknown(self.file.ignored()));
-        }
-        let mut w = self.writer.take().expect("finished once");
-        w.entries(&entries)?;
-        let (compare, _) = w.finish()?;
-        let len = self.file.source().len();
-        match compare.first_difference {
-            None if compare.at == len => Ok(()),
-            None => Err(CanonicalError::Bytes(compare.at.min(len))),
-            Some(at) => Err(CanonicalError::Bytes(at)),
-        }
+        Ok(false)
     }
 }
 
-/// Bytes the comparing sink reads from the file at a time.
+fn blocked(e: &FileError) -> bool {
+    matches!(e, FileError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// The most bytes the comparing sink reads from the file at a time.
 const WINDOW: u64 = 128 * 1024;
 
-/// A sink that compares what the writer writes with the file as it is produced, a window at a time.
+/// A sink that compares what the writer writes with the file as it is produced, at most a window a read; bytes it
+/// cannot read yet ([`std::io::ErrorKind::WouldBlock`]) wait in `pending` for [`Compare::settle`].
 struct Compare<S: ReadAt> {
     source: S,
+    /// The offset after the last byte written.
     at: u64,
     first_difference: Option<u64>,
-    window: Vec<u8>,
-    window_at: u64,
+    pending: Vec<u8>,
 }
 
 impl<S: ReadAt> Compare<S> {
-    fn compare(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+    /// Compares `buf` as the bytes at `at`; the number of bytes compared before a read would block.
+    fn compare(&mut self, mut at: u64, buf: &[u8]) -> std::io::Result<usize> {
         let len = self.source.len();
-        let mut at = self.at;
-        while !buf.is_empty() {
+        let mut done = 0;
+        while done < buf.len() && self.first_difference.is_none() {
             if at >= len {
                 self.first_difference = Some(at);
-                return Ok(());
+                break;
             }
-            let end = self.window_at + self.window.len() as u64;
-            if at < self.window_at || at >= end {
-                let n = WINDOW.min(len - at) as usize;
-                self.window = self.source.read_at(at, n)?;
-                self.window_at = at;
-            }
-            let off = (at - self.window_at) as usize;
-            let have = &self.window[off..];
-            let n = have.len().min(buf.len());
-            if let Some(k) = buf[..n].iter().zip(have).position(|(a, b)| a != b) {
+            let n = (buf.len() - done).min(WINDOW.min(len - at) as usize);
+            let have = match self.source.read_at(at, n) {
+                Ok(h) => h,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(done),
+                Err(e) => return Err(e),
+            };
+            if let Some(k) = buf[done..done + n]
+                .iter()
+                .zip(&have)
+                .position(|(a, b)| a != b)
+            {
                 self.first_difference = Some(at + k as u64);
-                return Ok(());
             }
-            buf = &buf[n..];
+            done += n;
             at += n as u64;
+        }
+        Ok(buf.len())
+    }
+
+    /// Compares what waits; [`std::io::ErrorKind::WouldBlock`] while some still cannot be read.
+    fn settle(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let p = std::mem::take(&mut self.pending);
+        let at = self.at - p.len() as u64;
+        let done = self.compare(at, &p)?;
+        if done < p.len() {
+            self.pending = p[done..].to_vec();
+            return Err(std::io::ErrorKind::WouldBlock.into());
         }
         Ok(())
     }
@@ -319,8 +429,11 @@ impl<S: ReadAt> Compare<S> {
 
 impl<S: ReadAt> std::io::Write for Compare<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.first_difference.is_none() {
-            self.compare(buf)?;
+        if self.pending.is_empty() {
+            let done = self.compare(self.at, buf)?;
+            self.pending.extend_from_slice(&buf[done..]);
+        } else {
+            self.pending.extend_from_slice(buf);
         }
         self.at += buf.len() as u64;
         Ok(buf.len())

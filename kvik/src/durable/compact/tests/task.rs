@@ -17,9 +17,9 @@ use super::{
     segments, temp_dir,
 };
 
-type Segments = Vec<(u32, Vec<TestBatch>)>;
+pub(super) type Segments = Vec<(u32, Vec<TestBatch>)>;
 
-fn put_all(dir: &std::path::Path, segs: &[(u32, Vec<TestBatch>)]) -> Vec<Candidate> {
+pub(super) fn put_all(dir: &std::path::Path, segs: &[(u32, Vec<TestBatch>)]) -> Vec<Candidate> {
     segs.iter()
         .enumerate()
         .map(|(i, (g, b))| {
@@ -243,7 +243,7 @@ fn peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes() {
 }
 
 /// The shapes that reach the cap hardest: many series, many series by many days, many batches by many days.
-fn heavy_shapes() -> Vec<(&'static str, Segments)> {
+pub(super) fn heavy_shapes() -> Vec<(&'static str, Segments)> {
     vec![
         (
             "many-series",

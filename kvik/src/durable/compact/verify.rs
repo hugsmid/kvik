@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use kvik_chunk::file::{
     CanonicalCheck, CanonicalError, Class, CompactedFile, Directory, Fact, FileError, Identity,
-    IndexEntry, Input, Layout, Position, ReadAt, SeriesInfo,
+    IndexEntry, Input, Layout, Position, ReadAt, SeriesInfo, TimedFact,
 };
 use kvik_log::fs::{FsFile, OpenMode};
 use sha2::{Digest, Sha256};
@@ -110,7 +110,8 @@ impl Held {
         })
     }
 
-    fn hold(&mut self, p: Position) -> Result<(), VerifyError> {
+    /// The word and bit of `p`, if it is not held yet.
+    fn free(&self, p: Position) -> Result<(usize, u64), VerifyError> {
         let s = self
             .spans
             .iter()
@@ -121,6 +122,11 @@ impl Held {
         if self.bits[w] & b != 0 {
             return Err(VerifyError::Placement("a position held twice"));
         }
+        Ok((w, b))
+    }
+
+    fn hold(&mut self, p: Position) -> Result<(), VerifyError> {
+        let (w, b) = self.free(p)?;
         self.bits[w] |= b;
         Ok(())
     }
@@ -129,23 +135,59 @@ impl Held {
 /// Bytes of a file from an offset.
 type Window = (u64, Vec<u8>);
 
-/// An output read back through windows of at least 128 KiB, shared by its clones: the reader and the canonical
-/// check's comparing sink each keep one, so that a step's header, body and directory reads are mostly one device
-/// read (compaction design §4, Q-1990).
+/// Windows a source keeps between steps.
+const KEPT: usize = 2;
+
+/// The device call this step declared (`None` for CPU only, taken once it is made), and the read that last waited
+/// for the next step to declare it; shared by a check's sources (compaction design §4, Q-1990).
+#[derive(Debug, Default)]
+struct Allowance {
+    left: Mutex<Option<u64>>,
+    wanted: Mutex<Option<u64>>,
+}
+
+type Budget = Arc<Allowance>;
+
+fn would_block() -> io::Error {
+    io::ErrorKind::WouldBlock.into()
+}
+
+impl Allowance {
+    /// Takes the step's call for a read of `n` bytes, or, when none is left or it is declared smaller, records `n`
+    /// for the next step to declare.
+    fn take(&self, n: u64) -> io::Result<()> {
+        let mut left = self.left.lock().expect("not poisoned");
+        if left.is_some_and(|l| n <= l) {
+            *left = None;
+            return Ok(());
+        }
+        *self.wanted.lock().expect("not poisoned") = Some(n);
+        Err(would_block())
+    }
+}
+
+/// An output read back through windows of at least 128 KiB, shared by its clones (the reader and the canonical
+/// check's comparing sink). A read the windows do not cover takes the step's device call, or fails with
+/// `WouldBlock` once it is spent; a step that fails so is taken again, finding what it read in the windows, which
+/// are trimmed to the last [`KEPT`] only after a step that completes.
 #[derive(Clone, Debug)]
 pub(super) struct Src {
     file: Arc<dyn FsFile>,
     len: u64,
-    windows: Arc<Mutex<[Window; 2]>>,
+    budget: Budget,
+    /// Most recently used first.
+    windows: Arc<Mutex<Vec<Window>>>,
 }
 
 impl Src {
-    fn open(input: &RunInput<'_>, w: &Written) -> io::Result<Self> {
+    fn open(input: &RunInput<'_>, w: &Written, budget: &Budget) -> io::Result<Self> {
+        budget.take(0)?;
         let file: Arc<dyn FsFile> = input.fs.open(&w.path, OpenMode::Read)?.into();
         let len = file.len()?;
         Ok(Self {
             file,
             len,
+            budget: budget.clone(),
             windows: Arc::default(),
         })
     }
@@ -154,6 +196,10 @@ impl Src {
     fn held(&self) -> u64 {
         let w = self.windows.lock().expect("not poisoned");
         w.iter().map(|(_, b)| b.capacity() as u64).sum()
+    }
+
+    fn settle(&self) {
+        self.windows.lock().expect("not poisoned").truncate(KEPT);
     }
 }
 
@@ -168,26 +214,30 @@ impl ReadAt for Src {
             .filter(|&e| e <= self.len)
             .ok_or(io::ErrorKind::UnexpectedEof)?;
         let mut w = self.windows.lock().expect("not poisoned");
-        if let Some(i) = w
-            .iter()
-            .position(|(at, b)| *at <= offset && end <= at + b.len() as u64)
-        {
-            w.swap(0, i);
-            let from = (offset - w[0].0) as usize;
-            return Ok(w[0].1[from..from + len].to_vec());
+        let mut out = Vec::with_capacity(len);
+        let mut at = offset;
+        while at < end {
+            if let Some(i) = w
+                .iter()
+                .position(|(s, b)| *s <= at && at < s + b.len() as u64)
+            {
+                let (s, b) = &w[i];
+                let to = end.min(s + b.len() as u64);
+                out.extend_from_slice(&b[(at - s) as usize..(to - s) as usize]);
+                at = to;
+                let used = w.remove(i);
+                w.insert(0, used);
+                continue;
+            }
+            // A read near the end takes the file's last window, which holds its tail, index and commit times.
+            let n = (end - at).max(PIECE as u64).min(self.len);
+            self.budget.take(n)?;
+            let from = at.min(self.len - n);
+            let buf = read_whole(&*self.file, from, n as usize)?;
+            out.extend_from_slice(&buf[(at - from) as usize..(end - from) as usize]);
+            at = end;
+            w.insert(0, (from, buf));
         }
-        if len > 2 * PIECE {
-            drop(w);
-            return read_whole(&*self.file, offset, len);
-        }
-        // A read near the end takes the file's last window, which holds its tail, index and commit times.
-        let n = (len as u64).max(PIECE as u64).min(self.len);
-        let at = offset.min(self.len - n);
-        let buf = read_whole(&*self.file, at, n as usize)?;
-        let from = (offset - at) as usize;
-        let out = buf[from..from + len].to_vec();
-        w.swap(0, 1);
-        w[0] = (at, buf);
         Ok(out)
     }
 }
@@ -210,68 +260,102 @@ type Canon = CanonicalCheck<Src, fn(u32) -> SeriesInfo>;
 
 const PLACED: VerifyError = VerifyError::Placement("a revision row not outranked in the run");
 
+/// Whether a step stopped at a read that must wait for the next step's device call.
+fn blocked(e: &VerifyError) -> bool {
+    let io = match e {
+        VerifyError::Io(e)
+        | VerifyError::Read(FileError::Io(e))
+        | VerifyError::Canonical(CanonicalError::File(FileError::Io(e))) => e,
+        _ => return false,
+    };
+    io.kind() == io::ErrorKind::WouldBlock
+}
+
 /// The current chunks of one series in a file, read a block at a time.
 struct Cursor {
     series: u32,
     file: CompactedFile<Src>,
     chunks: VecDeque<IndexEntry>,
-    dir: Option<(Directory, usize)>,
+    dir: Option<Directory>,
+    block: usize,
     buf: VecDeque<Fact>,
 }
 
 impl Cursor {
-    fn new(file: CompactedFile<Src>, series: u32) -> Result<Self, VerifyError> {
-        let mut chunks: Vec<IndexEntry> = file
+    fn new(file: CompactedFile<Src>) -> Self {
+        Self {
+            series: u32::MAX,
+            file,
+            chunks: VecDeque::new(),
+            dir: None,
+            block: 0,
+            buf: VecDeque::new(),
+        }
+    }
+
+    /// Turns to `series`, reading its index entries.
+    fn turn(&mut self, series: u32) -> Result<(), VerifyError> {
+        let mut chunks: Vec<IndexEntry> = self
+            .file
             .series(series)?
             .into_iter()
             .filter(|e| !e.set_aside())
             .collect();
         chunks.sort_by_key(|e| e.chunk_offset);
-        Ok(Self {
-            series,
-            file,
-            chunks: chunks.into(),
-            dir: None,
-            buf: VecDeque::new(),
-        })
+        self.series = series;
+        self.chunks = chunks.into();
+        self.dir = None;
+        self.block = 0;
+        self.buf.clear();
+        Ok(())
     }
 
-    /// Whether the row of `f`'s key here outranks `f`; calls come in `(t, position)` order. A revision block's step
-    /// reads the current blocks it spans.
-    fn outranks(&mut self, f: &Fact) -> Result<bool, VerifyError> {
-        loop {
-            while self.buf.front().is_some_and(|c| c.t < f.t) {
-                self.buf.pop_front();
-            }
-            if let Some(c) = self.buf.front() {
-                return Ok(c.t == f.t && rank(c) > rank(f));
-            }
-            let Some(e) = self.chunks.front().copied() else {
-                return Ok(false);
-            };
-            if self.dir.is_none() {
-                self.dir = Some((self.file.directory(&e)?, 0));
-            }
-            let (d, i) = self.dir.as_mut().expect("set above");
-            let rows = self.file.read_block(&e, d, *i)?;
-            self.buf.extend(rows.into_iter().map(|r| r.fact));
-            *i += 1;
-            if *i == d.blocks.len() {
-                self.chunks.pop_front();
-                self.dir = None;
-            }
+    /// Whether the row of `f`'s key here outranks `f`, or `None` until its next block is read; calls come in
+    /// `(t, position)` order.
+    fn outranks(&mut self, f: &Fact) -> Option<bool> {
+        while self.buf.front().is_some_and(|c| c.t < f.t) {
+            self.buf.pop_front();
         }
+        match self.buf.front() {
+            Some(c) => Some(c.t == f.t && rank(c) > rank(f)),
+            None if self.chunks.is_empty() => Some(false),
+            None => None,
+        }
+    }
+
+    /// Reads its next directory or block.
+    fn read(&mut self) -> Result<(), VerifyError> {
+        let e = *self.chunks.front().expect("a block to read");
+        let Some(d) = &self.dir else {
+            self.dir = Some(self.file.directory(&e)?);
+            return Ok(());
+        };
+        let rows = self.file.read_block(&e, d, self.block)?;
+        self.buf.extend(rows.into_iter().map(|r| r.fact));
+        self.block += 1;
+        if self.block == d.blocks.len() {
+            self.chunks.pop_front();
+            self.dir = None;
+            self.block = 0;
+        }
+        Ok(())
     }
 }
 
 enum Phase {
     Open,
+    Opening(Src),
     Canon(Box<Canon>),
     Content {
         file: Box<CompactedFile<Src>>,
         order: Vec<IndexEntry>,
         at: (usize, usize),
-        dir: Option<Directory>,
+        dir: Option<Box<Directory>>,
+        /// The rows of the block read last, not yet checked, and its index entry.
+        rows: VecDeque<TimedFact>,
+        entry: Option<Box<IndexEntry>>,
+        /// The current file of the period, for a revision file's rows: its source, then a cursor over it.
+        top: Option<Src>,
         current: Option<Box<Cursor>>,
     },
     Hash {
@@ -287,6 +371,7 @@ pub(super) struct Check {
     held: Option<Held>,
     j: usize,
     phase: Phase,
+    budget: Budget,
     /// The open files' sources, for their windows' bytes.
     reading: Vec<Src>,
     positions: u64,
@@ -302,6 +387,7 @@ impl Check {
             held: Held::new(ranges),
             j: 0,
             phase: Phase::Open,
+            budget: Budget::default(),
             reading: Vec::new(),
             positions: 0,
             entries: 0,
@@ -314,8 +400,8 @@ impl Check {
         &self.files
     }
 
-    /// Bytes it holds: the open file's index, the position bits and a block of each of two files; the sums and counts
-    /// it takes from are the census's.
+    /// Bytes it holds: the open file's index, the position bits, the sources' windows and a block of each of two
+    /// files; the sums and counts it takes from are the census's.
     pub(super) fn held(&self) -> u64 {
         let index = match &self.phase {
             Phase::Content { order, .. } => {
@@ -332,17 +418,38 @@ impl Check {
         index + bits as u64 + windows + 2 * PIECE as u64
     }
 
-    /// The size of the next step's device call.
-    pub(super) fn next_bytes(&self) -> u64 {
+    /// The next step's device call, `None` for CPU only: a step reads from its windows until a read waits, and the
+    /// next step declares that read.
+    pub(super) fn next_bytes(&self) -> Option<u64> {
         match &self.phase {
-            Phase::Hash { src, at, .. } => (src.len - at).min(PIECE as u64),
-            _ => PIECE as u64,
+            Phase::Hash { src, .. } => Some(src.len.min(PIECE as u64)),
+            _ => *self.budget.wanted.lock().expect("not poisoned"),
         }
     }
 
-    /// One step; the verified outputs once every check has passed. Each row is taken off `expect`'s sums and counts,
-    /// which end at zero when the outputs hold what the inputs promised.
+    /// One step, at most one device call; the verified outputs once every check has passed. Each row is taken off
+    /// `expect`'s sums and counts, which end at zero when the outputs hold what the inputs promised.
     pub(super) fn step(
+        &mut self,
+        input: &RunInput<'_>,
+        expect: &mut Expect,
+        infos: &dyn Fn(u32, Position) -> SeriesInfo,
+    ) -> Result<Option<Vec<Output>>, VerifyError> {
+        *self.budget.left.lock().expect("not poisoned") = self.next_bytes();
+        *self.budget.wanted.lock().expect("not poisoned") = None;
+        match self.step_once(input, expect, infos) {
+            Err(e) if blocked(&e) => Ok(None),
+            r => {
+                for s in &self.reading {
+                    s.settle();
+                }
+                r
+            }
+        }
+    }
+
+    /// A step that reads before it changes anything, so that one stopped by `WouldBlock` is taken again.
+    fn step_once(
         &mut self,
         input: &RunInput<'_>,
         expect: &mut Expect,
@@ -357,8 +464,11 @@ impl Check {
         };
         match &mut self.phase {
             Phase::Open => {
-                let src = Src::open(input, &w)?;
+                let src = Src::open(input, &w, &self.budget)?;
                 self.reading = vec![src.clone()];
+                self.phase = Phase::Opening(src);
+            }
+            Phase::Opening(src) => {
                 let file = CompactedFile::open(src.clone(), &w.id, Some(&w.layout))?;
                 let d = file.description();
                 if d.inputs != expect.names {
@@ -370,24 +480,23 @@ impl Check {
                 if d.run_count as usize != self.files.len() {
                     return Err(VerifyError::Description("run count"));
                 }
-                drop(file);
                 let lent: fn(u32) -> SeriesInfo = |_| unreachable!("lent to each step");
-                self.phase = Phase::Canon(Box::new(CanonicalCheck::new(src, &w.id, lent)?));
+                self.phase = Phase::Canon(Box::new(CanonicalCheck::from_file(file, lent)));
             }
             Phase::Canon(c) => {
                 if c.step_with(&|s| infos(s, w.greatest))? {
                     let Phase::Canon(c) = std::mem::replace(&mut self.phase, Phase::Open) else {
                         unreachable!("in the canonical phase")
                     };
-                    let order = c.into_order();
-                    let src = Src::open(input, &w)?;
-                    self.reading = vec![src.clone()];
-                    let file = CompactedFile::open(src, &w.id, Some(&w.layout))?;
+                    let (file, order) = c.into_parts();
                     self.phase = Phase::Content {
                         file: Box::new(file),
                         order,
                         at: (0, 0),
                         dir: None,
+                        rows: VecDeque::new(),
+                        entry: None,
+                        top: None,
                         current: None,
                     };
                 }
@@ -397,88 +506,109 @@ impl Check {
                 order,
                 at,
                 dir,
+                rows,
+                entry,
+                top,
                 current,
             } => {
-                let Some(e) = order.get(at.0).copied() else {
-                    for row in file.entries()? {
-                        if !within(row.commit_time) {
+                if rows.is_empty() {
+                    let Some(e) = order.get(at.0).copied() else {
+                        for row in file.entries()? {
+                            if !within(row.commit_time) {
+                                return Err(VerifyError::Placement(
+                                    "an entry outside its file's period",
+                                ));
+                            }
+                            let d = entry_digest(
+                                row.position,
+                                &row.entry,
+                                row.received_at,
+                                row.commit_time,
+                            )
+                            .map_err(|_| VerifyError::Checksum(None))?;
+                            self.entries = self.entries.wrapping_add(d);
+                            if let Some(h) = &mut self.held {
+                                h.hold(row.position)?;
+                            }
+                            self.positions += 1;
+                        }
+                        if !file.ignored().is_empty() {
                             return Err(VerifyError::Placement(
-                                "an entry outside its file's period",
+                                "an element the writer does not write",
                             ));
                         }
-                        let d = entry_digest(
-                            row.position,
-                            &row.entry,
-                            row.received_at,
-                            row.commit_time,
-                        )
-                        .map_err(|_| VerifyError::Checksum(None))?;
-                        self.entries = self.entries.wrapping_add(d);
-                        if let Some(h) = &mut self.held {
-                            h.hold(row.position)?;
-                        }
-                        self.positions += 1;
-                    }
-                    if !file.ignored().is_empty() {
-                        return Err(VerifyError::Placement(
-                            "an element the writer does not write",
-                        ));
-                    }
-                    self.phase = Phase::Hash {
-                        src: file.source().clone(),
-                        at: 0,
-                        hash: Box::default(),
+                        self.phase = Phase::Hash {
+                            src: file.source().clone(),
+                            at: 0,
+                            hash: Box::default(),
+                        };
+                        return Ok(None);
                     };
-                    return Ok(None);
-                };
-                if dir.is_none() {
-                    *dir = Some(file.directory(&e)?);
+                    if dir.is_none() {
+                        *dir = Some(Box::new(file.directory(&e)?));
+                    }
+                    let d = dir.as_ref().expect("read above");
+                    let n = d.blocks.len();
+                    *rows = file.read_block(&e, d, at.1)?.into();
+                    *entry = Some(Box::new(e));
+                    at.1 += 1;
+                    if at.1 == n {
+                        *at = (at.0 + 1, 0);
+                        *dir = None;
+                    }
                 }
-                let d = dir.as_ref().expect("read above");
-                let rows = file.read_block(&e, d, at.1)?;
-                at.1 += 1;
-                if at.1 == d.blocks.len() {
-                    *at = (at.0 + 1, 0);
-                    *dir = None;
-                }
-                for r in rows {
+                let e = **entry.as_ref().expect("set with its rows");
+                while let Some(r) = rows.front() {
                     let f = &r.fact;
                     let p = f.position;
                     if !within(f.t) {
                         return Err(VerifyError::Placement("a row outside its file's period"));
                     }
-                    if let Some(h) = &mut self.held {
-                        h.hold(p)?;
+                    if let Some(h) = &self.held {
+                        h.free(p)?;
                     }
                     if e.set_aside() != input.set_aside.holds(p) {
                         return Err(VerifyError::Placement("a set-aside row in the wrong chunk"));
                     }
                     if !e.set_aside() && w.class == Class::Revision {
-                        if current.as_ref().is_none_or(|c| c.series != f.series_id) {
-                            let top = self
+                        let Some(c) = current.as_mut().filter(|c| c.series == f.series_id) else {
+                            if let Some(c) = current.as_mut() {
+                                c.turn(f.series_id)?;
+                                continue;
+                            }
+                            let t = self
                                 .files
                                 .iter()
                                 .find(|o| o.period == w.period && o.class == Class::Current)
                                 .ok_or(PLACED)?;
-                            let cf = match current.take() {
-                                Some(c) => c.file,
-                                None => {
-                                    let src = Src::open(input, top)?;
-                                    self.reading.push(src.clone());
-                                    CompactedFile::open(src, &top.id, Some(&top.layout))?
-                                }
+                            let Some(src) = top.as_ref() else {
+                                let src = Src::open(input, t, &self.budget)?;
+                                self.reading.push(src.clone());
+                                *top = Some(src);
+                                continue;
                             };
-                            *current = Some(Box::new(Cursor::new(cf, f.series_id)?));
+                            let cf = CompactedFile::open(src.clone(), &t.id, Some(&t.layout))?;
+                            *current = Some(Box::new(Cursor::new(cf)));
+                            continue;
+                        };
+                        match c.outranks(f) {
+                            Some(true) => {}
+                            Some(false) => return Err(PLACED),
+                            None => {
+                                c.read()?;
+                                continue;
+                            }
                         }
-                        if !current.as_mut().expect("opened above").outranks(f)? {
-                            return Err(PLACED);
-                        }
+                    }
+                    if let Some(h) = &mut self.held {
+                        h.hold(p)?;
                     }
                     self.positions += 1;
                     let n = expect.anchors.facts.entry(f.series_id).or_default();
                     *n = n.wrapping_sub(1);
                     let s = expect.sums.entry(f.series_id).or_default();
                     *s = s.wrapping_sub(fact_digest(f, r.received_at, r.commit_time));
+                    rows.pop_front();
                 }
             }
             Phase::Hash { src, at, hash } => {
