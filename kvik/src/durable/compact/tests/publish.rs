@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use kvik_files::appender::{Appender, Opened};
+use kvik_files::appender::{AppendError, Appender, Opened};
 use kvik_files::compaction::{Judgement, compacted_through};
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
 use kvik_files::rebuild::{LocalFile, Place, RebuildInput, Verdict, Verifier, plan};
@@ -612,6 +612,38 @@ fn a_failed_record_sync_keeps_the_outputs_for_the_record_the_next_start_may_find
     drop(m);
     fs.restart();
     assert!(check_after_start(&fs, &outputs, &log));
+}
+
+#[test]
+fn a_publish_after_an_unsure_record_leaves_the_outputs_that_record_may_name() {
+    let (fs, _) = store();
+    let first = compact(&fs, &BTreeSet::new());
+    let mut m = open(&fs);
+    fs.fail_nth(
+        kvik_log::fs::FaultOp::Sync,
+        MANIFEST,
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let e = publish(&fs, &dir(), &mut m, &first, T).unwrap_err();
+    assert!(matches!(e, PublishError::Unsure(_)), "{e:?}");
+    let finals: BTreeMap<PathBuf, Vec<u8>> = first
+        .iter()
+        .map(|o| {
+            let f = final_path(&dir(), o.id.generation, o.id.file_id);
+            let b = fs.read(&f).unwrap();
+            (f, b)
+        })
+        .collect();
+    let again = compact(&fs, &BTreeSet::new());
+    let e = publish(&fs, &dir(), &mut m, &again, T).unwrap_err();
+    assert!(
+        matches!(e, PublishError::Refused(AppendError::ReadOnly)),
+        "{e:?}"
+    );
+    for (f, b) in &finals {
+        assert!(fs.read(f).as_ref() == Some(b), "{f:?}");
+    }
 }
 
 #[test]
