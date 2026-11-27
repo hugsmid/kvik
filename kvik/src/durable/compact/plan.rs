@@ -156,6 +156,19 @@ pub(crate) fn plan(candidates: &[Candidate], done: &BTreeMap<u32, u64>, run_byte
     }
 }
 
+/// The next run over the store's segments, with C(g) per generation from the catalogue: the end of that generation's
+/// compacted prefix of listed segments (compaction design §3.4 rule 2).
+pub(crate) fn next_run(
+    fs: &dyn Fs,
+    dir: &Path,
+    store_id: &[u8; 16],
+    catalogue: &kvik_files::catalogue::Catalogue,
+    run_bytes: u64,
+) -> io::Result<Plan> {
+    let done = kvik_files::compaction::compacted_through(catalogue);
+    Ok(plan(&candidates(fs, dir, store_id)?, &done, run_bytes))
+}
+
 /// The run so far, or a stall at `c` when nothing was taken before it.
 fn stop(run: Vec<Candidate>, c: &Candidate, cause: Cause) -> Plan {
     if run.is_empty() {

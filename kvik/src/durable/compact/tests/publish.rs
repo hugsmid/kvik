@@ -15,7 +15,7 @@ use kvik_log::store::{LOG_DIR, MANIFEST};
 use sha2::{Digest, Sha256};
 
 use super::super::Output;
-use super::super::plan::{Candidate, candidates};
+use super::super::plan::{Candidate, Plan, candidates, next_run};
 use super::super::publish::{
     CleanUp, PublishError, Recompaction, clean_data, final_path, layout, publish,
 };
@@ -585,4 +585,63 @@ fn a_process_stop_at_every_run_operation_leaves_no_output_after_the_start() {
         n += 1;
     }
     assert!(n > 3);
+}
+
+#[test]
+fn a_failed_record_sync_keeps_the_outputs_for_the_record_the_next_start_may_find() {
+    let (fs, _) = store();
+    let outputs: Vec<(Output, Vec<u8>)> = compact(&fs, &BTreeSet::new())
+        .into_iter()
+        .map(|o| {
+            let b = fs.read(&o.path).unwrap();
+            (o, b)
+        })
+        .collect();
+    let log = log_bytes(&fs);
+    let mut m = open(&fs);
+    fs.fail_nth(
+        kvik_log::fs::FaultOp::Sync,
+        MANIFEST,
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let only: Vec<Output> = outputs.iter().map(|(o, _)| o.clone()).collect();
+    let e = publish(&fs, &dir(), &mut m, &only, T).unwrap_err();
+    assert!(matches!(e, PublishError::Unsure(_)), "{e:?}");
+    assert_eq!(data_names(&fs).len(), outputs.len());
+    drop(m);
+    fs.restart();
+    assert!(check_after_start(&fs, &outputs, &log));
+}
+
+#[test]
+fn the_planner_starts_each_run_above_c_g_from_the_catalogue() {
+    let (fs, _) = store();
+    let d = dir();
+    let mut m = open(&fs);
+    let Plan::Run(first) = next_run(&fs, &d, &STORE, m.catalogue(), 1).unwrap() else {
+        panic!("no run")
+    };
+    assert_eq!(first.iter().map(|c| c.file_id).collect::<Vec<_>>(), vec![1]);
+    let sa = SetAside::new(vec![]);
+    let weeks = BTreeSet::new();
+    let outs = run(&run_input(&fs, &d, &sa, &weeks), &first).unwrap();
+    publish(&fs, &d, &mut m, &outs, T).unwrap();
+    let Plan::Run(second) = next_run(&fs, &d, &STORE, m.catalogue(), 1).unwrap() else {
+        panic!("no run")
+    };
+    assert_eq!(
+        second.iter().map(|c| c.file_id).collect::<Vec<_>>(),
+        vec![2]
+    );
+    let next = RunInput {
+        first_file_id: 200,
+        ..run_input(&fs, &d, &sa, &weeks)
+    };
+    let outs = run(&next, &second).unwrap();
+    publish(&fs, &d, &mut m, &outs, T).unwrap();
+    assert_eq!(
+        next_run(&fs, &d, &STORE, m.catalogue(), 1).unwrap(),
+        Plan::Idle
+    );
 }
