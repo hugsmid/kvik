@@ -17,6 +17,7 @@
 //!   for every corrupt record it stands for (its field 7; [`crate::rebuild::resolve`]), or are not configured. A provisional
 //!   rebuild cannot be acknowledged.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,7 @@ use kvik_log::fs::{Fs, FsFile, OpenMode};
 
 use crate::catalogue::{Catalogue, CatalogueError};
 use crate::compaction::{Breach, Judgement, judge, publish_shape};
+use crate::desc::FileRef;
 use crate::image::{Image, ReadError, read};
 use crate::record::{Acknowledgement, Body, EncodeError, Record};
 use crate::{MANIFEST, MANIFEST_NEW};
@@ -150,6 +152,13 @@ pub enum AppendError {
     /// A new publish record while the catalogue's rule is undecided or broken (compaction design §3.4 hold).
     #[error("compaction is held: the catalogue's rule is not decided")]
     CompactionHeld,
+    /// A new publish record after which the catalogue's rule would be undecided; names the files it lacks
+    /// (compaction design §3.4, Q-2121).
+    #[error("the record would leave the compaction rule undecided for {0:?}")]
+    Undecided(BTreeSet<FileRef>),
+    /// A new publish record giving a compacted file no layout (Q-2120).
+    #[error("compacted file {0:?} published without a layout")]
+    Unlaid(FileRef),
 }
 
 /// Why a rebuild acknowledgement was refused.

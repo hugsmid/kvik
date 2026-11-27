@@ -173,6 +173,54 @@ fn a_manifest_that_breaks_the_rule_opens_held_rather_than_refused() {
     ));
 }
 
+fn unlaid(out: &[FileDescription]) -> Body {
+    Body::Publish(Publish {
+        published: out.to_vec(),
+        layouts: Vec::new(),
+        retired: Vec::new(),
+    })
+}
+
+#[test]
+fn a_run_naming_an_unlisted_segment_is_refused_from_a_state_that_holds() {
+    let mut a = appender_with(&[sealed(1, &[segment(1, 1, 10)])]);
+    let o = output(100, 11, 20, &[seg_ref(2)]);
+    let l = laid(&o, 7, 1, 10);
+    assert!(matches!(
+        a.append(publish(&[(o, l)], &[]), T0),
+        Err(AppendError::Undecided(f)) if f == BTreeSet::from([seg_ref(2)])
+    ));
+    assert_eq!(a.compaction(), &Judgement::Holds);
+}
+
+#[test]
+fn a_new_record_publishing_a_compacted_file_without_a_layout_is_refused_while_broken() {
+    let segs = [segment(1, 1, 10), segment(2, 11, 20)];
+    let b = output(101, 11, 20, &[seg_ref(2)]);
+    let skipping = publish(&[(b.clone(), laid(&b, 9, 1, 10))], &[]);
+    let mut a = appender_with(&[sealed(1, &segs), Record::new(2, 0, T0, skipping)]);
+    let c = output(100, 1, 10, &[seg_ref(1)]);
+    assert!(matches!(
+        a.append(unlaid(&[c]), T0),
+        Err(AppendError::Unlaid(f)) if f == comp_ref(100)
+    ));
+    assert!(matches!(a.compaction(), Judgement::Broken(x) if x.rule == 2));
+    assert!(compacted_through(a.catalogue()).is_empty());
+}
+
+#[test]
+fn a_second_run_without_a_layout_over_a_compacted_segment_is_refused() {
+    let a1 = output(100, 1, 10, &[seg_ref(1)]);
+    let run = publish(&[(a1.clone(), laid(&a1, 7, 1, 10))], &[]);
+    let mut a = appender_with(&[sealed(1, &[segment(1, 1, 10)]), Record::new(2, 0, T0, run)]);
+    let again = output(101, 1, 10, &[seg_ref(1)]);
+    assert!(matches!(
+        a.append(unlaid(&[again]), T0),
+        Err(AppendError::Unlaid(f)) if f == comp_ref(101)
+    ));
+    assert_eq!(a.compaction(), &Judgement::Holds);
+}
+
 // ---- Generated compaction histories ----
 
 #[derive(Clone, Debug)]
