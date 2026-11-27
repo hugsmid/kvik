@@ -15,8 +15,8 @@
 //! registered, a poll, a confirmation, [`crate::Store::tick`]) and by the `kvik-deliver` thread ([`Hub`]), never on the writer thread.
 //! Timers run on `Env`'s monotonic clock; `now` and live staleness are the writer's ([`super::clock`]).
 //!
-//! Not here yet: windowed operators in funnels, starting at a position or a time, the saved-point check, timer
-//! sequences in the cursor file and the catch-up statistics (roadmap 5.3).
+//! Not here yet: windowed operators in funnels, starting at a time, timer sequences in the cursor file and the
+//! catch-up statistics (roadmap 5.3).
 
 mod confirm;
 mod funnels;
