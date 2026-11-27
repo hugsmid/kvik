@@ -6,6 +6,8 @@ pub(crate) mod job;
 pub(crate) mod read;
 #[cfg(test)]
 mod reads;
+#[cfg(test)]
+mod rebuild_tests;
 pub(crate) mod stretch;
 #[cfg(test)]
 mod tests;

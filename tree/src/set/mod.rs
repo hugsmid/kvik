@@ -1,7 +1,7 @@
 //! The visible state of a tree root (design 7.1b section 3.3), the cover of a span (section 2), the part merge
 //! and the merge planner (section 5). Pure functions over decoded roots and parts; files are the writer's concern.
 
-mod merge;
+pub(crate) mod merge;
 mod plan;
 
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use kvik_log::writer::Position;
 
 pub use merge::{MergeError, merge, next_root, part_ref};
-pub use plan::{DAY, Plan, Policy, Tier, plan};
+pub use plan::{DAY, Plan, Policy, Tier, plan, settled_period};
 
 use crate::level::{Level, MINUTE};
 use crate::node::Node;

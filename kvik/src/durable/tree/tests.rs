@@ -19,14 +19,14 @@ use crate::health::{Health, Reason};
 use crate::series::{Kind, ParameterChange, RetentionClass, SeriesSpec, ValueType};
 use crate::types::{Intent, Quality, Reading, SeriesId, Value};
 
-struct Store {
-    fs: MemFs,
-    clock: ManualClock,
-    dir: PathBuf,
-    w: Arc<Writer>,
-    id: SeriesId,
+pub(super) struct Store {
+    pub(super) fs: MemFs,
+    pub(super) clock: ManualClock,
+    pub(super) dir: PathBuf,
+    pub(super) w: Arc<Writer>,
+    pub(super) id: SeriesId,
     /// The current readings: `t` to value, `None` for bad quality.
-    current: BTreeMap<i64, Option<f64>>,
+    pub(super) current: BTreeMap<i64, Option<f64>>,
 }
 
 pub(super) fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
@@ -36,7 +36,19 @@ pub(super) fn open(fs: &MemFs, clock: &ManualClock, dir: &Path) -> Arc<Writer> {
     let config = StoreConfig::new(dir, "Etc/UTC")
         .create_if_missing(true)
         .env(env);
-    Writer::open(&config).unwrap()
+    crate::durable::LOG_SKEW.set(Some(skew()));
+    let w = Writer::open(&config);
+    crate::durable::LOG_SKEW.set(None);
+    w.unwrap()
+}
+
+thread_local! {
+    static SKEW: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+}
+
+/// This test thread's addition to the log's monotonic clock, shared by every writer it opens.
+pub(super) fn skew() -> Arc<std::sync::atomic::AtomicU64> {
+    SKEW.with(Arc::clone)
 }
 
 pub(super) fn wait(e: Emitted) {
@@ -53,7 +65,7 @@ pub(super) fn wait(e: Emitted) {
 }
 
 impl Store {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let fs = MemFs::new();
         let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
         let dir = PathBuf::from(format!("tree-unit/{name}"));
@@ -77,12 +89,12 @@ impl Store {
         }
     }
 
-    fn reopen(&mut self) {
+    pub(super) fn reopen(&mut self) {
         self.w = open(&self.fs, &self.clock, &self.dir);
     }
 
     /// Emits readings `(seconds before now, value)`, `None` as bad quality.
-    fn emit(&mut self, intent: Intent, readings: &[(u64, Option<f64>)]) {
+    pub(super) fn emit(&mut self, intent: Intent, readings: &[(u64, Option<f64>)]) {
         let now = self.clock.wall();
         let rs: Vec<Reading> = readings
             .iter()
@@ -105,12 +117,12 @@ impl Store {
     }
 
     /// A clean shutdown once the store's reader is open, so that it checkpoints (Q-1950).
-    fn stop(&self) {
+    pub(super) fn stop(&self) {
         self.w.reader().unwrap();
         self.w.shutdown().unwrap();
     }
 
-    fn params(&self) -> kvik_tree::Params {
+    pub(super) fn params(&self) -> kvik_tree::Params {
         let d = lock(&self.w.decider);
         let s = d.registry.get(self.id.0).unwrap();
         crate::fold::node_params(&windows::params(&s.def))
@@ -118,7 +130,7 @@ impl Store {
 }
 
 /// The newest root on disk, and the visible state of the parts it lists.
-fn tree_state(fs: &MemFs, dir: &Path) -> (Root, BTreeMap<Key, Seen>) {
+pub(super) fn tree_state(fs: &MemFs, dir: &Path) -> (Root, BTreeMap<Key, Seen>) {
     let tree = dir.join(DIR);
     let newest = fs
         .read_dir(&tree)
@@ -142,7 +154,7 @@ fn tree_state(fs: &MemFs, dir: &Path) -> (Root, BTreeMap<Key, Seen>) {
 }
 
 /// T1 against the readings the test emitted: every non-empty span of the folded levels, and nothing else.
-fn assert_t1(
+pub(super) fn assert_t1(
     p: &kvik_tree::Params,
     series: u32,
     current: &BTreeMap<i64, Option<f64>>,
@@ -171,7 +183,7 @@ fn assert_t1(
     assert_eq!(got, want);
 }
 
-fn history(st: &mut Store) {
+pub(super) fn history(st: &mut Store) {
     let normal: Vec<(u64, Option<f64>)> = (0..120u64)
         .map(|k| (7_300 - k * 61, (k % 9 != 4).then_some(k as f64 / 4.0)))
         .collect();

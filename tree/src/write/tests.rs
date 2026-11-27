@@ -15,10 +15,10 @@ use crate::level::MINUTE;
 use crate::node::{Kind, Params, Value};
 use crate::set::{self, Policy, QUARTER, Seen, visible};
 
-const S: i64 = 1_000_000_000;
-const SERIES: u64 = 3;
+pub(super) const S: i64 = 1_000_000_000;
+pub(super) const SERIES: u64 = 3;
 
-fn id() -> Identity {
+pub(super) fn id() -> Identity {
     Identity {
         generation: 1,
         reset: ResetStamp::default(),
@@ -26,41 +26,41 @@ fn id() -> Identity {
     }
 }
 
-fn pos(s: u64) -> Position {
+pub(super) fn pos(s: u64) -> Position {
     Position {
         generation: 1,
         sequence: s,
     }
 }
 
-fn params() -> Params {
+pub(super) fn params() -> Params {
     Params::new(Kind::Gauge, Some(600 * S))
 }
 
-type Current = BTreeMap<(u64, i64), (Position, Option<f64>)>;
+pub(super) type Current = BTreeMap<(u64, i64), (Position, Option<f64>)>;
 
 /// A log of facts and the tree writer of one process over it, on a [`MemFs`] that stops where the history says.
-struct World {
-    fs: Arc<MemFs>,
-    dir: PathBuf,
+pub(super) struct World {
+    pub(super) fs: Arc<MemFs>,
+    pub(super) dir: PathBuf,
     /// `(position, series, t, value)`; `None` is a fact summaries ignore.
-    log: Vec<(Position, u64, i64, Option<f64>)>,
-    synced: Position,
-    dirty: BTreeMap<(u64, i64), Position>,
-    files: Option<TreeFiles>,
-    now: Duration,
-    wall: i64,
+    pub(super) log: Vec<(Position, u64, i64, Option<f64>)>,
+    pub(super) synced: Position,
+    pub(super) dirty: BTreeMap<(u64, i64), Position>,
+    pub(super) files: Option<TreeFiles>,
+    pub(super) now: Duration,
+    pub(super) wall: i64,
     /// Bytes of every file under `tree/` when first seen renamed (T6).
-    renamed: BTreeMap<PathBuf, Vec<u8>>,
-    grace: Duration,
+    pub(super) renamed: BTreeMap<PathBuf, Vec<u8>>,
+    pub(super) grace: Duration,
 }
 
 impl World {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with_grace(GRACE)
     }
 
-    fn with_grace(grace: Duration) -> Self {
+    pub(super) fn with_grace(grace: Duration) -> Self {
         let mut w = World {
             fs: Arc::new(MemFs::new()),
             dir: PathBuf::from("s"),
@@ -77,12 +77,12 @@ impl World {
         w
     }
 
-    fn tick(&mut self) {
+    pub(super) fn tick(&mut self) {
         self.now += Duration::from_secs(60);
         self.wall += 60 * S;
     }
 
-    fn append(&mut self, facts: &[(u64, i64, Option<f64>)]) {
+    pub(super) fn append(&mut self, facts: &[(u64, i64, Option<f64>)]) {
         for &(s, t, v) in facts {
             let last = self.log.last().map_or(0, |l| l.0.sequence);
             let p = pos(last.max(self.synced.sequence) + 1);
@@ -95,14 +95,14 @@ impl World {
         }
     }
 
-    fn sync(&mut self) {
+    pub(super) fn sync(&mut self) {
         if let Some(l) = self.log.last() {
             self.synced = l.0;
         }
     }
 
     /// The current facts at `k` per `(series, t)`: the latest at or below it.
-    fn current(&self, k: Position) -> Current {
+    pub(super) fn current(&self, k: Position) -> Current {
         let mut m = BTreeMap::new();
         for &(p, s, t, v) in self.log.iter().filter(|l| l.0 <= k) {
             m.insert((s, t), (p, v));
@@ -110,7 +110,7 @@ impl World {
         m
     }
 
-    fn facts_in(cur: &Current, s: u64, from: i64, to: i64) -> Vec<Fact> {
+    pub(super) fn facts_in(cur: &Current, s: u64, from: i64, to: i64) -> Vec<Fact> {
         cur.range((s, from)..(s, to))
             .map(|(&(_, t), &(at, v))| Fact {
                 t,
@@ -120,13 +120,30 @@ impl World {
             .collect()
     }
 
-    fn checkpoint(&mut self) -> Result<(), WriteError> {
+    pub(super) fn checkpoint(&mut self) -> Result<(), WriteError> {
+        self.checkpoint_with(&BTreeSet::new())
+    }
+
+    /// A checkpoint that opens a floor for each series of `rebuilding` and writes none of their nodes; roll-ups over
+    /// changed quarter-hours are recomputed where covered.
+    pub(super) fn checkpoint_with(&mut self, rebuilding: &BTreeSet<u64>) -> Result<(), WriteError> {
         self.tick();
         let k = self.synced;
         let cur = self.current(k);
         let levels = folded_levels(&LEVELS);
         let mut entries: BTreeMap<(u64, u8), Vec<Entry>> = BTreeMap::new();
-        for &(s, q) in self.dirty.keys() {
+        let skip: BTreeSet<u64> = self
+            .files
+            .as_ref()
+            .expect("started")
+            .root()
+            .floors
+            .iter()
+            .filter(|f| f.rebuilding)
+            .map(|f| f.series)
+            .chain(rebuilding.iter().copied())
+            .collect();
+        for &(s, q) in self.dirty.keys().filter(|k| !skip.contains(&k.0)) {
             let facts = Self::facts_in(&cur, s, q, q + QUARTER);
             for (l, e) in quarter_entries(&params(), &levels, q, &facts) {
                 entries.entry((s, l)).or_default().push(e);
@@ -134,13 +151,15 @@ impl World {
         }
         let (wall, now) = (self.wall, self.now);
         let files = self.files.as_mut().expect("started");
-        files.checkpoint(k, self.synced, entries, &BTreeSet::new(), wall, now)?;
+        let (ups, _) = files.ancestors(&entries, |_| Some(params()))?;
+        entries.extend(ups);
+        files.checkpoint(k, self.synced, entries, rebuilding, wall, now)?;
         self.dirty.retain(|_, p| *p > k);
         Ok(())
     }
 
     /// The process stops: its memory is gone, and so are the log's positions above the synced mark.
-    fn stop(&mut self) {
+    pub(super) fn stop(&mut self) {
         self.files = None;
         self.dirty.clear();
         let synced = self.synced;
@@ -148,7 +167,7 @@ impl World {
     }
 
     /// A start: the files, then the dirty set from the log above K.
-    fn start(&mut self) {
+    pub(super) fn start(&mut self) {
         self.fs.restart();
         self.tick();
         let fresh = self.log.is_empty();
@@ -176,12 +195,12 @@ impl World {
         }
     }
 
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         self.start();
         self.check();
     }
 
-    fn tree_files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+    pub(super) fn tree_files(&self) -> Vec<(PathBuf, Vec<u8>)> {
         self.fs
             .paths()
             .into_iter()
@@ -190,7 +209,7 @@ impl World {
             .collect()
     }
 
-    fn temporaries(&self) -> usize {
+    pub(super) fn temporaries(&self) -> usize {
         self.fs
             .paths()
             .iter()
@@ -199,7 +218,7 @@ impl World {
     }
 
     /// T5, T6, T8 on the files as they are, and T1 on the writer's root when it is on disk.
-    fn check(&mut self) {
+    pub(super) fn check(&mut self) {
         let files = self.tree_files();
         let names: BTreeSet<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
         self.renamed.retain(|p, _| names.contains(p));
@@ -238,7 +257,7 @@ impl World {
 
 /// T1: every covered span of a folded level holds the canonical node of the current view at K, at its version,
 /// and no entry where that node is empty.
-fn t1(w: &World, f: &TreeFiles) {
+pub(super) fn t1(w: &World, f: &TreeFiles) {
     let root = f.root();
     let parts: Vec<Part> = f
         .read_parts()
@@ -247,14 +266,19 @@ fn t1(w: &World, f: &TreeFiles) {
             p.unwrap_or_else(|| panic!("T6: part {:#x} of the root missing or damaged", r.file_id))
         })
         .collect();
-    let vis = visible(root, &parts).expect("a visible state");
+    let folded: BTreeSet<u8> = folded_levels(&root.levels).iter().map(|l| l.id).collect();
+    let vis: BTreeMap<set::Key, Seen> = visible(root, &parts)
+        .expect("a visible state")
+        .into_iter()
+        .filter(|(k, _)| folded.contains(&k.1))
+        .collect();
     let cur = w.current(root.checkpoint);
     let mut expect: BTreeMap<set::Key, Seen> = BTreeMap::new();
     let spans: BTreeSet<(u64, i64)> = cur
         .keys()
         .map(|&(s, t)| (s, t - t.rem_euclid(QUARTER)))
         .collect();
-    for (s, q) in spans {
+    for (s, q) in spans.into_iter().filter(|&(s, _)| set::served(root, s)) {
         let facts = World::facts_in(&cur, s, q, q + QUARTER);
         for (l, e) in quarter_entries(&params(), &folded_levels(&root.levels), q, &facts) {
             let width = root.levels.iter().find(|x| x.id == l).unwrap().width;
@@ -278,15 +302,21 @@ fn t1(w: &World, f: &TreeFiles) {
             );
         }
     }
-    assert_eq!(
-        vis, expect,
-        "T1 at root {} (K {:?})",
-        root.seq, root.checkpoint
+    let diff: Vec<_> = vis
+        .keys()
+        .chain(expect.keys())
+        .filter(|k| vis.get(k) != expect.get(k))
+        .collect();
+    assert!(
+        diff.is_empty(),
+        "T1 at root {} (K {:?}): {diff:?}",
+        root.seq,
+        root.checkpoint
     );
 }
 
 #[derive(Clone, Debug)]
-enum Stop {
+pub(super) enum Stop {
     Kill,
     Power,
     Partial(u64),
@@ -392,6 +422,8 @@ fn run(ops: &[Op]) {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases.min(1024), ..ProptestConfig::default() })]
+
     #[test]
     fn t1_t5_t6_t8_hold_over_histories_with_a_stop_at_any_write_step(ops in prop::collection::vec(op(), 1..30)) {
         run(&ops);

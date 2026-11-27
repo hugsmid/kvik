@@ -5378,7 +5378,8 @@ facts through a reader, and a process that has not read opens one by reading the
 does (the registry file is written from the deliverer's index without reading the log).
 **Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
 leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
-that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it.
+that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it. Kept by 71b-4, which
+adds that a clean shutdown runs no maintenance either (no rebuild, scrub, backfill or merge).
 A first step that comes at a clean shutdown with no reader open does not start the tree either, since the start's
 pass reads the log (`a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree`).
 
@@ -5397,6 +5398,110 @@ session polled only when rung answers a `Latest` read with the value at sequence
 model give the one at sequence 11. It fails the same way on public main.
 **Recommended default.** Treat as a delivery bug: a later value of a series in the round that races the session's turn
 must reach it. Fix with the fan-out, then remove the `ignore`.
+
+## Q-2060 — The node version and registry entries
+Decided with roadmap 7.1b step 4 (`tree/src/write/nodes.rs` `quarter_entries`, `model/src/tree.rs` `as_of`),
+provisional; settle with 72-1 (the version rule).
+**Scenario.** Q-1422 makes `as_of` the highest position among the span's current facts, or the position of the latest
+registry entry that changed the series' nodes if higher. The registry holds no position per series, so a rebuild
+from the log could not give the second without a scan of every entry.
+**Decision (provisional).** `as_of` is the highest position among the span's current facts, bad-quality facts
+included; a roll-up's is its children's highest. A node-changing entry is seen through the series' floor instead: a
+cache keys on the floor's `seq` with `as_of`. Live and rebuilt trees agree (T3), and the model's `as_of` is the same.
+
+## Q-2061 — The late window before a day's part and roll-ups
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `POLICY`), provisional; settle on 72-2's backfill
+storms.
+**Scenario.** The merge planner waits a late window after a UTC day ends before writing its day part and roll-ups;
+design section 5 names the window but not its length.
+**Decision (provisional).** One day. Late data after it still lands: the checkpoint recomputes the covered roll-ups
+over each changed quarter-hour from the visible children (T2).
+
+## Q-2062 — Where a backfill stops walking back
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job/maintain.rs` `backfill`), provisional.
+**Scenario.** A backfill rebuilds newest period first, but the store keeps no cheap earliest time across series, so
+the walk cannot tell when it has passed the oldest fact.
+**Decision (provisional).** The first range is from the start of today's UTC day upwards; then each settled period
+below (days, weeks, 13 and 52 weeks as alignment allows). A period holding no fact of any served series ends the walk:
+the same rebuild takes everything below it and the quarter-hour level is then covered without bound. The first range
+and each unsettled day count, so one idle day ends the walk: a gap of a whole period in the data therefore reads all
+older facts at once, which is still each fact once, and publishes them one settled period a root (Q-2112).
+
+## Q-2063 — The scrub's cadence
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
+**Scenario.** Section 7 has the writer's scrub find a damaged part and rebuild its period, without a cadence; reading
+every live part costs a pass over the tree.
+**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge or a
+checkpoint that meets a damaged input runs it at once (Q-2111). The rebuild covers the part's period widened to every live part it overlaps, which it
+retires, so that it is the whole truth of that period.
+
+## Q-2070 — The stretch limit counted in log positions
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.
+**Scenario.** Design section 6 stops a reader using the tree when its stretch (K, P] is longer than 64 MiB of log,
+but a reader cannot count log bytes between two positions without reading them.
+**Decision (provisional).** The limit is 2^20 positions (about 20 to 190 MiB at the measured 21 to 184 bytes a
+reading); past it the read takes facts. Settle with the lifetime bench's log bytes a reading.
+
+## Q-2071 — A fixed step off the quarter-hours
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of`), provisional.
+**Scenario.** Design section 6 folds the partial quarter-hours of each bucket of a `Step` that is not a multiple of
+15 minutes from facts; that is two fact reads a bucket, up to 2,000 a chart.
+**Decision (provisional).** Such a chart, and any step below 15 minutes, is read from facts whole; results are
+equal either way (T7). Revisit with the 1-minute level (Q-1420).
+
+## Q-2072 — Whole parts decoded and kept by a reader
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::window`), provisional.
+**Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
+`Part::decode` decodes a whole part, every series in it.
+**Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
+it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
+peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
+through the part's directory, counted in the cap, follows if stores with many series show it.
+
+## Q-2073 — `tree_damaged` without an interface
+Decided with roadmap 7.1b step 5, provisional.
+**Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
+change in 7.1b.
+**Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
+count reaches `ReaderState` or health with the scrub's report.
+
+## Q-2074 — The visible entries formed per call
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
+**Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
+years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
+**Decision (provisional).** Kept for 7.1b; the fix is to look entries up in the parts directly (each part's runs are
+sorted) or to keep the visible entries per root. Q-1424's nested ladder stays unbuilt: it cuts merges, not this.
+
+## Q-2110 — T8 over the files on disk after a fallback start
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`), provisional.
+**Scenario.** A partial power loss leaves a newer root that the start refuses and leaves on disk; the start continues
+from an older root with a lower K. A rebuild or merge publishes at the root's K, so a repair or merge as the first
+publish after such a start writes a root of higher `seq` and lower K than the refused file.
+**Decision (provisional).** The job takes a checkpoint at the cut, at or above any root's K (T5), before any rebuild or
+merge, and the tree tests follow that order. A start does not remove a refused newer root.
+
+## Q-2111 — A checkpoint that meets a damaged part
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `ancestors`, `kvik/src/durable/tree/job.rs`),
+provisional.
+**Scenario.** Late data into a merged day makes the checkpoint recompute the day's roll-ups from the live parts over it.
+A damaged one failed the checkpoint, and maintenance (scrub, repair, merges) runs only after a checkpoint, so the tree
+stalled for good. A repair cannot run first: it publishes at the root's K, below the cut.
+**Decision (provisional).** The checkpoint goes through: each roll-up span over a part that will not load is written as
+a stale marker (readers take facts), and the job's maintenance at the same step runs the repair, whose widened period
+rewrites those spans from facts at the same cut.
+
+## Q-2112 — The size of one rebuild
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional; settle with 72-2.
+**Scenario.** A floor close and the end of a backfill walk rebuild a series' whole range. Published as one root, a
+stop loses all of it and every part is held until that publish.
+**Decision (provisional).** Both publish one settled period a root at the same K, newest first; the floor closes and
+the unbounded cover is added with the last, so a stop loses at most one period and the next step resumes below what
+is covered. The facts are still read and folded in one pass; streaming that fold is left to 72-2.
+
+## Q-2113 — Case counts of the tree's properties
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/write/tests.rs`), provisional.
+**Scenario.** A count fixed in source overrides `PROPTEST_CASES`, so the deep run never reaches the property.
+**Decision (provisional).** The tree's properties take `PROPTEST_CASES`, capped at 1,024 per run.
 
 ## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
 Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
@@ -5443,43 +5548,6 @@ per pair, and a second lock at the acknowledgement; no bench drove `emit`.
 rate (one reading a call, 45 calls a second) and at saturation (batches of 100 back to back), and
 `scripts/bench-emit-ab.sh` runs it on a base revision and the head, alternating. The result is in
 `docs/measurements/tree-71b-3-ingest-latency.md`.
-
-## Q-2070 — The stretch limit counted in log positions
-Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.
-**Scenario.** Design section 6 stops a reader using the tree when its stretch (K, P] is longer than 64 MiB of log,
-but a reader cannot count log bytes between two positions without reading them.
-**Decision (provisional).** The limit is 2^20 positions (about 20 to 190 MiB at the measured 21 to 184 bytes a
-reading); past it the read takes facts. Settle with the lifetime bench's log bytes a reading.
-
-## Q-2071 — A fixed step off the quarter-hours
-Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of`), provisional.
-**Scenario.** Design section 6 folds the partial quarter-hours of each bucket of a `Step` that is not a multiple of
-15 minutes from facts; that is two fact reads a bucket, up to 2,000 a chart.
-**Decision (provisional).** Such a chart, and any step below 15 minutes, is read from facts whole; results are
-equal either way (T7). Revisit with the 1-minute level (Q-1420).
-
-## Q-2072 — Whole parts decoded and kept by a reader
-Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::window`), provisional.
-**Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
-`Part::decode` decodes a whole part, every series in it.
-**Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
-it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
-peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
-through the part's directory, counted in the cap, follows if stores with many series show it.
-
-## Q-2073 — `tree_damaged` without an interface
-Decided with roadmap 7.1b step 5, provisional.
-**Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
-change in 7.1b.
-**Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
-count reaches `ReaderState` or health with the scrub's report.
-
-## Q-2074 — The visible entries formed per call
-Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
-**Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
-years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
-**Decision (provisional).** Kept for 7.1b; the fix is to look entries up in the parts directly (each part's runs are
-sorted) or to keep the visible entries per root. Q-1424's nested ladder stays unbuilt: it cuts merges, not this.
 
 ## Open at v0.2
 

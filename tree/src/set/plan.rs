@@ -96,6 +96,18 @@ pub struct Plan {
     pub minute_from: i64,
 }
 
+/// The widest period holding `t` that has settled at `now` (its merge would be due): a rebuild writes one part per
+/// such period, so the planner finds it already merged (section 5 Rebuild). A day when none has.
+pub fn settled_period(t: i64, now: i64, policy: &Policy) -> Option<(i64, u64)> {
+    Tier::ALL
+        .into_iter()
+        .rev()
+        .filter_map(|tier| Some((tier, tier.period(t)?)))
+        .find(|(tier, (start, _))| tier.due(*start, policy) <= now)
+        .map(|(_, p)| p)
+        .or_else(|| Tier::Day.period(t))
+}
+
 fn end(r: &PartRef) -> i64 {
     r.period_start.saturating_add(r.period_len as i64)
 }

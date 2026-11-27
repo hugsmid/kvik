@@ -1,6 +1,8 @@
 //! The checkpoint job (design 7.1b section 5), stepped on `kvik-maint`: at its first step it starts the tree's files
 //! and refills the dirty set from the log above K; then every interval, and at a clean shutdown, it brings each dirty
-//! quarter-hour up to a K taken from a cut, writes a delta part and a root, and clears what it covered.
+//! quarter-hour up to a K taken from a cut, writes a delta part and a root, and clears what it covered. Outside a
+//! shutdown, at the same cut, it then closes open floors, rebuilds what the scrub found damaged, backfills and runs
+//! the merges due (`maintain`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -12,7 +14,7 @@ use kvik_log::writer::{Position as LogPos, Watch};
 use kvik_model::summary::Params;
 use kvik_tree::Level;
 use kvik_tree::part::Entry;
-use kvik_tree::set::QUARTER;
+use kvik_tree::set::{DAY, Policy, QUARTER};
 use kvik_tree::write::{Fact, Identity, Opening, TreeFiles, folded_levels, quarter_entries};
 
 use super::dirty::{Dirty, Key};
@@ -23,10 +25,13 @@ use crate::durable::read::source::each_row;
 use crate::durable::read::view::View;
 use crate::durable::reader::DurableReader;
 use crate::durable::reader::facts::plan;
+use crate::durable::registry::Series;
 use crate::durable::{lock, windows};
 use crate::env::Env;
 use crate::read::View as ReadView;
 use crate::types::SeriesId;
+
+mod maintain;
 
 /// The checkpoint interval (Q-1423): taken this long after each quarter-hour of wall time.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -35,6 +40,17 @@ const AFTER_QUARTER: Duration = Duration::from_secs(20);
 const RETRY: Duration = Duration::from_secs(60);
 /// `tree_behind` once no checkpoint has succeeded for this many intervals (section 6 The stretch).
 const BEHIND_AFTER: u32 = 3;
+/// The merge planner's settings: a day's late window (Q-2061) and `tree.minute_keep` (Q-1420).
+pub(crate) const POLICY: Policy = Policy {
+    late_window: DAY,
+    minute_keep: 35 * DAY,
+};
+/// How often the scrub reads every live part (section 7); also at the first step after a start.
+const SCRUB: Duration = Duration::from_secs(86_400);
+/// Backfill periods published per step; with more left the next step comes at once.
+const BACKFILL_STEP: usize = 16;
+/// Merges published per step.
+const MERGES_STEP: usize = 16;
 
 /// The store's reader, opened when `open` and not yet open (Q-1951); `Ok(None)` when not open and not to be opened.
 pub(crate) type Readers =
@@ -72,6 +88,11 @@ struct State {
     failed: Option<String>,
     /// The ranges of the losses a discard this run already answered (Q-2182).
     answered: Vec<(LogPos, LogPos)>,
+    /// When the scrub is next due; `None` until the first maintenance after a start.
+    scrub_due: Option<Duration>,
+    /// The wall clock at the last step's start, for tests that step the clock in lockstep with the job.
+    #[cfg(test)]
+    stepped_wall: i64,
 }
 
 /// What a job runs on besides the store's files.
@@ -108,6 +129,10 @@ impl Job {
         let mut st = lock(&self.state);
         st.first_step.get_or_insert(now);
         st.last_step = now;
+        #[cfg(test)]
+        {
+            st.stepped_wall = self.env.clock.wall().0;
+        }
         if st.files.is_none() {
             // Q-1950: a clean shutdown reads no log, and the start's pass is a read of the log.
             if stopping && !self.reader_open() {
@@ -124,11 +149,17 @@ impl Job {
             return st.due.map(|d| d - now);
         }
         match self.checkpoint(&mut st, synced, now, stopping) {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some(more)) => {
                 st.last_ok = Some(now);
                 st.failed = None;
-                st.due = Some(now + self.until_due());
+                st.due = Some(
+                    now + if more {
+                        Duration::ZERO
+                    } else {
+                        self.until_due()
+                    },
+                );
             }
             Err(e) => {
                 st.failed = Some(e);
@@ -159,6 +190,12 @@ impl Job {
         let after = i64::try_from(AFTER_QUARTER.as_nanos()).unwrap_or(0);
         let next = wall - (wall - after).rem_euclid(step) + step;
         Duration::from_nanos(u64::try_from(next - wall).unwrap_or(0))
+    }
+
+    /// The wall clock at the start of the last step, read once that step has finished.
+    #[cfg(test)]
+    pub(crate) fn stepped_wall(&self) -> i64 {
+        lock(&self.state).stepped_wall
     }
 
     /// Gives the job the store's reader (Q-1951).
@@ -228,22 +265,22 @@ impl Job {
         Ok(())
     }
 
-    /// Whether a checkpoint was taken: a clean shutdown takes one only on a reader already open, so that it never
-    /// reads the log to build one (Q-1950).
+    /// Whether a checkpoint was taken, and if so whether backfill is left for the next step: a clean shutdown takes
+    /// one only on a reader already open, so that it never reads the log to build one (Q-1950), and does no more.
     fn checkpoint(
         &self,
         st: &mut State,
         synced: LogPos,
         now: Duration,
         stopping: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<bool>, String> {
         let r = match self.readers.get() {
             Some(f) => f(!stopping).map_err(|e| format!("tree reader: {e}"))?,
             None => None,
         };
         let Some(r) = r else {
             return if stopping {
-                Ok(false)
+                Ok(None)
             } else {
                 Err("tree reader: none".into())
             };
@@ -257,9 +294,14 @@ impl Job {
             }
             _ => Ok(synced),
         };
-        let out = synced.and_then(|synced| self.checkpoint_at(st, &r, &v, synced, now));
+        let out = synced
+            .and_then(|synced| self.checkpoint_at(st, &r, &v, synced, now))
+            .and_then(|()| match stopping {
+                true => Ok(false),
+                false => self.maintain(st, &r, &v, now),
+            });
         let _ = r.end(v);
-        out.map(|()| true)
+        out.map(Some)
     }
 
     fn checkpoint_at(
@@ -303,7 +345,15 @@ impl Job {
                 .filter(|f| f.rebuilding)
                 .map(|f| f.series),
         );
-        let entries = entries(r, v, &keys, &skip, &root.levels.clone())?;
+        let mut entries = entries(r, v, &keys, &skip, &root.levels.clone())?;
+        let (ups, damaged) = files
+            .ancestors(&entries, params_at(v))
+            .map_err(|e| e.to_string())?;
+        entries.extend(ups);
+        // Q-2111: the stale spans over a damaged part are rebuilt by the repair this step's maintenance runs.
+        if !damaged.is_empty() {
+            st.scrub_due = None;
+        }
         let rebuilding: BTreeSet<u64> = rebuild.iter().map(|&s| u64::from(s)).collect();
         files
             .checkpoint(k, synced, entries, &rebuilding, wall, now)
@@ -362,24 +412,7 @@ fn entries(
                 b += 1;
             }
             let (from, to) = (quarters[a], quarters[b - 1] + QUARTER);
-            let mut rows: Vec<Stored> = Vec::new();
-            each_row(r, v, &plan, from, to - 1, |s| rows.push(s)).map_err(|e| e.to_string())?;
-            rows.sort_by_key(|s| (s.row.t, s.position));
-            rows.dedup_by(|later, earlier| {
-                let same = later.row.t == earlier.row.t;
-                if same {
-                    std::mem::swap(later, earlier);
-                }
-                same
-            });
-            let facts: Vec<Fact> = rows
-                .iter()
-                .map(|s| Fact {
-                    t: s.row.t,
-                    reading: windows::reading_of(series, s).map(|(_, v)| v),
-                    at: s.position,
-                })
-                .collect();
+            let facts = facts_of(r, v, &plan, series, from, to - 1)?;
             for &q in &quarters[a..b] {
                 let lo = facts.partition_point(|f| f.t < q);
                 let hi = facts.partition_point(|f| f.t < q + QUARTER);
@@ -391,4 +424,42 @@ fn entries(
         }
     }
     Ok(out)
+}
+
+/// The current facts of one series with `t` in `[from, to]`, ascending, the latest position per `t`.
+fn facts_of(
+    r: &DurableReader,
+    v: &View,
+    plan: &crate::durable::read::source::Plan,
+    series: &Series,
+    from: i64,
+    to: i64,
+) -> Result<Vec<Fact>, String> {
+    let mut rows: Vec<Stored> = Vec::new();
+    each_row(r, v, plan, from, to, |s| rows.push(s)).map_err(|e| e.to_string())?;
+    rows.sort_by_key(|s| (s.row.t, s.position));
+    rows.dedup_by(|later, earlier| {
+        let same = later.row.t == earlier.row.t;
+        if same {
+            std::mem::swap(later, earlier);
+        }
+        same
+    });
+    Ok(rows
+        .iter()
+        .map(|s| Fact {
+            t: s.row.t,
+            reading: windows::reading_of(series, s).map(|(_, v)| v),
+            at: s.position,
+        })
+        .collect())
+}
+
+/// A series' node parameters by id, from the registry at `v`'s cut.
+fn params_at(v: &View) -> impl Fn(u64) -> Option<kvik_tree::Params> + '_ {
+    let registry = v.latest().registry();
+    move |s| {
+        let s = registry.get(u32::try_from(s).ok()?)?;
+        Some(crate::fold::node_params(&windows::params(&s.def)))
+    }
 }
