@@ -25,7 +25,12 @@ fn run(name: &str, extra_batches: u32) -> (Vec<(kvik::TransitionId, bool)>, u64)
     // Fill the queue with facts of the other series: the consumer is behind with nothing outstanding.
     for k in 0..4 {
         clock.advance(Duration::from_secs(1));
-        block_on(s.emit(&[kvik::Reading::new(b, clock.wall(), Value::F64(f64::from(k)))])).unwrap();
+        block_on(s.emit(&[kvik::Reading::new(
+            b,
+            clock.wall(),
+            Value::F64(f64::from(k)),
+        )]))
+        .unwrap();
     }
     // One transition judged while behind: deferred.
     clock.advance(Duration::from_secs(1));
@@ -33,7 +38,12 @@ fn run(name: &str, extra_batches: u32) -> (Vec<(kvik::TransitionId, bool)>, u64)
     // Later batches that judge nothing new.
     for k in 0..extra_batches {
         clock.advance(Duration::from_secs(1));
-        block_on(s.emit(&[kvik::Reading::new(b, clock.wall(), Value::F64(f64::from(k)))])).unwrap();
+        block_on(s.emit(&[kvik::Reading::new(
+            b,
+            clock.wall(),
+            Value::F64(f64::from(k)),
+        )]))
+        .unwrap();
     }
     let mut got = Vec::new();
     while let Some(d) = c.try_next().unwrap() {

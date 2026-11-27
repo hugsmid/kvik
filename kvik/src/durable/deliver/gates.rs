@@ -73,7 +73,7 @@ impl GateRun {
     /// Before a judgement that may emit: the snapshot `held` takes when the first transition after an empty
     /// `outstanding` is queued.
     fn ready(&mut self) {
-        if self.outstanding.is_empty() && self.pre.is_none() {
+        if self.outstanding.is_empty() && self.deferred.is_empty() && self.pre.is_none() {
             self.pre = Some(self.core.snapshot());
         }
     }
@@ -332,6 +332,7 @@ impl Deliverer {
         for rt in self.consumers.values_mut().filter(|rt| rt.attached) {
             if let Some(run) = rt.gates.as_mut()
                 && run.outstanding.is_empty()
+                && run.deferred.is_empty()
             {
                 run.pre = Some(run.core.snapshot());
             }
