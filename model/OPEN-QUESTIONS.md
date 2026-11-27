@@ -5456,21 +5456,29 @@ Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::windo
 **Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
 it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
 peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
-through the part's directory, counted in the cap, follows if stores with many series show it.
+through the part's directory, counted in the cap, follows if stores with many series show it. Accepted for 7.1b
+only with merges running (71b-4); settle by 7.3 at the latest, before the tree serves a store with many series.
+The search for the reading before a chart no longer decodes every part (`prior_node`, fix round of step 5): it
+takes the chart's window, then the fact path's search back.
 
 ## Q-2073 — `tree_damaged` without an interface
 Decided with roadmap 7.1b step 5, provisional.
 **Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
 change in 7.1b.
 **Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
-count reaches `ReaderState` or health with the scrub's report.
+count reaches `ReaderState` or health with the scrub's report. The count stays test-only until then: 71b-4's scrub
+finds and rebuilds damaged parts on the writer's side but reports nothing outside the process either. Settle with
+the first public report of the tree's health, at 7.3 at the latest.
 
 ## Q-2074 — The visible entries formed per call
 Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
 **Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
 years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
-**Decision (provisional).** Kept for 7.1b; the fix is to look entries up in the parts directly (each part's runs are
-sorted) or to keep the visible entries per root. Q-1424's nested ladder stays unbuilt: it cuts merges, not this.
+**Decision (provisional).** Kept for 7.1b. Order of levers (review ruling, Q-2133): first look the tiles a chart
+asks for up in the parts directly, a binary search in each part's sorted runs, with no map and nothing to
+invalidate; then measure again; only if still above 50 ms, Q-1424's nested ladder, which after the lookup cuts tiles
+and merges from about 40 a bucket to about 2. Keeping the visible entries per root is the alternative to the lookup
+but adds to Q-2072. Settle with the lookup's measurement, before 7.3.
 
 ## Q-2110 — T8 over the files on disk after a fallback start
 Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`), provisional.
@@ -5520,6 +5528,20 @@ Recorded by the review of roadmap 7.1b step 5, decided with its fix round
 **Scenario.** The property fixed 24 cases in source, so `PROPTEST_CASES` never reached it, and no deep shard ran it.
 **Decision (provisional).** It takes `PROPTEST_CASES`, 24 when unset, at most 1,024 a run as Q-2113 caps the tree's
 other properties; the shard `kvik-tree-reads` runs `durable::tree::reads::`.
+
+## Q-2132 — Whether a failing generated T7 case leaks its rig while shrinking
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/tree/reads.rs`),
+provisional.
+**Scenario.** Two mutants the generated property catches ended with the test binary killed at 12 to 14 GB instead of
+a counterexample: each shrink step built a rig whose writer was not shut down when the case panicked.
+**Decision (provisional).** The rig shuts its writer down when dropped, and the property shrinks at most 64 steps.
+
+## Q-2133 — Order of levers for a ten-year chart's 50 ms
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round, provisional.
+**Scenario.** A warm ten-year chart takes 181 ms against design S7's 50 ms; about 14 ms of it are merges, the rest
+the visible entries a chart forms per call (Q-2074).
+**Decision (provisional).** Direct lookup in the parts first, then measure, then the nested ladder (Q-1424), as
+Q-2074 records.
 
 ## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
 Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
@@ -5799,6 +5821,16 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
 | Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
 | Q-1149 | conditions step 3 | Decided by the lead, provisional: durations at most ten years, refused beyond |
+| Q-2070 | 7.3 | Decided by the lead, provisional: the stretch limit in log positions, 2^20; settle with the lifetime bench |
+| Q-2071 | 7.3 | Decided by the lead, accepted at review: steps off the quarter-hours read from facts; revisit with Q-1420 |
+| Q-2072 | 7.3 | Decided by the lead, accepted at review for 7.1b with merges running: whole parts decoded and kept, uncounted |
+| Q-2073 | 7.3 | Decided by the lead, accepted at review: `tree_damaged` counted inside the reader until the tree's health is reported |
+| Q-2074 | 7.3 | Decided by the lead, provisional: direct lookup first, measure, then the nested ladder (Q-2133) |
+| Q-2130 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: a chart's fetch bounded by the memory hint |
+| Q-2131 | 7.1b | Decided with the fix round of 7.1b step 5: the generated T7 property's cases from the environment, own shard |
+| Q-2132 | 7.1b | Decided with the fix round of 7.1b step 5: the rig shuts its writer down when dropped; 64 shrink steps |
+| Q-2133 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: order of levers for the ten-year chart |
+| Q-2260 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: the fetch's bound is the hint, not a grant |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

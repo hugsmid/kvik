@@ -245,7 +245,7 @@ pub(crate) fn buckets_of(
             // A day before the range, so that the first bucket's prior reading is most often in a node.
             let w = tree.window(a.saturating_sub(kvik_tree::set::DAY), b);
             let all: Vec<&Series> = series.iter().map(|(s, _)| *s).collect();
-            done = super::nodes::charts(r, v, &tree, &w, &all, (a, b, step), max, now)?;
+            done = super::nodes::charts(r, v, (&tree, &w), &all, (a, b, step), max, now)?;
         }
         let rest: Vec<(&Series, Params)> = series
             .iter()

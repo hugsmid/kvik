@@ -83,12 +83,10 @@ enum Eval {
 /// The charts of `series` over `[a, b)` at `step` from the tree; `None` for a series the tree cannot serve: a step off
 /// the quarter-hours, a series that stores no 15-minute level, is not served or was changed in the stretch, or an
 /// automatic resolution that may give raw facts. The facts every chart needs are read once for them all.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn charts(
     r: &DurableReader,
     v: &View,
-    tree: &TreeAt,
-    w: &Window,
+    (tree, w): (&TreeAt, &Window),
     series: &[&Series],
     (a, b, step): (i64, i64, i64),
     max: Option<usize>,

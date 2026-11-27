@@ -102,7 +102,8 @@ fn a_newer_root_of_another_generation_store_or_reset_or_with_k_past_the_cut_is_p
     rig.checkpoint();
     let fit = rig.newest_root();
     assert!(nodes_used(&rig) > 0);
-    let unfit: [(&str, fn(&mut kvik_tree::root::Root)); 4] = [
+    type Alter = fn(&mut kvik_tree::root::Root);
+    let unfit: [(&str, Alter); 4] = [
         ("another generation", |r| r.header.generation += 1),
         ("another store", |r| r.header.store_id = [0xee; 16]),
         ("another reset", |r| {

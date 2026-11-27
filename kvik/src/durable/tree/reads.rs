@@ -112,6 +112,14 @@ struct Rig {
     ids: Vec<(SeriesId, Shape)>,
 }
 
+impl Drop for Rig {
+    /// Q-2132: a failing generated case drops its rig at every shrink step, and a writer left running holds its
+    /// threads and its in-memory files.
+    fn drop(&mut self) {
+        let _ = self.w.shutdown();
+    }
+}
+
 impl Rig {
     fn new(name: &str) -> Self {
         let fs = MemFs::new();
@@ -566,9 +574,10 @@ fn a_roll_up_with_a_dirty_or_uncovered_quarter_hour_serves_its_clean_ones_and_eq
 }
 
 proptest! {
-    // Q-2131: 24 cases unless `PROPTEST_CASES` says otherwise, at most 1,024 a run (Q-2113).
+    // Q-2131: 24 cases unless `PROPTEST_CASES` says otherwise, at most 1,024 a run (Q-2113); Q-2132.
     #![proptest_config(ProptestConfig {
         cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(24).min(1024),
+        max_shrink_iters: 64,
         ..ProptestConfig::default()
     })]
 

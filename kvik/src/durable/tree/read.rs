@@ -239,7 +239,8 @@ mod tests {
         };
         assert!(fits(&fit, [7; 16], &cut));
         assert!(!fits(&fit, [8; 16], &cut), "another store");
-        let unfit: [(&str, fn(&mut Root)); 5] = [
+        type Alter = fn(&mut Root);
+        let unfit: [(&str, Alter); 5] = [
             ("another generation", |r| r.header.generation = 3),
             ("another stamp", |r| r.reset.nonce = 10),
             ("K past P", |r| r.checkpoint.sequence = 101),
