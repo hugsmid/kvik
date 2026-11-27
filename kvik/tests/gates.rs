@@ -313,9 +313,10 @@ fn a_gate_that_overflows_its_queue_counts_what_it_drops_and_sends_the_present_st
     block_on(s.shutdown()).unwrap();
 }
 
+/// Spec §6 Gates, Resume (Q-2080): a start replays, flagged `replayed`, the transitions handed out and not confirmed,
+/// and the resync gives the id that set each state; nothing is reseeded.
 #[test]
-fn every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor()
- {
+fn a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by() {
     let clock = kvik::env::ManualClock::new(common::start());
     let config = common::config_on(Backend::Durable, "gates-api-reseed", &clock);
     let s = block_on(Store::open(config.clone())).unwrap();
@@ -323,7 +324,7 @@ fn every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     block_on(c.watch("humidity", humidity(id))).unwrap();
     block_on(s.emit(&[kvik::Reading::new(id, clock.wall(), Value::F64(75.0))])).unwrap();
-    // Handed out, not confirmed: a replay would send it again.
+    // Handed out, not confirmed.
     while c.try_next().unwrap().is_some() {}
     drop(c);
     block_on(s.shutdown()).unwrap();
@@ -331,19 +332,30 @@ fn every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor
     let s = block_on(Store::open(config)).unwrap();
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     let mut gates = Vec::new();
+    let mut replayed = Vec::new();
     while let Some(d) = c.try_next().unwrap() {
         match &d.kind {
-            kvik::DeliveryKind::Transition(t) => panic!("replayed {t:?}"),
+            kvik::DeliveryKind::Transition(t) => {
+                assert!(d.flags.replayed, "{t:?}");
+                replayed.push(t.clone());
+            }
             kvik::DeliveryKind::Resync(r) => gates.extend(r.gates.clone()),
             _ => {}
         }
         block_on(c.confirm(d.id)).unwrap();
     }
+    assert_eq!(
+        replayed.iter().map(|t| t.to.clone()).collect::<Vec<_>>(),
+        [
+            Some(kvik::GateState::Unknown),
+            Some(kvik::GateState::Level(0))
+        ]
+    );
     assert_eq!(gates.len(), 1);
     assert_eq!(
         (gates[0].state.clone(), gates[0].set_by),
-        (kvik::GateState::Level(0), None)
+        (kvik::GateState::Level(0), Some(replayed[1].id))
     );
-    assert_eq!(s.stats().delivery.gates_reseeded, 1);
+    assert_eq!(s.stats().delivery.gates_reseeded, 0);
     block_on(s.shutdown()).unwrap();
 }

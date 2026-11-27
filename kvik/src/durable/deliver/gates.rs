@@ -240,9 +240,9 @@ impl Deliverer {
         Some(run)
     }
 
-    /// At a take (`docs/api.md` `Store::consumer`): the first in this run reseeds the consumer's gates in force
-    /// (no gate cursor is written yet, so every start does, cond2 step 4); a later one queues its unconfirmed
-    /// transitions again under their ids as the catch-up from its cursor passes them (design §4.4 step 4).
+    /// At a take (`docs/api.md` `Store::consumer`): the first in this run replays from the checkpoint or reseeds
+    /// (design §4.4 steps 2 and 3); a later one queues its unconfirmed transitions again under their ids as the
+    /// catch-up from its cursor passes them (design §4.4 step 4).
     pub(super) fn gate_take(&mut self, name: &str, again: bool, ctx: &Ctx<'_>) {
         let has = self
             .consumers

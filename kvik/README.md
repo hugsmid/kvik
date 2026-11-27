@@ -131,9 +131,10 @@ Model backend:
 
 Durable backend, besides windowed operators in funnels:
 
-- **Gates** are judged live on the commit clock; `each` gates and window inputs are refused `NotSupportedYet`, and the
-  gate cursor is kept in memory only, so after a restart every start reseeds its gates: nothing is replayed and the
-  resync's `set_by` is `None` (Q-1583, Q-2000).
+- **Gates** are judged live on the commit clock; `each` gates and window inputs are refused `NotSupportedYet`. The
+  cursor file holds the gate cursor and a checkpoint; a start replays the transitions after the gate cursor, flagged
+  `replayed`, and reseeds instead beyond `conditions.replay_max`, without a cursor file or after a reset point
+  (Q-1583, Q-2080, Q-2082).
 
 - **Every start kind:** a new consumer starts after the position before `start` with no resync; one whose cursor
   file was missing or unreadable at the start is first sent a resync of the added cause `ResyncCause::NoCursor`

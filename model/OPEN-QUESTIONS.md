@@ -5459,8 +5459,9 @@ reseeds the gates in force at the head by the seed rule, emits no start transiti
 (Q-1392), counted `gates_reseeded`; nothing is replayed.
 **Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`,
 `a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
-`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`; `kvik/tests/gates.rs`
-`every_start_reseeds_the_gates_with_no_replay_and_set_by_none_until_the_cursor_file_holds_the_gate_cursor`.
+`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`; the first take's reseed is
+replaced by Q-2080's replay, pinned by `kvik/tests/gates.rs`
+`a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by`.
 
 ## Q-2001 — What the durable backend's gate history reads cost
 Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
