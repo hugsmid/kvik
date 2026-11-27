@@ -311,6 +311,18 @@ impl Deliverer {
         }
     }
 
+    /// Before a batch's items: each run with nothing outstanding takes `pre` afresh, so the snapshot held for its
+    /// next transition is at most a batch behind its judgement (design §4.3; a replay from it stays short, step 5).
+    pub(super) fn gate_batch(&mut self) {
+        for rt in self.consumers.values_mut().filter(|rt| rt.attached) {
+            if let Some(run) = rt.gates.as_mut()
+                && run.outstanding.is_empty()
+            {
+                run.pre = Some(run.core.snapshot());
+            }
+        }
+    }
+
     /// The commit floor: once every batch assigned below it has been taken, timers due by it fire.
     pub(super) fn gate_timers(&mut self, ctx: &Ctx<'_>) {
         // The floor raises the commit clock: on a store with no gate, commit times stay as without gates (§2).
