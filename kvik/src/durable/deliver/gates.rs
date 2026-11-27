@@ -152,6 +152,12 @@ impl Deliverer {
         self.floor_hold = f;
     }
 
+    /// Makes the gate call for the item at `p` fail, as a failed history read does (Q-1881).
+    #[cfg(test)]
+    pub(crate) fn fail_gate_at(&mut self, p: Option<LogPos>) {
+        self.gate_fail_at = p;
+    }
+
     fn history<'a>(&'a self, ctx: &'a Ctx<'a>) -> LogHistory<'a> {
         LogHistory { d: self, ctx }
     }
@@ -287,7 +293,13 @@ impl Deliverer {
                 position: core_pos(p),
                 body,
             };
+            #[cfg(test)]
+            let fail = self.gate_fail_at == Some(p);
             self.gate_call(&name, ctx, |core, h| {
+                #[cfg(test)]
+                if fail {
+                    return Err(crate::gates::CoreError::Id(ConditionId(u32::MAX)));
+                }
                 core.apply_batch(commit, std::slice::from_ref(&item), h)
             });
         }

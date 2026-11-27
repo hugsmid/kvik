@@ -273,8 +273,14 @@ fn the_gate_limits_admit_the_last_gate_and_refuse_one_more() {
 }
 
 fn emit(w: &Arc<Writer>, clock: &ManualClock, s: SeriesId, v: f64) {
-    let r = crate::types::Reading::new(s, clock.wall(), Value::F64(v));
-    match w.emit(&[r], crate::types::Intent::Normal, true) {
+    emit_all(
+        w,
+        &[crate::types::Reading::new(s, clock.wall(), Value::F64(v))],
+    );
+}
+
+fn emit_all(w: &Arc<Writer>, rs: &[crate::types::Reading]) {
+    match w.emit(rs, crate::types::Intent::Normal, true) {
         Ok(crate::durable::Emitted::Ready(_)) => {}
         Ok(crate::durable::Emitted::Queued(mut q)) => {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -415,4 +421,53 @@ fn a_pump_on_a_store_without_gates_leaves_the_commit_clock_at_the_last_batch() {
     clock.advance(Duration::from_secs(100));
     assert!(transitions(&w, true).is_empty());
     assert_eq!(committed(&w), before);
+}
+
+#[test]
+fn a_gate_call_failing_mid_batch_reseeds_at_its_item_and_repeats_no_fact() {
+    let (w, _, clock) = open_clocked("gates-fail-mid-batch");
+    let a = gauge(&w, "hall/air/humidity");
+    let b = gauge(&w, "hall/air/temperature");
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    w.route("c", &crate::consume::Funnel::facts(Select::All))
+        .unwrap();
+    w.watch("c", "a", &Gate::change(Input::value(a)).deadband(5.0))
+        .unwrap();
+    w.watch("c", "b", &Gate::change(Input::value(b)).deadband(5.0))
+        .unwrap();
+    emit(&w, &clock, a, 50.0);
+    emit(&w, &clock, b, 1.0);
+    transitions(&w, true);
+    let h = head(&w);
+    let second = kvik_log::writer::Position {
+        generation: h.generation,
+        sequence: h.sequence + 2,
+    };
+    let hub = w.hub().unwrap().clone();
+    hub.run(|d, _| d.fail_gate_at(Some(second)));
+    clock.advance(Duration::from_secs(1));
+    let rs = [
+        crate::types::Reading::new(a, clock.wall(), Value::F64(60.0)),
+        crate::types::Reading::new(b, clock.wall(), Value::F64(20.0)),
+    ];
+    emit_all(&w, &rs);
+    let mut facts = Vec::new();
+    let mut gates = Vec::new();
+    while let Some(d) = w.poll_delivery("c", None).unwrap() {
+        match &d.kind {
+            crate::consume::DeliveryKind::Fact(f) => facts.push(f.position),
+            crate::consume::DeliveryKind::Resync(r) => gates.extend(r.gates.clone()),
+            _ => {}
+        }
+        w.confirm("c", d.id).unwrap();
+    }
+    hub.run(|d, _| d.fail_gate_at(None));
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    assert_eq!(
+        gates.iter().map(|g| g.state.clone()).collect::<Vec<_>>(),
+        [
+            GateState::Value(Value::F64(60.0)),
+            GateState::Value(Value::F64(20.0))
+        ]
+    );
 }
