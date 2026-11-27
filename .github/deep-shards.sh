@@ -77,6 +77,7 @@ tree-properties tree properties
 tree-fuzz-inputs tree fuzz_inputs
 tree-refusals   tree refusals
 tree-set        tree set
+tree-write      tree  lib         write::tests::t1_t5_t6_t8_
 backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys
@@ -90,6 +91,7 @@ log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::
 kvik-units      kvik  lib         durable::by_id::tests::
 kvik-ingest     kvik  lib         durable::ingest::
+kvik-tree-reads kvik  lib         durable::tree::reads::
 kvik-fold       kvik  lib         durable::derived::tests::
 kvik-pmap       kvik  lib         durable::read::pmap::
 kvik-views      kvik  lib         durable::read::tests::concurrent_calls_

@@ -32,8 +32,8 @@ impl Wake for Resolver {
     }
 }
 
-/// What a call does once the log acknowledges it, whoever waits for it.
-pub(super) type OnAck = Box<dyn FnOnce() + Send>;
+/// What a call does once the log has given its result, whoever waits for it.
+pub(super) type OnAck = Box<dyn FnOnce(&Result<LogAck, CommitError>) + Send>;
 
 struct CompletionState {
     pending: Option<LogPending>,
@@ -60,8 +60,8 @@ pub(crate) struct Completion {
 }
 
 impl Completion {
-    /// A completion whose `on_ack` runs once the log acknowledges the call, on the log's writer thread or in the
-    /// first poll that finds the acknowledgement.
+    /// A completion whose `on_ack` runs once the log gives the call's result, on the log's writer thread or in the
+    /// first poll that finds it.
     pub(super) fn new(pending: LogPending, on_ack: OnAck) -> Arc<Self> {
         let c = Arc::new_cyclic(|me| Completion {
             state: Mutex::new(CompletionState {
@@ -97,10 +97,10 @@ impl Completion {
             Poll::Ready(r) => {
                 st.result = Some(r.clone());
                 st.pending = None;
-                let on_ack = st.on_ack.take().filter(|_| r.is_ok());
+                let on_ack = st.on_ack.take();
                 drop(st);
                 if let Some(f) = on_ack {
-                    f();
+                    f(&r);
                 }
                 Waker::from(self.wakers.clone()).wake();
                 Poll::Ready(r)

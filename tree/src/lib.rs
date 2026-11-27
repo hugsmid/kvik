@@ -32,9 +32,11 @@ pub mod fuzz;
 mod level;
 mod node;
 pub mod part;
+pub mod read;
 pub mod root;
 pub mod set;
 mod window;
+pub mod write;
 
 pub use bytes::{DecodeError, NotStorable, decode, encode, form};
 pub use exact::{Exact, exact, exact_ns};

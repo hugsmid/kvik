@@ -1,7 +1,7 @@
 //! The visible state of a tree root (design 7.1b section 3.3), the cover of a span (section 2), the part merge
 //! and the merge planner (section 5). Pure functions over decoded roots and parts; files are the writer's concern.
 
-mod merge;
+pub(crate) mod merge;
 mod plan;
 
 use std::collections::BTreeMap;
@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 use kvik_log::writer::Position;
 
 pub use merge::{MergeError, merge, next_root, part_ref};
-pub use plan::{DAY, Plan, Policy, Tier, plan};
+pub use plan::{DAY, Plan, Policy, Tier, plan, settled_period};
 
 use crate::level::{Level, MINUTE};
 use crate::node::Node;
-use crate::part::Part;
+use crate::part::{Entry, Part};
 use crate::root::{PartRef, Root};
 
 /// The unit of dirtiness and of cover edges (design section 2): levels at least this wide are cover levels, the
@@ -81,25 +81,46 @@ pub fn covered(root: &Root, level: u8, from: i64, to: i64) -> bool {
 /// `covered`, empty markers left out. Parts the root does not list are ignored.
 pub fn visible(root: &Root, parts: &[Part]) -> Result<BTreeMap<Key, Seen>, SetError> {
     let live = live_parts(root, parts)?;
-    let won = overlay(root, &live)?;
-    Ok(won
+    Ok(seen(root, overlay(root, &live)?))
+}
+
+/// The entries of `visible(R)` of one series by `(level, start)`, borrowed from the root's live parts (a reader's
+/// state, design section 6).
+pub fn visible_entries<'a>(
+    root: &Root,
+    live: &[&'a Part],
+    series: u64,
+) -> Result<BTreeMap<(u8, i64), &'a Entry>, SetError> {
+    Ok(overlay_refs(root, live, Some(series))?
         .into_iter()
-        .filter_map(|(k, (_, e))| {
-            let (series, level, start) = k;
-            let width = width(&root.levels, level)?;
-            let keep = served(root, series)
-                && (e.stale || e.node.is_some())
-                && covered(root, level, start, start + width);
-            keep.then_some((
+        .filter(|(k, (_, e))| keep(root, *k, e))
+        .map(|((_, level, start), (_, e))| ((level, start), e))
+        .collect())
+}
+
+fn seen(root: &Root, won: BTreeMap<Key, (u64, Entry)>) -> BTreeMap<Key, Seen> {
+    won.into_iter()
+        .filter(|(k, (_, e))| keep(root, *k, e))
+        .map(|(k, (_, e))| {
+            (
                 k,
                 Seen {
                     as_of: e.as_of,
                     stale: e.stale,
                     node: e.node,
                 },
-            ))
+            )
         })
-        .collect())
+        .collect()
+}
+
+/// Whether an overlay's winning entry is visible: its series served, a node or a stale mark, inside `covered`.
+fn keep(root: &Root, (series, level, start): Key, e: &Entry) -> bool {
+    width(&root.levels, level).is_some_and(|w| {
+        served(root, series)
+            && (e.stale || e.node.is_some())
+            && covered(root, level, start, start + w)
+    })
 }
 
 pub(crate) fn live_parts<'a>(root: &Root, parts: &'a [Part]) -> Result<Vec<&'a Part>, SetError> {
@@ -119,10 +140,31 @@ pub(crate) fn live_parts<'a>(root: &Root, parts: &'a [Part]) -> Result<Vec<&'a P
 pub(crate) fn overlay(
     root: &Root,
     parts: &[&Part],
-) -> Result<BTreeMap<Key, (u64, crate::part::Entry)>, SetError> {
-    let mut won: BTreeMap<Key, (u64, crate::part::Entry, bool)> = BTreeMap::new();
+) -> Result<BTreeMap<Key, (u64, Entry)>, SetError> {
+    Ok(overlay_refs(root, parts, None)?
+        .into_iter()
+        .map(|(k, (s, e))| (k, (s, e.clone())))
+        .collect())
+}
+
+/// [`overlay`] borrowing its entries, over the runs of `series` alone or of every series.
+fn overlay_refs<'a>(
+    root: &Root,
+    parts: &[&'a Part],
+    series: Option<u64>,
+) -> Result<BTreeMap<Key, (u64, &'a Entry)>, SetError> {
+    let mut won: BTreeMap<Key, (u64, &'a Entry, bool)> = BTreeMap::new();
     for p in parts {
-        for run in &p.runs {
+        let runs = match series {
+            // Runs are in ascending `(series, level)`.
+            Some(s) => {
+                let lo = p.runs.partition_point(|r| r.series < s);
+                let hi = p.runs.partition_point(|r| r.series <= s);
+                &p.runs[lo..hi]
+            }
+            None => &p.runs[..],
+        };
+        for run in runs {
             if !above_floors(root, run.series, p.seq) {
                 continue;
             }
@@ -132,7 +174,7 @@ pub(crate) fn overlay(
                     Some((s, _, _)) if *s > p.seq => {}
                     Some((s, _, tied)) if *s == p.seq => *tied = true,
                     _ => {
-                        won.insert(k, (p.seq, e.clone(), false));
+                        won.insert(k, (p.seq, e, false));
                     }
                 }
             }
@@ -212,7 +254,7 @@ pub fn rollups(levels: &[Level]) -> Vec<(Level, Level)> {
 
 /// One tile of a cover, left to right.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Tile<'a> {
+pub enum Tile<'a, S = Seen> {
     /// A covered node span: the visible entry, or `None` for an empty node.
     Node {
         /// Level id.
@@ -222,7 +264,7 @@ pub enum Tile<'a> {
         /// Span end.
         end: i64,
         /// The visible entry; a `stale` one sends the reader to facts.
-        seen: Option<&'a Seen>,
+        seen: Option<&'a S>,
     },
     /// Quarter-hours no level covers, or a series not served: the reader takes facts.
     Facts {
@@ -245,6 +287,22 @@ pub fn cover<'a>(
     a: i64,
     b: i64,
 ) -> Vec<Tile<'a>> {
+    cover_by(root, series, a, b, |level, start| {
+        vis.get(&(series, level, start))
+    })
+}
+
+/// [`cover`] with the visible entry of `(level, start)` given by `get`.
+///
+/// # Panics
+/// Panics when `a` or `b` is off a quarter-hour or `a > b`.
+pub fn cover_by<'a, S>(
+    root: &Root,
+    series: u64,
+    a: i64,
+    b: i64,
+    get: impl Fn(u8, i64) -> Option<&'a S>,
+) -> Vec<Tile<'a, S>> {
     assert!(
         a.rem_euclid(QUARTER) == 0 && b.rem_euclid(QUARTER) == 0 && a <= b,
         "cover needs quarter-hour edges in order"
@@ -257,7 +315,7 @@ pub fn cover<'a>(
         };
     }
     let levels = cover_levels(&root.levels);
-    let mut out: Vec<Tile<'a>> = Vec::new();
+    let mut out: Vec<Tile<'a, S>> = Vec::new();
     let mut x = a;
     while x < b {
         let fit = levels.iter().find(|l| {
@@ -271,7 +329,7 @@ pub fn cover<'a>(
                     level: l.id,
                     start: x,
                     end: x + l.width,
-                    seen: vis.get(&(series, l.id, x)),
+                    seen: get(l.id, x),
                 });
                 x += l.width;
             }

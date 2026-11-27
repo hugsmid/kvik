@@ -691,6 +691,7 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     LocalDataUnreadable { readings: u64, deliveries: u64, evaluations: u64, regions: u64 },
         // decided this run with a check unmade for want of local data (Q-750, Q-925); damaged regions no lost range
         // and no loss this process reports stands for, at every start until repaired or recorded as lost (Q-755, Q-929)
+    TreeBehind { cause: String },  // summary-tree checkpoints failing or overdue; reads stay correct (design 7.1b)
     StorageSuspect { corruptions: u32, within: Span },    // repeated corruption (spec §8 Self-repair, Q-247)
     LabelLimit { which: StoreLimit, used: u64, limit: u64 }, LabelSeriesLimit { series: SeriesId, used: u64, limit: u64 },
     LabelsUnavailable }            // Labels: the limit reasons are information, not degraded

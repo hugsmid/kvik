@@ -7,6 +7,7 @@ use std::sync::Arc;
 use km::summary::Params;
 use kvik_model as km;
 use kvik_tree as kt;
+use kvik_tree::set::QUARTER;
 
 use super::super::index::{Stored, fact_into};
 use super::super::read::source::{each_row, search_back_each};
@@ -236,7 +237,23 @@ pub(crate) fn buckets_of(
         let Some((a, b, step, max)) = shape else {
             return Ok(Vec::new());
         };
-        let mut members = members(r, v, &series, a, now, |s, core| Member {
+        // Design 7.1b section 6 Charts: series the tree serves take their buckets from it, the rest one stream.
+        let mut done: Vec<Option<ChartData>> = vec![None; series.len()];
+        if step % QUARTER == 0
+            && let Some(tree) = r.tree_at(v)
+        {
+            // A day before the range, so that the first bucket's prior reading is most often in a node.
+            let w = tree.window(a.saturating_sub(kvik_tree::set::DAY), b);
+            let all: Vec<&Series> = series.iter().map(|(s, _)| *s).collect();
+            done = super::nodes::charts(r, v, (&tree, &w), &all, (a, b, step), max, now)?;
+        }
+        let rest: Vec<(&Series, Params)> = series
+            .iter()
+            .zip(&done)
+            .filter(|(_, d)| d.is_none())
+            .map(|(x, _)| *x)
+            .collect();
+        let mut members = members(r, v, &rest, a, now, |s, core| Member {
             series: s,
             states: s.def.state_names.len(),
             reach: fold::reach(&params(&s.def), a),
@@ -252,19 +269,33 @@ pub(crate) fn buckets_of(
             }),
         })?;
         drive(r, v, &mut members, b)?;
-        let charts: Vec<ChartData> = members
+        let mut streamed = members.into_iter();
+        let charts: Vec<ChartData> = done
             .into_iter()
-            .map(|m| match (m.head, m.out) {
-                (Some(h), _) => ChartData::Facts(h.facts),
-                (None, Out::Buckets(buckets)) => ChartData::Buckets {
-                    step: convert::dur(i128::from(step)),
-                    buckets,
-                },
-                (None, Out::Node(_)) => unreachable!("buckets fold into buckets"),
+            .map(|d| {
+                d.unwrap_or_else(|| {
+                    streamed
+                        .next()
+                        .expect("a member per series left")
+                        .chart(step)
+                })
             })
             .collect();
         Ok(at.iter().map(|&k| charts[k].clone()).collect())
     })
+}
+
+impl Member<'_> {
+    fn chart(self, step: i64) -> ChartData {
+        match (self.head, self.out) {
+            (Some(h), _) => ChartData::Facts(h.facts),
+            (None, Out::Buckets(buckets)) => ChartData::Buckets {
+                step: convert::dur(i128::from(step)),
+                buckets,
+            },
+            (None, Out::Node(_)) => unreachable!("buckets fold into buckets"),
+        }
+    }
 }
 
 /// Window results of several series over one window and aggregate, from one stream of its span: each as

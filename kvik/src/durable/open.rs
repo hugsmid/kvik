@@ -193,6 +193,25 @@ impl Writer {
                 });
             }
         };
+        let dirty = Arc::new(tree::Dirty::default());
+        let tree_job = start_fault.is_none().then(|| {
+            let ds = writer.directory_start();
+            let job = Arc::new(tree::Job::new(tree::job::Parts {
+                dir: dir.clone(),
+                env: env.clone(),
+                latch: latch.clone(),
+                recorded: recorded.to_vec(),
+                id: kvik_tree::write::Identity {
+                    generation: ds.generation,
+                    reset: ds.stamp.unwrap_or_default(),
+                    store_id: descriptor.store_id,
+                },
+                fresh: writer.stats().max_series_id == 0,
+                dirty: dirty.clone(),
+            }));
+            hook.tree(job.clone());
+            job
+        });
         let log =
             Log::start_with(writer, clock, Some(derived::options(&hook))).map_err(|source| {
                 OpenError::Io {
@@ -200,6 +219,9 @@ impl Writer {
                     source,
                 }
             })?;
+        if let Some(job) = &tree_job {
+            job.marks(log.watch());
+        }
         let watch_log = log.watch();
         hook.fold.follow(move || watch_log.mark_synced());
         let counters = Arc::new(Mutex::new(counters));
@@ -261,8 +283,23 @@ impl Writer {
             scan: Mutex::new(scan),
             bucket_warning: config.log.bucket_warning(),
             fast: Arc::default(),
+            dirty,
+            tree: tree_job,
             env,
         });
+        if let Some(job) = &w.tree {
+            let weak = Arc::downgrade(&w);
+            job.readers(Box::new(move |open| {
+                let Some(w) = weak.upgrade() else {
+                    return Ok(None);
+                };
+                if open {
+                    w.reader().map(Some).map_err(|e| e.to_string())
+                } else {
+                    Ok(lock(&w.reader).clone())
+                }
+            }));
+        }
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
         // Opening). A release whose name is not a valid entry is left out.
         let release = tzdata_name(tz.version());

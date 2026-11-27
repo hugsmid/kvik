@@ -4418,6 +4418,21 @@ impl Model {
         Ok(build_trees(&v.registry, &current))
     }
 
+    /// The version of the series' node over `[start, end)` (Q-1422, Q-2060).
+    pub fn tree_as_of(
+        &self,
+        s: SeriesId,
+        start: Nanos,
+        end: Nanos,
+    ) -> Result<Option<Position>, Error> {
+        let v = self.vol()?;
+        Ok(crate::tree::as_of(
+            v.current.range((s, start)..(s, end)).map(|(_, f)| f),
+            start,
+            end,
+        ))
+    }
+
     /// A window `[start, end)` over a series from the tree, evaluated at the
     /// engine clock `now` (§6).
     pub fn window(&self, s: SeriesId, start: Nanos, end: Nanos) -> Result<Node, Error> {

@@ -5707,6 +5707,285 @@ Decided with the review of roadmap 6.3e, provisional. To be settled by the roadm
 **Decision (provisional).** The appender's fault ends compaction for the run of the process: `publish` refuses (`PublishError::Refused(AppendError::ReadOnly)`) before any rename when the appender is faulted; the next start finds the record or not and cleans up as §3.5 says. Reason: only the next start can tell whether the unsure record is on disk.
 **Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_publish_after_an_unsure_record_leaves_the_outputs_that_record_may_name`.
 
+## Q-1428 — Which registry entries change a series' nodes
+Settled with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs` `node_changing`).
+**Scenario.** A registry entry committed beside facts can change nodes already stored; the series must then not be
+served from the tree until rebuilt. The design's default was everything but labels, aliases and routing.
+**Decision.** By entry type: a definition of an id already defined; a parameter change carrying the expected
+interval, the staleness limit, the wrap or the reset ceiling; a retirement. No node changes for aliases, routing,
+zone and tzdata entries (no calendar node is stored, Q-1425), recovery entries (their losses take the global floor,
+Q-1429), scale raises (decimal series store no level), or parameter changes of recording, lateness, retention or
+excess precision. Such a series gets an open floor in the next root; 71b-4's rebuild closes it.
+**Pinned by.** `durable::tree::tests` `a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_not`.
+
+## Q-1830 — K and the dirty set without a race
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs`), provisional.
+**Scenario.** Acknowledgements reach the commit hook out of order across threads, so a set filled at acknowledgement
+can miss a fact at or below a K the job has already taken.
+**Decision (provisional).** A call marks its pairs before its facts are offered; K is the durable position of a cut
+taken before the set is read; a pair is cleared only when no call that marked it is unsettled and the highest last
+position of those settled is at or below K. A call whose outcome is unknown keeps its pairs until a restart.
+**Pinned by.** `durable::tree::dirty::tests`, `durable::tree::tests` `a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark`.
+
+## Q-1831 — One delta part per UTC day
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs`), provisional.
+**Scenario.** The design writes one delta part a checkpoint; a part has one period, and the planner merges deltas of
+one UTC day; late data dirties quarter-hours of other days.
+**Decision (provisional).** A checkpoint writes one delta part per UTC day its entries fall in, all with the root's
+`seq`; usually one, two around midnight.
+**Pinned by.** `tree/src/write/tests.rs` (histories cross midnight).
+
+## Q-1832 — Definitions met by `dirty_from_log`
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/stretch.rs`), provisional.
+**Scenario.** The pass over `(K, P]` does not know the registry at K, so it cannot tell a new series' definition from a
+redefinition (Q-1428).
+**Decision (provisional).** Every definition in the stretch marks its series for rebuild. A series defined in the
+last interval before a stop is served from facts until its rebuild (71b-4), which is cheap; the commit path, which
+has the registry, marks only redefinitions.
+
+## Q-1833 — Empty markers for every empty span of a dirty quarter-hour
+Decided with roadmap 7.1b step 3 (`tree/src/write/nodes.rs`), provisional.
+**Scenario.** The job does not read the visible state, so it cannot tell whether an empty span hides an older entry.
+**Decision (provisional).** Every empty span of a folded level inside a dirty quarter-hour is written as an empty
+marker (about 4 bytes each, at most 16 a quarter-hour); a merge that takes every live part of its period drops them.
+The extension of a stored node by later readings (section 5 step 3) is left for a later step: the job always folds
+the span's current facts, which gives the same node.
+
+## Q-1834 — The tree's coverage before backfill
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs` `covered_all`), provisional.
+**Scenario.** With no root, `covered` must be true only where every fact has gone through the dirty set.
+**Decision (provisional).** A start with no valid root covers every span of the folded levels when the registry holds
+no series (no fact can exist), and nothing otherwise until backfill (71b-4). A tree whose first checkpoint never
+landed therefore waits for backfill; reads take facts meanwhile.
+
+## Q-1950 — A clean shutdown's checkpoint and reading the log
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle with 71b-4.
+**Scenario.** Design section 5 checkpoints at a clean shutdown, but the checkpoint reads the dirty quarter-hours'
+facts through a reader, and a process that has not read opens one by reading the log, which a clean shutdown never
+does (the registry file is written from the deliverer's index without reading the log).
+**Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
+leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
+that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it. Kept by 71b-4, which
+adds that a clean shutdown runs no maintenance either (no rebuild, scrub, backfill or merge).
+A first step that comes at a clean shutdown with no reader open does not start the tree either, since the start's
+pass reads the log (`a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree`).
+
+## Q-1951 — One reader for the tree's checkpoints and the process's reads
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
+**Scenario.** A checkpoint job with its own reader holds a second index of the log in the writer's process, and its
+start opened it only to learn whether the store held a series.
+**Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
+if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
+
+## Q-1952 — A fan-out session answers a race with an older value
+Recorded with roadmap 7.1b step 3, open; for a fix of the live fan-out (`kvik/src/durable/read/live/fanout.rs`).
+**Scenario.** The property `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive`
+found a history (pinned, ignored, as `a_race_between_two_rounds_of_one_series_delivers_the_later_value`) in which a
+session polled only when rung answers a `Latest` read with the value at sequence 6 where every-round sessions and the
+model give the one at sequence 11. It fails the same way on public main.
+**Recommended default.** Treat as a delivery bug: a later value of a series in the round that races the session's turn
+must reach it. Fix with the fan-out, then remove the `ignore`.
+
+## Q-2060 — The node version and registry entries
+Decided with roadmap 7.1b step 4 (`tree/src/write/nodes.rs` `quarter_entries`, `model/src/tree.rs` `as_of`),
+provisional; settle with 72-1 (the version rule).
+**Scenario.** Q-1422 makes `as_of` the highest position among the span's current facts, or the position of the latest
+registry entry that changed the series' nodes if higher. The registry holds no position per series, so a rebuild
+from the log could not give the second without a scan of every entry.
+**Decision (provisional).** `as_of` is the highest position among the span's current facts, bad-quality facts
+included; a roll-up's is its children's highest. A node-changing entry is seen through the series' floor instead: a
+cache keys on the floor's `seq` with `as_of`. Live and rebuilt trees agree (T3), and the model's `as_of` is the same.
+
+## Q-2061 — The late window before a day's part and roll-ups
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `POLICY`), provisional; settle on 72-2's backfill
+storms.
+**Scenario.** The merge planner waits a late window after a UTC day ends before writing its day part and roll-ups;
+design section 5 names the window but not its length.
+**Decision (provisional).** One day. Late data after it still lands: the checkpoint recomputes the covered roll-ups
+over each changed quarter-hour from the visible children (T2).
+
+## Q-2062 — Where a backfill stops walking back
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job/maintain.rs` `backfill`), provisional.
+**Scenario.** A backfill rebuilds newest period first, but the store keeps no cheap earliest time across series, so
+the walk cannot tell when it has passed the oldest fact.
+**Decision (provisional).** The first range is from the start of today's UTC day upwards; then each settled period
+below (days, weeks, 13 and 52 weeks as alignment allows). A period holding no fact of any served series ends the walk:
+the same rebuild takes everything below it and the quarter-hour level is then covered without bound. The first range
+and each unsettled day count, so one idle day ends the walk: a gap of a whole period in the data therefore reads all
+older facts at once, which is still each fact once, and publishes them one settled period a root (Q-2112).
+
+## Q-2063 — The scrub's cadence
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
+**Scenario.** Section 7 has the writer's scrub find a damaged part and rebuild its period, without a cadence; reading
+every live part costs a pass over the tree.
+**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge or a
+checkpoint that meets a damaged input runs it at once (Q-2111). The rebuild covers the part's period widened to every live part it overlaps, which it
+retires, so that it is the whole truth of that period.
+
+## Q-2070 — The stretch limit counted in log positions
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.
+**Scenario.** Design section 6 stops a reader using the tree when its stretch (K, P] is longer than 64 MiB of log,
+but a reader cannot count log bytes between two positions without reading them.
+**Decision (provisional).** The limit is 2^20 positions (about 20 to 190 MiB at the measured 21 to 184 bytes a
+reading); past it the read takes facts. Settle with the lifetime bench's log bytes a reading.
+
+## Q-2071 — A fixed step off the quarter-hours
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of`), provisional.
+**Scenario.** Design section 6 folds the partial quarter-hours of each bucket of a `Step` that is not a multiple of
+15 minutes from facts; that is two fact reads a bucket, up to 2,000 a chart.
+**Decision (provisional).** Such a chart, and any step below 15 minutes, is read from facts whole; results are
+equal either way (T7). Revisit with the 1-minute level (Q-1420).
+
+## Q-2072 — Whole parts decoded and kept by a reader
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::window`), provisional.
+**Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
+`Part::decode` decodes a whole part, every series in it.
+**Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
+it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
+peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
+through the part's directory, counted in the cap, follows if stores with many series show it. Accepted for 7.1b
+only with merges running (71b-4); settle by 7.3 at the latest, before the tree serves a store with many series.
+The search for the reading before a chart no longer decodes every part (`prior_node`, fix round of step 5): it
+takes the chart's window, then the fact path's search back.
+
+## Q-2073 — `tree_damaged` without an interface
+Decided with roadmap 7.1b step 5, provisional.
+**Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
+change in 7.1b.
+**Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
+count reaches `ReaderState` or health with the scrub's report. The count stays test-only until then: 71b-4's scrub
+finds and rebuilds damaged parts on the writer's side but reports nothing outside the process either. Settle with
+the first public report of the tree's health, at 7.3 at the latest.
+
+## Q-2074 — The visible entries formed per call
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
+**Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
+years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
+**Decision (provisional).** Kept for 7.1b. Order of levers (review ruling, Q-2133): first look the tiles a chart
+asks for up in the parts directly, a binary search in each part's sorted runs, with no map and nothing to
+invalidate; then measure again; only if still above 50 ms, Q-1424's nested ladder, which after the lookup cuts tiles
+and merges from about 40 a bucket to about 2. Keeping the visible entries per root is the alternative to the lookup
+but adds to Q-2072. Settle with the lookup's measurement, before 7.3.
+
+## Q-2110 — T8 over the files on disk after a fallback start
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`), provisional.
+**Scenario.** A partial power loss leaves a newer root that the start refuses and leaves on disk; the start continues
+from an older root with a lower K. A rebuild or merge publishes at the root's K, so a repair or merge as the first
+publish after such a start writes a root of higher `seq` and lower K than the refused file.
+**Decision (provisional).** The job takes a checkpoint at the cut, at or above any root's K (T5), before any rebuild or
+merge, and the tree tests follow that order. A start does not remove a refused newer root.
+
+## Q-2111 — A checkpoint that meets a damaged part
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `ancestors`, `kvik/src/durable/tree/job.rs`),
+provisional.
+**Scenario.** Late data into a merged day makes the checkpoint recompute the day's roll-ups from the live parts over it.
+A damaged one failed the checkpoint, and maintenance (scrub, repair, merges) runs only after a checkpoint, so the tree
+stalled for good. A repair cannot run first: it publishes at the root's K, below the cut.
+**Decision (provisional).** The checkpoint goes through: each roll-up span over a part that will not load is written as
+a stale marker (readers take facts), and the job's maintenance at the same step runs the repair, whose widened period
+rewrites those spans from facts at the same cut.
+
+## Q-2112 — The size of one rebuild
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional; settle with 72-2.
+**Scenario.** A floor close and the end of a backfill walk rebuild a series' whole range. Published as one root, a
+stop loses all of it and every part is held until that publish.
+**Decision (provisional).** Both publish one settled period a root at the same K, newest first; the floor closes and
+the unbounded cover is added with the last, so a stop loses at most one period and the next step resumes below what
+is covered. The facts are still read and folded in one pass; streaming that fold is left to 72-2.
+
+## Q-2113 — Case counts of the tree's properties
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/write/tests.rs`), provisional.
+**Scenario.** A count fixed in source overrides `PROPTEST_CASES`, so the deep run never reaches the property.
+**Decision (provisional).** The tree's properties take `PROPTEST_CASES`, capped at 1,024 per run.
+
+## Q-2130 — How much of a chart the tree's reads may hold from facts
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/windows/nodes.rs`
+`fetch`), provisional.
+**Scenario.** A chart over a span the tree does not cover (history before the first checkpoint, a damaged part, a
+tree discarded by a lost range) fetched every reading of that span for every charted series before folding any
+bucket, outside `ReaderConfig.memory`; the fact path it replaces folds as it streams.
+**Decision (provisional).** The fetch counts the bytes of the readings it holds and, once they pass what one pass of
+the reader's memory would be granted now (Q-2260), drops them and gives every series of the call to the fact path.
+The result is the same either way (T7). Test:
+`a_chart_over_more_uncovered_readings_than_the_memory_hint_holds_them_not_and_takes_facts`.
+
+## Q-2131 — The case count and shard of the generated T7 property
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round
+(`kvik/src/durable/tree/reads.rs`), provisional.
+**Scenario.** The property fixed 24 cases in source, so `PROPTEST_CASES` never reached it, and no deep shard ran it.
+**Decision (provisional).** It takes `PROPTEST_CASES`, 24 when unset, at most 1,024 a run as Q-2113 caps the tree's
+other properties; the shard `kvik-tree-reads` runs `durable::tree::reads::`.
+
+## Q-2132 — Whether a failing generated T7 case leaks its rig while shrinking
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/tree/reads.rs`),
+provisional.
+**Scenario.** Two mutants the generated property catches ended with the test binary killed at 12 to 14 GB instead of
+a counterexample: each shrink step built a rig whose writer was not shut down when the case panicked.
+**Decision (provisional).** The rig shuts its writer down when dropped, and the property shrinks at most 64 steps.
+
+## Q-2133 — Order of levers for a ten-year chart's 50 ms
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round, provisional.
+**Scenario.** A warm ten-year chart takes 181 ms against design S7's 50 ms; about 14 ms of it are merges, the rest
+the visible entries a chart forms per call (Q-2074).
+**Decision (provisional).** Direct lookup in the parts first, then measure, then the nested ladder (Q-1424), as
+Q-2074 records.
+
+## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
+Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
+with 71b-4.
+**Scenario.** The mark is synced every `log.mark_sync` (1 s by default), so for up to a second after each commit the
+durable position, and with it a cut's K, is above the synced mark, and the tree refuses a root naming it. A store
+taking a commit a second or more never took an interval checkpoint.
+**Decision (provisional).** After taking its cut, an interval checkpoint whose K is above the synced mark has the log
+sync the mark through K (`Watch::sync_mark`) and checkpoints with what it returns: at most one extra mark sync an
+interval, 96 a day. A clean shutdown keeps the mark its own sync left. Alternative not taken: answer "not yet", ask
+for a sync as the derived files do, and retry within a second.
+Test: `an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds`.
+
+## Q-2181 — K of a tree started on a store with facts and no root
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `start`), provisional; settle with 71b-4.
+**Scenario.** A store with facts and no tree starts an empty root that covers nothing, with K at the origin; the
+start's pass from the origin read the whole log and, by Q-1832, floored every series defined in it.
+**Decision (provisional).** When the start continues no root and the store is not fresh, it makes no pass: nothing is
+covered, so nothing below the mark needs marking. The first checkpoint takes K from its cut and writes a root with no
+part and no floor; 71b-4's backfill covers the store from facts. Test:
+`a_store_with_facts_and_no_tree_starts_without_marking_its_log`.
+
+## Q-2182 — A loss found while running
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional; settle with 71b-4.
+**Scenario.** A loss found this run below the root's K discards the tree (Q-1429). The comparison is with the
+manifest's lost ranges as they were at opening, so the same loss discarded the tree again at every later checkpoint
+that left a part.
+**Decision (provisional).** The job remembers the ranges of the losses each discard answered, and discards again only
+for a loss outside them. Test: `a_loss_found_while_running_discards_the_tree_once`.
+
+## Q-2183 — A checkpoint with nothing to write
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional.
+**Scenario.** An idle store published a root every interval: a file, a file sync and a directory sync, 96 times a
+day.
+**Decision (provisional).** With no dirty pair, no series to floor, no discard and K equal to the root's, the step
+removes the retired parts that are due and counts as a checkpoint without publishing. When only K moved, a root with
+no part is published, so the stretch stays short. Test: `an_idle_store_writes_no_root_at_its_intervals`.
+
+## Q-2184 — How ingest latency is measured for the commit path's dirty set
+Decided with the fix round of roadmap 7.1b step 3, provisional.
+**Scenario.** The commit path gained, per call and under the decision lock, the call's sorted keys and a hash insert
+per pair, and a second lock at the acknowledgement; no bench drove `emit`.
+**Decision (provisional).** `kvik/benches/emit.rs` measures each call from `emit` to its acknowledgement at a home
+rate (one reading a call, 45 calls a second) and at saturation (batches of 100 back to back), and
+`scripts/bench-emit-ab.sh` runs it on a base revision and the head, alternating. The result is in
+`docs/measurements/tree-71b-3-ingest-latency.md`.
+
+## Q-2260 — The tree's fetch bounded by the memory hint, not charged
+Decided with the fix round of roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `fetch`), provisional.
+**Scenario.** Q-2130 bounds the readings a chart's fetch holds. Charging them to the accountant would hold a grant
+while the fetch's own passes ask for theirs, and an admission waits for running grants, so the fetch could wait on
+itself.
+**Decision (provisional).** The bound is the accountant's `rows_hint` taken when the fetch starts, not a grant: the
+fetch holds at most about one pass's grant beside the passes it runs. A span past the bound is read twice, once by
+the abandoned fetch and once by the fact path. Settle with Q-2072's block-level decode, which brings tree reads
+under the cap.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5943,6 +6222,16 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
 | Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
 | Q-1149 | conditions step 3 | Decided by the lead, provisional: durations at most ten years, refused beyond |
+| Q-2070 | 7.3 | Decided by the lead, provisional: the stretch limit in log positions, 2^20; settle with the lifetime bench |
+| Q-2071 | 7.3 | Decided by the lead, accepted at review: steps off the quarter-hours read from facts; revisit with Q-1420 |
+| Q-2072 | 7.3 | Decided by the lead, accepted at review for 7.1b with merges running: whole parts decoded and kept, uncounted |
+| Q-2073 | 7.3 | Decided by the lead, accepted at review: `tree_damaged` counted inside the reader until the tree's health is reported |
+| Q-2074 | 7.3 | Decided by the lead, provisional: direct lookup first, measure, then the nested ladder (Q-2133) |
+| Q-2130 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: a chart's fetch bounded by the memory hint |
+| Q-2131 | 7.1b | Decided with the fix round of 7.1b step 5: the generated T7 property's cases from the environment, own shard |
+| Q-2132 | 7.1b | Decided with the fix round of 7.1b step 5: the rig shuts its writer down when dropped; 64 shrink steps |
+| Q-2133 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: order of levers for the ten-year chart |
+| Q-2260 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: the fetch's bound is the hint, not a grant |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
