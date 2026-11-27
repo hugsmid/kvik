@@ -414,52 +414,18 @@ impl<'w> Chart<'w> {
             .and_then(|f| reading(states, f)))
     }
 
-    /// `Some` with the last reading before `qa` when the tree alone tells it: from the chart's window, else, when the
-    /// window holds no node before `qa`, from every part before it.
+    /// `Some` with the last reading before `qa` when the chart's window tells it: from the nearest node before it,
+    /// when every quarter-hour between is covered and clean. With no node before `qa` in the window the search back
+    /// answers, which decodes no part (Q-2072).
     fn prior_node(&self, qa: i64) -> Option<Option<Reading>> {
-        if self
-            .vis
-            .range((LEVEL, i64::MIN)..(LEVEL, qa))
-            .next()
-            .is_some()
+        let ((_, from), seen) = self.vis.range((LEVEL, i64::MIN)..(LEVEL, qa)).next_back()?;
+        if seen.stale
+            || !covered(self.root, LEVEL, *from, qa)
+            || self.tree.dirty(self.id, *from, qa)
         {
-            return told(self.root, &self.vis, qa, |a, b| {
-                self.tree.dirty(self.id, a, b)
-            });
+            return None;
         }
-        let w = self.tree.window(i64::MIN, qa);
-        let live: Vec<&Part> = w.live.iter().map(|p| &**p).collect();
-        let vis = visible_entries(&w.root, &live, u64::from(self.id)).ok()?;
-        told(&w.root, &vis, qa, |a, b| self.tree.dirty(self.id, a, b))
-    }
-}
-
-/// The last reading before `qa` from the nearest node before it, when every quarter-hour between is covered and
-/// clean; with no node before, no reading when the covered range reaches back to the first quarter-hour.
-fn told(
-    root: &Root,
-    vis: &BTreeMap<(u8, i64), &Entry>,
-    qa: i64,
-    dirty: impl Fn(i64, i64) -> bool,
-) -> Option<Option<Reading>> {
-    let found = vis.range((LEVEL, i64::MIN)..(LEVEL, qa)).next_back();
-    let from = match found {
-        Some(((_, start), _)) => *start,
-        None => {
-            let c = root
-                .covered
-                .iter()
-                .find(|c| c.level == LEVEL && c.from < qa && qa <= c.to)?;
-            (c.from <= ceil_q(i64::MIN)).then_some(c.from)?
-        }
-    };
-    if !covered(root, LEVEL, from, qa) || dirty(from, qa) {
-        return None;
-    }
-    match found {
-        Some((_, seen)) if seen.stale => None,
-        Some((_, seen)) => Some(seen.node.as_ref().and_then(|n| n.last.clone())),
-        None => Some(None),
+        Some(seen.node.as_ref().and_then(|n| n.last.clone()))
     }
 }
 
