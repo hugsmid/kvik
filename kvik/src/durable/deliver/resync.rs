@@ -8,6 +8,8 @@ use kvik_log::writer::Position as LogPos;
 use kvik_model::condition::{ConditionState as MState, Runner};
 
 use super::confirm::{state_in, state_out};
+use super::gate_history::log_pos;
+use super::gates::{GatePoint, transition_delivery};
 use super::{Ctx, Deliverer, FState, Out, Pend, Rec, next};
 use crate::backend::Error;
 use crate::consume::{
@@ -90,10 +92,14 @@ impl Deliverer {
             forget_above,
             position,
             funnels: states,
+            gates: Vec::new(),
+            gate_frontier: None,
             reset,
             unchecked,
         });
         self.unchecked += u64::from(unchecked);
+        self.gate_resynced(name);
+        let rt = self.consumers.get_mut(name).expect("looked up above");
         rt.evaluated = runners.keys().map(|id| (*id, ctx.now)).collect();
         rt.runners = runners;
         rt.emitted = emitted;
@@ -102,7 +108,7 @@ impl Deliverer {
     }
 
     /// The routes and registry as of the position before `at`, built from the entries before it.
-    fn view_before(&self, at: LogPos) -> View {
+    pub(super) fn view_before(&self, at: LogPos) -> View {
         let mut v = View::default();
         for (p, e) in self.entries.range(..at) {
             v.apply(*p, e);
@@ -137,6 +143,7 @@ impl Deliverer {
                 let Some(p) = a.into_iter().chain(b).min() else {
                     break;
                 };
+                self.gate_flush(name, Some(p), true);
                 let rt = self.consumers.get_mut(name).expect("looked up above");
                 if rt.queue.len() >= self.capacity {
                     paused = true;
@@ -159,6 +166,8 @@ impl Deliverer {
                                 forget_above: Some(fa),
                                 position: p,
                                 funnels: Vec::new(),
+                                gates: Vec::new(),
+                                gate_frontier: None,
                                 reset: true,
                                 unchecked: false,
                             });
@@ -182,6 +191,7 @@ impl Deliverer {
                     }
                     _ => {}
                 }
+                self.gate_flush(name, Some(p), false);
                 at = next(p);
             }
             let rt = self.consumers.get_mut(name).expect("looked up above");
@@ -215,6 +225,7 @@ impl Deliverer {
                         }
                     }
                 }
+                self.gate_flush(name, Some(stop), false);
                 self.issue_resync(
                     name,
                     ResyncCause::Resume,
@@ -231,6 +242,10 @@ impl Deliverer {
             }
             rt.behind = None;
             rt.view = None;
+            if self.gate_reattach(name) {
+                let at = self.head;
+                self.issue_resync(name, ResyncCause::Resume, None, at, false, ctx);
+            }
             self.reattach(name);
             return;
         }
@@ -268,14 +283,24 @@ impl Deliverer {
         }
         self.tick(ctx);
         self.catch_up(name, ctx);
-        let Some(p) = self
+        let Some(mut p) = self
             .consumers
             .get_mut(name)
             .and_then(|rt| rt.queue.pop_front())
         else {
             return Ok(None);
         };
-        let parts = self.deliveries(p, ctx);
+        // Gate states are those now, as the resync is handed out (spec §6 Gates, Resume).
+        if let Pend::Resync {
+            gates,
+            gate_frontier,
+            position,
+            ..
+        } = &mut p
+        {
+            (*gates, *gate_frontier) = self.gate_resync(name, *position);
+        }
+        let parts = self.deliveries(name, p, ctx);
         let rt = self.consumers.get_mut(name).expect("bound above");
         rt.parts.extend(parts);
         Ok(self.hand_out(name))
@@ -289,13 +314,44 @@ impl Deliverer {
         {
             rt.gate = Some(p.part);
         }
+        let handed = match (&d.kind, out.gate) {
+            (DeliveryKind::Transition(_), Some(GatePoint::Transition(id))) => Some(id),
+            _ => None,
+        };
         rt.unconfirmed.push(out);
+        if let Some(id) = handed {
+            self.gate_handed(name, id);
+        }
         Some(d)
     }
 
-    pub(super) fn deliveries(&self, p: Pend, ctx: &Ctx<'_>) -> Vec<(Delivery, Out)> {
+    pub(super) fn deliveries(&self, name: &str, p: Pend, ctx: &Ctx<'_>) -> Vec<(Delivery, Out)> {
         let delivered_at = Timestamp(ctx.now);
         match p {
+            Pend::Transition { t, replayed } => {
+                let tr = transition_delivery(self, name, &t);
+                let id = DeliveryId::Transition(tr.id);
+                vec![(
+                    Delivery {
+                        id,
+                        position: tr.id.at,
+                        kind: DeliveryKind::Transition(tr),
+                        flags: DeliveryFlags {
+                            replayed,
+                            ..DeliveryFlags::default()
+                        },
+                        delivered_at,
+                    },
+                    Out {
+                        id,
+                        position: log_pos(t.id.at),
+                        latches: Vec::new(),
+                        forced: false,
+                        reset: false,
+                        gate: Some(GatePoint::Transition(t.id)),
+                    },
+                )]
+            }
             Pend::Fact { rec, replayed } => {
                 let unchecked = rec.unchecked;
                 let position = rec.stored.position;
@@ -320,6 +376,7 @@ impl Deliverer {
                         latches: Vec::new(),
                         forced: false,
                         reset: false,
+                        gate: None,
                     },
                 )]
             }
@@ -359,6 +416,7 @@ impl Deliverer {
                         latches: vec![(funnel, incarnation, state)],
                         forced: false,
                         reset: false,
+                        gate: None,
                     },
                 )]
             }
@@ -367,6 +425,8 @@ impl Deliverer {
                 forget_above,
                 position,
                 funnels,
+                gates,
+                gate_frontier,
                 reset,
                 unchecked,
             } => {
@@ -393,19 +453,13 @@ impl Deliverer {
                         })
                     })
                     .collect();
-                let chunks: Vec<Vec<FunnelState>> = if states.is_empty() {
-                    vec![Vec::new()]
-                } else {
-                    states
-                        .chunks(RESYNC_PART_FUNNELS)
-                        .map(<[FunnelState]>::to_vec)
-                        .collect()
-                };
-                let n = chunks.len();
-                chunks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(k, funnels)| {
+                let mut funnel_parts = states.chunks(RESYNC_PART_FUNNELS);
+                let mut gate_parts = gates.chunks(RESYNC_PART_FUNNELS);
+                let n = funnel_parts.len().max(gate_parts.len()).max(1);
+                (0..n)
+                    .map(|k| {
+                        let funnels = funnel_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
+                        let gates = gate_parts.next().map_or_else(Vec::new, <[_]>::to_vec);
                         let part = u32::try_from(k + 1).unwrap_or(u32::MAX);
                         let last = k + 1 == n;
                         let id = DeliveryId::Resync { part };
@@ -419,6 +473,7 @@ impl Deliverer {
                                     part,
                                     last,
                                     funnels,
+                                    gates,
                                 }),
                                 flags: DeliveryFlags {
                                     unchecked,
@@ -432,6 +487,11 @@ impl Deliverer {
                                 latches: if last { latches.clone() } else { Vec::new() },
                                 forced: last && forget_above.is_some(),
                                 reset: last && reset,
+                                gate: if last {
+                                    gate_frontier.map(GatePoint::Frontier)
+                                } else {
+                                    None
+                                },
                             },
                         )
                     })

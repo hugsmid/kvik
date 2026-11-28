@@ -18,6 +18,7 @@ use crate::durable::{self, DurableReader, Emitted};
 use crate::error::{
     BackupError, ConsumerError, DefineError, EmitError, OpenError, QueryError, WriteError,
 };
+use crate::gate::{Gate, GateId};
 use crate::health::{ConsumerStats, Health, LossReport, SeriesStats, Stats};
 use crate::provisional::{Provisional, ProvisionalOptions};
 use crate::read::{
@@ -622,6 +623,34 @@ impl Consumer {
         match &self.inner {
             ConsumerInner::Model(w) => w.shared.with(|s| s.routes(w.epoch, &self.name)),
             ConsumerInner::Durable(d) => d.routes(&self.name),
+        }
+        .map_err(|e| e.consumer(self.dir()))
+    }
+
+    /// Watches a gate under a name (spec §6 Gates); a log entry that takes effect at its position. An equal gate
+    /// under the name is the gate in force: its id is returned and nothing is written.
+    pub async fn watch(&self, name: &str, gate: Gate) -> Result<GateId, ConsumerError> {
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.watch(w.epoch, &self.name, name, gate)),
+            ConsumerInner::Durable(d) => d.watch(&self.name, name, &gate),
+        }
+        .map_err(|e| e.consumer(self.dir()))
+    }
+
+    /// Unwatches the gate under a name; a log entry that takes effect at its position.
+    pub async fn unwatch(&self, name: &str) -> Result<(), ConsumerError> {
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.unwatch(w.epoch, &self.name, name)),
+            ConsumerInner::Durable(d) => d.unwatch(&self.name, name),
+        }
+        .map_err(|e| e.consumer(self.dir()))
+    }
+
+    /// The gates in force, with their names (series by id).
+    pub fn gates(&self) -> Result<Vec<(GateId, String, Gate)>, ConsumerError> {
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.gates(w.epoch, &self.name)),
+            ConsumerInner::Durable(d) => d.gates(&self.name),
         }
         .map_err(|e| e.consumer(self.dir()))
     }

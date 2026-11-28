@@ -181,7 +181,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1142 | §6 Gates; `api.md` Gates (proposal) | A transition's identity names the instance's series, not an instance number (decided by the lead, provisional) |
 | Q-1143 | §6 Gates | An `Each` past its 256 instances (decided by the lead, provisional) |
 | Q-1144 | §6 Gates | A timer due at an entry's commit time (decided by the lead, provisional) |
-| Q-1145 | §6 Gates | A gate's state when it starts (decided by the lead, provisional) |
+| Q-1145 | §6 Gates | A gate's state when it starts (settled by the owner: seeded from history) |
 | Q-1146 | §6 Gates | Holds across `Unknown` and `Stale` (decided by the lead, provisional) |
 | Q-1147 | §6 Gates, Windows | Window inputs in the model: sampling and the reading at `now` (decided by the lead, provisional) |
 | Q-1148 | §6 Gates; §4 Future facts, Outranked facts; Q-16 | What counts as an arrival for a gate's staleness (decided by the lead, provisional) |
@@ -190,6 +190,76 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-1201 | §4 Consumers; `api.md` Memory | Records held for a consumer not taken in this run (settled by the owner) |
 | Q-1202 | §4 Resync; `api.md` Consumers | `CursorBehindLog` on the durable backend (settled by the owner) |
 | Q-1203 | `api.md` Live reads; Q-1011, Q-1118 | A fan-out round that fails after taking events (settled by the owner) |
+| Q-1410 | §7; Q-801, Q-811 | Roadmap 6.2a2 in two parts (provisional) |
+| Q-1411 | §7; Q-809 | Unknown elements in a run's inputs, found by canonical form |
+| Q-1412 | §7; `format-compacted.md` B.1 | The name and reach a compacted file gives a series (provisional) |
+| Q-1413 | §7, §8 Restore step 1; Q-796 | A non-fact entry set aside beyond a restored end (provisional) |
+| Q-1414 | §7, §9 row 10 | Where a run's outputs wait before publishing (provisional) |
+| Q-1530 | `format-compacted.md` B.1 Canonical writing; Q-811 | A chunk the streaming writer holds whole (provisional) |
+| Q-1531 | compaction design §4; `api.md` Threads; Q-721 | The governor's details and the background task's hook (provisional) |
+| Q-1532 | compaction design §3.2 step 2; Q-800, Q-1410 | The per-series digest stays SHA-256 (provisional) |
+| Q-1533 | compaction design §4; `api.md` Threads; Q-801 | The background task stays on `kvik-maint`: the gate for a fourth thread passes (provisional) |
+| Q-1534 | compaction design §4; Q-1531 | A whole input segment held and scanned as one step (provisional) |
+| Q-1535 | compaction design §3.1, §4; `format-compacted.md` B.1 | Count passes ahead of write passes (provisional) |
+| Q-1536 | compaction design §4 Memory | Index entries and a window's entries counted, not spilled (provisional) |
+| Q-1537 | compaction design §4 Memory | A series too large for one pass taken a range of `t` at a time (provisional) |
+| Q-1840 | compaction design §4 Memory; Q-1536 | The window when index entries or commit-time rows would not fit (provisional) |
+| Q-1841 | compaction design §4 Memory | What "counted" means for the cap (provisional) |
+| Q-1843 | compaction design §4; Q-1531 | A share configured as 0 or not a number (provisional) |
+| Q-1940 | compaction design §4 Memory; Q-1840 | A window's writers reserved by the writer's own figures; a file's index written a block a step (provisional) |
+| Q-1842 | compaction design §4; Q-1533, Q-1534 | The longest step the run may take (provisional) |
+| Q-1990 | compaction design §4; Q-1842 | The run's steps and their device calls (provisional) |
+| Q-1850 | `format.md` A.14 `0x21`; compaction design §2, §3.4; Q-792 | Publish record field 3, the layout, and records without it (provisional) |
+| Q-1851 | compaction design §3.5; `spec.md` §7 Manifest step 2 | The rebuild's verdict on outputs no valid record names (provisional) |
+| Q-1852 | compaction design §3.4, §3.5 | A merge's counts after a rebuild restates a retirement without its layout (provisional) |
+| Q-1853 | compaction design §5, §6 (6.3e); `api.md` Threads; Q-1531 | Publish built over the manifest's writer, not yet started by the running store (provisional) |
+| Q-1854 | compaction design §3.5 | The rebuild's verifier compacts the inputs again (provisional) |
+| Q-2120 | compaction design §3.4; Q-1850 | When publish records without field 3 stop being accepted (provisional) |
+| Q-2121 | compaction design §3.4 | Whether a new record may leave the rule undecided (provisional) |
+| Q-2122 | compaction design §3.5; Q-1851 | What a rebuild's held file holds (provisional) |
+| Q-2125 | compaction design §3.5; Q-1853 | Publish after an unsure record (provisional) |
+| Q-1390 | §6 Gates, Transitions; Q-1145 | The seed at a gate's start: how far back, and the value before the first reading (decided by the lead, provisional; amended by Q-1560) |
+| Q-1391 | §6 Gates, Resume; `api.md` Gates | Durable resume state: one gate cursor and a checkpoint, the bound from the checkpoint (decided by the lead, provisional) |
+| Q-1393 | §6 Gates, Clock; `api.md` Gates | The clock live gate timers run on (OWNER) |
+| Q-1560 | §6 Gates, Transitions; Q-1390 | Facts inside the seed's look-back that were never the live value: what the seed reads (decided by the lead, provisional) |
+| Q-1880 | §6 Gates; Q-1560 | What the gates core's history reads must return, and what they cost (decided by the lead, provisional) |
+| Q-1881 | §6 Gates; Q-1880 | How a failed or short history read reaches the gates core (decided by the lead, provisional) |
+| Q-1882 | §6 Gates; Q-1560 | Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start (decided by the lead, provisional) |
+| Q-1561 | §6 Gates, Transitions; Q-1390 | Arrivals inside the seed: a series stale throughout the look-back can complete a hold (decided by the lead, provisional) |
+| Q-1580 | `format.md` A.6 | The routing field ids of a watch and an unwatch, and the member value form (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1581 | `api.md` Gates | The gate interface as built: `Transition` without flags, `TransitionCause`, `gates()`, two more `GateError`s (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1582 | §6 Gates; Q-1140 | Entries other than facts, definitions and the consumer's own gates move the judgement's frontier (decided by the lead, provisional; settle with conditions step 4) |
+| Q-1583 | `api.md` Gates; crate README | What the model backend's gates do not do yet (decided by the lead, provisional; settle with conditions step 5) |
+| Q-1810 | `format.md` A.6; Q-1580 | The bounds of a set member: decimal scale and state index (decided at review, provisional) |
+| Q-1811 | `api.md` Gates, Naming | A set gate with the same members in another order is not an equal spec (decided at review, provisional) |
+| Q-1812 | `api.md` Gates; Q-1583 | A named-state member on the durable backend (decided at review, provisional) |
+| Q-1800 | §6 Gates; Q-1390 | A fact at position `0:0` in a history given to `judge` (decided by the lead) |
+| Q-2000 | §6 Gates, Resume; `api.md` Gates | The durable gate cursor in memory until the cursor file holds it (superseded by Q-2080) |
+| Q-2001 | §6 Gates; Q-1880 | What the durable backend's gate history reads cost (decided at review, provisional; settle with cond2 step 5) |
+| Q-2002 | §4 Overflow; §6 Gates, Resume; Q-1396 | Gate state after an overflow catch-up: a resync, cause `Resume` (decided at review, provisional) |
+| Q-2003 | §6 Gates, Resume; Q-1391 | When a resync's gate states are taken and the gate cursor its confirmation sets (decided by the lead, provisional) |
+| Q-2080 | §6 Gates, Resume; `format.md` A.15; Q-2000 | The durable gate cursor and checkpoint in the cursor file, replayed at the first take (decided by the builder, provisional) |
+| Q-2081 | `format.md` A.15; Q-1391 | The checkpoint block as built: series apart from instances, every field the core restores (decided by the builder, provisional) |
+| Q-2082 | §6 Gates, Resume; §4 Resync | A reset point or lost range after the checkpoint reseeds, until cond2 step 6 (decided by the builder, provisional) |
+| Q-2083 | §6 Gates, Resume | Facts counted for `replay_max` without reading them; entries of a newer format in a replay (decided by the builder, provisional) |
+| Q-2084 | §6 Gates, Resume; Q-1392 | `set_by` after a replay of an instance a reseed set (superseded by Q-2160) |
+| Q-2085 | `api.md` Gates; Q-1583 | The model backend's resume: unbounded, everything after the gate cursor `replayed` (decided by the builder, provisional) |
+| Q-2086 | §6 Gates, Resume; Q-1395, Q-1396 | When a cursor write carries a checkpoint, and what holds it back (decided by the builder, provisional) |
+| Q-2087 | §6 Gates, Resume, Transitions; Q-1392 | The instant a reseed starts the gates at: the commit floor, not the head's commit time (decided by the builder, provisional) |
+| Q-2160 | §6 Gates, Resume; `format.md` A.15; Q-1392, Q-2084 | `set_by` of a reseeded instance after a restart: a flag in the checkpoint keeps it `None` (decided at review) |
+| Q-2161 | §6 Gates, Resume | The crash property's cases and checks (decided at review) |
+| Q-2162 | §6 Gates, Resume; Q-2086 | Bytes written per confirmed transition by a consumer with many gates (decided at review, provisional; settle with the step 6 bench notes) |
+| Q-2163 | `format.md` A.15; Q-2081 | A checkpoint larger than a block once `Each` lands (bounded at 12,288 `Each` instances a consumer, provisional) |
+| Q-2170 | §6 Gates, Resume; §4 Resync; Q-2082 | A reset point or a new generation in the judgement: a reseed entry; a replay reseeds where the reset point lies (decided by the builder, provisional) |
+| Q-2171 | §6 Gates, Resume; §8 | A new generation on the durable backend reseeds at the take, not at the generation's first position (decided by the builder, provisional) |
+| Q-2172 | §6 Gates; §4 Resync | A lost range recorded at run time, after the engine judged its facts (decided by the builder, provisional) |
+| Q-2173 | §6 Gates, One stream; `format.md` A.15; Q-1143 | An `Each` gate's refused series are not in the checkpoint (decided by the builder, provisional) |
+| Q-2220 | §6 Gates, Resume; Q-132 | A resync's confirmation over replayed transitions is written at once (decided in the fix round) |
+| Q-2250 | §4.3 held snapshot; G5 | When a run takes the snapshot that becomes `held`: only with nothing outstanding and nothing deferred (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2251 | §6 Gates, Resume; Q-2003 | Deferred transitions older than a dropped one, delivered after the resync that ended the quiet (decided by the lead, provisional; settle with cond2 step 5) |
+| Q-2270 | §6 Gates, Resume; Q-1396, Q-2002 | The checkpoint while a quiet catch-up ends with a resync (decided at merge) |
+| Q-2271 | §6 Gates; Q-1880, Q-2001 | The bounded gate history read named as a merge condition on cond2 step 5 (ruled by the lead: built with step 6, Q-2295) |
+| Q-2295 | §6 Gates; Q-1880, Q-2001, Q-2271 | How the durable gate history read is bounded: event-time windows and when they answer exactly |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
 | Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
@@ -3266,7 +3336,8 @@ its blocks follow each other in a fixed order.
 length 0 or one whose end leaves `i64`, a run count of 0, or names out of order are invalid.
 (j) The reader records the ignorable elements it skips (`Ignored`), and the canonical checks do not judge a file
 holding any, so a scrub by an older binary does not call a newer minor version's file damaged.
-**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate:
+**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate (the first part moved to
+6.2a2b by Q-1410; the second built by 6.2a2 as a stall, `Cause::CommitTimeDecreases`):
 - the writer takes a series' facts whole and the canonical check holds every fact of the file as decoded rows (80
   bytes a fact; about 175 MB for 2,000,000 facts). Section 4's caps (32 MiB minimal, 256 MiB desktop) need a writer
   that takes a series' rows in order a block at a time and a canonical check that reads from a `ReadAt` and compares
@@ -5180,16 +5251,16 @@ last position before the entry, so it does not depend on what the entry holds.
 **Pinned by.** `tests/gates.rs` `a_timer_due_at_an_entrys_commit_time_fires_before_that_entry`.
 
 ## Q-1145 — A gate's state when it starts
-Decided by the lead with the gates model, provisional.
+Settled by the owner, 26 November: option (b).
 **Scenario.** A Levels gate with `hold_up` 5 min is watched (or its series joins an `Each`) while the value has been
 above its level for an hour.
 **Options.** (a) Boundaries start uncrossed and holds count from the start, so the state at the watch is the lower
 side and rises after the hold; (b) judge the holds over the facts before the start (the history is in the store).
-**Decision (provisional).** (a): it is the conservative reading of a hold (nothing is claimed for time before the
-gate existed), it needs no history scan at a watch, and it matches today's rule that a threshold resumes on its
-lower side between its levels (§6 Restart and resume). A hub that needs (b) can read the window itself.
-**Pinned by.** `tests/gates.rs` `a_hold_counts_from_the_watch_not_from_before_it`,
-`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now`.
+**Decision.** (b): a gate added mid-event seeds its holds from history, by the rule of Q-1390. (a) was the lead's
+provisional choice; it remains only for gates with no hold, which read no history.
+**Pinned by.** `tests/gate_seed.rs` `a_hold_is_seeded_from_before_the_watch_so_a_value_long_above_starts_crossed`,
+`a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now_judged_from_history`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
 
 ## Q-1146 — Holds across `Unknown` and `Stale`
 Decided by the lead with the gates model, provisional.
@@ -5238,6 +5309,73 @@ arithmetic, so a late commit clock plus the maximum never panics: a deadline bey
 **Pinned by.** `tests/gate_edges.rs` `durations_beyond_the_maximum_are_refused_and_the_maximum_is_accepted`,
 `the_longest_durations_late_on_the_commit_clock_judge_without_overflow`.
 
+## Q-1450 — A lost consumer taken again before it confirms its `NoCursor` resync
+
+§4 Resync, invariant 25; Q-95 (b), Q-131. Scenario: a power loss reassigns positions above P; the consumer's cursor
+file is lost; it is taken, sent `NoCursor` with `forget_above` = P, and its process restarts before confirming. The
+durable backend (`deliver/take.rs`: `dormant` is cleared at the first take and the cursor file waits for the
+confirmation) resumes it from P with a plain `Resume`, so facts above P reach a consumer that was never told to
+forget above P; `recovery_generator_coverage` at 1,024 cases finds the model doing the same. Recommended default:
+until the `NoCursor` resync is confirmed the consumer stays lost, and every take sends it again (model `reconnect`
+and the durable `take`, together, so the differential still agrees). **Settled by the lead, 26 November, to the
+recommended default; built with roadmap 5.3 step 1:** every take before the confirmation sends the `NoCursor` resync
+again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`;
+`kvik/tests/consumers.rs`). Until then neither backend reads the log for it, so a fact committed meanwhile follows the
+confirmation as replayed (`kvik/tests/consumer_properties.rs`
+`a_fact_after_a_retake_with_no_cursor_unconfirmed_is_flagged_as_the_model_flags_it`).
+
+## Q-1400 — Restore records in the saved-point check
+
+§7 Readers, Reset stamp and saved points. Scenario: a point of generation 1 checked in generation 2. The log does not
+yet expose restore records with their stamps, so the durable check (`kvik/src/durable/saved.rs`) has the restore case
+and never fills it. **Provisional default:** a point judged after a restore is `Unknown` by the ordinary rule (no kept
+entry carries the mark's stamp), which is safe; the restore records join the check with roadmap 8.3.
+
+## Q-1406 — `Tail` from a saved point
+
+`api.md` Live reads. Scenario: a live read opened at a saved point rather than at the cut of its `Opened`.
+**Provisional default:** moves to roadmap 9.0f, which builds the static-prefix-then-live mechanism for "from a time";
+5.3 supplies the check (`Reader::check`).
+
+## Q-1630 — A lost range at the tail and a consumer at the position before it
+
+§4 Resync. Scenario: a fact's batch, the last of the log, is damaged and the store restarts on the same boot; the
+lost range is a reset point whose id is the mark's last position. A consumer started then (now, or at a kept saved
+point) begins at the last kept position before the range. The model sends it the reset point, a resync whose
+`forget_above` is the consumer's own position; the durable backend's last position is below the range and it sends
+none (`kvik/tests/saved_points.rs`
+`a_lost_range_at_the_tail_gives_a_new_consumer_a_resync_with_nothing_to_forget_on_the_model_only`). Nothing above the
+consumer's position is affected either way. **Provisional default:** the two differ only by that resync; the history
+property ignores reset points with nothing to forget at the start; align with the run-time lost range of step 5.
+
+## Q-1631 — A power loss after a lost recovery entry
+
+§3 Recovery. Scenario: a power loss writes a recovery entry; the entry's batch is damaged and the store restarts on
+the same boot (the lost range takes the entry; the check answers `Unknown` on both backends, as row 7b); a fact and a
+consumer registration follow; a second power loss. The durable backend's last position is then one above the
+model's (`kvik/tests/saved_points.rs` `a_power_loss_after_a_lost_recovery_entry_keeps_the_model_s_last_position`,
+ignored while open). In the same histories, a consumer started at a point below the lost entry is sent the lost
+range's reset point by the durable backend and none by the model. **Open; recommended default:** read the recovery rule the two apply to a mark whose stamp no
+kept entry carries, and §4 Resync's rule for a lost range holding a recovery entry, before deciding which is right;
+until then the history property stops restarting and comparing deliveries once an entry is lost.
+Traced at the end of the ignored history: the consumer start synced both marks to the fact, so the second power loss
+loses nothing on the model, which then writes no recovery entry (last position 3, the fact); the history's power loss
+zeroes the fact's bytes on the durable backend anyway, which grows the recorded loss over them (§3 Recovery rule 2)
+and writes an entry at 4. §3 Recovery rule 3 has a start on another boot write an entry unless it adopts one, and the
+last kept batch is a fact, so the model is the backend at fault on the last position; the history also cuts a batch
+the mark was synced past, which no power loss does. Both are to be ruled, with a fault on each backend that loses the
+same bytes, before step 5 compares whole histories.
+
+## Q-1621 — A start whose position the synced mark cannot reach
+
+§3 Durable mark, §4 New consumer; invariants 25 and 26. A cursor file never names a position above the last synced
+mark, so a start beyond it cannot write its cursor at once. Writing the mark's last position instead resumes the
+consumer below its start after a crash, under a reset point it was never meant to meet; writing nothing loses the
+start. **Settled by the lead, 27 November:** as the durable backend, the start's write stays pending, the cursor
+file keeps what it held, and the write lands when a mark sync reaches it; a confirmation meanwhile raises the pending
+position; a crash first drops it (`model/tests/starts.rs`
+`a_start_the_synced_mark_cannot_reach_keeps_the_old_cursor_until_a_mark_sync_lands_it`).
+
 ## Q-1200 — A future fact outranked before its `t`
 Settled by the owner on 2026-11-26.
 **Scenario.** `stale_after` 10 s; a reading at 1 s; a future fact for 30 s commits at 2 s and is outranked at 3 s by
@@ -5267,6 +5405,1176 @@ returns those events again, so dropping the round's collector lost facts for eve
 over, since a carried collector grows without bound while the fault lasts. A round that took nothing is dropped.
 **Pinned by.** `kvik/src/durable/read/live/lags.rs` `a_round_failing_after_taking_events_lags_the_tail_it_took_them_for`.
 
+## Q-1460 — How a nodes block stores a node version
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.9), provisional.
+**Scenario.** The design gave each entry one `as_of: uv64` relative to the block's `base_pos`. A version is a position
+(Q-1422), and positions of current facts can belong to an older generation, whose sequences restart at 1, so one
+unsigned difference cannot hold every version a run may carry.
+**Options.** (a) Two fields: the generation difference from `base_pos`, then the sequence, as a difference when the
+generation is the same and whole otherwise; (b) a full 12-byte position per entry; (c) one field, refusing a run
+that spans generations.
+**Decision (provisional).** (a), with `base_pos` the least version of the whole run so both differences are
+non-negative, the same in each of the run's blocks so a block's split does not depend on the versions it holds. It
+costs one byte more than the design's field in the usual case; (c) would make an ordinary restore fail a checkpoint.
+**Pinned by.** `tests/refusals.rs` vectors `AsOf` and `BasePosition`; `tests/files/mod.rs` `day_part` (an older
+generation's version).
+
+## Q-1461 — Tree files accept only canonical bytes
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.8, T.11), provisional.
+**Scenario.** `format.md`'s common rules have readers ignore reserved bytes and padding and accept non-canonical
+blocks, so a later minor version may use them. A tree part or root that passes the listed checks but is not what the
+writer would write (other padding, another block split, a stale directory) could then be read with nothing to say
+which bytes are meant.
+**Options.** (a) Accept only canonical bytes, as the derived files of A.18 already refuse unknown skippable blocks;
+(b) the common rules, with a separate canonical check for the scrub.
+**Decision (provisional).** (a): a tree file is derived, so a refusal costs a rebuild and never data, and a reader
+that accepts only what encodes to itself has one meaning for every accepted file, which the fuzz target checks.
+A newer writer's additions take version refusals (Q-1462), not reserved bytes.
+**Pinned by.** `tests/refusals.rs` vectors `Reserved`, `Padding`, `Split`, `Directory`, `DirectoryRoot`, `Summary`;
+`tests/fuzz_inputs.rs`.
+
+## Q-1462 — A record size above v1 in a tree file
+Decided with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12), provisional.
+**Scenario.** A.18 lets a reader ignore the tail of a record longer than it knows. With canonical reading (Q-1461) a
+file whose records carry such a tail would not encode to itself.
+**Options.** (a) A version refusal; (b) keep the tail bytes through a decode and encode.
+**Decision (provisional).** (a): the reader leaves the file to the newer writer that wrote it and takes facts; a
+size below v1 is damage.
+**Pinned by.** `tests/refusals.rs` vectors `RecordSize`, `RecordSizeSmall`;
+`root_refusals_shared_with_parts`, `a_directory_or_directory_root_record_size_above_v1_is_a_version_refusal`.
+
+## Q-1540 — What a part's `seq` is, and whether two live parts may share one
+Settled by the lead with roadmap 7.1b step 1 (`format-tree.md` T.11, T.12).
+**Scenario.** A part split on series ranges above 256 MiB gives two parts written for one root; a merge that leaves
+out a newer delta of its period (a week merged from day parts of `seq` 100 to 107 while a late-data delta of `seq`
+150 sits on one day) must not overlay that delta, so its `seq` has to be the highest of its inputs, equal to an
+input's and, split, to its sibling's. Distinct `seq`s in a root cannot hold either.
+**Options.** (a) Delta and rebuilt parts take the `seq` of the root that first lists them, a merged part the highest
+`seq` of its inputs; parts of one `seq` are allowed when their series ranges or periods are disjoint, and the root
+refuses two of one `seq` whose periods and series ranges both overlap; (b) as (a), overlay order `(seq, file_id)` and
+no refusal; (c) distinct `seq` kept, every merge taking every live part overlapping its output.
+**Decision.** (a). Periods are half-open and series ranges inclusive, as the trailer records them (an empty part's
+is 0 to 0); a range whose least is above its greatest overlaps nothing.
+**Pinned by.** `tests/refusals.rs` `parts_of_one_seq_are_accepted_when_periods_or_series_ranges_are_disjoint`,
+`parts_of_one_seq_overlapping_in_period_and_series_are_refused`,
+`parts_of_one_seq_are_refused_exactly_when_a_pair_overlaps_in_period_and_series`.
+
+## Q-1550 — A roll-up over a stale child
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merge writes each roll-up as the merge of its visible children (design 7.1b T2). A child may be
+marked `stale`, so its node is not the canonical one, or has none.
+**Options.** (a) The roll-up is `stale` with no node bytes, at the children's highest version; (b) merge the nodes
+that are present and mark it `stale`; (c) leave the roll-up out.
+**Decision (provisional).** (a): the reader takes facts for a stale entry anyway, so bytes would never be read, and
+(c) would read as an empty node where the span is covered.
+**Pinned by.** `tests/set.rs` `a_merge_leaves_visible_unchanged_and_writes_the_rollups_of_t2` (`check_rollups`).
+
+## Q-1551 — The age of a delta part
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design merges two deltas of a day once the oldest is two hours old. A root records no write time
+per part.
+**Options.** (a) The age of the lowest-`seq` delta's greatest entry end; (b) add a write time to the root's part
+record.
+**Decision (provisional).** (a): no format change, and a delta's newest entry ends near the checkpoint that wrote it.
+A delta of late data looks old at once, which only merges it sooner.
+**Pinned by.** `tests/plan.rs` `two_deltas_merge_once_the_oldest_ends_two_hours_before_now`.
+
+## Q-1552 — Where weeks and 13- and 52-week periods start
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** Merged parts span a UTC day, a week, 13 weeks or 52 weeks; the design does not fix their alignment.
+**Options.** (a) Weeks from Monday 1970-01-05 UTC, and 13 and 52 weeks counted from the same Monday; (b) ISO weeks
+and quarters or years, which are not whole numbers of weeks.
+**Decision (provisional).** (a): every period is a whole number of the next shorter one, so a 52-week part is the
+merge of four 13-week parts. Periods are internal; no reader sees them.
+**Pinned by.** `tree/src/set/plan.rs` `weeks_start_on_monday_and_each_period_lies_inside_the_next`; `tests/plan.rs`
+`a_week_of_day_parts_merges_two_weeks_after_it_ends`.
+
+## Q-1553 — A delta part that spans day boundaries
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** A checkpoint writes one delta part, so late data can give it a period over many days. Day, week and
+longer merges take parts inside their period, so such a part would never be merged.
+**Options.** (a) The planner first splits it into one part per UTC day that holds an entry, of the same `seq`;
+(b) day merges take it whole and widen their period; (c) the checkpoint writes one delta per day.
+**Decision (provisional).** (a): (b) breaks the period tiers and (c) multiplies syncs at a checkpoint; the split is
+one more merge and keeps every later rule per day.
+**Pinned by.** `tests/plan.rs` `a_delta_crossing_a_day_boundary_is_split_by_day`.
+
+## Q-1554 — The `seq` of a merged part
+Decided with roadmap 7.1b step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** A merged part overlays other live parts by its `seq`. If it took a new, higher `seq`, a live part
+outside the merge that overlaid one of its inputs would fall beneath it.
+**Options.** (a) The inputs' highest `seq` (as Q-1540 settles), refusing a merge when a live part outside it has a
+`seq` inside the inputs' range, a period overlapping an input's or an output period, and a series range overlapping
+the inputs'; (b) a new `seq`, taking as inputs every overlapping part above the lowest input.
+**Decision (provisional).** (a): order against every part outside the merge is kept, and the planner can merge a
+run of deltas without waiting for parts that interleave them. Every entry of the output keeps the version it had.
+**Pinned by.** `tests/plan.rs` `merge_refuses_a_part_between_the_inputs_seqs`,
+`a_delta_between_the_seqs_of_others_breaks_their_run`.
+
+## Q-1555 — When a day counts as merged
+Decided with roadmap 7.1b step 2 (`tree/src/set/plan.rs`), provisional.
+**Scenario.** The design writes a day's roll-ups when its day part is written, and the planner must know which days
+have one. The root records roll-up spans only through `covered`.
+**Options.** (a) A day is merged when every roll-up span inside it that the finest cover level covers is covered at
+its own level, so a day with nothing covered counts as merged; (b) a day is merged when a merged part spans it.
+**Decision (provisional).** (a): it follows the level table rather than fixed levels, and a day with nothing covered
+would otherwise be merged again at every pass, since its roll-ups can never be covered.
+**Pinned by.** `tests/plan.rs` `a_day_past_its_late_window_gets_its_day_part_with_rollups`,
+`without_rollup_levels_a_day_never_waits_for_a_day_part`, `the_planner_reads_level_widths_from_the_table`.
+
+## Q-1670 — A merge that leaves out a sibling of its own `seq`
+Raised by the re-check of roadmap 7.1b step 1; decided with step 2 (`tree/src/set/merge.rs`), provisional.
+**Scenario.** Inputs A (`seq` 100, series 0 to 100) and B (`seq` 107, series 0 to 50); B's split sibling C (`seq`
+107, series 51 to 100) is not taken. The output takes `seq` 107 and series 0 to 100, overlaps C in period and series,
+and a root listing both is refused (T.12).
+**Options.** (a) A merge takes every live part of its output's `seq` that overlaps its output in period and series,
+and never writes an empty merged part; (b) overlay order `(seq, file_id)` and no refusal.
+**Decision (provisional).** (a): the merge refuses a live part outside it whose `seq` lies in the inputs' range and
+whose period and series range overlap theirs (Q-1554), which covers the sibling; it writes a part only for a period
+that keeps an entry; the planner's runs and whole-period merges take such siblings.
+**Pinned by.** `tests/plan.rs` `a_merge_must_take_the_overlapping_siblings_of_its_output_seq`,
+`the_planner_takes_a_delta_run_with_its_same_seq_siblings`.
+
+## Q-2050 — The cause a start records for a batch whose content does not decode
+Raised by the re-check of the train-6 review follow-up (S2); decided, provisional.
+**Scenario.** A checksum-valid batch in an unsealed segment, below the durable mark, whose content does not decode. A
+start records its positions as a lost range with cause corruption; `format.md` A.2 names cause 4 (invalid content),
+as the loss finder does while the store is open.
+**Decision (provisional).** A start is to record cause 4, in a later log item; until then `api.md` names no cause.
+**Pinned by.** `log/tests/recovery.rs`
+`a_checksum_valid_batch_whose_content_does_not_decode_is_a_recorded_loss_and_the_start_succeeds` (the loss and the
+start; not the cause).
+
+## Q-2051 — Where the S2 follow-up goes
+Raised with Q-2050; settled. The four follow-up edits and their test go with the train-6 review fixes, not into the
+next docs item.
+
+## Q-2010 — A saved point judged after it answered unknown
+
+§7 Readers, Reset stamp and saved points. A point answers unknown while no kept entry carries the mark's stamp; a
+later recovery writes an entry that carries the new stamp, after which the same point answers void above, a position
+higher than unknown's nothing. **Decided by the lead, 27 November:** allowed; unknown already told the holder to
+start again as if it kept no position, so "never rises" holds only until a point answers unknown
+(`kvik/tests/saved_points.rs`, the history property).
+## Q-1410 — Roadmap 6.2a2 in two parts
+Decided with roadmap 6.2a2, provisional.
+**Scenario.** As designed, 6.2a2 holds the run, its verification and the L0 planner, and also the governor, the
+stepping on `kvik-maint`, the measured gate for a fourth thread (Q-801), the streaming writer and canonical check
+within the memory cap (Q-811), the 16-partition bound and the digest's measured cost: about 5,000 lines.
+**Decision (provisional).** 6.2a2 builds the run, the verification, the planner, the model's placement and the
+stalls; its outputs are verified and left unpublished, and nothing outside its tests calls it. Roadmap 6.2a2b builds
+the governor, the background-task trait and the stepping, the gate of Q-801, the streaming writer and canonical check
+with the 16-partition bound, and the digest's cost on a core without SHA instructions (the digest function stays
+provisional until then, Q-800). 6.3e follows 6.2a2b. Reason: the design allows the governor to be cut out as its own
+item; the run is testable alone, and the memory work changes the writer's signatures, which belongs with the cap it
+serves.
+**Pinned by.** `kvik/src/durable/compact/tests.rs`.
+
+## Q-1411 — Unknown elements in a run's inputs, found by canonical form
+Decided with roadmap 6.2a2.
+**Scenario.** The log's decoders skip unknown ignorable columns and fields without a trace, so a run that rearranged
+their batches would drop them (Q-809).
+**Decision.** A batch that holds a skipped block, an ignored entry, or does not decode to exactly its canonical
+blocks (`BatchContent::decode_canonical`) stalls the run with the cause "unknown". A writer of this version writes only
+canonical batches (`format.md` A.4), so the stall arises only where something would be dropped or another writer
+made the bytes; both are lossless.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_segment_with_a_block_of_unknown_type_stalls`.
+
+## Q-1412 — The name and reach a compacted file gives a series
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** `format-compacted.md` B.1 orders a file's series by the name in force at the file's greatest position;
+the durable store holds only the registry as of now.
+**Decision (provisional).** The definition's name (field 2), not an alias, from the last definition entry of the
+run's inputs at or below the file's greatest position, else from the registry the caller passes as in force below the
+run's first position; the reach from the same definition's kind and interval (`format.md` A.8). Until 6.3e wires the
+run into the store, its caller passes the current registry, which differs only for a series defined again after the
+run's inputs.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_definition_in_the_inputs_names_its_series_only_in_files_ending_after_it`,
+`an_interval_definition_gives_its_reach`.
+
+## Q-1413 — A non-fact entry set aside beyond a restored end
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.2c.
+**Scenario.** Set-aside facts go to set-aside chunks of a revision file (Q-796); a compacted file's entries are in
+its current file, with no way to mark one set aside.
+**Decision (provisional).** A run whose inputs hold a set-aside non-fact entry stalls (cause "set-aside entry"):
+lossless, and rare (a restore whose generation wrote entries past the restored end). 6.2c gives the entries a mark or
+a rule.
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `a_set_aside_entry_stalls`.
+
+## Q-1414 — Where a run's outputs wait before publishing
+Decided with roadmap 6.2a2, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §3.2 of the compaction design renames outputs to their final names just before the publish record;
+publishing is roadmap 6.3e.
+**Decision (provisional).** A run writes, syncs and verifies its outputs under their `.tmp` names in `data/` and
+leaves them there; the outputs carry the writer's current generation and consecutive `file_id`s the caller gives,
+the first being the run id. 6.3e renames, publishes, and discards unpublished outputs at start (§9 row 10).
+**Pinned by.** `kvik/src/durable/compact/tests.rs` `every_input_position_lands_in_exactly_one_output_where_the_model_places_it`.
+
+## Q-1530 — A chunk the streaming writer holds whole
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** B.1 orders a series' chunks by first `t`, then least position. A writer that takes a series' rows a block at a time (Q-811) cannot place a chunk while a later chunk could still sort before it: when every row of the chunk so far shares one `t` (a chunk boundary inside a run of one key, revision files only) or a set-aside chunk shares its first `t`.
+**Decision (provisional).** `FileWriter::push` streams a chunk block by block once a row with a greater `t` has arrived, no set-aside chunk shares its first `t` and no chunk is held; otherwise it holds the chunk's rows whole and writes the held chunks in B.1 order once the next chunk's first `t` is greater. Set-aside facts, which only a restore makes, come whole with the series. Held rows count against the maintenance cap (`FileWriter::held_rows`). Reason: the format is unchanged, the bytes equal the whole-series writer's, and the held case needs more than 4,096 revisions of one key or a restore.
+**Pinned by.** `chunk/src/file/stream.rs` tests (`a_streamed_revision_series_writes_the_bytes_of_the_whole_one`, `a_chunk_boundary_inside_one_key_orders_chunks_by_least_position`).
+
+## Q-1531 — The governor's details and the background task's hook
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §4 of the compaction design gives the governor's two limits and its idle preference but not: when a returned sync counts, what a sync or a rename costs, how an idle task is asked again, or how a task reaches `kvik-maint` before 6.3e wires compaction in.
+**Decision (provisional).** `kvik_log::writer::share::Governor`: after a step that worked `w` the next waits `w × (1 − share) / share`, rounded up to the nanosecond; the byte bucket refills at `io_rate` (the floor rate under the writer's pressure flag, which is ingest waiting) and holds one 128 KiB piece. A device call goes at the first of: no commit sync in flight; a commit sync returned since the governor last looked (each return counts once, and one seen while the step waited for CPU or bytes is spent); or the floor's deadline, a piece's time at the floor rate from when the call was first asked for. A sync or a rename costs no bytes and takes a piece's deadline. The writer marks each commit sync and wakes `kvik-maint` when a waiting task asked to hear of a return. A task with nothing due is asked again after a seal or after a second. Creation ahead, seals and descriptions always go before a step. `Log::start_with_task` takes the task (hidden from the documentation until 6.3e wires compaction in); `Log::maint_waits` reports how long creations and seals waited for `kvik-maint`, for the gate of Q-801.
+**Pinned by.** `log/src/writer/share/tests.rs`; `log/tests/threads.rs` `a_background_task_runs_between_creations_and_seals_and_every_call_still_lands`.
+
+## Q-1532 — The per-series digest stays SHA-256
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.3e.
+**Scenario.** §3.2 step 2 left the digest function open until its cost was measured on a core without SHA instructions: a cheaper keyed 128-bit hash takes its place if the digest dominates a run.
+**Decision (provisional).** The digest stays the first 16 bytes of SHA-256 of the fact's tuple. Measured (`kvik/src/durable/compact/tests.rs` `measure_the_digest_against_the_run`, one core of a shared 4-core cloud machine, 40,000 facts, three runs each): with SHA instructions the digests of the input and output sides take 220–254 ns a fact of a 1.70–1.83 µs run (13–14 %); with the portable SHA-256 (`--cfg sha2_backend="soft"`) 681–700 ns of 2.24–2.34 µs (30–31 %). It does not dominate, so the guard against mistakes keeps a standard function; the file's own SHA-256 (step 5) is paid either way. Reason: below half of the run on the slower path, and a keyed hash would need a key kept with the outputs.
+**Pinned by.** `kvik/src/durable/compact/tests/verify.rs` (each check fails on its own mutant); the figures in `docs/measurements/6.2a2b-maintenance-gate.md`.
+
+## Q-1533 — The background task stays on `kvik-maint`: the gate for a fourth thread passes
+Decided with roadmap 6.2a2b, provisional. To be settled by the owner with roadmap 6.3e.
+**Scenario.** Q-801 moves the background task to a fourth thread, `kvik-background`, if a running job adds more than a fifth of the class's commit-latency target at p99 to creation ahead or to a seal: 10 ms on the minimal SSD row, 50 ms on the SD row.
+**Decision (provisional).** It stays a stepped task on `kvik-maint`; the thread list of `api.md` is unchanged. Measured by `scripts/maint-gate.sh` (`log/examples/maint_gate.rs`), one core of a shared 4-core cloud machine, a sleep in every sync standing in for the device, 1,000 readings a second, 64 KiB segments, 60 s, a task of block encodes, 128 KiB writes and a sync each 1 MiB: at 2 ms a sync and 8 MiB/s the p99 added delay is 2.1 ms to creation and 1.9 ms to a seal (bound 10 ms); at 25 ms a sync and 1 MiB/s, 22.1 ms and 19.3 ms (bound 50 ms). The added delay is one step's device call, as §4 predicts. Commit p99 with the task against without: 12.4 against 12.1 ms and 71.6 against 72.3 ms. The samples are few (25 to 35 creations, 23 to 33 seals a run, so p99 is the largest) and the device is simulated; a run on real SSD and card hardware is owed with the benchmark kit.
+**Restated with the real run (6.2a2b review, third fix round).** With the compaction run itself as the task (many-series shape, `real_run_gate`), the added p99 delay is −0.03 ms to creation and −0.60 ms to a seal at 2 ms a sync and 8 MiB/s, with a whole run through verification inside the 180 s; 0.41 ms to a seal at 25 ms and 1 MiB/s (census and collect only in 120 s). The gate passes with the real task; the task stays on `kvik-maint`. Four steps of 945,728 took 10 ms or more (Q-1842).
+**Pinned by.** `docs/measurements/6.2a2b-maintenance-gate.md`; `kvik/src/durable/compact/tests/gate.rs`.
+
+## Q-1534 — A whole input segment held and scanned as one step
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §4 bounds a step at one block decoded and one device call, and counts decoded rows against `maintenance.memory`. The log's scan and its seal checks (file CRC, segment index, batch order) take a segment's bytes whole.
+**Decision (provisional).** A run reads each input in 128 KiB steps into one buffer, then scans it and checks its seal as one CPU step, then decodes one batch a step; the buffer is counted against the cap and freed at the segment's end, and each pass reads the segment again. `compaction.run_bytes` (a quarter of the cap) bounds the buffer except for a single segment larger than that, which a run still takes whole. Reason: a scan over a `ReadAt` is a change to the log's reader that no promise needs before 6.2c's budget benchmarks; the scan of a 16 MiB segment is a few milliseconds.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `each_step_declares_at_most_one_piece_of_device_work`.
+
+## Q-1535 — Count passes ahead of write passes
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** B.1 puts a file's description, with its positions per generation, its flags and the run's file count, before its data. Which rows of a partition are current and which revisions is known only once every row of a key is seen, so a run that takes series in groups cannot describe a file before its last group.
+**Decision (provisional).** After the census, a run makes count passes over every window of at most 16 partitions and every group of series, then the same passes again to write. A run that fits one window and one group counts and writes from the same rows in one pass. Each file is given only the commit-time rows of batches it holds. Reason: the format is unchanged and the outputs are byte for byte those of the whole-in-memory run; the doubled reads fall on runs that do not fit the cap, which a 16 MiB segment on the minimal class does.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_stepped_run_writes_the_whole_runs_bytes_with_any_number_of_passes`, `a_backfill_over_more_than_sixteen_partitions_takes_several_windows`.
+
+## Q-1536 — Index entries and a window's entries counted, not spilled
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §4 sends a writer's index entries past a quarter of the cap to a spill file. A window's non-fact entries are written after every series of their file, and verification reads a file's index whole.
+**Decision (provisional).** Index entries (96 bytes a chunk), a window's entries and the census (24 bytes a series, a commit-time row a batch, a day a partition) are counted against the cap, not spilled; group sizes leave room for them. Reason: at 100,000 series one file's index is about 9.6 MiB, inside the minimal cap with one window open; the spill file and its merge belong with 6.2c's merges, which need it for many inputs.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes`.
+
+## Q-1537 — A series too large for one pass taken a range of `t` at a time
+Decided with roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** Series go to passes in name order, in groups whose rows fit half of what the cap leaves; a full segment of one series does not fit one group.
+**Decision (provisional).** A series larger than a group is split into up to 64 ranges of `t` of equal width between its least and greatest `t`, taken in order by successive passes, with its writers' series left open between them; its set-aside facts go with the first range. A range holds whole keys, so ranking is unchanged. When a series is renamed in the inputs, every series is one group, since each file then orders its series by its own names (Q-1412). Reason: equal widths fit readings at a steady rate; a series whose rows bunch in a narrow range of `t`, or a rename, can still pass the cap, which 6.2c's benchmarks are to show or rule out.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `peak_memory_stays_within_the_minimal_cap_on_the_worst_shapes` (one series, 350,000 facts).
+
+## Q-1840 — The window when index entries or commit-time rows would not fit
+Decided with the review of roadmap 6.2a2b, provisional. To be settled by roadmap 6.2c.
+**Scenario.** A window is 16 partitions; with 12,000 series a day on each of 16 days, or 17,000 batches each with facts on 15 days, the writers' index entries (96 bytes a chunk) and commit-time rows of a whole window pass the minimal cap although each file alone fits (Q-1536).
+**Decision (provisional).** After the census, a window is the most partitions, at most 16 and at least one, for which `series × 2 files × 96 bytes` plus a commit-time row a batch, for each file, fits a quarter of the cap. Reason: more passes, the same bytes.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes` (series-by-days, batches-by-days).
+
+## Q-1841 — What "counted" means for the cap
+Decided with the review of roadmap 6.2a2b, provisional. To be settled with its fix round.
+**Scenario.** §4 says the memory is counted by the task and never exceeded; the task's own tally left out verification's indexes, vectors' spare capacity and sort scratch, and the allocator measured 46 MiB against a 32 MiB cap.
+**Decision (provisional).** The cap bounds allocated bytes. The tally counts capacities, not lengths, and maps at about half full; sorts are unstable, so hold no scratch. A test holds both the allocator's peak, less what the test held before the run, and the tally to the cap on the heaviest shapes, in a process of its own.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`.
+
+## Q-1843 — A share configured as 0 or not a number
+Decided with the review of roadmap 6.2a2b, provisional. To be settled with its fix round.
+**Scenario.** With an `io_rate` of 0 and an empty byte bucket the governor's wait is infinite and converting it panics; a `cpu_share` that is not a number passes the clamp and then waits 0.
+**Decision (provisional).** An `io_rate` below the least floor (128 KiB/s) is raised to it; a `cpu_share` not above 0, or not a number, is refused when the task starts.
+**Pinned by.** `log/src/writer/share/tests.rs` `an_io_rate_of_zero_is_raised_to_the_least_floor`, `a_cpu_share_not_above_zero_or_not_a_number_is_refused`; `log/tests/threads.rs` `a_task_whose_cpu_share_is_not_a_number_is_refused_at_start`.
+
+## Q-1940 — A window's writers reserved by the writer's own figures; a file's index written a block a step
+Decided with the fix round of roadmap 6.2a2b's review, provisional. To be settled by roadmap 6.2c.
+**Scenario.** The group budget reserved 64 KiB for a writer's block being built, while the writer counts a block of rows at their longest text (4,096 × (fact + 255 bytes)) and a commit-time row at its own size; with many batches the tally passed the cap. Finishing a file encoded its whole index into the sink in one step, holding the index twice (19 MiB at 100,000 series), and the canonical check held a name for every series and read the index three times.
+**Decision (provisional).** A writer is reserved as `FileWriter::held_bytes` counts it, and a window also holds no more writers than fit half the cap. `FileWriter::finish_step` writes the commit-time table, then one index block a step, then the trailer, so the sink holds one index block between drains; `finish` is the same steps run together, and the bytes are unchanged. Verification lends the registry to each step of the canonical check (`CanonicalCheck::step_with`), reads a chunk's directory when the chunk is reached, and passes the check's index to the content phase. Reason: each removes a copy of a per-series structure without changing a byte written.
+**Pinned by.** `kvik/src/durable/compact/tests/task.rs` `the_run_allocates_within_the_minimal_cap_on_the_heavy_shapes`, `a_window_of_writers_at_their_fullest_holds_at_most_half_the_cap`.
+
+## Q-1990 — The run's steps and their device calls
+Decided with the third fix round of roadmap 6.2a2b's review, provisional. To be settled before roadmap 6.2c, with Q-1842.
+**Scenario.** §4 allows a step one blocking device call. Opening a segment, preparing an output (its directory, the removal of a stale copy, its creation) and syncing the data directory each shared a step with other calls, and some were declared CPU-only; verification read a block's header, body and directory, and the comparing sink's window, in separate calls, up to 26 in a step.
+**Decision (provisional).** In the census and the passes every call is a step of its own and declared as device work: a segment is opened a step before its first read, an output's directory, removal and creation are a step each, and the directory sync is declared `Device(0)`. Verification makes at most one call a step, of at most the bytes declared: its sources share an allowance of one call a step; a read the windows do not cover takes it, and a read after it, or one larger than declared, fails with `WouldBlock`, and the step is taken again in the next, which declares that read's size. Each step reads before it changes anything: the canonical check reads the index and commit times a block a step, a series' set-aside blocks before it takes any, and writes the tail an index block a step; its comparing sink reads only the bytes it compares, mostly from the reader's windows, and keeps bytes it cannot read yet for the next step; the current file's rows are read a block a step as the revision rows need them. Windows read during a step that is taken again are kept until it completes, then the last two.
+**Pinned by.** `kvik/src/durable/compact/tests/steps.rs` `each_step_makes_at_most_one_device_call_of_at_most_its_declared_bytes`, `outputs_are_synced_every_mebibyte_at_their_end_and_the_directory_before_verification`; `chunk/src/file/canonical.rs` `a_check_whose_reads_each_wait_once_compares_every_byte_and_reaches_the_plain_verdict`.
+
+## Q-1842 — The longest step the run may take
+Raised by roadmap 6.2a2b's review (S3), provisional. To be settled before roadmap 6.2c, with Q-1534; owner sees it with Q-1533.
+**Scenario.** §4 bounds a step at one block and one device call; the gate's bound is 10 ms added at p99 on the minimal SSD row, and a minimal-class core is several times slower than the one measured.
+**Decision (provisional).** The gate applies to the real task, measured with `RunTask` on the heavy shapes. Measured on one core of a shared cloud machine (many-series, `real_run_gate`): 4 of 945,728 steps at 10 ms or more: two in the census (21.8 ms, the whole-segment scan of Q-1534) and two in the write passes (20.4 ms, by reading the sorts of a pass's rows and the plan, `task/passes.rs` `place`, `task/census.rs`); verification's longest is 5.8 ms. The added p99 delay stays below 1 ms, so the gate passes, but the 10 ms bound for a single step is not met. Recommended: bound the census scan by Q-1534's piece and sort a bounded slice a step; if a step cannot be cut, state its bound here. Roadmap 6.3e split `task.rs` along census, passes and verification without changing a step, so both cuts are new stepping (a stepped scan of a segment, a sort spread over steps) and move to roadmap 6.2c with Q-1534. If the bound is not met on the minimal class, the task moves to `kvik-background` (Q-801).
+**Pinned by.** `docs/measurements/6.2a2b-maintenance-gate.md`.
+
+## Q-1850 — Publish record field 3, the layout, and records without it
+Decided with roadmap 6.3e, provisional. To be settled by the owner with Q-792.
+**Scenario.** The compaction design adds a repeated field 3 to the publish record: one layout per published compacted file, in the order of field 1, so that the catalogue checks counts and finds C(g) without opening files (§3.4). Q-792 asks the owner to accept it as an addition inside version 1. Publish records written before it (by tests, and by a rebuild restating a file whose layout it cannot read) have none.
+**Decision (provisional).** Field 3 is laid out as `format.md` A.14 now states (`kvik_files::layout::CompactedLayout`) and is decoded strictly. A record carries a layout for every published compacted file or for none. The catalogue's rule covers the files that have a layout; a file without one is outside rules 1, 3 and 4 and is counted only as naming its inputs (rule 2, C(g)). The writer refuses a new record that publishes a compacted file without one (Q-2120). Reason: no released version wrote a publish record, so a record without field 3 comes only from tests or a restatement; refusing it would refuse every manifest the 6.3a tests write.
+**Pinned by.** `files/tests/records.rs` `a_publish_record_refuses_layouts_that_are_not_one_per_compacted_file_in_order`; `files/src/layout.rs` tests; `files/tests/compaction_rule.rs`.
+
+## Q-1851 — The rebuild's verdict on outputs no valid record names
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5 discards an output no valid record names only when nothing names any file of its run, its inputs are local and pass their checksums, and the run's files fail against them; otherwise it is live if it verifies or an input is not at hand, and kept and held where neither can be said. The rebuild's verifier judged one output at a time and an output was either published or discarded.
+**Decision (provisional).** The rebuild groups the outputs no valid record names into runs by shared inputs (a log segment is the input of one run, rule 1; a compacted file of one merge) and asks the verifier once per run, with the run's local files and inputs; it answers holds, fails or cannot say (`kvik_files::rebuild::Verdict`). A run one of whose files shares an input with a file a valid record names (published, retired or as an input) is never discarded: a failure counts as cannot say. Cannot say with every input at hand puts the file in `RebuildPlan::held`: it stays on disk, unlisted, and is not removed by the start's clean-up. With an input not at hand the file is published without a verdict, as before. Reason: a run's files are published by one record, so a sibling a valid record names proves that record existed; and an output alone cannot be checked for counts against inputs it shares with its siblings.
+**Pinned by.** `files/tests/unnamed_outputs.rs`; `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1852 — A merge's counts after a rebuild restates a retirement without its layout
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** A run's publish record is corrupt and a later merge, whose record is valid, retired the run's files. The rebuild restates the retirement from the merge record, which carries no layout of a retired file, so rule 3 cannot compare the merge's counts with its inputs'.
+**Decision (provisional).** The rule is undecided, naming the inputs; the catalogue holds runs, merges, removals and releases until a copy of the corrupt record is supplied (§3.4). C(g) still follows the retired files' inputs. *Alternative:* read the retired files' layouts from the files where they are still local. Reason: the hold is what §3.4 prescribes for an undecidable check, and merges, which make the case reachable, are roadmap 6.2c.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_corrupt_record_rebuilt_at_any_epoch_keeps_the_rule_and_c_g`.
+
+## Q-1853 — Publish built over the manifest's writer, not yet started by the running store
+Decided with roadmap 6.3e, provisional. To be settled by the roadmap item that gives the running store its manifest writer.
+**Scenario.** 6.3e wires compaction into `kvik-maint` with C(E) cached in the log directory's root and the upload driver's additions. The running store does not write the manifest yet: `StartOptions::recorder` and `sealed` are refused until roadmap 6.3c, nothing appends sealed-segment records, so the planner, which takes only listed segments, never has a run to make.
+**Decision (provisional).** Publish, the start's clean-up of `data/` and the rebuild's verdict are built over `kvik_files::appender::Appender` and tested on the in-memory file system at every file operation (`kvik/src/durable/compact/publish.rs`). The maintenance thread is unchanged; the task, C(E) in the root, the upload driver's additions and the removal of retired inputs (none exist before merges, roadmap 6.2c) come with the item that starts the store's manifest writer. Readers ignore chunks until roadmap 6.2b1, so a cut answers the same before and after a publish by construction. Row 6.3e's test "the same cut answers the same before and after a publish" is owed by roadmap 6.2b1, when readers use chunks. Reason: wiring a task that can never plan a run adds a maintenance-thread change with nothing to test.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs`.
+
+## Q-1854 — The rebuild's verifier compacts the inputs again
+Decided with roadmap 6.3e, provisional. To be settled by roadmap 6.2c.
+**Scenario.** §3.5's rebuild judges a set of outputs no valid record names against their inputs with the checks of §3.2, which a run makes as it reads its inputs.
+**Decision (provisional).** The verifier compacts the run's input segments again into `.tmp` files, with the run's generation, run id (its first `file_id`) and the `created_at` read from a found output, then compares each found output's SHA-256 with that of the file of the same identity, and removes what it wrote. A found file that differs, or has no counterpart, fails the run; matching files fewer than the run made cannot be judged; an input that is not local, a merge's outputs or a run that stalls cannot be judged either. Reason: a run is deterministic (Q-1535), so equality of bytes is every check of §3.2 at once; a run made under a later week rule or registry fails and is discarded only when its inputs are local, so their positions are compacted again and nothing is lost.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_set_of_outputs_is_judged_against_its_inputs_by_compacting_them_again`, `a_corrupt_run_record_whose_outputs_fail_against_local_inputs_discards_them`.
+
+## Q-2120 — When publish records without field 3 stop being accepted
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** With the catalogue broken by rule 2, a new record publishing a compacted file without field 3 was accepted, after which the state read as holding and C(g) moved; a second run over a compacted segment without field 3 was accepted and the state still held, as files without a layout are outside rules 1, 3 and 4 (Q-1850).
+**Decision (provisional).** The writer refuses a new record (`old_epoch` none) that publishes a compacted file without a layout (`AppendError::Unlaid`), before the hold and the rule are judged. A restated record (`old_epoch` set) may still have none and is judged on the state. The generated histories of `kvik-files`' tests give their records layouts. Reason: `publish()` always writes layouts, so only tests wrote such records, and accepting them let a record end a hold or break rule 1 unseen.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_new_record_publishing_a_compacted_file_without_a_layout_is_refused_while_broken`, `a_second_run_without_a_layout_over_a_compacted_segment_is_refused`.
+
+## Q-2121 — Whether a new record may leave the rule undecided
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** From a state that holds, a laid-out run naming a segment no record lists was appended; the state was then undecided and every later publish was refused as held until a sealed-segment record listed the segment, and rule 3 was never checked for the run.
+**Decision (provisional).** The writer refuses a new publish record unless the state after it holds (`AppendError::Undecided`, naming the files the catalogue lacks). Reason: §3.4 makes the writer's check a guard against its own mistakes; the state before is known to hold at that point, so the only source of an undecided state is the record.
+**Pinned by.** `files/tests/compaction_rule.rs` `a_run_naming_an_unlisted_segment_is_refused_from_a_state_that_holds`.
+
+## Q-2122 — What a rebuild's held file holds
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** `RebuildPlan::held` lists outputs that can be neither published nor discarded, said to hold runs, merges, removals and releases; only the start's clean-up took the list. With a held file on disk the planner would compact its segments again, and a copy of the corrupt record arriving later would then name two runs for one segment (rule 1, a hold with no end).
+**Decision (provisional).** The appender carries the held files (`Appender::hold_unlocated`, called by `rebuild_manifest`): while a record has not named one, `Appender::compaction` is undecided and names it, so one accessor answers for both holds and new publish records are refused as held. A carried copy of the corrupt record that names the file ends its hold. The hold lasts for the run of the process; the driver (Q-1853) consults `compaction()` before planning a run and keeps the held files out of a later start's clean-up while the rebuild is provisional. Reason: §3.5 keeps such a file and holds as for an unlocated one; carrying it in the appender's judgement needs no new record.
+**Pinned by.** `files/tests/unnamed_outputs.rs` `a_held_output_holds_compaction_in_the_rebuilt_appender_until_a_copy_of_its_record_names_it`.
+
+## Q-2125 — Publish after an unsure record
+Decided with the review of roadmap 6.3e, provisional. To be settled by the roadmap item that starts the store's manifest writer.
+**Scenario.** A failed sync leaves the appender faulted, the record possibly on disk and the outputs under their final names. A second publish of the same segments with the same first `file_id` renamed its outputs over them, was refused by the faulted appender, and its clean-up removed the final names, so a durable record could name absent files.
+**Decision (provisional).** The appender's fault ends compaction for the run of the process: `publish` refuses (`PublishError::Refused(AppendError::ReadOnly)`) before any rename when the appender is faulted; the next start finds the record or not and cleans up as §3.5 says. Reason: only the next start can tell whether the unsure record is on disk.
+**Pinned by.** `kvik/src/durable/compact/tests/publish.rs` `a_publish_after_an_unsure_record_leaves_the_outputs_that_record_may_name`.
+
+## Q-1428 — Which registry entries change a series' nodes
+Settled with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs` `node_changing`).
+**Scenario.** A registry entry committed beside facts can change nodes already stored; the series must then not be
+served from the tree until rebuilt. The design's default was everything but labels, aliases and routing.
+**Decision.** By entry type: a definition of an id already defined; a parameter change carrying the expected
+interval, the staleness limit, the wrap or the reset ceiling; a retirement. No node changes for aliases, routing,
+zone and tzdata entries (no calendar node is stored, Q-1425), recovery entries (their losses take the global floor,
+Q-1429), scale raises (decimal series store no level), or parameter changes of recording, lateness, retention or
+excess precision. Such a series gets an open floor in the next root; 71b-4's rebuild closes it.
+**Pinned by.** `durable::tree::tests` `a_retirement_stops_the_tree_serving_the_series_and_a_retention_change_does_not`.
+
+## Q-1830 — K and the dirty set without a race
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/dirty.rs`), provisional.
+**Scenario.** Acknowledgements reach the commit hook out of order across threads, so a set filled at acknowledgement
+can miss a fact at or below a K the job has already taken.
+**Decision (provisional).** A call marks its pairs before its facts are offered; K is the durable position of a cut
+taken before the set is read; a pair is cleared only when no call that marked it is unsettled and the highest last
+position of those settled is at or below K. A call whose outcome is unknown keeps its pairs until a restart.
+**Pinned by.** `durable::tree::dirty::tests`, `durable::tree::tests` `a_clean_shutdown_brings_every_dirty_quarter_hour_up_to_the_mark`.
+
+## Q-1831 — One delta part per UTC day
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs`), provisional.
+**Scenario.** The design writes one delta part a checkpoint; a part has one period, and the planner merges deltas of
+one UTC day; late data dirties quarter-hours of other days.
+**Decision (provisional).** A checkpoint writes one delta part per UTC day its entries fall in, all with the root's
+`seq`; usually one, two around midnight.
+**Pinned by.** `tree/src/write/tests.rs` (histories cross midnight).
+
+## Q-1832 — Definitions met by `dirty_from_log`
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/stretch.rs`), provisional.
+**Scenario.** The pass over `(K, P]` does not know the registry at K, so it cannot tell a new series' definition from a
+redefinition (Q-1428).
+**Decision (provisional).** Every definition in the stretch marks its series for rebuild. A series defined in the
+last interval before a stop is served from facts until its rebuild (71b-4), which is cheap; the commit path, which
+has the registry, marks only redefinitions.
+
+## Q-1833 — Empty markers for every empty span of a dirty quarter-hour
+Decided with roadmap 7.1b step 3 (`tree/src/write/nodes.rs`), provisional.
+**Scenario.** The job does not read the visible state, so it cannot tell whether an empty span hides an older entry.
+**Decision (provisional).** Every empty span of a folded level inside a dirty quarter-hour is written as an empty
+marker (about 4 bytes each, at most 16 a quarter-hour); a merge that takes every live part of its period drops them.
+The extension of a stored node by later readings (section 5 step 3) is left for a later step: the job always folds
+the span's current facts, which gives the same node.
+
+## Q-1834 — The tree's coverage before backfill
+Decided with roadmap 7.1b step 3 (`tree/src/write/mod.rs` `covered_all`), provisional.
+**Scenario.** With no root, `covered` must be true only where every fact has gone through the dirty set.
+**Decision (provisional).** A start with no valid root covers every span of the folded levels when the registry holds
+no series (no fact can exist), and nothing otherwise until backfill (71b-4). A tree whose first checkpoint never
+landed therefore waits for backfill; reads take facts meanwhile.
+
+## Q-1950 — A clean shutdown's checkpoint and reading the log
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle with 71b-4.
+**Scenario.** Design section 5 checkpoints at a clean shutdown, but the checkpoint reads the dirty quarter-hours'
+facts through a reader, and a process that has not read opens one by reading the log, which a clean shutdown never
+does (the registry file is written from the deliverer's index without reading the log).
+**Decision (provisional).** A clean shutdown checkpoints only when the store's reader is already open; otherwise it
+leaves the dirty set to the next start's `dirty_from_log`, which scans the log above K. Runs shorter than an interval
+that never read therefore lengthen that scan; `tree_stretch_max` bounds what readers pay for it. Kept by 71b-4, which
+adds that a clean shutdown runs no maintenance either (no rebuild, scrub, backfill or merge).
+A first step that comes at a clean shutdown with no reader open does not start the tree either, since the start's
+pass reads the log (`a_shutdown_before_the_first_step_with_no_reader_open_does_not_start_the_tree`).
+
+## Q-1951 — One reader for the tree's checkpoints and the process's reads
+Decided with roadmap 7.1b step 3 (`kvik/src/durable/open.rs`), provisional.
+**Scenario.** A checkpoint job with its own reader holds a second index of the log in the writer's process, and its
+start opened it only to learn whether the store held a series.
+**Decision (provisional).** The job reads through the store's reader, opening it at the first interval's checkpoint
+if no read has; whether the store is fresh (Q-1834) is taken from the log's highest series id at opening.
+
+## Q-1952 — A fan-out session answers a race with an older value
+Recorded with roadmap 7.1b step 3, open; for a fix of the live fan-out (`kvik/src/durable/read/live/fanout.rs`).
+**Scenario.** The property `sessions_polled_only_when_rung_receive_what_sessions_rung_by_every_round_and_the_model_receive`
+found a history (pinned, ignored, as `a_race_between_two_rounds_of_one_series_delivers_the_later_value`) in which a
+session polled only when rung answers a `Latest` read with the value at sequence 6 where every-round sessions and the
+model give the one at sequence 11. It fails the same way on public main.
+**Recommended default.** Treat as a delivery bug: a later value of a series in the round that races the session's turn
+must reach it. Fix with the fan-out, then remove the `ignore`.
+
+## Q-2060 — The node version and registry entries
+Decided with roadmap 7.1b step 4 (`tree/src/write/nodes.rs` `quarter_entries`, `model/src/tree.rs` `as_of`),
+provisional; settle with 72-1 (the version rule).
+**Scenario.** Q-1422 makes `as_of` the highest position among the span's current facts, or the position of the latest
+registry entry that changed the series' nodes if higher. The registry holds no position per series, so a rebuild
+from the log could not give the second without a scan of every entry.
+**Decision (provisional).** `as_of` is the highest position among the span's current facts, bad-quality facts
+included; a roll-up's is its children's highest. A node-changing entry is seen through the series' floor instead: a
+cache keys on the floor's `seq` with `as_of`. Live and rebuilt trees agree (T3), and the model's `as_of` is the same.
+
+## Q-2061 — The late window before a day's part and roll-ups
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `POLICY`), provisional; settle on 72-2's backfill
+storms.
+**Scenario.** The merge planner waits a late window after a UTC day ends before writing its day part and roll-ups;
+design section 5 names the window but not its length.
+**Decision (provisional).** One day. Late data after it still lands: the checkpoint recomputes the covered roll-ups
+over each changed quarter-hour from the visible children (T2).
+
+## Q-2062 — Where a backfill stops walking back
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job/maintain.rs` `backfill`), provisional.
+**Scenario.** A backfill rebuilds newest period first, but the store keeps no cheap earliest time across series, so
+the walk cannot tell when it has passed the oldest fact.
+**Decision (provisional).** The first range is from the start of today's UTC day upwards; then each settled period
+below (days, weeks, 13 and 52 weeks as alignment allows). A period holding no fact of any served series ends the walk:
+the same rebuild takes everything below it and the quarter-hour level is then covered without bound. The first range
+and each unsettled day count, so one idle day ends the walk: a gap of a whole period in the data therefore reads all
+older facts at once, which is still each fact once, and publishes them one settled period a root (Q-2112).
+
+## Q-2063 — The scrub's cadence
+Decided with roadmap 7.1b step 4 (`kvik/src/durable/tree/job.rs` `SCRUB`), provisional.
+**Scenario.** Section 7 has the writer's scrub find a damaged part and rebuild its period, without a cadence; reading
+every live part costs a pass over the tree.
+**Decision (provisional).** At the first interval's maintenance after a start and then once a day; a merge or a
+checkpoint that meets a damaged input runs it at once (Q-2111). The rebuild covers the part's period widened to every live part it overlaps, which it
+retires, so that it is the whole truth of that period.
+
+## Q-2070 — The stretch limit counted in log positions
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `STRETCH_MAX`), provisional.
+**Scenario.** Design section 6 stops a reader using the tree when its stretch (K, P] is longer than 64 MiB of log,
+but a reader cannot count log bytes between two positions without reading them.
+**Decision (provisional).** The limit is 2^20 positions (about 20 to 190 MiB at the measured 21 to 184 bytes a
+reading); past it the read takes facts. Settle with the lifetime bench's log bytes a reading.
+
+## Q-2071 — A fixed step off the quarter-hours
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/many.rs` `buckets_of`), provisional.
+**Scenario.** Design section 6 folds the partial quarter-hours of each bucket of a `Step` that is not a multiple of
+15 minutes from facts; that is two fact reads a bucket, up to 2,000 a chart.
+**Decision (provisional).** Such a chart, and any step below 15 minutes, is read from facts whole; results are
+equal either way (T7). Revisit with the 1-minute level (Q-1420).
+
+## Q-2072 — Whole parts decoded and kept by a reader
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/tree/read.rs` `TreeAt::window`), provisional.
+**Scenario.** Design section 6 puts decoded directory and node blocks in the reader's cache under its memory cap.
+`Part::decode` decodes a whole part, every series in it.
+**Decision (provisional).** A reader decodes, whole, the parts whose periods meet a chart's span (from a day before
+it), keeps them while a root lists them and does not count them against `ReaderConfig.memory`. Ten unmerged years
+peak at about 1 GiB on a ten-year chart (`docs/measurements/tree-reads.md`); merged, 236 MiB. A block-level decode
+through the part's directory, counted in the cap, follows if stores with many series show it. Accepted for 7.1b
+only with merges running (71b-4); settle by 7.3 at the latest, before the tree serves a store with many series.
+The search for the reading before a chart no longer decodes every part (`prior_node`, fix round of step 5): it
+takes the chart's window, then the fact path's search back.
+
+## Q-2073 — `tree_damaged` without an interface
+Decided with roadmap 7.1b step 5, provisional.
+**Scenario.** Design section 6 reports a damaged part in the reader's statistics; promise 5 allows no signature
+change in 7.1b.
+**Decision (provisional).** The reader counts damaged parts internally and reads their periods from facts; the
+count reaches `ReaderState` or health with the scrub's report. The count stays test-only until then: 71b-4's scrub
+finds and rebuilds damaged parts on the writer's side but reports nothing outside the process either. Settle with
+the first public report of the tree's health, at 7.3 at the latest.
+
+## Q-2074 — The visible entries formed per call
+Decided with roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `charts`), provisional.
+**Scenario.** A chart forms its series' visible entries over the whole span at every call: about 400,000 keys for ten
+years, which makes a warm ten-year chart 181 ms against S7's 50 ms; merges are about 14 ms of it.
+**Decision (provisional).** Kept for 7.1b. Order of levers (review ruling, Q-2133): first look the tiles a chart
+asks for up in the parts directly, a binary search in each part's sorted runs, with no map and nothing to
+invalidate; then measure again; only if still above 50 ms, Q-1424's nested ladder, which after the lookup cuts tiles
+and merges from about 40 a bucket to about 2. Keeping the visible entries per root is the alternative to the lookup
+but adds to Q-2072. Settle with the lookup's measurement, before 7.3.
+
+## Q-2110 — T8 over the files on disk after a fallback start
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`), provisional.
+**Scenario.** A partial power loss leaves a newer root that the start refuses and leaves on disk; the start continues
+from an older root with a lower K. A rebuild or merge publishes at the root's K, so a repair or merge as the first
+publish after such a start writes a root of higher `seq` and lower K than the refused file.
+**Decision (provisional).** The job takes a checkpoint at the cut, at or above any root's K (T5), before any rebuild or
+merge, and the tree tests follow that order. A start does not remove a refused newer root.
+
+## Q-2111 — A checkpoint that meets a damaged part
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `ancestors`, `kvik/src/durable/tree/job.rs`),
+provisional.
+**Scenario.** Late data into a merged day makes the checkpoint recompute the day's roll-ups from the live parts over it.
+A damaged one failed the checkpoint, and maintenance (scrub, repair, merges) runs only after a checkpoint, so the tree
+stalled for good. A repair cannot run first: it publishes at the root's K, below the cut.
+**Decision (provisional).** The checkpoint goes through: each roll-up span over a part that will not load is written as
+a stale marker (readers take facts), and the job's maintenance at the same step runs the repair, whose widened period
+rewrites those spans from facts at the same cut.
+
+## Q-2112 — The size of one rebuild
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional; settle with 72-2.
+**Scenario.** A floor close and the end of a backfill walk rebuild a series' whole range. Published as one root, a
+stop loses all of it and every part is held until that publish.
+**Decision (provisional).** Both publish one settled period a root at the same K, newest first; the floor closes and
+the unbounded cover is added with the last, so a stop loses at most one period and the next step resumes below what
+is covered. The facts are still read and folded in one pass; streaming that fold is left to 72-2.
+
+## Q-2113 — Case counts of the tree's properties
+Decided with roadmap 7.1b step 4 (`tree/src/write/rebuild_tests.rs`, `tree/src/write/tests.rs`), provisional.
+**Scenario.** A count fixed in source overrides `PROPTEST_CASES`, so the deep run never reaches the property.
+**Decision (provisional).** The tree's properties take `PROPTEST_CASES`, capped at 1,024 per run.
+
+## Q-2130 — How much of a chart the tree's reads may hold from facts
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/windows/nodes.rs`
+`fetch`), provisional.
+**Scenario.** A chart over a span the tree does not cover (history before the first checkpoint, a damaged part, a
+tree discarded by a lost range) fetched every reading of that span for every charted series before folding any
+bucket, outside `ReaderConfig.memory`; the fact path it replaces folds as it streams.
+**Decision (provisional).** The fetch counts the bytes of the readings it holds and, once they pass what one pass of
+the reader's memory would be granted now (Q-2260), drops them and gives every series of the call to the fact path.
+The result is the same either way (T7). Test:
+`a_chart_over_more_uncovered_readings_than_the_memory_hint_holds_them_not_and_takes_facts`.
+
+## Q-2131 — The case count and shard of the generated T7 property
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round
+(`kvik/src/durable/tree/reads.rs`), provisional.
+**Scenario.** The property fixed 24 cases in source, so `PROPTEST_CASES` never reached it, and no deep shard ran it.
+**Decision (provisional).** It takes `PROPTEST_CASES`, 24 when unset, at most 1,024 a run as Q-2113 caps the tree's
+other properties; the shard `kvik-tree-reads` runs `durable::tree::reads::`.
+
+## Q-2132 — Whether a failing generated T7 case leaks its rig while shrinking
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round (`kvik/src/durable/tree/reads.rs`),
+provisional.
+**Scenario.** Two mutants the generated property catches ended with the test binary killed at 12 to 14 GB instead of
+a counterexample: each shrink step built a rig whose writer was not shut down when the case panicked.
+**Decision (provisional).** The rig shuts its writer down when dropped, and the property shrinks at most 64 steps.
+
+## Q-2133 — Order of levers for a ten-year chart's 50 ms
+Recorded by the review of roadmap 7.1b step 5, decided with its fix round, provisional.
+**Scenario.** A warm ten-year chart takes 181 ms against design S7's 50 ms; about 14 ms of it are merges, the rest
+the visible entries a chart forms per call (Q-2074).
+**Decision (provisional).** Direct lookup in the parts first, then measure, then the nested ladder (Q-1424), as
+Q-2074 records.
+
+## Q-2180 — How the root's K meets T5 when the mark is synced on a timer
+Decided with the fix round of roadmap 7.1b step 3 (`kvik/src/durable/tree/job.rs` `checkpoint`), provisional; settle
+with 71b-4.
+**Scenario.** The mark is synced every `log.mark_sync` (1 s by default), so for up to a second after each commit the
+durable position, and with it a cut's K, is above the synced mark, and the tree refuses a root naming it. A store
+taking a commit a second or more never took an interval checkpoint.
+**Decision (provisional).** After taking its cut, an interval checkpoint whose K is above the synced mark has the log
+sync the mark through K (`Watch::sync_mark`) and checkpoints with what it returns: at most one extra mark sync an
+interval, 96 a day. A clean shutdown keeps the mark its own sync left. Alternative not taken: answer "not yet", ask
+for a sync as the derived files do, and retry within a second.
+Test: `an_interval_checkpoint_after_a_commit_above_the_synced_mark_succeeds`.
+
+## Q-2181 — K of a tree started on a store with facts and no root
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `start`), provisional; settle with 71b-4.
+**Scenario.** A store with facts and no tree starts an empty root that covers nothing, with K at the origin; the
+start's pass from the origin read the whole log and, by Q-1832, floored every series defined in it.
+**Decision (provisional).** When the start continues no root and the store is not fresh, it makes no pass: nothing is
+covered, so nothing below the mark needs marking. The first checkpoint takes K from its cut and writes a root with no
+part and no floor; 71b-4's backfill covers the store from facts. Test:
+`a_store_with_facts_and_no_tree_starts_without_marking_its_log`.
+
+## Q-2182 — A loss found while running
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional; settle with 71b-4.
+**Scenario.** A loss found this run below the root's K discards the tree (Q-1429). The comparison is with the
+manifest's lost ranges as they were at opening, so the same loss discarded the tree again at every later checkpoint
+that left a part.
+**Decision (provisional).** The job remembers the ranges of the losses each discard answered, and discards again only
+for a loss outside them. Test: `a_loss_found_while_running_discards_the_tree_once`.
+
+## Q-2183 — A checkpoint with nothing to write
+Decided with the fix round of roadmap 7.1b step 3 (`job.rs` `checkpoint_at`), provisional.
+**Scenario.** An idle store published a root every interval: a file, a file sync and a directory sync, 96 times a
+day.
+**Decision (provisional).** With no dirty pair, no series to floor, no discard and K equal to the root's, the step
+removes the retired parts that are due and counts as a checkpoint without publishing. When only K moved, a root with
+no part is published, so the stretch stays short. Test: `an_idle_store_writes_no_root_at_its_intervals`.
+
+## Q-2184 — How ingest latency is measured for the commit path's dirty set
+Decided with the fix round of roadmap 7.1b step 3, provisional.
+**Scenario.** The commit path gained, per call and under the decision lock, the call's sorted keys and a hash insert
+per pair, and a second lock at the acknowledgement; no bench drove `emit`.
+**Decision (provisional).** `kvik/benches/emit.rs` measures each call from `emit` to its acknowledgement at a home
+rate (one reading a call, 45 calls a second) and at saturation (batches of 100 back to back), and
+`scripts/bench-emit-ab.sh` runs it on a base revision and the head, alternating. The result is in
+`docs/measurements/tree-71b-3-ingest-latency.md`.
+
+## Q-2260 — The tree's fetch bounded by the memory hint, not charged
+Decided with the fix round of roadmap 7.1b step 5 (`kvik/src/durable/windows/nodes.rs` `fetch`), provisional.
+**Scenario.** Q-2130 bounds the readings a chart's fetch holds. Charging them to the accountant would hold a grant
+while the fetch's own passes ask for theirs, and an admission waits for running grants, so the fetch could wait on
+itself.
+**Decision (provisional).** The bound is the accountant's `rows_hint` taken when the fetch starts, not a grant: the
+fetch holds at most about one pass's grant beside the passes it runs. A span past the bound is read twice, once by
+the abandoned fetch and once by the fact path. Settle with Q-2072's block-level decode, which brings tree reads
+under the cap.
+## Q-1390 — The seed at a gate's start
+Decided by the lead with cond2 step 1, provisional, to the design's default; what the seed reads amended by Q-1560.
+**Scenario.** Q-1145 (b) seeds a starting gate's holds from history; the rule must be a function of the log, cheap
+at a watch, and say what the value was before the first reading it reads.
+**Decision.** With `L` the gate's longest hold, the look-back is `[T − min(2L, 24 h), T)`, `T` the start's commit
+time. The instance is judged, emitting nothing, as if watched at the look-back's start with boundaries uncrossed,
+over the series' state then and its facts committed inside the look-back before the start entry (Q-1560). Then the start transition (from none to the state at
+`T`, evaluated with the live-state value then) is emitted at the start's position. `2L`, so that a series
+reporting at least once per `L` completes a hold that truly held; a value first read inside the look-back later
+than `T − L` completes its hold late, never early. Gates with no hold read nothing. Staleness is judged at `T` from
+the series' arrivals; inside the seed the facts before the look-back count as arriving at its start (Q-1561). A
+window input in the seed sees the series' facts as the seed reads them.
+**Pinned by.** `tests/gate_seed.rs` `a_seed_reads_twice_the_longest_hold_back_and_counts_from_the_first_reading_inside`,
+`a_value_that_rose_shortly_before_the_watch_completes_its_hold_late_never_early`, `the_look_back_is_at_most_a_day`,
+`a_gate_without_holds_reads_no_history_so_its_boundaries_start_uncrossed`,
+`a_series_joining_an_each_is_seeded_from_its_history_at_the_join`, `a_fact_committed_at_the_look_backs_start_is_read`,
+`the_longest_hold_counts_hold_down`, `a_sets_longest_hold_counts_hold_off`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+
+## Q-1391 — Durable resume state for gates
+Decided by the lead with cond2 step 1, provisional, to the design's default.
+**Scenario.** A consumer's gates must resume exactly after a crash. Per-instance latches cost a record per instance
+on every confirmation, and a bound measured from the cursor refuses the replay of a consumer whose gates have been
+quiet for longer than `replay_max.span`.
+**Decision.** One gate cursor per consumer, a point in id order (the last confirmed transition id, or the frontier
+of the last confirmed resync), plus a checkpoint frontier at or after it and never after an unconfirmed transition.
+Confirmation is cumulative, so the cursor filters exactly as per-instance latches would. Resume replays every
+transition after both; the bound (`replay_max`) is measured from the checkpoint, so a quiet consumer still replays
+exactly. `kvik_model::gate::resume` takes the checkpoint and the gate cursor.
+**Pinned by.** `tests/gate_properties.rs` `a_restart_resumes_every_transition_once_after_dedup_by_id` (the replay
+equals the per-instance latch filter); `tests/gates.rs`
+`the_replay_bound_counts_facts_and_time_from_the_checkpoint_not_the_gate_cursor`,
+`a_frontier_gate_cursor_covers_timer_transitions_due_by_its_instant_only`; `tests/gate_edges.rs`
+`the_replay_bound_runs_from_the_checkpoint_not_from_an_old_gate_cursor`.
+
+## Q-1393 — The clock live gate timers run on
+Open, for the owner.
+**Scenario.** A gate's holds and staleness are timers. On the commit clock a forward step of the host clock
+completes holds and fires staleness at once, and a quiet store fires no timer until its writer's commit clock
+reaches the deadline; on the host clock live and replay can disagree.
+**Options.** (a) The commit clock, as for replay: a timer due at `d` fires once every batch committed before `d` is
+judged and the writer's commit clock has reached `d`, a backward step pausing timers; (b) the host clock live and
+the commit clock on replay, accepting that they can differ.
+**Provisional default.** (a), the commit clock, so live and replay agree (spec §6 Gates, Clock).
+**Pinned by.** none yet: the model judges on the commit clock only; the engine's live timers are cond2's.
+
+## Q-1560 — Facts inside the seed's look-back that were never the live value
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default; amends Q-1390.
+**Scenario.** Level 10, holds 5 s both ways; the live value is 5 (`t` 50, committed at 50); a backfill for `t` 40
+with value 50 commits at 92; the gate is watched at 100. Seeded from the facts committed inside the look-back
+alone, on an empty series, the backfill is the live value and the gate starts crossed, then falls at 105; the same
+gate watched at 90 stays at `Level(0)`. A fact outranked at its `t` (lower `changed_at`) does the same.
+**Decision (provisional).** The seed judges the series' true live state over the look-back: every fact of the series
+committed before the look-back counts as committed at its start, in position order, then the facts committed inside
+it before the start entry. A backfilled or outranked fact is never the live value, and the stand-in of Q-1390 is
+no longer needed. The engine then needs the live fact as of the look-back's start (one read by position), to be
+costed in cond2 step 2. **Fallback** if that read is too dear: count an inside fact only when it is not outranked
+and its `t` is at or after the look-back's start; that stays late, never early, except against future facts.
+**Pinned by.** `tests/gate_seed.rs` `a_backfill_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`an_outranked_fact_committed_inside_the_look_back_is_not_the_live_value_in_the_seed`,
+`a_backfill_before_a_late_rise_does_not_start_the_hold_early`,
+`a_bad_fact_inside_the_look_back_leaves_the_earlier_live_value_in_the_seed`,
+`a_future_fact_taking_effect_inside_the_look_back_holds_from_its_t`,
+`a_seeded_start_judges_as_the_same_gate_watched_at_the_look_backs_start`.
+
+## Q-1880 — What the gates core's history reads must return, and what they cost
+Decided by the lead with cond2 step 2's fix round, provisional, to the review's default; moves Q-1560's costing.
+**Scenario.** The core holds one live fact per series (G9's bound), so three things it cannot answer go to
+`History`: the series' state at a watch, the fallback when a bad or valueless fact replaces the live one at its
+`t` (spec §2.3), and the seed's look-back (Q-1390, Q-1560). The rules that matter were only in the tests' double.
+**Decision (provisional).** (1) `series(now, through)` is the state over the log through a position, not at its
+head: live, `through` is the item being applied, so the read sees the batch in flight, the triggering fact and
+earlier facts of the same batch included. (2) Its `last_arrival` counts the commit time of a usable fact even when
+a later fact replaced it at its `t`, and a fact committed ahead of its `t` counts at its `t` unless replaced before
+then: commit times are needed, which a latest-value index does not hold. (3) `at_look_back` is the state as of a
+commit time, every earlier usable fact in effect by then arriving at `from`; whether one still ahead at `from`
+counts there is Q-1882. (4) The fallback runs on the commit path, once per bad fact that lands on the live `t`.
+Costed in cond2 step 4 against the hot log and compacted segments, with the real `History` checked against the
+tests' double over the same generated logs. If `series` through a past position is too dear for replay, step 5
+replays from the checkpoint's held series states and reads only facts ahead.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_bad_fact_replacing_the_live_one_falls_back_to_the_older_value`,
+`the_seed_starts_from_the_live_fact_in_force_at_the_look_back_start`; the core's differential
+(`kvik/src/gates/differential.rs`).
+
+## Q-1881 — How a failed or short history read reaches the gates core
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** The seed's read may not reach the look-back's start (compacted away), and any read may fail (damage,
+I/O). The design seeds over what was read and counts `seeds_shortened`, and abandons a replay whose read fails.
+**Decision (provisional).** `History`'s reads are fallible: a failed read is `CoreError::History`, the call fails,
+and the core is not used again (any `CoreError` part-way through a batch is fatal to it; the caller restores from
+its checkpoint). A watch reads before it changes anything, so a failed read there adds nothing of the gate. A
+short read is not an error: `History` returns what it reached and its caller counts `seeds_shortened`.
+**Pinned by.** `kvik/src/gates/tests.rs` `a_failed_history_read_fails_the_call_and_a_watch_adds_nothing`.
+
+## Q-1882 — Whether the seed's start state counts a fact still ahead as an arrival at the look-back's start
+Decided by the lead with cond2 step 2's fix round, provisional.
+**Scenario.** A usable fact committed before the look-back's start with `t` beyond it. `at_look_back` may count it
+as an arrival at `from` or not.
+**Decision (provisional).** Either: a seeded instance's state is never read (the start evaluation recomputes it),
+and with no live fact at `from` its holds and crossings stay empty either way, so transitions and states are the
+same. The real `History` takes whichever read is cheaper.
+**Pinned by.** Nothing can: the tests' double's choice is an equivalent mutant.
+
+## Q-1561 — Arrivals inside the seed
+Decided by the lead with cond2 step 1's fix round, provisional, to the review's default.
+**Scenario.** A series silent since commit 1 (value 50), `stale_after` 8 s, hold 5 s, watched at 100: inside the
+seed its facts count as arriving at the look-back's start, so the hold completes in the seed; the start is `Stale`
+and the next reading gives `Level(1)` at once. A gate watched at the look-back's start would hold again from that
+reading; one watched all along gives `Level(1)` at once, as the seed does.
+**Decision (provisional).** Keep: inside the seed the facts before the look-back arrive at its start. It agrees with
+a gate watched all along; spec §6 Gates, Transitions says so.
+**Pinned by.** `tests/gate_seed.rs` `a_series_stale_throughout_the_look_back_still_completes_its_hold_in_the_seed`.
+
+## Q-1580 — The routing fields of a watch and an unwatch
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** Routing changes 4 and 5 need field ids after 66. Ids are per entry type,
+but `format.md` A.6 names field 70 as the label item of type 10, and one id meaning two things across types invites
+mistakes. A set gate's members need a value form in the entry codec, which had none.
+**Decision.** 67 gate id, 68 name, 69 selector, 71 input, 72 kind, 73 level, 74 member, 75 holds, 76 dead-band,
+77 stale after; 70 is skipped and stays an unknown critical field of a routing change. A member is a tag byte then
+the value: 1 `f64`, 2 decimal (`i64` units, `u8` scale), 3 named state index `u32`, 4 boolean byte, 5 text of 1 to
+255 bytes. Window inputs (71 = 2) are refused when read until their fold exists.
+**Pinned by.** `log/tests/entries_gates.rs` (every field check, the byte vector of `format.md` A.6),
+`log/tests/batches.rs` round trip.
+
+## Q-1581 — The gate interface as built
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** `api.md` Gates sketched `Transition.flags`, a `Cause` enum and no error for an unknown name or a name
+the grammar refuses.
+**Decision.** A transition's flags are its delivery's (`Delivery.flags`, as for facts and triggers); the cause enum is
+`TransitionCause`; `Consumer::gates()` returns `(GateId, String, Gate)` with the series by id; `GateError::Name` (not
+1 to 64 bytes, or holding `/`) and `GateError::NoSuchGate` (unwatch of a name not in force) are added;
+`GateInstanceState.set_by` is an `Option` (Q-1392). An equal spec is compared after resolving a series name, so a
+watch by name and one by id of the same series are equal. A builder method of another kind (`deadband` on a levels
+gate) has no effect.
+**Pinned by.** `kvik/tests/gates.rs`, `kvik/src/gate.rs` tests, `kvik/src/durable/gates/tests.rs`.
+
+## Q-1582 — Every entry moves a gate's frontier
+Decided by the lead, provisional (settle with conditions step 4).
+**Scenario.** A timer transition's `at` is the last position of the whole log before its instant, but `kvik_model::gate::Entry` could carry only facts, definitions and the consumer's own gates, so the
+model backend could not hand `judge` a funnel change, another consumer's watch or a site-zone entry.
+**Decision.** `gate::Entry::Other { position, commit_time }` carries any other entry; it changes no state.
+`Model::gate_history` maps the whole log so.
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`a_watch_starts_from_none_and_a_crossing_after_its_hold_is_a_timer_transition`,
+`a_timer_after_a_funnel_change_takes_that_entry_as_its_at`.
+
+## Q-1583 — The model backend's gates for now
+Decided by the lead, provisional (settle with conditions step 5).
+**Scenario.** The model backend serves gates from `judge` so that the durable engine has an oracle; some parts of the
+interface have no model counterpart yet.
+**Decision.** A decimal member is compared as the `f64` it denotes; a named-state member on a gate whose series has
+no named states (every `each` gate) is `NotSupportedYet`. The gate cursor is the last confirmed transition, kept in
+the process with the store; after a restart every transition after it comes again flagged `replayed`, with no
+replay bound, and a resync carries each instance's state at the model's now, as it is handed out. A confirmation is
+cumulative across transitions and the model's other deliveries (cond2 step 4). The durable backend refuses window
+inputs and `each` gates with `NotSupportedYet` (until cond2 step 6 for `each`).
+**Pinned by.** `kvik/src/backend/gates/tests.rs`
+`unconfirmed_transitions_come_again_flagged_replayed_after_a_restart_and_a_resync_carries_gate_states`,
+`kvik/src/durable/gates/tests.rs` `an_each_gate_is_refused_not_supported_yet_and_writes_nothing`.
+
+## Q-1810 — The bounds of a set member
+Decided at the review of conditions step 3, provisional.
+**Scenario.** Field 74 took any `u8` decimal scale and any `u32` state index, where every other decimal in the
+format is held to scale 18, a series has at most 65,536 names and `Value::State` is `u16`. Neither could match a
+value, and once stores hold such entries the format cannot be tightened.
+**Decision.** Scale at most 18 and index below 65,536, refused when read (field 74) and the scale at `watch`
+(`GateError::Set`; the index cannot exceed `u16`).
+**Pinned by.** `log/tests/entries_gates.rs` `gate_field_values_are_range_checked`, `kvik/src/gate.rs`
+`a_set_holds_one_to_sixty_four_values_none_absent`.
+
+## Q-1811 — Member order in an equal spec
+Decided at the review of conditions step 3, provisional.
+**Scenario.** A set gate watched again with the same members in another order.
+**Decision.** Not an equal spec: members compare in order, as written, so the second watch is `NameInUse`.
+`api.md` Gates, Naming says so.
+**Pinned by.** By reading (the spec comparison is the entry's equality).
+
+## Q-1812 — A named-state member on the durable backend
+Decided at the review of conditions step 3, provisional.
+**Scenario.** The model backend checks a named-state member against its series' names at `watch`; the durable
+backend wrote the index unchecked, so the two disagreed once durable gates are live.
+**Decision.** Both call one check: an index past the names is `GateError::Set`; a state member on a series without
+named states, every `each` gate included, is `NotSupportedYet` until `each` gates carry state names.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`a_named_state_member_is_checked_against_the_series_names_as_on_the_model`.
+
+## Q-1800 — A fact at position `0:0` in a history given to `judge`
+Decided by the lead at the re-check of cond2 step 1.
+**Scenario.** The seed's inner run starts after `Position::ORIGIN`, so a fact at `0:0` committed inside the
+look-back made `judge` panic; the outer run accepted it. No log holds one (positions start at `0:1`).
+**Decision.** `judge` refuses a fact at the origin as `GateError::Order`, so the seed's invariant holds for every
+history it accepts. A watch or other entry at the origin stays accepted (the tests' early-watch oracle uses one).
+**Pinned by.** `model/tests/gate_seed.rs`
+`a_fact_at_the_origin_position_is_refused_as_out_of_order_not_a_panic_in_the_seed`.
+
+## Q-2000 — The durable gate cursor in memory until the cursor file holds it
+Decided by the lead with cond2 step 4, provisional; settle with cond2 step 5.
+**Scenario.** Gates are judged live before the cursor file has a gate cursor field or a checkpoint block.
+**Decision (provisional).** The gate cursor and the held snapshot (the core at or before the oldest unconfirmed
+transition, G5) live in the process. A second take in the same run queues the unconfirmed transitions again under
+their ids (flagged `replayed` if handed out before) as its catch-up passes their positions, then the resync with state
+now: the same transitions a replay from the held snapshot gives, without reading the log. The first take after a start
+reseeds the gates in force at the head by the seed rule, emits no start transitions and reports `set_by` `None`
+(Q-1392), counted `gates_reseeded`; nothing is replayed.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`,
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`; `kvik/src/durable/gates/tests.rs`
+`a_confirmed_transition_moves_the_gate_cursor_in_memory_and_drops_the_held_snapshot`; the first take's reseed is
+replaced by Q-2080's replay, pinned by `kvik/tests/gates.rs`
+`a_start_replays_the_transitions_handed_out_and_not_confirmed_with_their_set_by`.
+
+## Q-2001 — What the durable backend's gate history reads cost
+Decided by the lead with cond2 step 4, narrowed at its review, provisional; settle with cond2 step 5.
+**Scenario.** Q-1880 asks for the real `History` to be costed and checked against the tests' double. The first
+decision scanned the whole log per read, twice per gate at every reseed, under the deliverer lock.
+**Decision (provisional).** A read takes the series' facts at or before `through` through the segment indexes
+(`format.md` A.8; a segment without one is scanned) and judges them by the double's own rules (`Replay`), so the two
+cannot differ; the gate differential checks it end to end. One read per series and position serves a whole core
+call, so a reseed reads each watched series once for all its gates. A read that cannot read every place that may
+hold the series fails (Q-1881). Cost: memory and I/O proportional to the series' facts, not the log's; bounded in
+time by Q-2295. The bounded read of Q-1880 (from `commit_at(T − 2L)`, with the series' state there from the
+summaries) is a merge condition on cond2 step 5, which builds it with replay.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_without_restarts`;
+`kvik/src/durable/gates/tests.rs` `a_reseed_reads_a_series_from_the_log_once_for_all_its_gates`.
+
+## Q-2002 — Gate state after an overflow catch-up
+Decided by the lead with cond2 step 4; replaced at its review, provisional.
+**Scenario.** Spec §6 Gates, Resume says the overflow catch-up's resync carries gate states, but §4 Overflow ends a
+catch-up with no resync: condition funnels re-attach by sending each changed state. The first decision re-sent, on
+re-attaching, the transition that set each changed state. That transition was judged before any snapshot the run
+still holds, so G5 cannot hold for it, and after a second take it came again unflagged though confirmed.
+**Decision (provisional).** Transitions judged while a consumer is behind wait in a buffer as large as its queue and
+are queued as the catch-up passes their positions, so a short catch-up loses none and needs no resync. A buffer that
+fills makes the gates quiet: judged, counted `transitions_not_delivered`, not queued. Any resync queued while quiet
+ends it (its states are taken as it is handed out, Q-2003); a catch-up still quiet at its end issues one at the last
+position taken, as a resume does: cause `Resume`, funnel states included, so funnels re-attach by it (§4 Overflow, a
+resync counts as emitting the states it carries). No new resync cause.
+**Pinned by.** `kvik/tests/gates.rs`
+`a_gate_that_overflows_its_queue_counts_what_it_drops_and_ends_its_catch_up_with_a_resync_of_the_present_state` and
+`a_transition_confirmed_before_an_overflow_does_not_come_again_after_a_second_take_while_quiet` (the model backend
+has no overflow: its transitions are computed when handed out).
+
+## Q-2003 — When a resync's gate states are taken, and the gate cursor its confirmation sets
+Decided by the lead with cond2 step 4, provisional.
+**Scenario.** A resync is queued at one moment and handed out later; transitions may be judged in between.
+**Decision (provisional).** Its gate states are taken as it is handed out, as the model backend's are. Confirming it
+sets the gate cursor to the frontier at the resync's position: every transition at or below it is queued before the
+resync and none above, so the transitions queued behind it stay unconfirmed.
+**Pinned by.** `kvik/tests/consumer_properties.rs`
+`a_gate_watched_after_a_second_take_starts_behind_the_resync_that_take_sends`.
+
+
+## Q-2080 — The durable gate cursor and checkpoint in the cursor file
+Decided by the builder with cond2 step 5, provisional; supersedes Q-2000.
+**Scenario.** A consumer with gates stops or crashes; at the next start it should receive every transition after the
+last one it confirmed, under the same ids, then a resync with state now (spec §6 Gates, Resume).
+**Decision (provisional).** Every cursor block written once the consumer's first watch has been applied holds the gate
+cursor (field 4); a write that carries a checkpoint appends block `0x31` before it in the same write and sync. At the
+first take in a run the engine is restored from the last valid checkpoint (from the empty core at the cursor when the
+file has no gate cursor), fed every record after it from the deliverer's kept log with each batch's commit time, and
+advanced to the commit floor; the transitions after the gate cursor are queued flagged `replayed` as the catch-up passes
+their positions, then the resume's resync carries state now. Replay is refused, and the gates in force are reseeded
+(counted `gates_reseeded`; `transitions_not_replayed` when over `conditions.replay_max`), with no cursor file, a gate
+cursor with no checkpoint (damage), a checkpoint of another generation or past the head, a reset point after it
+(Q-2082), or a failed read. A checkpoint instance naming a gate not in force at its frontier is dropped and a gate in
+force there with no instance is reseeded, both counted `checkpoint_mismatch`. At a start the commit clock is raised to
+every checkpoint's instant and every gate cursor's (G10, Q-1394). Q-2001's effect on replay: the replay itself reads no
+history, but restoring reads each held series' facts ahead of the checkpoint with one history read, and a reseed two
+per gate, each a scan of the log from its start (not changed here).
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`;
+`kvik/tests/gates_durable.rs`, `gate_deliveries_after_crashes_follow_the_rules` among them, and its failure-table rows
+(torn checkpoint, torn cursor block, lost file, failed cursor write, bound, clock stepped back).
+
+## Q-2081 — The checkpoint block as built
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The design laid out a checkpoint record per instance with the series' live fact inside it; the engine
+keeps series apart (several gates may read one) and restores fields the design did not list.
+**Decision (provisional).** Block `0x31` holds instances and series as two lists (`format.md` A.15): an instance adds a
+change gate's reference value and the instant of its last evaluation; a series adds whether its live fact is usable and
+its revision. Values use the checkpoint's own tagged form (none, number, boolean, text), since a core value is not an
+entry value. Facts ahead of the frontier are read again at a restore, as designed.
+**Pinned by.** `log/src/cursor/tests.rs` `checkpoint_vector_matches_format_md_and_round_trips`;
+`log/tests/cursor_checkpoint.rs`.
+
+## Q-2082 — A reset point or lost range after the checkpoint
+Decided by the builder with cond2 step 5, provisional; settle with cond2 step 6.
+**Scenario.** A recovery entry or a lost range lies between a consumer's checkpoint and the head at its take.
+**Decision (provisional).** The take reseeds rather than replays: the replay would judge across positions the reset
+point voids. Cond2 step 6 replaces this with the reseed at the reset point during the replay (design §4.4 step 5).
+Reset points below the checkpoint do not stop a replay: nothing after the checkpoint rests on them.
+**Pinned by.** `kvik/tests/gates_durable.rs`
+`a_power_loss_replays_up_to_its_reset_point_then_reseeds_there` (renamed by Q-2170), and
+`gate_deliveries_after_crashes_follow_the_rules` (a power loss ends the resume with a reset point).
+
+## Q-2083 — Facts counted for the bound; entries of a newer format in a replay
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** `conditions.replay_max.facts` must be checked before reading the replay; a log written by a newer
+minor version may hold ignorable entries the deliverer keeps no record of.
+**Decision (provisional).** Facts after the checkpoint are counted as the positions after it less those of the entries
+the deliverer holds, so an ignorable entry counts as facts (the bound can only be met early). A replay feeds the engine
+the records it holds; an ignorable entry last in a batch before a timer's instant would give that timer an `at` lower
+than live judgement gave it. No binary writes such entries yet.
+**Pinned by.** none yet.
+
+## Q-2084 — `set_by` after a replay of an instance a reseed set
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A reseed sets an instance with no transition, so a resync reports `set_by` none (Q-1392); a checkpoint
+taken then is replayed after a restart.
+**Decision (provisional).** The checkpoint holds the start id the instance would have had, not that a reseed set it, so
+after the replay the resync reports that id until a transition moves the instance. A flag in the instance record would
+keep `None`; not added while no consumer reads `set_by` to act.
+**Superseded by Q-2160.**
+
+## Q-2085 — The model backend's resume
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** The public-interface differential compares the durable backend's replay with the model backend's
+after clean restarts.
+**Decision (provisional).** The model backend keeps the whole log, has no checkpoint and applies no bound: at the first
+take after a store restart, every transition after the gate cursor that its judgement holds then comes flagged
+`replayed` (`kvik_model::gate::resume` with the bound not reached). The differential therefore runs the durable
+backend with an unbounded `conditions.replay_max`; the bound is pinned on the durable backend alone.
+**Pinned by.** `kvik/tests/consumer_properties.rs` `gate_deliveries_follow_the_model_over_restarts`.
+
+## Q-2086 — When a cursor write carries a checkpoint
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** Design §4.3 lists the writes that carry a checkpoint and what it holds.
+**Decision (provisional).** A cursor write carries a fresh checkpoint when its content's frontier differs from the one
+last written and either a gate confirmation came since, none was written yet, it is the last write of a clean
+shutdown, or `conditions.checkpoint_interval` has passed; a gates-only consumer whose engine moves is written on that
+interval though its cursor did not move. The content is the held snapshot (the engine at or before the oldest
+transition judged and not confirmed, whether queued, deferred while behind, or dropped while quiet) or, with none, the
+engine now. The held snapshot stays until all of them are confirmed: a consumer always one transition behind keeps an
+old checkpoint, whose replay may outgrow the bound (then reseeded, counted). A confirmed transition writes the cursor
+file at once.
+**Pinned by.** `kvik/tests/gates_durable.rs`, `a_clean_shutdown_writes_a_checkpoint_at_the_frontier` and
+`the_replay_bound_counts_facts_from_the_checkpoint_not_the_cursor` among them.
+
+## Q-2087 — The instant a reseed starts the gates at
+Decided by the builder with cond2 step 5, provisional.
+**Scenario.** A take reseeds (no cursor file, beyond `conditions.replay_max`, a reset point after the checkpoint) while
+a hold begun before the head's last commit has completed by the commit floor: in the previous run it fired, was
+delivered and was confirmed. Seeded at the head's commit time, the hold completes after the start and fires again, a
+transition with no `replayed` flag ahead of the resync, where the spec sends the resync alone.
+**Decision (provisional).** The reseed's start instant `T` is the commit floor when the deliverer has read through the
+floor's position (the floor's guarantee then holds: nothing later commits below it), else the head's commit time. A
+hold complete by then is in the resync's state, `set_by` none; nothing is sent before the resync.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_lost_cursor_file_reseeds_the_gates`,
+`a_resume_beyond_the_replay_bound_reseeds_without_replaying`.
+
+## Q-2160 — `set_by` of a reseeded instance after a restart
+Decided at review of cond2 step 5 (S1), replacing Q-2084.
+**Scenario.** The cursor file is lost; the take reseeds (resync `NoCursor`, `set_by` none); the consumer confirms; a
+clean stop; the next start replays from the checkpoint that confirmation wrote. Under Q-2084 the resync then named
+the start id, which no delivery in either run carried; a consumer that de-duplicates or audits by `set_by` is misled.
+**Decision.** An instance record's `set_by` gate point sets its third byte, otherwise zero, to 1 when a reseed set the
+instance and no transition has moved it since (`format.md` A.15); a restore keeps the instance reported as `set_by`
+none until a transition moves it. Files written before the flag read it as 0.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_reseeded_gate_keeps_set_by_none_after_a_restart`;
+`log/src/cursor/tests.rs` `a_reseeded_instance_sets_byte_2_of_its_set_by_and_round_trips`; the crash property's check
+that a resync's `set_by` is an id handed out.
+
+## Q-2161 — The crash property's cases and checks
+Decided at review of cond2 step 5 (S2).
+**Scenario.** `gate_deliveries_after_crashes_follow_the_rules` ran a quarter of the configured cases and checked three
+rules, so a transition lost between a checkpoint and the head, or a wrong state in a resync, would pass.
+**Decision.** It runs every configured case and adds two continuity checks needing no log oracle: a new transition
+starts from the state the consumer last learnt for its instance; a resync's `set_by` is none or an id handed out, and
+its state is the one that id set. It fails when fewer than one history in 64 reaches the replay check or fewer than
+one `set_by` check per 4 histories (measured at 1,024 cases: one in 22, and 0.8 a history).
+**Pinned by.** `kvik/tests/gates_durable.rs` `gate_deliveries_after_crashes_follow_the_rules`.
+
+## Q-2162 — Bytes written per confirmed transition by a consumer with many gates
+Decided at review of cond2 step 5 (S4), provisional.
+**Scenario.** A confirmed transition with nothing else outstanding appends the consumer's whole checkpoint and syncs
+(Q-2086). From the A.15 layout a levels instance with no pending hold takes 54 bytes and the series it reads 42
+(a numeric live fact and a last arrival), so a consumer with 1,000 single-series gates appends about 96 KB a confirmed
+transition and writes its 16 MiB file again about every 170.
+**Decision (provisional).** Keep the rule; the bench notes of cond2 step 6 measure bytes as well as syncs. If the
+bytes show, write a checkpoint on a confirmation at most once per `conditions.checkpoint_interval` and rely on replay.
+**Pinned by.** none: a measurement.
+
+## Q-2163 — A checkpoint larger than a block once `Each` lands
+Decided at review of cond2 step 5; bound chosen by the builder with cond2 step 6, provisional.
+**Scenario.** `Each` allows 4,096 gates of up to 256 instances on one consumer; their checkpoint would pass the 16 MiB
+block limit. Today's limit, 4,096 single-series gates, stays under 3 MiB.
+**Decision (provisional).** A consumer holds at most 12,288 `Each` instances across its gates (`MAX_EACH_INSTANCES`);
+a series that would pass it is refused and counted like one beyond a gate's 256 (Q-1143), and joins at the first
+definition entry that finds room, gates taken in id order. With 4,096 single-series gates that is 16,384 instances;
+at every field's widest (255-byte text values, 16 pending holds) an instance with its series takes about 1,009 bytes,
+so the largest checkpoint is about 16.5 MB, under the block. Splitting the checkpoint across blocks was the
+alternative; it changes the format and is not needed at this bound.
+**Pinned by.** `kvik/src/gates/each_tests.rs` (`the_largest_checkpoint_a_consumer_can_hold_fits_one_block`,
+`a_consumer_full_of_each_instances_refuses_and_takes_a_series_when_another_gate_frees_room`, core against `judge`).
+
+## Q-2170 — A reset point or a new generation in the judgement
+Decided by the builder with cond2 step 6, provisional. Supersedes Q-2082.
+**Scenario.** A gate has crossed a boundary with hysteresis on a value since lost (a power loss truncated it, or a
+lost range voids it), and the log now holds a recovery entry or a lost range after the checkpoint. Judged straight
+through, the instance keeps a crossing that rests on facts the log no longer holds.
+**Decision (provisional).** The judgement treats a reset point (a recovery entry at its position; a lost range not
+described by one at its last position, before the next entry and at the commit time before it) and the start of a new
+generation as a reseed entry (`gate::Entry::Reset`): every instance in force is seeded again there by the seed rule,
+as if starting, with no transition; its `set_by` is that start id, carried as none in a resync until the instance moves
+(Q-1392); the series an `Each` holds and refuses are kept, so no instance joins or leaves there. The model engine's
+gate history places these entries from its reset points; the durable replay at a take does the same where it meets
+one after the checkpoint, so it replays the transitions before the reset point rather than reseeding the whole take
+at the head. The consumer forgets ids above the resync's `forget_above` (Q-1140). Counted once per take as
+`gates_reseeded`.
+**Pinned by.** `model/tests/gate_reset.rs` (`after_a_reset_the_judgement_is_that_of_a_gate_started_there` and the
+unit cases); `kvik/src/gates/differential.rs` (resets in the core differential), `kvik/src/gates/each_tests.rs`
+`a_reset_reseeds_every_instance_without_a_transition`; `kvik/tests/gates_each.rs`
+`a_reset_point_after_the_checkpoint_reseeds_where_it_lies_after_replaying_up_to_it`.
+
+## Q-2171 — A new generation on the durable backend
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A store is restored (§8); a consumer's checkpoint is of the previous generation.
+**Decision (provisional).** The durable backend reseeds at the take, at the commit floor (Q-2087), not at the first
+position of the new generation where the model's history places its reseed entry (Q-2170). The two agree on states
+except where a hold or hysteresis spans entries between the generation's start and the take. Restores are not in the
+gate differentials; settle with the restore work if they are added.
+**Pinned by.** `kvik/src/durable/deliver/gate_resume.rs` (another generation is not replayed); no differential.
+
+## Q-2172 — A lost range recorded at run time
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A scrub finds a sealed segment damaged with no copy while the store runs; the engine has already judged
+its facts. Consumers past the range receive a plain resync (§4 Resync).
+**Decision (provisional).** The running engine keeps what it judged; a later replay from a checkpoint before the range
+reseeds there (Q-2170), as the model's history, which lists every lost range among its reset points, does. Until a
+restart the live states may rest on the lost facts. Not in the differentials.
+**Pinned by.** Nothing yet.
+
+## Q-2173 — An `Each` gate's refusals across a restore
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** A full `Each` refuses a series; the consumer stops; its checkpoint holds instances only (`format.md`
+A.15, Q-2081).
+**Decision (provisional).** No format change: at restore the refusals are every series the pattern matches at the
+checkpoint's position, by the names in force there, beyond the instances (with the instances, every match: the
+invariant the core keeps). `instances_refused` counts per run: a replay counts again the refusals it judges again.
+**Pinned by.** `kvik/src/gates/differential.rs` (restores with `Each` gates); `kvik/tests/gates_each.rs`
+`each_instances_replay_after_a_restart_from_the_checkpoint`.
+
+## Q-2220 — A resync's confirmation over replayed transitions is written at once
+Decided in the fix round of cond2 step 5.
+**Scenario.** A start replays transitions handed out before a crash and ends with a resync; the consumer confirms the
+resync, which returns, and the process crashes within a second. The confirmation's frontier covered the replayed
+transitions, but only a confirmed transition was written at once: the frontier went on the timed path (at most once
+a second), so the crash lost it and the next start replayed the same transitions again after their confirmation had
+returned. Found by the crash property at its full case count.
+**Decision.** Every gate confirmation, a transition or a resync's frontier, writes the cursor file before `confirm`
+returns, as a latch change does. A resync is confirmed once a resume, so the extra writes are few.
+**Pinned by.** `kvik/tests/gates_durable.rs` `a_confirmed_start_transition_does_not_come_again_after_three_crashes`.
+
+## Q-2250 — When a run takes the snapshot that becomes `held`
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A consumer that is behind with nothing outstanding can hold transitions in `deferred`, judged in an
+earlier batch. A snapshot taken at the next batch is after their judgement, and the catch-up then makes it `held`
+under them (G5).
+**Decision (provisional).** A run takes the snapshot that becomes `held` only when `outstanding` and `deferred` are
+both empty: in `gate_batch` and in `ready`. `gate_confirm` takes none; it clears `pre`, and the next `ready` retakes it
+under the same condition. Settle with cond2 step 5, which writes `held` as the checkpoint.
+**Pinned by.** `kvik/tests/gates_snapshot.rs`
+`a_transition_deferred_while_behind_is_delivered_once_after_later_batches_judge_nothing`; the S5 test
+`the_snapshot_held_for_a_transition_is_from_no_earlier_than_the_batch_before_its_judgement` still holds.
+**At the step 5 merge.** The condition is written as `held` none: the durable hold sets `held` at every judged
+transition and keeps it while one is outstanding, deferred or dropped (Q-2270), so it is the same condition.
+
+## Q-2251 — Deferred transitions older than a dropped one, after the resync that ended the quiet
+Decided by the lead at the cond2 live fix round, provisional.
+**Scenario.** A resync that ends a quiet clears `quiet` while `deferred` may hold transitions above the resync's
+position and older than the ones dropped; they arrive after it with a state it superseded.
+**Decision (provisional).** Keep, as Q-2003 accepts (`set_by` names the newer id). `api.md` is not changed here: a
+transition whose id is below a resync's `set_by` for its instance is superseded. Not probed in this round; settle
+by step 5's merge.
+**At the step 5 merge.** Unchanged: the checkpoint hold (Q-2270) does not move `held` past these transitions,
+and a quiet ended by a resync below a dropped id keeps the checkpoint until a later confirmation covers it.
+
+## Q-2270 — The checkpoint while a quiet catch-up ends with a resync
+Decided when the overflow resync (Q-2002) met the durable checkpoint (Q-2086).
+**Scenario.** A consumer behind fills its buffer, so its gates go quiet; the transition that filled it is dropped,
+then the catch-up ends with a resync of the present state. The consumer confirms every transition queued before
+that resync but not the resync, and the process crashes. Nothing is outstanding or deferred and the run is no
+longer quiet, so without more the checkpoint moves to the core now, after the dropped transition, and the restart
+does not replay it although it is after the gate cursor.
+**Decision.** The highest dropped id is kept (the one that makes the gates quiet included) and holds the checkpoint
+before it until the gate cursor covers it: the confirmed resync's frontier does. Kept rather than a "resync
+pending" flag, since it holds whatever confirms past it.
+**Pinned by.** `kvik/tests/gates_checkpoint.rs`
+`a_transition_dropped_while_quiet_is_replayed_after_a_crash_before_the_catch_up_resync_is_confirmed`.
+
+## Q-2271 — The bounded gate history read named as a merge condition on cond2 step 5
+Open, for the lead.
+**Scenario.** Q-2001, as narrowed at the step 4 review, makes the bounded read of Q-1880 (from `commit_at(T − 2L)`,
+with the series' state there from the summaries) a merge condition on step 5. Step 5 bounds replay by
+`conditions.replay_max`, but each history read still takes all of a series' facts at or before its position.
+**Default (provisional).** Merge step 5 without it; the bounded read lands with step 6, measured in its bench notes;
+Q-2001 keeps its text until then.
+**Ruling.** The lead: build it with step 6. Built as Q-2295.
+
+## Q-2295 — How the durable gate history read is bounded
+Decided by the builder with cond2 step 6, provisional.
+**Scenario.** Q-2001's reads took every fact of a series at or before their position, so a reseed or a watch on a
+series with years of history read all of it. The design's bound (positions from `commit_at(T − 2L)`, the state there
+from the summaries) needs a per-series state at a position that the summaries do not keep.
+**Decision (provisional).** A read takes the series' facts with `t` from whole days before the time asked about,
+through the segment indexes bounded to positions at or below the read's: 1 day (covers the longest look-back), then
+16, then 256, then the whole series. A window answers only where the facts it omits (all with `t` before it) cannot
+change the answer: the series' state needs a usable fact in effect then inside the window and a last arrival not
+in the window (any is above every omitted one); the look-back's start needs a usable fact in effect then; the
+facts since a time need the window's first commit before it (the seed asks for them after the look-back's start,
+whose answer needs that already). A window is
+refused when a fact before it was committed after its first (a backfill it cannot see, found by a position-bounded
+probe that keeps no facts); one with nothing before it is the whole series. So the answers equal the whole series'
+(Q-1880's rules unchanged), and a series reporting at least daily is read for a day, not its history. A series quiet
+for longer than the windows, or with backfills older than them, is still read whole.
+**Pinned by.** `kvik/src/durable/gates/tests.rs`
+`bounded_history_reads_answer_as_the_whole_series_does` (property: months of history, backfills, future and bad
+facts) and `a_reseed_reads_only_the_facts_of_the_look_back_window_not_the_series_history`.
+
+## Q-2370 — The summary tree off by default while its memory is unbounded
+Decided by the builder with the tree switch, provisional; settle with the step that bounds the tree's memory.
+**Scenario.** The tree's checkpoint and chart reads can hold memory that grows with a long backlog; a release must
+not carry that by default.
+**Decision (provisional).** `tree.enabled` (default off, documented as experimental). Off: no checkpoint job, no
+dirty marking on the commit path, nothing written under `tree/`; readers are unchanged and use a root an earlier run
+left only while its stretch is within `STRETCH_MAX`, so charts over old data take facts. The default turns on with
+the step that bounds the tree's memory. Tests: `with_the_tree_off_the_dirty_set_stays_empty_and_nothing_is_written_under_tree`,
+`charts_equal_the_fact_path_throughout_a_store_written_with_the_tree_on_then_off_then_on`,
+`a_store_written_with_the_tree_on_then_off_then_on_ends_equal_to_a_rebuild`.
+
+## Q-2371 — Turning the tree on with its root far behind
+Decided by the builder with the tree switch, provisional; settle with the step that bounds the tree's memory.
+**Scenario.** A store run with the tree off for long has a root whose K is far below the mark; continuing it would
+read the whole log since K into the dirty set at the start.
+**Decision (provisional).** A start whose root's K is more than `STRETCH_MAX` positions below the synced mark
+discards the tree as for a loss (Q-1429) and, as for a store with no root (Q-2181), marks nothing from the log: the
+discarded root covers nothing and the backfill rebuilds it from facts. Test:
+`turning_the_tree_on_with_its_root_behind_past_stretch_max_discards_it_and_backfills`.
+
+## Q-2470 — A series rebuild resumed after a stop
+Decided with a fix round of the tree writer (`tree/src/write/rebuild.rs` `rebuild_newest_first`), provisional.
+**Scenario.** A series' rebuild publishes its newest period, then the process stops with the floor still open. A
+later fact empties a node of that period. The resumed rebuild, at a newer K, writes nothing for the empty node, so
+the stopped attempt's entry, above the floor, is visible once the floor closes (T1).
+**Decision (provisional).** The first root of a rebuild that closes floors raises each of those open floors to its
+own `seq`, so only that attempt's parts are visible when the floor closes. Checkpoints still skip a rebuilding
+series. **Pinned by.** `tree/src/write/rebuild_tests.rs`
+`t1_holds_when_a_series_rebuild_resumed_after_a_kill_finds_a_node_now_empty`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -5280,7 +6588,7 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950. The owner's rulings of 2026-11-18 settled Q-925, Q-928, Q-951, Q-960, Q-962 and Q-970. Roadmap 9.0c (latest values from the series directory and the log tail) recorded Q-1000 to Q-1006, decided all but Q-1002 by the lead and left Q-1002 to the owner, settled Q-777, and confirmed Q-774, Q-776 and Q-991 for review and moved Q-773 to 9.0e. Roadmap 9.0d (live reads, first part)
-recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. The owner's rulings of 2026-11-26 settled Q-1200 to Q-1203, recorded by the review of conditions and fan-out.
+recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadmap 9.0f (sources, the merge and the memory cap) recorded and decided Q-1060 to Q-1065 by the lead and settled Q-850; its fix round recorded and decided Q-1066 to Q-1069 by the lead, and its second fix round Q-1095 and Q-1096. The follow-ups of Q-614's re-check recorded Q-1030, decided by the lead. The labels spec-and-model step of the series labels design (L1) recorded Q-880, Q-881 and Q-884 for the owner with the design's proposals applied, applied the design's settled Q-882 and Q-890 to Q-893, and recorded and decided Q-1020 to Q-1029; its review recorded Q-1040 to Q-1043, the lead deciding Q-1040 to Q-1042. The owner's rulings of 2026-11-21 settled Q-1102. The gates model (in-store conditions, step 1) recorded and decided Q-1140 to Q-1148 by the lead, provisional; its fix round changed Q-1148 (bad and valueless readings are not arrivals) and recorded Q-1149. Roadmap 6.2a2 (the compaction run) recorded and decided Q-1410 to Q-1414, all but Q-1411 provisional. Roadmap 6.2a2b (the maintenance share, the streaming writer and check, the stepped run) recorded and decided Q-1530 to Q-1537, provisional; its review recorded Q-1840, Q-1841 and Q-1843 with their proposals applied, and its fix round Q-1940. The owner's rulings of 2026-11-26 settled Q-1200 to Q-1203, recorded by the review of conditions and fan-out.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -5423,7 +6731,15 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
 | Q-854 | 9.0b2 | The lease records the highest epoch read; decided by the lead at 9.0b1's review, to be confirmed at the re-check |
-| Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
+| Q-811 | 6.2a2b | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; the stall on decreasing commit times is built by 6.2a2; open for the memory of the writer and the canonical check (Q-1410) |
+| Q-1410 | 6.2a2b | Roadmap 6.2a2 in two parts: the governor, stepping, gate of Q-801, streaming writer and digest cost in 6.2a2b; provisional |
+| Q-1412 | 6.3e | The name and reach of a series in a compacted file, from the definition in force at its greatest position; provisional |
+| Q-1413 | 6.2c | A set-aside non-fact entry stalls a run; provisional |
+| Q-1414 | 6.3e | Unpublished outputs wait under `.tmp` names in `data/`; provisional |
+| Q-1530 | 6.2c | The streaming writer holds a chunk only while its place is undecided; provisional |
+| Q-1531 | 6.3e | Governor details and the hook for a background task; provisional |
+| Q-1532 | 6.3e | The digest stays SHA-256: 13 % of a run with SHA instructions, 30 % without; provisional |
+| Q-1533 | 6.3e | The gate passes on simulated devices: the task stays on `kvik-maint`; owner to confirm; provisional |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 | Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give, which 9.0c adds a case of (a registry file that could not be written, Q-1001); for review |
@@ -5478,17 +6794,67 @@ recorded and decided Q-1010 to Q-1016 by the lead, and its review Q-1017. Roadma
 | Q-1133 | 7.1 | OWNER. A reader call on more than one thread; (a) as built: every call on the caller's thread |
 | Q-1150 | 6.2 | Decided by the lead: series batches at seal (A.8a), one-series lookups from their own batches, read without the lookups' lock; the halves, gap, pair limit and reference size provisional; for review |
 | Q-1151 | 6.2 | For review: concurrent many-series reads; (a) as built until callers' reads arrive together |
+| Q-1400 | 8.3 | Provisional: restore records are not read by the check; a point judged after a restore is `Unknown` |
+| Q-1406 | 9.0f | Provisional: `Tail` from a saved point moves to 9.0f with "from a time" |
+| Q-1621 | 5.3 step 1 | Settled by the lead: a start beyond the synced mark keeps its cursor write pending until a mark sync reaches it, as the durable backend |
+| Q-1630 | 5.3 step 5 | Provisional: the durable backend sends no resync for a lost range at the tail to a consumer at the position before it |
+| Q-1631 | 5.3 step 5, before it compares whole histories | Open: the model is wrong on the last position (no recovery entry on another boot after a lost entry, against §3 Recovery rule 3), and the history cuts a batch the mark was synced past; until ruled the history property stops restarting and comparing deliveries once an entry is lost |
+| Q-2010 | 5.3 step 2 | Decided by the lead: a point that answered unknown may later answer void above |
 
 | Q-1140 | conditions step 4 | Decided by the lead, provisional: the model defines gates; losses during a replay forget ids above `forget_above`, specified with exact resume |
 | Q-1141 | conditions step 3 | Decided by the lead, provisional: `Unknown` with no value; for review with the public API |
 | Q-1142 | conditions step 3 | Decided by the lead, provisional: ids name the series; for review with the public API |
 | Q-1143 | conditions step 6 | Decided by the lead, provisional: refused and counted, joining when there is room |
 | Q-1144 | conditions step 2 | Decided by the lead, provisional: timers first; the engine is compared with the model on it |
-| Q-1145 | conditions step 3 | Decided by the lead, provisional: boundaries start uncrossed; for review with the public API |
+| Q-1145 | cond2 step 1 | Settled by the owner: (b), seeded from history by the rule of Q-1390 |
 | Q-1146 | conditions step 2 | Decided by the lead, provisional: `Unknown` and `Stale` break holds, crossings kept |
 | Q-1147 | conditions step 5 | Decided by the lead, provisional: the §6 window at the instant, sampled on facts and ticks |
 | Q-1148 | conditions step 2 | Decided by the lead, provisional: arrivals as built in the model; with Q-16 |
 | Q-1149 | conditions step 3 | Decided by the lead, provisional: durations at most ten years, refused beyond |
+| Q-2070 | 7.3 | Decided by the lead, provisional: the stretch limit in log positions, 2^20; settle with the lifetime bench |
+| Q-2071 | 7.3 | Decided by the lead, accepted at review: steps off the quarter-hours read from facts; revisit with Q-1420 |
+| Q-2072 | 7.3 | Decided by the lead, accepted at review for 7.1b with merges running: whole parts decoded and kept, uncounted |
+| Q-2073 | 7.3 | Decided by the lead, accepted at review: `tree_damaged` counted inside the reader until the tree's health is reported |
+| Q-2074 | 7.3 | Decided by the lead, provisional: direct lookup first, measure, then the nested ladder (Q-2133) |
+| Q-2130 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: a chart's fetch bounded by the memory hint |
+| Q-2131 | 7.1b | Decided with the fix round of 7.1b step 5: the generated T7 property's cases from the environment, own shard |
+| Q-2132 | 7.1b | Decided with the fix round of 7.1b step 5: the rig shuts its writer down when dropped; 64 shrink steps |
+| Q-2133 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: order of levers for the ten-year chart |
+| Q-2260 | 7.3 | Decided with the fix round of 7.1b step 5, provisional: the fetch's bound is the hint, not a grant |
+| Q-1390 | cond2 step 1 | Decided by the lead, provisional: look-back `min(2L, 24 h)`, the series' state at its start (Q-1560) |
+| Q-1391 | cond2 step 1 | Decided by the lead, provisional: one gate cursor and a checkpoint; the bound from the checkpoint |
+| Q-1393 | cond2 step 2 | Open, for the owner: the commit clock as the provisional default |
+| Q-1560 | cond2 step 4 | Decided by the lead, provisional: the series' true live state; the read costed in step 4 (Q-1880), else the fallback |
+| Q-1561 | cond2 step 2 | Decided by the lead, provisional: facts before the look-back arrive at its start (kept) |
+| Q-1880 | cond2 step 5 | Decided by the lead, provisional: the four rules as the contract; a log scan per read for now (Q-2001), the bounded read with replay |
+| Q-1881 | cond2 step 5 | Decided by the lead, provisional: reads fallible and a failure fatal to the core; a short read counted by the caller |
+| Q-1882 | cond2 step 4 | Decided by the lead, provisional: either; the real read takes the cheaper |
+| Q-2000 | cond2 step 5 | Superseded by Q-2080 |
+| Q-2001 | cond2 step 5 | Decided at review, provisional: one indexed read per series per core call; the bounded read with replay, before step 5 merges |
+| Q-2002 | cond2 step 6 | Decided at review, provisional: buffered while behind; a quiet catch-up ends with a resync |
+| Q-2003 | cond2 step 5 | Decided by the lead, provisional: states as handed out; the cursor at the resync's position |
+| Q-2080 | cond2 review | Decided by the builder, provisional: field 4 and block 0x31; replay at the first take |
+| Q-2081 | cond2 review | Decided by the builder, provisional: series apart from instances; every restored field |
+| Q-2082 | cond2 step 6 | Superseded by Q-2170 (cond2 step 6): the replay reseeds where the reset point lies |
+| Q-2083 | cond2 review | Decided by the builder, provisional: positions less entries; newer-format entries not fed |
+| Q-2084 | cond2 review | Superseded by Q-2160 |
+| Q-2085 | cond2 review | Decided by the builder, provisional: unbounded on the model backend |
+| Q-2086 | cond2 review | Decided by the builder, provisional: as built; held until everything judged is confirmed |
+| Q-2087 | cond2 review | Decided by the builder, provisional: the commit floor once read through its position |
+| Q-2160 | cond2 review | Decided at review: a reseed flag in the instance's `set_by` |
+| Q-2161 | cond2 review | Decided at review: every case; two continuity checks; floors on checks reached |
+| Q-2162 | cond2 step 6 | Decided at review, provisional: keep the rule; measure bytes in the step 6 bench notes |
+| Q-2163 | cond2 step 6 | Provisional: at most 12,288 `Each` instances per consumer, refused and counted beyond |
+| Q-2170 | cond2 review | Decided by the builder, provisional: a reseed entry; the replay reseeds at the reset point |
+| Q-2171 | cond2 review | Decided by the builder, provisional: reseed at the take; the differentials hold no restore |
+| Q-2172 | cond2 review | Decided by the builder, provisional: the engine keeps what it judged; reseeded at the next replay across it |
+| Q-2173 | cond2 review | Decided by the builder, provisional: recomputed at restore from the names in force |
+| Q-2220 | cond2 review | Decided in the fix round: every gate confirmation written at once |
+| Q-2270 | cond2 review | Decided at merge: the highest dropped id holds the checkpoint until the gate cursor covers it |
+| Q-2271 | cond2 step 6 | Ruled by the lead: built with step 6 (Q-2295) |
+| Q-2295 | cond2 step 6 | Decided by the builder, provisional: event-time windows of 1, 16, 256 days, exact or widened |
+| Q-2370 | tree switch | Decided by the builder, provisional: `tree.enabled` default off, experimental, until the tree's memory is bounded |
+| Q-2371 | tree switch | Decided by the builder, provisional: a root behind by more than `STRETCH_MAX` is discarded at the start and backfilled |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -5826,6 +7192,11 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-1201 | Records held for a consumer not taken in this run | `api.md` Memory (ruled by the owner, 2026-11-26: none held) |
 | Q-1202 | `CursorBehindLog` on the durable backend | `api.md` Consumers (ruled by the owner, 2026-11-26: model only until the log trims) |
 | Q-1203 | A fan-out round that fails after taking events | `api.md` Live reads (ruled by the owner, 2026-11-26: not whole, `Lagged` to every session) |
+| Q-1401 | A saved point whose stamp matches and whose position is above the last position | §4 New consumer, §7 Readers (decided by the lead, 26 November, to the provisional default): the check answers `Kept`; a start at it begins at the last position, as every start is lowered to it. Scenario: a point built by hand with a zero stamp against a store that never reset (`starts.rs` `each_start_kind_begins_after_its_position_with_no_resync`; `kvik/tests/api.rs` `a_new_consumer_starts_after_the_position_before_its_start_with_no_resync`, both backends) |
+| Q-1403 | "First fact at or after T" for `start: time` | §4 New consumer (decided by the lead, 26 November, to the provisional default): by the receive time of the batch, as the durable backend's commit index; the model takes the last entry received before T. Scenario: facts received a second apart; a start at the second's receive time begins after the first (`starts.rs`; `kvik/tests/api.rs`, both backends) |
+| Q-1450 | A lost consumer taken again before it confirms its `NoCursor` resync | §4 Resync, invariant 25 (settled by the lead, 26 November, to the recommended default): every take before the confirmation sends the `NoCursor` resync again with the same `forget_above`, and nothing above it follows until it is confirmed (`starts.rs`; `kvik/tests/consumers.rs`) |
+| Q-2051 | Where the S2 follow-up goes | With the train-6 review fixes (`api.md` `Store::open`, `log/tests/recovery.rs`) |
+| Q-1145 | A gate's state when it starts | §6 Gates, Transitions (ruled by the owner, 2026-11-26: (b), seeded from history) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

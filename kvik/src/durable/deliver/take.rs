@@ -3,13 +3,14 @@
 
 use std::io;
 
-use kvik_log::entries::Entry;
 use kvik_log::writer::Position as LogPos;
 
-use super::{Ctx, Deliverer, before, next};
+use super::{Ctx, Deliverer, next};
 use crate::backend::Error;
 use crate::consume::{ResyncCause, Start};
-use crate::types::SavedPoint;
+use crate::durable::index::log_pos;
+use crate::durable::saved;
+use crate::types::{PointCheck, ResetStamp, SavedPoint};
 
 impl Deliverer {
     /// The position before a start (`spec.md` §4 New consumer, Resync): the last position for `start: now`, the
@@ -24,65 +25,28 @@ impl Deliverer {
         }
     }
 
-    /// A saved point judged against the current mark (`spec.md` §7 Readers, Reset stamp and saved points).
+    /// A saved point judged against the current mark (`spec.md` §7 Readers): kept, its position; void above X, X;
+    /// both lowered to the last position (Q-1401). The same answer as `Reader::check`.
     fn judge(&self, point: SavedPoint) -> Result<LogPos, Error> {
-        let p = crate::durable::index::log_pos(point.position);
-        let current = self
-            .reader
-            .borrow()
+        let reader = self.reader.borrow();
+        let (current, lost) = reader
             .as_ref()
-            .map(|r| r.state().stamp)
-            .unwrap_or_default();
-        let saved = (point.stamp.sequence, point.stamp.nonce);
-        let carries = |st: Option<kvik_log::mark::ResetStamp>, s: (u64, u64)| {
-            st.is_some_and(|st| (st.sequence, st.nonce) == s)
-        };
-        if p.generation == self.head.generation && (current.sequence, current.nonce) == saved {
-            return Ok(p.min(self.head));
-        }
-        let recoveries: Vec<(LogPos, &kvik_log::entries::Recovery)> = self
-            .entries
-            .iter()
-            .filter_map(|(q, e)| match e {
-                Entry::Recovery(r) => Some((*q, r)),
-                _ => None,
-            })
-            .collect();
-        // The reset the mark names must be kept, or nothing can be told.
-        if current.nonce != 0
-            && !recoveries
-                .iter()
-                .any(|(_, r)| carries(r.stamp, (current.sequence, current.nonce)))
-        {
-            return Err(Error::UnknownPoint);
-        }
-        let from = recoveries
-            .iter()
-            .position(|(_, r)| saved.1 != 0 && carries(r.stamp, saved))
-            .map_or(0, |i| i + 1);
-        let since = recoveries.get(from).map(|(q, _)| *q);
-        let mut x = p;
-        for (_, r) in &recoveries[from..] {
-            x = x.min(LogPos {
-                generation: p.generation,
-                sequence: r.after,
+            .map_or((ResetStamp::default(), &[][..]), |r| {
+                let st = r.state().stamp;
+                (
+                    ResetStamp {
+                        sequence: st.sequence,
+                        nonce: st.nonce,
+                    },
+                    r.lost_ranges(),
+                )
             });
-        }
-        let lost: Vec<_> = self
-            .reader
-            .borrow()
-            .as_ref()
-            .map(|r| r.lost_ranges().to_vec())
-            .unwrap_or_default();
-        for l in lost {
-            let first = LogPos {
-                generation: l.first.0,
-                sequence: l.first.1,
-            };
-            if first.generation == p.generation && since.is_none_or(|q| first >= before(q)) {
-                x = x.min(before(first));
-            }
-        }
+        let entries = self.entries.iter().map(|(p, e)| (*p, e));
+        let x = match saved::check(point, self.head.generation, current, entries, lost) {
+            PointCheck::Kept => log_pos(point.position),
+            PointCheck::VoidAbove(x) => log_pos(x),
+            PointCheck::Unknown => return Err(Error::UnknownPoint),
+        };
         Ok(x.min(self.head))
     }
 
@@ -92,8 +56,9 @@ impl Deliverer {
     /// - one whose cursor file was missing or unreadable at the start is first sent a resync of cause `NoCursor`
     ///   whose `forget_above` is the position before its start, carrying each funnel's state (its latches are lost),
     ///   then continues from there;
+    /// - one taken again before it confirmed that resync is sent it again, with the same `forget_above` (Q-1450);
     /// - one taken again in this run resumes from its confirmed cursor, and one with a cursor file as set up at the
-    ///   start, whatever `start`; one whose `NoCursor` resync is not yet confirmed is sent it again.
+    ///   start, whatever `start`.
     pub(crate) fn take(
         &mut self,
         name: &str,
@@ -118,6 +83,7 @@ impl Deliverer {
             None
         };
         let rt = self.consumers.entry(name.to_string()).or_default();
+        let retake = rt.attached;
         let again = rt.attached.then_some(rt.forget).flatten();
         if rt.attached {
             // The consumer process restarted (Q-95 (b)): what it was handed is dropped and it resumes from its
@@ -137,6 +103,8 @@ impl Deliverer {
         }
         rt.handle = true;
         rt.attached = true;
+        self.gate_take(name, retake, ctx);
+        let rt = self.consumers.get_mut(name).expect("inserted above");
         let Some(point) = point.or(again) else {
             return Ok(Ok(()));
         };
@@ -147,6 +115,9 @@ impl Deliverer {
         if lost || again.is_some() {
             rt.latches.clear();
             rt.forget = Some(point);
+            // Nothing is read from the log until the resync is confirmed, as the model's `awaiting` (Q-1450): a fact
+            // committed meanwhile is caught up after it, replayed.
+            rt.paused = true;
             self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
             return Ok(Ok(()));
         }

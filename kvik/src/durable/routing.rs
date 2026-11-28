@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kvik_log::entries::{
-    Entry, RouteCondition, RouteOp, RouteOperator, Routing, Selection, StateArg,
+    Entry, GateSpec, RouteCondition, RouteOp, RouteOperator, Routing, Selection, StateArg,
 };
 use kvik_log::writer::Position as LogPos;
 
@@ -56,6 +56,19 @@ pub(crate) struct ConsumerRoutes {
     pub(crate) emits: Option<Selection>,
     /// The highest funnel id any routing change named, removed ones included: the next is above it.
     pub(crate) max_funnel: u32,
+    /// Gates in force by id (spec §6 Gates).
+    pub(crate) gates: BTreeMap<u32, GateRec>,
+    /// The highest gate id any watch named: ids are never reused by the consumer.
+    pub(crate) max_gate: u32,
+}
+
+/// A gate in force.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GateRec {
+    /// The position of its watch entry.
+    pub(crate) watched_at: LogPos,
+    /// The gate as its entry carries it.
+    pub(crate) spec: GateSpec,
 }
 
 /// The routing table with the registry it resolves patterns against, as of one position.
@@ -77,6 +90,11 @@ fn resolve(registry: &Registry, pattern: &str) -> BTreeSet<u32> {
 }
 
 impl View {
+    /// The live series with a name or alias matching `pattern`, in id order.
+    pub(crate) fn matching(&self, pattern: &str) -> BTreeSet<u32> {
+        resolve(&self.registry, pattern)
+    }
+
     /// Applies an entry at its position.
     pub(crate) fn apply(&mut self, p: LogPos, e: &Entry) {
         match e {
@@ -103,6 +121,24 @@ impl View {
     fn route(&mut self, p: LogPos, r: &Routing) {
         let c = self.consumers.entry(r.consumer.clone()).or_default();
         c.emits = Some(r.emits.clone());
+        if let Some(g) = &r.gate {
+            c.max_gate = c.max_gate.max(g.id);
+            match &g.spec {
+                Some(spec) if r.op == RouteOp::Watch => {
+                    c.gates.insert(
+                        g.id,
+                        GateRec {
+                            watched_at: p,
+                            spec: spec.clone(),
+                        },
+                    );
+                }
+                _ => {
+                    c.gates.remove(&g.id);
+                }
+            }
+            return;
+        }
         let Some(id) = r.funnel else { return };
         c.max_funnel = c.max_funnel.max(id);
         match r.op {
@@ -126,7 +162,7 @@ impl View {
                 c.funnels.remove(&id);
                 self.sets.remove(&(r.consumer.clone(), id));
             }
-            RouteOp::Emits => {}
+            RouteOp::Emits | RouteOp::Watch | RouteOp::Unwatch => {}
         }
     }
 
@@ -432,6 +468,7 @@ pub(crate) fn add_change(
         operator: None,
         emits,
         condition,
+        gate: None,
     })
 }
 

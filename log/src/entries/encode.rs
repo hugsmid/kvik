@@ -60,6 +60,74 @@ impl Fields {
             Selection::All => self.u8(kind, 3),
         }
     }
+    /// Fields 67 to 77 of a watch or unwatch; 54 or 55 are written with the selection.
+    fn gate(&mut self, g: &RouteGate) {
+        self.u32(67, g.id);
+        let Some(s) = &g.spec else { return };
+        self.str(68, &s.name);
+        self.u8(
+            69,
+            match s.selector {
+                GateSelector::One(_) => 1,
+                GateSelector::Each(_) => 2,
+            },
+        );
+        self.u8(71, s.input);
+        match &s.kind {
+            GateKind::Levels(ls) => {
+                self.u8(72, 1);
+                for l in ls {
+                    let mut v = Vec::with_capacity(32);
+                    v.extend_from_slice(&l.at.to_bits().to_le_bytes());
+                    v.extend_from_slice(&l.clear.to_bits().to_le_bytes());
+                    v.extend_from_slice(&l.hold_up.to_le_bytes());
+                    v.extend_from_slice(&l.hold_down.to_le_bytes());
+                    self.raw(73, &v);
+                }
+            }
+            GateKind::Set {
+                members,
+                hold_on,
+                hold_off,
+            } => {
+                self.u8(72, 2);
+                for m in members {
+                    let mut v = Vec::with_capacity(10);
+                    match m {
+                        GateValue::F64(x) => {
+                            v.push(1);
+                            v.extend_from_slice(&x.to_bits().to_le_bytes());
+                        }
+                        GateValue::Decimal { units, scale } => {
+                            v.push(2);
+                            v.extend_from_slice(&units.to_le_bytes());
+                            v.push(*scale);
+                        }
+                        GateValue::State(i) => {
+                            v.push(3);
+                            v.extend_from_slice(&i.to_le_bytes());
+                        }
+                        GateValue::Bool(b) => v.extend_from_slice(&[4, u8::from(*b)]),
+                        GateValue::Text(t) => {
+                            v.push(5);
+                            v.extend_from_slice(t.as_bytes());
+                        }
+                    }
+                    self.raw(74, &v);
+                }
+                let mut v = hold_on.to_le_bytes().to_vec();
+                v.extend_from_slice(&hold_off.to_le_bytes());
+                self.raw(75, &v);
+            }
+            GateKind::Change { deadband } => {
+                self.u8(72, 3);
+                self.u64(76, deadband.to_bits());
+            }
+        }
+        if let Some(n) = s.stale_after {
+            self.i64(77, n);
+        }
+    }
 }
 
 pub(super) fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
@@ -185,6 +253,16 @@ pub(super) fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
             if let Some(sel) = &r.selection {
                 f.selection(53, sel);
             }
+            match r
+                .gate
+                .as_ref()
+                .and_then(|g| g.spec.as_ref())
+                .map(|s| &s.selector)
+            {
+                Some(GateSelector::One(id)) => f.u32(54, *id),
+                Some(GateSelector::Each(p)) => f.str(55, p),
+                None => {}
+            }
             if let Some(op) = &r.operator {
                 f.u8(56, op.aggregate);
                 f.i64(57, op.width);
@@ -219,6 +297,9 @@ pub(super) fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
                     f.u8(63, 4);
                     f.i64(66, n);
                 }
+            }
+            if let Some(g) = &r.gate {
+                f.gate(g);
             }
             entry_type::ROUTING
         }

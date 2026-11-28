@@ -2,9 +2,11 @@
 //!
 //! - [`desc`]: file descriptions, what a record says about a file and what a self-describing file says about itself.
 //! - [`record`]: typed manifest records, their canonical encoding and strict decoding.
+//! - [`layout`]: publish record field 3, what the catalogue knows of a published compacted file.
 //! - [`image`]: reading a manifest whole, every valid record on both sides of each corrupt one.
 //! - [`catalogue`]: the fold of the records: live and retired files by epoch, tiers, verification marks, losses,
 //!   acknowledgements, rebuilds and `file_id` floors.
+//! - [`compaction`]: the catalogue's rule for compacted files (invariant 14 in code) and C(g).
 //! - [`appender`]: the one run-time writer of `MANIFEST`: the start's repair, appends after the previous record's
 //!   sync, and the rule that the last record is not acted on irreversibly until a successor is synced.
 //! - [`tier`], [`restore`]: the copy-verified (roadmap 8.1c) and restore records as typed views over
@@ -40,11 +42,13 @@
 
 pub mod appender;
 pub mod catalogue;
+pub mod compaction;
 pub mod desc;
 mod fields;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod image;
+pub mod layout;
 pub mod rebuild;
 pub mod record;
 pub mod restore;

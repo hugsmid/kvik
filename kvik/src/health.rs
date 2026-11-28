@@ -127,6 +127,12 @@ pub enum Reason {
         /// since by a consumer's read of the log that no loss this process reports stands for (Q-929).
         regions: u64,
     },
+    /// The summary tree's checkpoints are failing or overdue: reads stay correct, and slow down as they take more
+    /// from facts (design 7.1b section 5).
+    TreeBehind {
+        /// Why: the last failed job's error, or how long no checkpoint has succeeded.
+        cause: String,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -171,6 +177,7 @@ impl fmt::Display for Reason {
                 "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries and \
                  {evaluations} evaluations unchecked, {regions} damaged regions not recorded as lost"
             ),
+            Reason::TreeBehind { cause } => write!(f, "summary tree behind: {cause}"),
         }
     }
 }
@@ -479,6 +486,19 @@ pub struct DeliveryStats {
     pub evaluations_unchecked: u64,
     /// Damaged regions a consumer's read of the log passed over that the store's start had not (Q-750).
     pub regions_unread: u64,
+    /// Gate transitions judged while their consumer caught up and not delivered (spec §4 Overflow; Q-1396).
+    pub transitions_not_delivered: u64,
+    /// Starts whose gates were rebuilt from history rather than replayed (spec §6 Gates, Resume; Q-1392).
+    pub gates_reseeded: u64,
+    /// Resumes beyond `conditions.replay_max`: nothing was replayed, the resync alone sent (spec §6 Gates, Resume).
+    pub transitions_not_replayed: u64,
+    /// Checkpoint instances that named a gate or series not in force at the checkpoint, and gates in force there
+    /// with no instance in it: dropped or reseeded at a resume (cond2 design §4.4).
+    pub checkpoint_mismatch: u64,
+    /// Gate judgements that failed (a history read) and were rebuilt by a reseed (Q-1881).
+    pub gate_errors: u64,
+    /// Series an `Each` gate at its 256 instances refused, once each time one started to match (Q-1143).
+    pub instances_refused: u64,
 }
 
 /// Per-series statistics.

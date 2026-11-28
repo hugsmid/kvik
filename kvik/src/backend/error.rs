@@ -68,6 +68,8 @@ pub(crate) enum Error {
     TooLarge { readings: usize, bytes: usize },
     #[error("not supported yet: {0}")]
     NotSupportedYet(&'static str),
+    #[error("gate refused: {0}")]
+    Gate(crate::gate::GateError),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -176,6 +178,7 @@ impl Error {
             Error::UnknownSeries(_) => ConsumerError::UnknownSeries,
             Error::Route(r) => ConsumerError::Route(r),
             Error::Pattern(e) => ConsumerError::Pattern(e),
+            Error::Gate(e) => ConsumerError::Gate(e),
             Error::RouteCycle(c) => ConsumerError::RouteCycle(c),
             Error::BadConfirm => ConsumerError::BadConfirm,
             Error::UnknownPoint => ConsumerError::UnknownPoint,

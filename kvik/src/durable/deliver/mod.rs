@@ -15,11 +15,15 @@
 //! registered, a poll, a confirmation, [`crate::Store::tick`]) and by the `kvik-deliver` thread ([`Hub`]), never on the writer thread.
 //! Timers run on `Env`'s monotonic clock; `now` and live staleness are the writer's ([`super::clock`]).
 //!
-//! Not here yet: windowed operators in funnels, starting at a position or a time, the saved-point check, timer
-//! sequences in the cursor file and the catch-up statistics (roadmap 5.3).
+//! Not here yet: windowed operators in funnels, starting at a time, timer sequences in the cursor file and the
+//! catch-up statistics (roadmap 5.3).
 
 mod confirm;
 mod funnels;
+mod gate_history;
+mod gate_resume;
+pub(crate) use gate_resume::GateConfig;
+mod gates;
 mod held;
 mod hub;
 mod intake;
@@ -28,6 +32,8 @@ mod resync;
 mod seeded;
 mod take;
 
+#[cfg(test)]
+pub(crate) use gates::GatePoint;
 pub(crate) use hub::Hub;
 
 use std::cell::{Cell, RefCell};
@@ -41,7 +47,6 @@ use std::time::Duration;
 use kvik_log::content::Item;
 use kvik_log::cursor::{self, Latch};
 use kvik_log::entries::Entry;
-use kvik_log::manifest::LossCause;
 use kvik_log::reader::{
     LogReader, ReadBatch, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError, Update,
 };
@@ -182,11 +187,19 @@ enum Pend {
         position: LogPos,
         unchecked: bool,
     },
+    /// A gate transition (spec §6 Gates).
+    Transition {
+        t: Box<kvik_model::gate::Transition>,
+        replayed: bool,
+    },
     Resync {
         cause: ResyncCause,
         forget_above: Option<LogPos>,
         position: LogPos,
         funnels: Vec<FState>,
+        /// Each gate instance's state, and the frontier the core was at.
+        gates: Vec<crate::gate::GateInstanceState>,
+        gate_frontier: Option<crate::gates::Frontier>,
         /// It is, or ends with, a reset point: its confirmation records its id in the cursor file (field 3).
         reset: bool,
         unchecked: bool,
@@ -204,6 +217,8 @@ struct Out {
     forced: bool,
     /// A reset point's resync.
     reset: bool,
+    /// The gate cursor its confirmation sets.
+    gate: Option<gates::GatePoint>,
 }
 
 /// A consumer as this process runs it.
@@ -233,6 +248,8 @@ struct Rt {
     paused: bool,
     /// The `forget_above` of a `NoCursor` resync not yet confirmed: a second take in this run sends it again.
     forget: Option<LogPos>,
+    /// Its gates, from its first watch applied in this run or its take with gates in force.
+    gates: Option<gates::GateRun>,
     runners: BTreeMap<u32, Runner>,
     /// A void changed the funnels in force: the runners are synced at the next evaluation.
     stale_runners: bool,
@@ -247,6 +264,15 @@ struct Rt {
     file_end: Option<u64>,
     dirty: bool,
     last_write: Option<i64>,
+    /// The gate cursor the cursor file holds (field 4), for a consumer whose gates are not judged in this run.
+    gate_saved: Option<kvik_log::cursor::GateCursor>,
+    /// The last valid gate checkpoint the cursor file holds: replayed from at the first take, carried into a file
+    /// written again (`format.md` A.15).
+    checkpoint: Option<kvik_log::cursor::Checkpoint>,
+    /// When the last checkpoint was written, on the monotonic clock.
+    checkpoint_at: Option<i64>,
+    /// The gate cursor moved since the last checkpoint was written (cond2 design §4.3).
+    gate_dirty: bool,
 }
 
 /// See the module documentation.
@@ -298,6 +324,23 @@ pub(crate) struct Deliverer {
     seeded: Option<LogPos>,
     view: View,
     head: LogPos,
+    /// The commit time of the batch at `head`.
+    last_commit_time: i64,
+    /// The last commit floor gate timers fired under.
+    gate_floor: Option<i64>,
+    /// `conditions.replay_max` and `conditions.checkpoint_interval`, in nanoseconds and facts (spec §6 Gates, Resume).
+    gate_config: gate_resume::GateConfig,
+    /// A floor the tests set in place of the commit clock's.
+    #[cfg(test)]
+    floor_hold: Option<(i64, LogPos)>,
+    /// The position whose gate call the tests make fail.
+    #[cfg(test)]
+    gate_fail_at: Option<LogPos>,
+    /// Gate history reads from the log.
+    #[cfg(test)]
+    gate_reads: Cell<u64>,
+    #[cfg(test)]
+    gate_facts_read: Cell<u64>,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
     resets: BTreeMap<LogPos, LogPos>,
     /// Per consumer named in a recovery entry (field 47: its cursor file was missing or unreadable), the lowest
@@ -439,6 +482,17 @@ impl Deliverer {
             seeded: None,
             view: View::default(),
             head: LogPos::default(),
+            last_commit_time: i64::MIN,
+            gate_floor: None,
+            gate_config: gate_resume::GateConfig::default(),
+            #[cfg(test)]
+            floor_hold: None,
+            #[cfg(test)]
+            gate_fail_at: None,
+            #[cfg(test)]
+            gate_reads: Cell::new(0),
+            #[cfg(test)]
+            gate_facts_read: Cell::new(0),
             resets: BTreeMap::new(),
             lost: BTreeMap::new(),
             consumers: BTreeMap::new(),
@@ -526,10 +580,10 @@ impl Deliverer {
                 generation: l.last.0,
                 sequence: l.last.1,
             };
-            let described = l.cause == LossCause::TruncatedTail
-                && d.resets
-                    .get(&next(last))
-                    .is_some_and(|after| *after == before(first));
+            let described = d
+                .resets
+                .get(&next(last))
+                .is_some_and(|after| super::saved::describes(next(last), *after, &l));
             if !described {
                 let fa = before(first);
                 let e = d.resets.entry(last).or_insert(fa);
@@ -545,6 +599,8 @@ impl Deliverer {
                     rt.cursor = f.state.position;
                     rt.latches = f.state.latches.iter().map(|l| (l.funnel, *l)).collect();
                     rt.reset = f.state.reset;
+                    rt.gate_saved = f.state.gate;
+                    rt.checkpoint = f.checkpoint;
                     rt.file_end = Some(f.end);
                     rt.behind = Some(next(f.state.position));
                     rt.resume = Some(d.head);

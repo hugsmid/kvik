@@ -5,6 +5,9 @@ use std::cell::RefCell;
 use super::definition::{Names, definition};
 use super::*;
 
+mod routing;
+use routing::routing;
+
 /// The fields an entry type allows, the ones a parameter change forbids, and the repeated ones.
 const fn allowed(t: u8, id: u16) -> Allowed {
     use Allowed::*;
@@ -18,7 +21,7 @@ const fn allowed(t: u8, id: u16) -> Allowed {
         }
         entry_type::ALIAS => matches!(id, 1 | 2),
         entry_type::RETIREMENT => matches!(id, 1 | 21),
-        entry_type::ROUTING => matches!(id, 50..=58 | 60..=66),
+        entry_type::ROUTING => matches!(id, 50..=58 | 60..=69 | 71..=77),
         entry_type::SITE_ZONE => matches!(id, 20 | 30),
         entry_type::TZDATA => id == 31,
         entry_type::RECOVERY => matches!(id, 40..=47),
@@ -68,11 +71,13 @@ const fn repeated(t: u8, id: u16) -> bool {
             | (entry_type::RECOVERY, 47)
             | (entry_type::ROUTING, 54)
             | (entry_type::ROUTING, 61)
+            | (entry_type::ROUTING, 73)
+            | (entry_type::ROUTING, 74)
     )
 }
 
 /// One past the largest id a known entry type allows.
-const IDS: usize = 67;
+const IDS: usize = 78;
 
 /// The fields of one entry, framing and order checked. Without `keep`, text is checked but not copied (Q-651).
 pub(super) struct Parsed<'a> {
@@ -500,119 +505,6 @@ fn finite(p: &Parsed<'_>, id: u16) -> Result<f64, BodyError> {
 fn non_negative(p: &Parsed<'_>, id: u16) -> Result<i64, BodyError> {
     let v = p.i64(id)?;
     if v >= 0 { Ok(v) } else { Err(p.bad(id)) }
-}
-
-fn routing(p: &Parsed<'_>) -> Result<Routing, BodyError> {
-    let v = p.need(50)?;
-    let consumer = match std::str::from_utf8(v) {
-        Ok(s) if consumer_name_ok(s) => p.own(s),
-        _ => return Err(p.bad(50)),
-    };
-    let op = match p.u8_in(51, 3)? {
-        1 => RouteOp::Add,
-        2 => RouteOp::Remove,
-        3 => RouteOp::Emits,
-        _ => return Err(p.bad(51)),
-    };
-    let funnel_fields = [53, 54, 55, 56, 57, 58, 63, 64, 65, 66];
-    let funnel = match op {
-        RouteOp::Emits => p.none(52).map(|()| None)?,
-        _ => Some(p.u32(52)?),
-    };
-    let (selection, operator, condition) = if op == RouteOp::Add {
-        let selection = read_selection(p, 53, true)?;
-        let operator = match p.get(56) {
-            None => {
-                p.none(57)?;
-                p.none(58)?;
-                None
-            }
-            Some(_) => {
-                let aggregate = p.u8_in(56, 10)?;
-                if aggregate == 0 {
-                    return Err(p.bad(56));
-                }
-                let width = p.i64(57)?;
-                if width <= 0 {
-                    return Err(p.bad(57));
-                }
-                let state = if aggregate == 10 {
-                    let v = p.need(58)?;
-                    match (v.len(), v.first()) {
-                        (5, Some(0)) if v[1] <= 1 && v[2..].iter().all(|b| *b == 0) => {
-                            Some(StateArg::Bool(v[1] == 1))
-                        }
-                        (5, Some(1)) => Some(StateArg::State(u32_at(v, 1))),
-                        _ => return Err(p.bad(58)),
-                    }
-                } else {
-                    p.none(58).map(|()| None)?
-                };
-                Some(RouteOperator {
-                    aggregate,
-                    width,
-                    state,
-                })
-            }
-        };
-        let condition = match p.get(63) {
-            None => {
-                for id in [64, 65, 66] {
-                    p.none(id)?;
-                }
-                None
-            }
-            Some(_) => Some(match p.u8_in(63, 4)? {
-                1 => {
-                    p.none(66)?;
-                    let (on, clear) = (finite(p, 64)?, finite(p, 65)?);
-                    if clear > on {
-                        return Err(p.bad(65));
-                    }
-                    RouteCondition::Threshold { on, clear }
-                }
-                2 => {
-                    p.none(65)?;
-                    p.none(66)?;
-                    let deadband = finite(p, 64)?;
-                    if deadband < 0.0 {
-                        return Err(p.bad(64));
-                    }
-                    RouteCondition::OnChange { deadband }
-                }
-                3 => {
-                    p.none(65)?;
-                    RouteCondition::HeldFor {
-                        above: finite(p, 64)?,
-                        n: non_negative(p, 66)?,
-                    }
-                }
-                4 => {
-                    p.none(64)?;
-                    p.none(65)?;
-                    RouteCondition::StaleFor {
-                        n: non_negative(p, 66)?,
-                    }
-                }
-                _ => return Err(p.bad(63)),
-            }),
-        };
-        (Some(selection), operator, condition)
-    } else {
-        for id in funnel_fields {
-            p.none(id)?;
-        }
-        (None, None, None)
-    };
-    Ok(Routing {
-        consumer,
-        op,
-        funnel,
-        selection,
-        operator,
-        emits: read_selection(p, 60, false)?,
-        condition,
-    })
 }
 
 /// A consumer name: `[a-z0-9][a-z0-9._-]{0,63}` (A.12).

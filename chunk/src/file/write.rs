@@ -16,8 +16,9 @@ use super::parts::{
     BlockRecord, Directory, IndexEntry, MARKER_LEN, RootRecord, SET_ASIDE, TimesRecord, Trailer,
     encode_index_block, encode_marker, encode_root, encode_times_directory, sort_key,
 };
-use super::stats::{Reach, bounds};
+use super::stats::{BoundsFold, Reach};
 use super::times::{Batch, encode_times};
+pub use super::tweaks::Tweaks;
 use super::{
     BLOCK_ROWS, CHUNK_ROWS, INDEX_BLOCK_ENTRIES, KIND_COMPACTED, Position, TIMES_ROWS, block_type,
 };
@@ -111,93 +112,13 @@ pub struct Written {
     pub layout: Layout,
 }
 
-/// Departures from canonical writing. `bodies` serves the canonical check, which hands the file's own data block
-/// bodies back (a compressed XOR payload is a writer's choice, C.10); the other fields write files a v1 writer
-/// never writes, for golden files and the reader's tests, and exist only with the `tweaks` feature.
-#[derive(Clone, Debug, Default)]
-pub struct Tweaks {
-    /// Data block bodies in file order, each used where it is a canonical body of the same rows.
-    pub bodies: Vec<Vec<u8>>,
-    /// Bits set in every chunk's directory and index flags.
-    #[cfg(feature = "tweaks")]
-    pub chunk_flags: u16,
-    /// A plain column added to the first data block.
-    #[cfg(feature = "tweaks")]
-    pub data_column: Option<(u8, Vec<u8>)>,
-    /// A plain column added to the first commit-times block.
-    #[cfg(feature = "tweaks")]
-    pub times_column: Option<(u8, Vec<u8>)>,
-    /// A field appended to the description.
-    #[cfg(feature = "tweaks")]
-    pub description_field: Option<(u16, Vec<u8>)>,
-    /// Bytes appended to the trailer body.
-    #[cfg(feature = "tweaks")]
-    pub trailer_tail: Vec<u8>,
-    /// Batch rows written in place of the held batches, unchecked.
-    #[cfg(feature = "tweaks")]
-    pub times_rows: Option<Vec<Batch>>,
-    /// Leaves each chunk's last block out of its directory and index entry, though it is written.
-    #[cfg(feature = "tweaks")]
-    pub unrecorded_last_block: bool,
-}
-
-#[cfg(feature = "tweaks")]
-impl Tweaks {
-    fn chunk_flags(&self) -> u16 {
-        self.chunk_flags
-    }
-    fn data_column(&self) -> Option<(u8, Vec<u8>)> {
-        self.data_column.clone()
-    }
-    fn take_times_column(&mut self) -> Option<(u8, Vec<u8>)> {
-        self.times_column.take()
-    }
-    fn description_field(&self) -> Option<(u16, Vec<u8>)> {
-        self.description_field.clone()
-    }
-    fn trailer_tail(&self) -> &[u8] {
-        &self.trailer_tail
-    }
-    fn take_times_rows(&mut self) -> Option<Vec<Batch>> {
-        self.times_rows.take()
-    }
-    fn unrecorded_last_block(&self) -> bool {
-        self.unrecorded_last_block
-    }
-}
-
-#[cfg(not(feature = "tweaks"))]
-impl Tweaks {
-    fn chunk_flags(&self) -> u16 {
-        0
-    }
-    fn data_column(&self) -> Option<(u8, Vec<u8>)> {
-        None
-    }
-    fn take_times_column(&mut self) -> Option<(u8, Vec<u8>)> {
-        None
-    }
-    fn description_field(&self) -> Option<(u16, Vec<u8>)> {
-        None
-    }
-    fn trailer_tail(&self) -> &[u8] {
-        &[]
-    }
-    fn take_times_rows(&mut self) -> Option<Vec<Batch>> {
-        None
-    }
-    fn unrecorded_last_block(&self) -> bool {
-        false
-    }
-}
-
 /// Writes one compacted segment.
 pub struct FileWriter<W: Write> {
     out: W,
     offset: u64,
     crc: Crc32c,
     id: Identity,
-    description: Description,
+    pub(super) description: Description,
     description_crc: u32,
     batches: Vec<Batch>,
     held: Vec<u64>,
@@ -214,6 +135,43 @@ pub struct FileWriter<W: Write> {
     entries_crc: u32,
     tweaks: Tweaks,
     data_blocks: usize,
+    /// Alternative bodies by data block number (the canonical check's [`Tweaks::bodies`]).
+    alt_bodies: std::collections::BTreeMap<usize, Vec<u8>>,
+    pub(super) block_rows: usize,
+    pub(super) chunk_rows: usize,
+    pub(super) stream: Option<super::stream::SeriesStream>,
+    finishing: Option<Finishing>,
+    finished: Option<Written>,
+}
+
+/// What [`FileWriter::finish_step`] carries between its calls.
+struct Finishing {
+    range: (Position, Position),
+    used: Vec<Batch>,
+    times_offset: u64,
+    times_dir_offset: u64,
+    times_dir_crc32c: u32,
+    times_count: u32,
+    /// Sorted; written an index block a call from `at`.
+    index: Vec<IndexEntry>,
+    at: usize,
+    index_offset: u64,
+    roots: Vec<RootRecord>,
+}
+
+/// A chunk being written: where it starts, its block records so far and its index entry's folds.
+pub(super) struct ChunkAcc {
+    series_id: u32,
+    flags: u16,
+    start: u64,
+    records: Vec<BlockRecord>,
+    rows: u32,
+    fold: BoundsFold,
+    min_t: i64,
+    max_t: i64,
+    reach: i64,
+    first: Option<Position>,
+    last: Position,
 }
 
 fn content(what: &'static str) -> WriteError {
@@ -312,6 +270,12 @@ impl<W: Write> FileWriter<W> {
             entries_crc: 0,
             tweaks: Tweaks::default(),
             data_blocks: 0,
+            alt_bodies: Default::default(),
+            block_rows: BLOCK_ROWS,
+            chunk_rows: CHUNK_ROWS,
+            stream: None,
+            finishing: None,
+            finished: None,
         };
         let header = FileHeader::new(
             KIND_COMPACTED,
@@ -326,9 +290,61 @@ impl<W: Write> FileWriter<W> {
 
     /// Departures from canonical writing; call before the first series.
     #[doc(hidden)]
-    pub fn with_tweaks(mut self, tweaks: Tweaks) -> Self {
+    pub fn with_tweaks(mut self, mut tweaks: Tweaks) -> Self {
+        self.alt_bodies = std::mem::take(&mut tweaks.bodies)
+            .into_iter()
+            .enumerate()
+            .collect();
         self.tweaks = tweaks;
         self
+    }
+
+    /// Offers the file's own body for the data block numbered `n` in write order (the canonical check, C.10).
+    pub(super) fn offer_body(&mut self, n: usize, body: Vec<u8>) {
+        self.alt_bodies.insert(n, body);
+    }
+
+    /// Smaller blocks and chunks, so tests reach chunk boundaries with few rows.
+    #[cfg(test)]
+    pub(crate) fn with_rows(mut self, block_rows: usize, chunk_rows: usize) -> Self {
+        self.block_rows = block_rows;
+        self.chunk_rows = chunk_rows;
+        self
+    }
+
+    /// The sink.
+    pub fn sink(&self) -> &W {
+        &self.out
+    }
+
+    /// The sink, for a caller that drains what is written as it goes.
+    pub fn sink_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
+    /// Bytes written so far.
+    pub fn offset(&mut self) -> u64 {
+        self.offset
+    }
+
+    /// Data blocks written so far.
+    pub fn data_blocks(&self) -> usize {
+        self.data_blocks
+    }
+
+    /// Reserves room for `n` more index entries, so that the index is allocated once.
+    pub fn reserve_index(&mut self, n: usize) {
+        self.index.reserve_exact(n);
+    }
+
+    /// Bytes the writer holds besides its sink: index entries, commit-time rows and the open series' rows.
+    pub fn held_bytes(&self) -> u64 {
+        let fact = std::mem::size_of::<Fact>() as u64;
+        let index =
+            self.index.capacity() + self.finishing.as_ref().map_or(0, |f| f.index.capacity());
+        (index * std::mem::size_of::<IndexEntry>()) as u64
+            + (self.batches.capacity() * (std::mem::size_of::<Batch>() + 8)) as u64
+            + self.held_rows() as u64 * (fact + 255)
     }
 
     fn put(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -385,29 +401,12 @@ impl<W: Write> FileWriter<W> {
     /// order of B.1 (by name as UTF-8 bytes, then those with no definition by id), each once; facts of a current
     /// file have strictly ascending `t`.
     pub fn series(&mut self, mut s: Series) -> Result<(), WriteError> {
-        if self.entries_written {
-            return Err(content("a series after the entries"));
-        }
-        self.description_written()?;
-        let key = (
-            s.name.is_none(),
-            s.name.as_deref().unwrap_or("").as_bytes().to_vec(),
+        self.series_head(
             s.series_id,
-        );
-        if self
-            .last_key
-            .as_ref()
-            .is_some_and(|k| *k >= key || k.2 == s.series_id)
-        {
-            return Err(content("series out of the order of B.1"));
-        }
-        self.last_key = Some(key);
-        if !s.set_aside.is_empty() && self.description.class != Class::Revision {
-            return Err(content("set-aside facts outside a revision file"));
-        }
-        if matches!(s.reach, Reach::Fixed(d) if d <= 0) {
-            return Err(content("an interval length of 0 or less"));
-        }
+            s.name.as_deref(),
+            s.reach,
+            !s.set_aside.is_empty(),
+        )?;
         let mut chunks: Vec<(u16, bool, std::ops::Range<usize>)> = Vec::new();
         for (flags, aside) in [(0, false), (SET_ASIDE, true)] {
             let facts = if aside {
@@ -424,8 +423,12 @@ impl<W: Write> FileWriter<W> {
             {
                 return Err(content("two facts of one key in a current file"));
             }
-            for start in (0..facts.len()).step_by(CHUNK_ROWS) {
-                chunks.push((flags, aside, start..facts.len().min(start + CHUNK_ROWS)));
+            for start in (0..facts.len()).step_by(self.chunk_rows) {
+                chunks.push((
+                    flags,
+                    aside,
+                    start..facts.len().min(start + self.chunk_rows),
+                ));
             }
         }
         let rows = |aside: bool, r: &std::ops::Range<usize>| {
@@ -445,45 +448,135 @@ impl<W: Write> FileWriter<W> {
         Ok(())
     }
 
-    fn chunk(
+    /// The checks every series passes before its chunks: after the description, before the entries, in the order
+    /// of B.1, set-aside facts only in a revision file, a positive interval length.
+    pub(super) fn series_head(
+        &mut self,
+        series_id: u32,
+        name: Option<&str>,
+        reach: Reach,
+        has_set_aside: bool,
+    ) -> Result<(), WriteError> {
+        if self.entries_written {
+            return Err(content("a series after the entries"));
+        }
+        if self.stream.is_some() {
+            return Err(content("a series while another is open"));
+        }
+        self.description_written()?;
+        let key = (
+            name.is_none(),
+            name.unwrap_or("").as_bytes().to_vec(),
+            series_id,
+        );
+        if self
+            .last_key
+            .as_ref()
+            .is_some_and(|k| *k >= key || k.2 == series_id)
+        {
+            return Err(content("series out of the order of B.1"));
+        }
+        self.last_key = Some(key);
+        if has_set_aside && self.description.class != Class::Revision {
+            return Err(content("set-aside facts outside a revision file"));
+        }
+        if matches!(reach, Reach::Fixed(d) if d <= 0) {
+            return Err(content("an interval length of 0 or less"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn chunk(
         &mut self,
         series_id: u32,
         reach: Reach,
         flags: u16,
         facts: &[Fact],
     ) -> Result<(), WriteError> {
-        for f in facts {
+        let mut c = self.chunk_begin(series_id, flags);
+        for rows in facts.chunks(self.block_rows) {
+            self.chunk_block(&mut c, reach, rows)?;
+        }
+        self.chunk_end(c)
+    }
+
+    /// Starts a chunk at the current offset; its blocks follow with [`Self::chunk_block`].
+    pub(super) fn chunk_begin(&mut self, series_id: u32, flags: u16) -> ChunkAcc {
+        ChunkAcc {
+            series_id,
+            flags,
+            start: self.offset,
+            records: Vec::new(),
+            rows: 0,
+            fold: BoundsFold::default(),
+            min_t: i64::MAX,
+            max_t: i64::MIN,
+            reach: i64::MIN,
+            first: None,
+            last: Position::default(),
+        }
+    }
+
+    /// Writes one data block of a chunk.
+    pub(super) fn chunk_block(
+        &mut self,
+        c: &mut ChunkAcc,
+        reach: Reach,
+        rows: &[Fact],
+    ) -> Result<(), WriteError> {
+        for f in rows {
             self.hold(f.position)?;
+            c.fold.push(f.flags, f.value_type, f.value, f.scale);
+            c.min_t = c.min_t.min(f.t);
+            c.max_t = c.max_t.max(f.t);
+            c.reach = c.reach.max(reach.of(f.t));
+            c.first = Some(c.first.map_or(f.position, |p| p.min(f.position)));
+            c.last = c.last.max(f.position);
         }
-        let start = self.offset;
-        let mut records: Vec<BlockRecord> = Vec::with_capacity(facts.len().div_ceil(BLOCK_ROWS));
-        for rows in facts.chunks(BLOCK_ROWS) {
-            let block = columns(rows);
-            let mut body = block.encode()?;
-            if let Some(alt) = self.tweaks.bodies.get(self.data_blocks)
-                && *alt != body
-                && Block::decode_canonical(alt).as_ref() == Ok(&block)
-            {
-                body = alt.clone();
-            }
-            if self.data_blocks == 0
-                && let Some((id, payload)) = self.tweaks.data_column()
-            {
-                body = insert_column(&body, 0, id, &payload);
-            }
-            self.data_blocks += 1;
-            let (at, h) = self.block(block_type::DATA, &body)?;
-            records.push(BlockRecord {
-                first_t: rows[0].t,
-                last_t: rows[rows.len() - 1].t,
-                offset: u32::try_from(at - start).map_err(|_| content("chunk above 4 GiB"))?,
-                body_len: h.body_len,
-                row_count: rows.len() as u16,
-                body_crc32c: h.body_crc32c,
-            });
+        let block = columns(rows);
+        let mut body = block.encode()?;
+        if let Some(alt) = self.alt_bodies.remove(&self.data_blocks)
+            && alt != body
+            && Block::decode_canonical(&alt).as_ref() == Ok(&block)
+        {
+            body = alt;
         }
+        if self.data_blocks == 0
+            && let Some((id, payload)) = self.tweaks.data_column()
+        {
+            body = insert_column(&body, 0, id, &payload);
+        }
+        self.data_blocks += 1;
+        let (at, h) = self.block(block_type::DATA, &body)?;
+        c.records.push(BlockRecord {
+            first_t: rows[0].t,
+            last_t: rows[rows.len() - 1].t,
+            offset: u32::try_from(at - c.start).map_err(|_| content("chunk above 4 GiB"))?,
+            body_len: h.body_len,
+            row_count: rows.len() as u16,
+            body_crc32c: h.body_crc32c,
+        });
+        c.rows += rows.len() as u32;
+        Ok(())
+    }
+
+    /// Writes a chunk's directory and records its index entry.
+    pub(super) fn chunk_end(&mut self, c: ChunkAcc) -> Result<(), WriteError> {
+        let ChunkAcc {
+            series_id,
+            flags,
+            start,
+            mut records,
+            rows,
+            fold,
+            min_t,
+            max_t,
+            reach,
+            first,
+            last,
+        } = c;
         let flags = flags | self.tweaks.chunk_flags();
-        let mut recorded = facts.len() as u32;
+        let mut recorded = rows;
         if self.tweaks.unrecorded_last_block() && records.len() > 1 {
             recorded -= u32::from(records.pop().map_or(0, |r| r.row_count));
         }
@@ -495,14 +588,9 @@ impl<W: Write> FileWriter<W> {
             summary: Vec::new(),
         };
         let (dir_at, dh) = self.block(block_type::DIRECTORY, &dir.encode())?;
-        let (b, has_nan) = bounds(
-            facts
-                .iter()
-                .map(|f| (f.flags, f.value_type, f.value, f.scale)),
-        );
+        let (b, has_nan) = fold.finish();
         let raw = b.map(|b| b.raw()).unwrap_or_default();
-        let min_t = facts.iter().map(|f| f.t).min().unwrap_or(0);
-        let reach = facts.iter().map(|f| reach.of(f.t)).max().unwrap_or(0);
+        let empty = rows == 0;
         let entry = IndexEntry {
             series_id,
             flags: flags
@@ -514,11 +602,11 @@ impl<W: Write> FileWriter<W> {
                 | if has_nan { super::parts::HAS_NAN } else { 0 },
             value_type: raw.value_type,
             scale: raw.scale,
-            min_t,
-            max_t: facts.iter().map(|f| f.t).max().unwrap_or(0),
-            reach,
-            first: facts.iter().map(|f| f.position).min().unwrap_or_default(),
-            last: facts.iter().map(|f| f.position).max().unwrap_or_default(),
+            min_t: if empty { 0 } else { min_t },
+            max_t: if empty { 0 } else { max_t },
+            reach: if empty { 0 } else { reach },
+            first: first.unwrap_or_default(),
+            last,
             chunk_offset: start,
             chunk_len: u32::try_from(self.offset - start)
                 .map_err(|_| content("chunk above 4 GiB"))?,
@@ -529,9 +617,11 @@ impl<W: Write> FileWriter<W> {
             max_value: raw.max,
         };
         self.index.push(entry);
-        self.fact_count += facts.len() as u64;
-        self.min_t = self.min_t.min(min_t);
-        self.max_reach = self.max_reach.max(reach);
+        self.fact_count += u64::from(rows);
+        if !empty {
+            self.min_t = self.min_t.min(min_t);
+            self.max_reach = self.max_reach.max(reach);
+        }
         self.set_aside |= flags & SET_ASIDE != 0;
         Ok(())
     }
@@ -540,6 +630,9 @@ impl<W: Write> FileWriter<W> {
     /// Per generation a marker, then entries blocks grouped as `format.md` A.16 groups them (one batch,
     /// consecutive sequences, a recovery entry alone, at most 16 MiB a body).
     pub fn entries(&mut self, rows: &[(Position, Entry)]) -> Result<(), WriteError> {
+        if self.stream.is_some() {
+            return Err(content("entries while a series is open"));
+        }
         if self.entries_written {
             return Err(content("entries written twice"));
         }
@@ -615,13 +708,62 @@ impl<W: Write> FileWriter<W> {
 
     /// Writes the commit-time table, the chunk index, the trailer and the end marker; returns the output.
     pub fn finish(mut self) -> Result<(W, Written), WriteError> {
+        while !self.finish_step()? {}
+        let written = self.finished.take().expect("finished above");
+        Ok((self.out, written))
+    }
+
+    /// One piece of [`Self::finish`]: the commit-time table, then an index block a call, then the root, trailer and
+    /// end marker; `true` once the file is whole, after which [`Self::finish`] only returns it. A caller that drains
+    /// the sink between calls holds one index block of it at a time.
+    pub fn finish_step(&mut self) -> Result<bool, WriteError> {
+        if self.finished.is_some() {
+            return Ok(true);
+        }
+        let Some(f) = self.finishing.as_mut() else {
+            self.begin_finish()?;
+            return Ok(false);
+        };
+        if f.at < f.index.len() {
+            let end = (f.at + INDEX_BLOCK_ENTRIES).min(f.index.len());
+            let body = encode_index_block(&f.index[f.at..end]);
+            let (first, last, min_t, count) = (
+                f.index[f.at].series_id,
+                f.index[end - 1].series_id,
+                f.index[f.at].min_t,
+                (end - f.at) as u32,
+            );
+            f.at = end;
+            let index_offset = f.index_offset;
+            let (offset, h) = self.block(block_type::INDEX, &body)?;
+            let f = self.finishing.as_mut().expect("finishing");
+            f.roots.push(RootRecord {
+                first_series_id: first,
+                last_series_id: last,
+                first_min_t: min_t,
+                offset: offset - index_offset,
+                entry_count: count,
+                body_crc32c: h.body_crc32c,
+            });
+            return Ok(false);
+        }
+        let f = self.finishing.take().expect("finishing");
+        let written = self.end_file(f)?;
+        self.finished = Some(written);
+        Ok(true)
+    }
+
+    fn begin_finish(&mut self) -> Result<(), WriteError> {
+        if self.stream.is_some() {
+            return Err(content("finished while a series is open"));
+        }
         self.description_written()?;
         if self.description.has_entries != self.entries_written
             || self.description.has_set_aside != self.set_aside
         {
             return Err(content("description flags disagree with the content"));
         }
-        let Some((first, last)) = self.range else {
+        let Some(range) = self.range else {
             return Err(content("a file holds at least one position"));
         };
         let mut positions: Vec<(u32, u64)> = Vec::new();
@@ -671,20 +813,37 @@ impl<W: Write> FileWriter<W> {
         let (times_dir_offset, tdh) =
             self.block(block_type::TIMES_DIRECTORY, &encode_times_directory(&times))?;
         let mut index = std::mem::take(&mut self.index);
-        index.sort_by_key(sort_key);
+        index.sort_unstable_by_key(sort_key);
         let index_offset = if index.is_empty() { 0 } else { self.offset };
-        let mut roots = Vec::with_capacity(index.len().div_ceil(INDEX_BLOCK_ENTRIES));
-        for entries in index.chunks(INDEX_BLOCK_ENTRIES) {
-            let (offset, h) = self.block(block_type::INDEX, &encode_index_block(entries))?;
-            roots.push(RootRecord {
-                first_series_id: entries[0].series_id,
-                last_series_id: entries[entries.len() - 1].series_id,
-                first_min_t: entries[0].min_t,
-                offset: offset - index_offset,
-                entry_count: entries.len() as u32,
-                body_crc32c: h.body_crc32c,
-            });
-        }
+        let roots = Vec::with_capacity(index.len().div_ceil(INDEX_BLOCK_ENTRIES));
+        self.finishing = Some(Finishing {
+            range,
+            used,
+            times_offset,
+            times_dir_offset,
+            times_dir_crc32c: tdh.body_crc32c,
+            times_count: times.len() as u32,
+            index,
+            at: 0,
+            index_offset,
+            roots,
+        });
+        Ok(())
+    }
+
+    fn end_file(&mut self, f: Finishing) -> Result<Written, WriteError> {
+        let Finishing {
+            range: (first, last),
+            used,
+            times_offset,
+            times_dir_offset,
+            times_dir_crc32c,
+            times_count,
+            index,
+            index_offset,
+            roots,
+            ..
+        } = f;
         let (index_root_offset, rh) = self.block(block_type::ROOT, &encode_root(&roots))?;
         let no_fact = self.fact_count == 0;
         let trailer = Trailer {
@@ -697,7 +856,7 @@ impl<W: Write> FileWriter<W> {
             min_t: if no_fact { 0 } else { self.min_t },
             max_reach: if no_fact { 0 } else { self.max_reach },
             chunk_count: u32::try_from(index.len()).map_err(|_| content("too many chunks"))?,
-            times_count: times.len() as u32,
+            times_count,
             entries_offset: self.entries_offset,
             times_offset,
             times_dir_offset,
@@ -705,7 +864,7 @@ impl<W: Write> FileWriter<W> {
             index_root_offset,
             file_crc32c: self.crc.clone().finish(),
             root_crc32c: rh.body_crc32c,
-            times_dir_crc32c: tdh.body_crc32c,
+            times_dir_crc32c,
             description_crc32c: self.description_crc,
             entries_crc32c: self.entries_crc,
         };
@@ -714,13 +873,10 @@ impl<W: Write> FileWriter<W> {
         let (trailer_offset, _) = self.block(block_type::TRAILER, &body)?;
         self.put(&encode_end_marker(trailer_offset))?;
         let layout = Layout::of(&self.id, &self.description, &trailer);
-        Ok((
-            self.out,
-            Written {
-                len: self.offset,
-                trailer,
-                layout,
-            },
-        ))
+        Ok(Written {
+            len: self.offset,
+            trailer,
+            layout,
+        })
     }
 }

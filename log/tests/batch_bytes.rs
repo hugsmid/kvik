@@ -446,3 +446,30 @@ fn every_file_matches_its_golden_digest() {
     ];
     assert_eq!(got, want);
 }
+
+#[test]
+fn a_batch_commits_at_or_after_a_floor_already_given_and_the_floor_then_names_its_last_position() {
+    let mut h = H::new();
+    let clock = h.w.commit_clock();
+    let ahead = h.wall + 3_600 * SECOND;
+    assert_eq!(clock.floor(ahead).0, ahead);
+    h.submit(facts(1, T0, 3, 0));
+    assert_eq!(h.step_queue(), 1);
+    let last = h.done.last().unwrap().1.as_ref().unwrap().last;
+    assert!(h.wall < ahead);
+    let commit_time = segments(&h.fs)
+        .values()
+        .flat_map(|(name, bytes)| {
+            let id = SegmentIdentity {
+                store_id: STORE_ID,
+                file_id: name.file_id,
+                generation: name.generation,
+            };
+            scan(bytes, &id, ScanLimit::End).unwrap().batches
+        })
+        .find(|b| b.commit.last_sequence == last.sequence)
+        .map(|b| b.commit.commit_time)
+        .unwrap();
+    assert_eq!(commit_time, ahead);
+    assert_eq!(clock.floor(i64::MIN), (ahead, last));
+}

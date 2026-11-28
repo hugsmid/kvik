@@ -3,6 +3,7 @@
 use super::*;
 use crate::read::{SessionOptions, Snapshot};
 use crate::store::LiveSession;
+use crate::types::{PointCheck, SavedPoint};
 
 /// A read-only handle (`docs/api.md` Reader processes, Reading). Calls are
 /// blocking and take no lock on the directory; it keeps reading after the
@@ -107,6 +108,15 @@ impl Reader {
         self.on(
             |s| s.with(|s| s.refresh()).map_err(|e| e.query()),
             durable::refresh,
+        )
+    }
+
+    /// Judges a point kept with the stamp it was read under against the resets since (spec §7 Readers, Reset stamp
+    /// and saved points), after the ordinary refresh; reads no byte at the point.
+    pub fn check(&self, point: SavedPoint) -> Result<PointCheck, QueryError> {
+        self.on(
+            |s| s.with(|s| s.check_point(point)).map_err(|e| e.query()),
+            |r| r.check_point(point),
         )
     }
 

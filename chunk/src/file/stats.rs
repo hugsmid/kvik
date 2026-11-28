@@ -128,69 +128,115 @@ pub(crate) fn total_order(bits: u64) -> u64 {
 /// Bounds exist only when every row with a value word has one type and it is not text; `has_nan` only when that
 /// type is `f64`. Decimals are brought exactly to the highest stored scale; a product outside `i64` gives no
 /// bounds (Q-802: never saturated).
+#[cfg(test)]
 pub(crate) fn bounds(rows: impl Iterator<Item = (u16, u8, u64, u8)>) -> (Option<Bounds>, bool) {
-    let mut vt: Option<u8> = None;
-    let mut words: Vec<(u64, u8)> = Vec::new();
+    let mut fold = BoundsFold::default();
     for (flags, t, w, scale) in rows {
-        if flags & flag::NO_VALUE != 0 {
-            continue;
-        }
-        if vt.is_some_and(|v| v != t) || t == value_type::TEXT {
-            return (None, false);
-        }
-        vt = Some(t);
-        words.push((w, scale));
+        fold.push(flags, t, w, scale);
     }
-    let Some(vt) = vt else {
-        return (None, false);
-    };
-    match vt {
-        value_type::F64 => {
-            let has_nan = words.iter().any(|&(w, _)| f64::from_bits(w).is_nan());
-            let numbers = words
-                .iter()
-                .map(|&(w, _)| w)
-                .filter(|&w| !f64::from_bits(w).is_nan());
-            let min = numbers.clone().min_by_key(|&w| total_order(w));
-            let max = numbers.max_by_key(|&w| total_order(w));
-            let b = min.zip(max).map(|(min, max)| Bounds::F64 { min, max });
-            (b, has_nan)
+    fold.finish()
+}
+
+/// [`bounds`] folded one row at a time, holding a few words whatever the number of rows: decimals keep each stored
+/// scale's extremes, which bound every product once both extremes fit.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BoundsFold {
+    vt: Option<u8>,
+    none: bool,
+    nan: bool,
+    lo: Option<u64>,
+    hi: Option<u64>,
+    scales: std::collections::BTreeMap<u8, (i64, i64)>,
+}
+
+impl BoundsFold {
+    /// Adds one row.
+    pub(crate) fn push(&mut self, flags: u16, t: u8, w: u64, scale: u8) {
+        if self.none || flags & flag::NO_VALUE != 0 {
+            return;
         }
-        value_type::DECIMAL => {
-            let scale = words.iter().map(|&(_, s)| s).max().unwrap_or(0);
-            let mut lo = i64::MAX;
-            let mut hi = i64::MIN;
-            for &(w, s) in &words {
-                let Some(v) = scale
-                    .checked_sub(s)
-                    .and_then(|k| 10i64.checked_pow(u32::from(k)))
-                    .and_then(|p| (w as i64).checked_mul(p))
-                else {
-                    return (None, false);
-                };
-                lo = lo.min(v);
-                hi = hi.max(v);
+        if self.vt.is_some_and(|v| v != t) || t == value_type::TEXT {
+            self.none = true;
+            return;
+        }
+        self.vt = Some(t);
+        match t {
+            value_type::F64 if f64::from_bits(w).is_nan() => self.nan = true,
+            value_type::F64 => {
+                self.lo = Some(self.lo.map_or(w, |m| min_by(m, w, total_order)));
+                self.hi = Some(self.hi.map_or(w, |m| max_by(m, w, total_order)));
             }
-            (
-                Some(Bounds::Decimal {
-                    scale,
-                    min: lo,
-                    max: hi,
-                }),
-                false,
-            )
-        }
-        _ => {
-            let min = words.iter().map(|&(w, _)| w).min().unwrap_or(0);
-            let max = words.iter().map(|&(w, _)| w).max().unwrap_or(0);
-            let b = if vt == value_type::STATE {
-                Bounds::State { min, max }
-            } else {
-                Bounds::Bool { min, max }
-            };
-            (Some(b), false)
+            value_type::DECIMAL => {
+                let v = w as i64;
+                let e = self.scales.entry(scale).or_insert((v, v));
+                e.0 = e.0.min(v);
+                e.1 = e.1.max(v);
+            }
+            _ => {
+                self.lo = Some(self.lo.map_or(w, |m| m.min(w)));
+                self.hi = Some(self.hi.map_or(w, |m| m.max(w)));
+            }
         }
     }
+
+    /// The bounds and whether a value word is a NaN.
+    pub(crate) fn finish(&self) -> (Option<Bounds>, bool) {
+        let Some(vt) = self.vt.filter(|_| !self.none) else {
+            return (None, false);
+        };
+        match vt {
+            value_type::F64 => {
+                let b = self
+                    .lo
+                    .zip(self.hi)
+                    .map(|(min, max)| Bounds::F64 { min, max });
+                (b, self.nan)
+            }
+            value_type::DECIMAL => {
+                let scale = self.scales.keys().next_back().copied().unwrap_or(0);
+                let mut lo = i64::MAX;
+                let mut hi = i64::MIN;
+                for (&s, &(a, z)) in &self.scales {
+                    let Some(p) = scale
+                        .checked_sub(s)
+                        .and_then(|k| 10i64.checked_pow(u32::from(k)))
+                    else {
+                        return (None, false);
+                    };
+                    let (Some(a), Some(z)) = (a.checked_mul(p), z.checked_mul(p)) else {
+                        return (None, false);
+                    };
+                    lo = lo.min(a);
+                    hi = hi.max(z);
+                }
+                (
+                    Some(Bounds::Decimal {
+                        scale,
+                        min: lo,
+                        max: hi,
+                    }),
+                    false,
+                )
+            }
+            _ => {
+                let (min, max) = (self.lo.unwrap_or(0), self.hi.unwrap_or(0));
+                let b = if vt == value_type::STATE {
+                    Bounds::State { min, max }
+                } else {
+                    Bounds::Bool { min, max }
+                };
+                (Some(b), false)
+            }
+        }
+    }
+}
+
+fn min_by(a: u64, b: u64, key: fn(u64) -> u64) -> u64 {
+    if key(b) < key(a) { b } else { a }
+}
+
+fn max_by(a: u64, b: u64, key: fn(u64) -> u64) -> u64 {
+    if key(b) >= key(a) { b } else { a }
 }
 
 #[cfg(test)]
@@ -259,5 +305,94 @@ mod tests {
             (None, false)
         );
         assert_eq!(bounds([none].into_iter()), (None, false));
+    }
+
+    use proptest::prelude::Strategy;
+
+    // The whole-slice form this fold replaced, as the oracle.
+    fn reference_bounds(rows: impl Iterator<Item = (u16, u8, u64, u8)>) -> (Option<Bounds>, bool) {
+        let mut vt: Option<u8> = None;
+        let mut words: Vec<(u64, u8)> = Vec::new();
+        for (flags, t, w, scale) in rows {
+            if flags & flag::NO_VALUE != 0 {
+                continue;
+            }
+            if vt.is_some_and(|v| v != t) || t == value_type::TEXT {
+                return (None, false);
+            }
+            vt = Some(t);
+            words.push((w, scale));
+        }
+        let Some(vt) = vt else {
+            return (None, false);
+        };
+        match vt {
+            value_type::F64 => {
+                let has_nan = words.iter().any(|&(w, _)| f64::from_bits(w).is_nan());
+                let numbers = words
+                    .iter()
+                    .map(|&(w, _)| w)
+                    .filter(|&w| !f64::from_bits(w).is_nan());
+                let min = numbers.clone().min_by_key(|&w| total_order(w));
+                let max = numbers.max_by_key(|&w| total_order(w));
+                let b = min.zip(max).map(|(min, max)| Bounds::F64 { min, max });
+                (b, has_nan)
+            }
+            value_type::DECIMAL => {
+                let scale = words.iter().map(|&(_, s)| s).max().unwrap_or(0);
+                let mut lo = i64::MAX;
+                let mut hi = i64::MIN;
+                for &(w, s) in &words {
+                    let Some(v) = scale
+                        .checked_sub(s)
+                        .and_then(|k| 10i64.checked_pow(u32::from(k)))
+                        .and_then(|p| (w as i64).checked_mul(p))
+                    else {
+                        return (None, false);
+                    };
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                (
+                    Some(Bounds::Decimal {
+                        scale,
+                        min: lo,
+                        max: hi,
+                    }),
+                    false,
+                )
+            }
+            _ => {
+                let min = words.iter().map(|&(w, _)| w).min().unwrap_or(0);
+                let max = words.iter().map(|&(w, _)| w).max().unwrap_or(0);
+                let b = if vt == value_type::STATE {
+                    Bounds::State { min, max }
+                } else {
+                    Bounds::Bool { min, max }
+                };
+                (Some(b), false)
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_fold_gives_the_bounds_of_the_whole_rows(
+            rows in proptest::collection::vec(
+                (0u16..4, 1u8..6, proptest::prop_oneof![
+                    proptest::prelude::any::<u64>(),
+                    (-1000i64..1000).prop_map(|v| v as u64),
+                    proptest::prelude::Just(f64::NAN.to_bits()),
+                    proptest::prelude::Just((-0.0f64).to_bits()),
+                ], 0u8..22),
+                0..40,
+            )
+        ) {
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(fl, t, w, s)| (if fl == 3 { flag::NO_VALUE } else { 0 }, t, w, s))
+                .collect();
+            proptest::prop_assert_eq!(bounds(rows.iter().copied()), reference_bounds(rows.into_iter()));
+        }
     }
 }

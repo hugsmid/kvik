@@ -425,6 +425,7 @@ fn f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources() {
         position: at(generation, sequence),
         latches: Vec::new(),
         reset: None,
+        gate: None,
     };
     append(&r.fs, &dir(), STORE_ID, 1, T0, &state("other", 1, 12), None).unwrap();
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("old", 0, 90), None).unwrap();

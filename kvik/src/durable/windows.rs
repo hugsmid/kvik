@@ -1,9 +1,9 @@
 //! Live state, windows, chart buckets and calendar results of a durable store (roadmap 5.4, spec §2.3, §5, §6).
 //!
 //! Windows, buckets and calendar results fold a series' current facts in the range, streamed from the sources
-//! ([`stream`], roadmap 9.0h); a broken state's live state reads the reader's [`Index`] (Q-1006). No summary is
-//! stored yet: when the summary tree arrives (roadmap 7.x), its stored nodes take the place of the parts they cover
-//! in a window's core, and these calls keep their shape.
+//! ([`stream`], roadmap 9.0h); a broken state's live state reads the reader's [`Index`] (Q-1006). Chart buckets of a
+//! series that stores the 15-minute level take the summary tree's nodes in place of the facts they cover ([`nodes`],
+//! roadmap 7.1b); windows and calendar results follow with 7.3.
 
 use std::ops::Bound;
 use std::sync::{Arc, OnceLock};
@@ -260,6 +260,7 @@ pub(crate) use many::{buckets_of, distinct, window_of};
 #[cfg(test)]
 pub(crate) mod indexed;
 mod many;
+pub(crate) mod nodes;
 mod stream;
 #[cfg(test)]
 pub(crate) use stream::ChunkOverride;

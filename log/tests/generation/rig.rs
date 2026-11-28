@@ -106,6 +106,7 @@ pub fn routing(consumer: &str) -> Item {
         operator: None,
         emits: Selection::None,
         condition: None,
+        gate: None,
     })))
 }
 

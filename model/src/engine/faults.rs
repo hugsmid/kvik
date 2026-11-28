@@ -146,7 +146,7 @@ impl Model {
     }
 
     /// Fault injection while the engine is down: a consumer's cursor file is
-    /// missing or unreadable. The next recovery entry names it, and the
+    /// unreadable. The next recovery entry names it, and the
     /// consumer is treated as having no cursor (§3 Recovery rule 3).
     pub fn lose_cursor_file(&mut self, c: ConsumerId) -> Result<(), Error> {
         if self.vol.is_some() {

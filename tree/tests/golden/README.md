@@ -18,3 +18,15 @@ Regenerate only after a deliberate format change: `KVIK_BLESS_GOLDEN=1 cargo tes
 | `text.node` | An empty text and one with multi-byte UTF-8 |
 | `interval.node` | Three 5-minute interval readings in a 15-minute node |
 | `unknown-form.node` | `gauge.node` with form `0x11`: a version refusal |
+
+## Tree parts and roots
+
+Built by [`../golden_files.rs`](../golden_files.rs) from the synthetic parts in [`../files/mod.rs`](../files/mod.rs)
+(`docs/format-tree.md` T.8 to T.12). Regenerate with `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-tree --test golden_files`.
+
+| File | Shows |
+|---|---|
+| `part-day.kvt` | A merged day part: quarter-hours of a gauge with a gap, stale entries with and without a node, an empty marker and an `as_of` of an older generation; counter roll-ups at 2 hours and a day; a state series |
+| `part-empty.kvt` | A delta part with no entries: no nodes or directory blocks, an empty directory root |
+| `part-newer-major.kvt` | `part-empty.kvt` with format major 2: a version refusal |
+| `root.kvr` | A root naming three parts, covered ranges at three levels, a series floor, an open floor and two retired parts |

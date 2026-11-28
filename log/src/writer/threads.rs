@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::directories::{Directories, DirectoryOptions};
 use super::maint::{AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest};
+use super::share::{SyncSignal, Task};
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Fault, Halt, IngestQueue, LogStats, LogWriter,
     Reason, Wait,
@@ -161,6 +162,9 @@ struct Front {
 #[derive(Debug, Default)]
 struct Maint {
     request: Option<SegmentRequest>,
+    /// When the request and each job were handed over, for [`MaintWaits`].
+    requested_at: Option<Duration>,
+    job_times: VecDeque<Duration>,
     created: Option<Result<AheadSegment, CreateError>>,
     jobs: VecDeque<SealJob>,
     results: Vec<(SealJob, Result<SealedFile, SealError>)>,
@@ -197,6 +201,9 @@ struct Shared {
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
+    sync: Arc<SyncSignal>,
+    waits: Mutex<MaintWaits>,
+    commit_clock: Arc<super::CommitClock>,
     /// The writer's held batch entries and calls as the last acknowledgements were delivered, and just after.
     #[cfg(test)]
     held: Mutex<Option<(usize, usize)>>,
@@ -206,6 +213,30 @@ impl Shared {
     fn wake_writer(&self) {
         lock(&self.front).wake = true;
         self.writer_cv.notify_one();
+    }
+}
+
+/// How long creation ahead and seals waited for `kvik-maint` after the writer handed them over: the delay a
+/// background task adds is measured from these (compaction design §4, Q-801).
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct MaintWaits {
+    /// Waits of creation ahead, in order, at most [`MaintWaits::KEPT`].
+    pub creation: Vec<Duration>,
+    /// Waits of seals.
+    pub seal: Vec<Duration>,
+    /// Steps of the background task run.
+    pub steps: u64,
+}
+
+impl MaintWaits {
+    /// The most waits kept of each kind.
+    pub const KEPT: usize = 1 << 16;
+
+    fn push(v: &mut Vec<Duration>, d: Duration) {
+        if v.len() < Self::KEPT {
+            v.push(d);
+        }
     }
 }
 
@@ -297,10 +328,24 @@ impl Log {
 
     /// [`Log::start`], with `kvik-maint` also writing the derived files (`format.md` A.18) as `dirs` says.
     pub fn start_with(
-        mut writer: LogWriter,
+        writer: LogWriter,
         clock: Arc<dyn Clock>,
         dirs: Option<DirectoryOptions>,
     ) -> io::Result<Self> {
+        Self::start_with_task(writer, clock, dirs, None)
+    }
+
+    /// [`Log::start_with`], with `kvik-maint` also stepping a background task within its share.
+    #[doc(hidden)]
+    pub fn start_with_task(
+        mut writer: LogWriter,
+        clock: Arc<dyn Clock>,
+        dirs: Option<DirectoryOptions>,
+        task: Option<Task>,
+    ) -> io::Result<Self> {
+        if let Some(t) = &task {
+            t.share.check()?;
+        }
         let dirs = dirs.map(|opts| {
             let start = writer.directory_start();
             let store = writer.store();
@@ -313,6 +358,10 @@ impl Log {
             )
         });
         writer.set_sync_clock(clock.clone());
+        let sync = Arc::new(SyncSignal::default());
+        if task.is_some() {
+            writer.set_sync_signal(sync.clone());
+        }
         let cfg = writer.config().clone();
         let shared = Arc::new(Shared {
             front: Mutex::new(Front {
@@ -341,14 +390,17 @@ impl Log {
             stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
+            commit_clock: writer.commit_clock(),
             clock,
+            sync,
+            waits: Mutex::new(MaintWaits::default()),
             #[cfg(test)]
             held: Mutex::new(None),
         });
         let s = shared.clone();
         let maint = std::thread::Builder::new()
             .name("kvik-maint".into())
-            .spawn(move || maint_loop(&s, dirs))?;
+            .spawn(move || maint_loop(&s, dirs, task))?;
         let s = shared.clone();
         let w = std::thread::Builder::new()
             .name("kvik-writer".into())
@@ -475,6 +527,12 @@ impl Log {
     /// last call ([`LogWriter::take_sealed`]).
     pub fn take_sealed(&self) -> Vec<SealedFile> {
         std::mem::take(&mut lock(&self.shared.info).sealed)
+    }
+
+    /// The waits of creation ahead and seals for `kvik-maint` so far.
+    #[doc(hidden)]
+    pub fn maint_waits(&self) -> MaintWaits {
+        lock(&self.shared.waits).clone()
     }
 
     /// Entries queued.
@@ -748,7 +806,9 @@ mod tests {
         let pending = log.submit(vec![alias(2)]).unwrap();
         clock.hold(false);
         pending.wait().unwrap();
-        let committed = log.shutdown_then(|w| w.last_commit_time).unwrap();
+        let committed = log
+            .shutdown_then(|w| w.commit_clock().floor(i64::MIN).0)
+            .unwrap();
         assert_eq!(committed, 157);
     }
 }

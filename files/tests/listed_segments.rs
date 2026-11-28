@@ -32,6 +32,7 @@ fn listed_segments_reads_the_log_segments_of_sealed_and_publish_records_by_gener
             0,
             T0,
             Body::Publish(Publish {
+                layouts: Vec::new(),
                 published: vec![compacted(
                     8,
                     FileClass::Current,

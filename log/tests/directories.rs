@@ -700,3 +700,27 @@ fn no_derived_file_is_written_while_free_space_is_below_the_critical_mark() {
     assert!(r.derived().is_empty(), "{:?}", r.derived());
     assert!(r.dirs.as_ref().unwrap().stats().failed > 0);
 }
+
+/// A hook that records the `stopping` flag of each step it is given.
+#[derive(Debug, Default)]
+struct Stepped(Mutex<Vec<bool>>);
+
+impl SealHook for Stepped {
+    fn series(&self, _: Position, _: i64) -> Option<SeriesEntries> {
+        None
+    }
+
+    fn step(&self, _: Position, _: Duration, stopping: bool) -> Option<Duration> {
+        self.0.lock().unwrap().push(stopping);
+        None
+    }
+}
+
+#[test]
+fn a_clean_shutdown_steps_the_hook_while_the_starts_steps_are_unfinished() {
+    let hook = Arc::new(Stepped::default());
+    let mut d = hooked(hook.clone());
+    assert!(!d.started());
+    d.finish(Position::default(), Duration::from_secs(1), T0);
+    assert_eq!(*hook.0.lock().unwrap(), vec![true]);
+}

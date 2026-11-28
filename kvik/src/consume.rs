@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::gate::{GateInstanceState, Transition, TransitionId};
 use crate::read::{Aggregate, Live};
 use crate::time::Timestamp;
 use crate::types::{Fact, Position, SavedPoint, SeriesId};
@@ -14,10 +15,9 @@ pub enum Start {
     #[default]
     Now,
     /// After a saved point: a position and the reset stamp it was read under, checked against the resets since
-    /// (spec §4 New consumer, §7 Readers). Not supported by the model backend yet.
+    /// (spec §4 New consumer, §7 Readers).
     Position(SavedPoint),
-    /// After the last position committed at or before a time. Not supported
-    /// by the model backend yet.
+    /// After the last position committed before a time (Q-1403).
     Time(Timestamp),
 }
 
@@ -185,6 +185,8 @@ pub enum DeliveryId {
     },
     /// `generation_changed`.
     GenerationChanged,
+    /// A gate transition (spec §6 Gates), de-duplicated by its id.
+    Transition(TransitionId),
     /// A part of a resync; confirming the last part confirms the resync,
     /// confirming an earlier one does nothing.
     Resync {
@@ -254,7 +256,7 @@ pub enum ResyncCause {
     /// The consumer's cursor file was missing or unreadable at the start:
     /// sent before its first delivery, with `forget_above` the position
     /// before its start and each funnel's state (spec §4 Resync; Q-131). A
-    /// new consumer receives none. Never produced by the model backend.
+    /// new consumer receives none.
     NoCursor,
 }
 
@@ -275,6 +277,8 @@ pub struct ResyncPart {
     pub last: bool,
     /// At most 256 funnel states; empty unless the resync ends a resume.
     pub funnels: Vec<FunnelState>,
+    /// Each gate instance's state now (spec §6 Gates), at most 256 a part.
+    pub gates: Vec<GateInstanceState>,
 }
 
 /// Funnel states per resync part (`docs/api.md` Consuming).
@@ -288,6 +292,8 @@ pub enum DeliveryKind {
     Fact(Fact),
     /// A condition transition.
     Trigger(Trigger),
+    /// A gate transition (spec §6 Gates).
+    Transition(Transition),
     /// A part of a resync: live and condition state now.
     Resync(ResyncPart),
     /// A restore started a new generation (spec §8).

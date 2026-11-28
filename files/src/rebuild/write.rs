@@ -165,5 +165,6 @@ pub fn rebuild_manifest(
             Vec::new(),
         ),
     }
+    app.hold_unlocated(p.held.iter().copied());
     Ok((*app, p))
 }

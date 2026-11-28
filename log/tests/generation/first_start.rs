@@ -190,6 +190,7 @@ fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_firs
             position: at(generation, 3),
             latches: Vec::new(),
             reset: None,
+            gate: None,
         };
         append(&r.fs, &dir(), STORE_ID, generation, T0, &state, None).unwrap();
         lose_unsealed(&mut r, generation, false);
@@ -252,6 +253,7 @@ fn a_cursor_naming_a_position_makes_a_start_with_no_mark_and_no_segment_a_recove
             position: at(generation, 3),
             latches: Vec::new(),
             reset: None,
+            gate: None,
         };
         append(&r.fs, &dir(), STORE_ID, generation, T0, &state, None).unwrap();
         lose_unsealed(&mut r, generation, false);

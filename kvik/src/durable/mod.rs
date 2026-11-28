@@ -16,6 +16,10 @@
 
 mod by_id;
 mod clock;
+// Wired into the maintenance loop once the running store writes the manifest (Q-1853); until then only its tests
+// call it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod compact;
 mod completion;
 mod consumers;
 mod deliver;
@@ -23,6 +27,7 @@ mod derived;
 mod emit;
 mod entries;
 pub(crate) mod fast;
+mod gates;
 #[cfg(test)]
 mod held_state;
 mod history;
@@ -39,11 +44,13 @@ pub(crate) mod reader;
 mod registering;
 mod registry;
 mod routing;
+mod saved;
 mod scan;
 mod seed;
 mod start;
 mod status;
 mod summary;
+mod tree;
 mod windows;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -266,6 +273,12 @@ pub(crate) struct Writer {
     bucket_warning: Option<String>,
     /// The provisional streams' ring (spec §4 Provisional streams).
     fast: Arc<fast::Fast>,
+    /// The summary tree's dirty set, marked before each call is offered (design 7.1b section 5).
+    dirty: Arc<tree::Dirty>,
+    /// The summary tree's checkpoint job; `None` with `tree.enabled` off or when the start left the store read-only.
+    tree: Option<Arc<tree::Job>>,
+    /// Whether `watch` writes its entry; off until gates are judged live ([`gates::LIVE`]).
+    gates_live: AtomicBool,
 }
 
 impl Drop for Writer {

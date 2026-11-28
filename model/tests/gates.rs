@@ -5,8 +5,8 @@ mod gate_common;
 
 use gate_common::*;
 use kvik_model::gate::{
-    Cause, ConditionId, Entry, GateError, GateState, Input, Kind, Latches, Level, ReplayBound,
-    Selector, TimerKind, TransitionId, Window, judge, resume,
+    Cause, ConditionId, Entry, Frontier, GateError, GatePoint, GateState, Input, Kind, Level,
+    ReplayBound, Selector, TimerKind, TransitionId, Window, judge, resume,
 };
 use kvik_model::summary::Aggregate;
 use kvik_model::types::{Position, Quality, SECOND, SeriesId, Value};
@@ -238,33 +238,6 @@ fn stale_breaks_a_pending_hold_which_starts_again_after_the_arrival() {
     let j = run(&h);
     assert_eq!(instants(&j.transitions), vec![0, 1, 31, 40, 90, 130]);
     assert_eq!(j.transitions[4].to, lv(1));
-}
-
-#[test]
-fn a_gate_watched_after_its_series_has_data_starts_from_none_at_its_state_now() {
-    let h = H::new()
-        .num(1, 25.0)
-        .watch(2, C, levels(&[Level::at(10.0), Level::at(20.0)]));
-    let watch = h.last();
-    let j = run(&h);
-    assert_eq!(moves(&j.transitions), vec![(None, lv(2))]);
-    assert_eq!(j.transitions[0].id.at, watch);
-    assert_eq!(j.transitions[0].value, Some(Value::Num(25.0)));
-    assert_eq!(j.transitions[0].event_time, Some(SECOND));
-    assert_eq!(
-        j.states[&(C, S)],
-        (GateState::Level(2), j.transitions[0].id)
-    );
-}
-
-#[test]
-fn a_hold_counts_from_the_watch_not_from_before_it() {
-    let h = H::new()
-        .num(1, 11.0)
-        .watch(100, C, levels(&[Level::at(10.0).hold(5 * SECOND, 0)]));
-    let j = run(&h);
-    assert_eq!(moves(&j.transitions), vec![(None, lv(0)), (lv(0), lv(1))]);
-    assert_eq!(instants(&j.transitions), vec![100, 105]);
 }
 
 #[test]
@@ -580,10 +553,6 @@ fn gates_with_invalid_parameters_are_refused() {
     );
 }
 
-fn latches(entries: &[(SeriesId, TransitionId)]) -> Latches {
-    entries.iter().map(|(s, id)| ((C, *s), *id)).collect()
-}
-
 fn hold_history() -> H {
     H::new()
         .watch(0, C, levels(&[Level::at(10.0).hold(5 * SECOND, 0)]))
@@ -593,16 +562,24 @@ fn hold_history() -> H {
         .num(30, 11.0)
 }
 
+const ORIGIN: Frontier = Frontier {
+    at: Position::ORIGIN,
+    now: 0,
+};
+
+fn after(t: &kvik_model::gate::Transition) -> Option<GatePoint> {
+    Some(GatePoint::Transition(t.id))
+}
+
 #[test]
-fn resume_replays_each_transition_after_the_latch_under_the_same_id() {
+fn resume_replays_each_transition_after_the_gate_cursor_under_the_same_id() {
     let h = hold_history();
     let all = run(&h).transitions;
-    let latch = latches(&[(S, all[1].id)]);
     let r = resume(
         &h.entries,
         END * SECOND,
-        Position::ORIGIN,
-        &latch,
+        ORIGIN,
+        after(&all[1]),
         ReplayBound::default(),
     )
     .unwrap();
@@ -613,48 +590,105 @@ fn resume_replays_each_transition_after_the_latch_under_the_same_id() {
 }
 
 #[test]
-fn resume_with_no_latch_replays_from_the_cursor() {
+fn resume_with_nothing_confirmed_replays_every_transition_after_the_checkpoint() {
     let h = hold_history();
     let all = run(&h).transitions;
     let r = resume(
         &h.entries,
         END * SECOND,
-        Position::new(0, 3),
-        &Latches::new(),
+        ORIGIN,
+        None,
         ReplayBound::default(),
     )
     .unwrap();
-    assert_eq!(
-        r.replayed.first().map(|t| t.id.at),
-        Some(Position::new(0, 3))
-    );
-    assert_eq!(
-        r.replayed,
-        all.into_iter()
-            .filter(|t| t.id.at >= Position::new(0, 3))
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(r.replayed, all);
+    let start = Frontier {
+        at: all[1].id.at,
+        now: all[1].now,
+    };
+    let r = resume(
+        &h.entries,
+        END * SECOND,
+        start,
+        None,
+        ReplayBound::default(),
+    )
+    .unwrap();
+    assert_eq!(r.replayed, all[2..].to_vec());
+}
+
+#[test]
+fn a_frontier_gate_cursor_covers_timer_transitions_due_by_its_instant_only() {
+    let h = hold_history();
+    let all = run(&h).transitions;
+    let k = all.iter().position(|t| t.id.due.is_some()).unwrap();
+    let up = &all[k];
+    let due = up.id.due.unwrap();
+    let before = GatePoint::Frontier(Frontier {
+        at: up.id.at,
+        now: due - 1,
+    });
+    let r = resume(
+        &h.entries,
+        END * SECOND,
+        ORIGIN,
+        Some(before),
+        ReplayBound::default(),
+    )
+    .unwrap();
+    assert_eq!(r.replayed, all[k..].to_vec());
+    let at_due = GatePoint::Frontier(Frontier {
+        at: up.id.at,
+        now: due,
+    });
+    let r = resume(
+        &h.entries,
+        END * SECOND,
+        ORIGIN,
+        Some(at_due),
+        ReplayBound::default(),
+    )
+    .unwrap();
+    assert_eq!(r.replayed, all[k + 1..].to_vec());
 }
 
 #[test]
 fn resume_beyond_the_replay_bound_replays_nothing_and_carries_state_now() {
     let h = hold_history();
-    let latch = latches(&[(S, run(&h).transitions[0].id)]);
+    let cursor = after(&run(&h).transitions[0]);
     let by_facts = ReplayBound {
         span: END * SECOND,
         facts: 3,
     };
-    let r = resume(&h.entries, END * SECOND, Position::ORIGIN, &latch, by_facts).unwrap();
+    let r = resume(&h.entries, END * SECOND, ORIGIN, cursor, by_facts).unwrap();
     assert!(r.not_replayed && r.replayed.is_empty());
     assert_eq!(r.states[&(C, S)].0, GateState::Level(1));
     let by_span = ReplayBound {
         span: 60 * SECOND,
         facts: 100,
     };
-    let r = resume(&h.entries, 61 * SECOND, Position::ORIGIN, &latch, by_span).unwrap();
+    let r = resume(&h.entries, 61 * SECOND, ORIGIN, cursor, by_span).unwrap();
     assert!(r.not_replayed);
-    let r = resume(&h.entries, 60 * SECOND, Position::ORIGIN, &latch, by_span).unwrap();
+    let r = resume(&h.entries, 60 * SECOND, ORIGIN, cursor, by_span).unwrap();
     assert!(!r.not_replayed && !r.replayed.is_empty());
+}
+
+#[test]
+fn the_replay_bound_counts_facts_and_time_from_the_checkpoint_not_the_gate_cursor() {
+    let h = hold_history();
+    let all = run(&h).transitions;
+    let down = all.len() - 2;
+    let start = Frontier {
+        at: all[down].id.at,
+        now: all[down].now,
+    };
+    let bound = ReplayBound {
+        span: 60 * SECOND,
+        facts: 1,
+    };
+    let r = resume(&h.entries, 75 * SECOND, start, after(&all[0]), bound).unwrap();
+    assert!(!r.not_replayed);
+    assert_eq!(r.replayed, all[down + 1..].to_vec());
 }
 
 #[test]
@@ -665,12 +699,11 @@ fn a_restart_delivers_every_transition_once_after_dedup_with_unconfirmed_ones_ag
     let prefix = &h.entries[..split];
     let before = judge(prefix, 15 * SECOND).unwrap().transitions;
     let delivered = &before[..3];
-    let latch = latches(&[(S, before[1].id)]);
     let r = resume(
         &h.entries,
         END * SECOND,
-        Position::ORIGIN,
-        &latch,
+        ORIGIN,
+        after(&before[1]),
         ReplayBound::default(),
     )
     .unwrap();

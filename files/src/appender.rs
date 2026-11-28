@@ -17,12 +17,15 @@
 //!   for every corrupt record it stands for (its field 7; [`crate::rebuild::resolve`]), or are not configured. A provisional
 //!   rebuild cannot be acknowledged.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use kvik_log::fs::{Fs, FsFile, OpenMode};
 
 use crate::catalogue::{Catalogue, CatalogueError};
+use crate::compaction::{Breach, Judgement, judge, publish_shape};
+use crate::desc::{FileRef, kind};
 use crate::image::{Image, ReadError, read};
 use crate::record::{Acknowledgement, Body, EncodeError, Record};
 use crate::{MANIFEST, MANIFEST_NEW};
@@ -143,6 +146,19 @@ pub enum AppendError {
     /// A rebuild acknowledgement while the rebuild is provisional (`api.md` `WriteError::NotFinal`).
     #[error("the manifest rebuild is provisional")]
     NotFinal,
+    /// A publish record that would break the catalogue's rule for compacted files (compaction design §3.4).
+    #[error(transparent)]
+    Breach(#[from] Breach),
+    /// A new publish record while the catalogue's rule is undecided or broken (compaction design §3.4 hold).
+    #[error("compaction is held: the catalogue's rule is not decided")]
+    CompactionHeld,
+    /// A new publish record after which the catalogue's rule would be undecided; names the files it lacks
+    /// (compaction design §3.4, Q-2121).
+    #[error("the record would leave the compaction rule undecided for {0:?}")]
+    Undecided(BTreeSet<FileRef>),
+    /// A new publish record giving a compacted file no layout (Q-2120).
+    #[error("compacted file {0:?} published without a layout")]
+    Unlaid(FileRef),
 }
 
 /// Why a rebuild acknowledgement was refused.
@@ -176,6 +192,10 @@ pub struct Appender {
     /// The corrupt records of a provisional rebuild not yet answered for in this run.
     pending: Vec<Gap>,
     dropped_tail: u64,
+    /// The catalogue's rule as last judged: at open, and after each publish, sealed-segment or carried record.
+    compaction: Judgement,
+    /// Outputs a rebuild could neither publish nor discard, until a record names them (§3.5, Q-2122).
+    unlocated: BTreeSet<FileRef>,
 }
 
 pub(crate) fn read_file(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
@@ -297,7 +317,9 @@ impl Appender {
             next_epoch,
             synced: image.last_epoch(),
             generation: image.records.last().map_or(0, |p| p.record.generation),
+            compaction: judge(&catalogue),
             catalogue,
+            unlocated: BTreeSet::new(),
             faulted: false,
             rebuild,
             pending,
@@ -321,6 +343,26 @@ impl Appender {
             return Err(AppendError::NotFinal);
         }
         self.catalogue.check(&r)?;
+        if let (Body::Publish(p), None) = (&r.body, r.old_epoch)
+            && p.published.iter().any(|d| d.kind == kind::COMPACTED)
+        {
+            if let Some(d) = p.published.iter().find(|d| {
+                d.kind == kind::COMPACTED && !p.layouts.iter().any(|l| l.file_ref() == d.file_ref())
+            }) {
+                return Err(AppendError::Unlaid(d.file_ref()));
+            }
+            if self.compaction.holds_compaction() {
+                return Err(AppendError::CompactionHeld);
+            }
+            publish_shape(p)?;
+            let mut after = self.catalogue.clone();
+            after.apply(&r)?;
+            match judge(&after) {
+                Judgement::Holds => {}
+                Judgement::Undecided(f) => return Err(AppendError::Undecided(f)),
+                Judgement::Broken(b) => return Err(b.into()),
+            }
+        }
         let bytes = r.encode()?;
         let next = self
             .next_epoch
@@ -336,6 +378,9 @@ impl Appender {
         }
         self.end += bytes.len() as u64;
         self.catalogue.apply(&r)?;
+        if matches!(r.body, Body::Publish(_) | Body::Sealed(_)) || r.old_epoch.is_some() {
+            self.rejudge();
+        }
         self.synced = r.epoch;
         self.next_epoch = next;
         Ok(r.epoch)
@@ -401,6 +446,33 @@ impl Appender {
             written_at,
         )?;
         Ok(true)
+    }
+
+    /// The catalogue's rule for compacted files as last judged; anything but [`Judgement::Holds`] holds runs,
+    /// merges, removals and releases (compaction design §3.4).
+    pub fn compaction(&self) -> &Judgement {
+        &self.compaction
+    }
+
+    /// Holds runs, merges, removals and releases while a record has not named `files`: a rebuild's
+    /// [`crate::rebuild::RebuildPlan::held`] (compaction design §3.5, Q-2122).
+    pub fn hold_unlocated(&mut self, files: impl IntoIterator<Item = FileRef>) {
+        self.unlocated.extend(files);
+        self.rejudge();
+    }
+
+    fn rejudge(&mut self) {
+        let c = &self.catalogue;
+        self.unlocated.retain(|f| c.file(*f).is_none());
+        self.compaction = match judge(c) {
+            Judgement::Holds if self.unlocated.is_empty() => Judgement::Holds,
+            Judgement::Holds => Judgement::Undecided(self.unlocated.clone()),
+            Judgement::Undecided(mut u) => {
+                u.extend(self.unlocated.iter().copied());
+                Judgement::Undecided(u)
+            }
+            b @ Judgement::Broken(_) => b,
+        };
     }
 
     /// The fold of every record, those appended in this run included.

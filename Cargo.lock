@@ -728,6 +728,7 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "kvik-backup",
+ "kvik-chunk",
  "kvik-files",
  "kvik-log",
  "kvik-model",
@@ -736,6 +737,7 @@ dependencies = [
  "loom",
  "peak_alloc",
  "proptest",
+ "sha2",
  "stats_alloc",
  "thiserror",
  "tracing",
@@ -852,6 +854,7 @@ dependencies = [
 name = "kvik-tree"
 version = "0.1.0"
 dependencies = [
+ "kvik-log",
  "kvik-model",
  "num-bigint 0.4.8",
  "num-rational",

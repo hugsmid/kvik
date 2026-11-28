@@ -612,6 +612,76 @@ fn damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point() {
 }
 
 #[test]
+fn a_checksum_valid_batch_whose_content_does_not_decode_is_a_recorded_loss_and_the_start_succeeds()
+{
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        ..cfg()
+    });
+    for i in 0..4 {
+        r.submit((0..40).map(|k| fact(1 + k, i)).collect());
+        r.drain();
+    }
+    r.shutdown().unwrap();
+    r.w = None;
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let scanned = scan(&bytes, &id, ScanLimit::End).unwrap();
+    assert_eq!(scanned.batches.len(), 4);
+    let old = &scanned.batches[1];
+    let first = old.commit.first_sequence;
+    // A recovery entry that is not alone: every checksum holds, the content does not decode.
+    let entries = vec![
+        Entry::Recovery(kvik_log::entries::Recovery {
+            after: 0,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: MarkState::Readable,
+            id_floor: 0,
+            consumers: vec![],
+        }),
+        Entry::Alias {
+            id: 1,
+            name: "a".into(),
+        },
+    ];
+    let mut b = kvik_log::batch::BatchBuilder::new();
+    b.push(
+        kvik_log::block::block_type::ENTRIES,
+        kvik_log::entries::EntriesBlock {
+            first_sequence: first,
+            received_at: T0,
+            entries,
+        }
+        .encode()
+        .unwrap(),
+    )
+    .unwrap();
+    let mut crafted = b.encode(&id, old.offset, T0).unwrap();
+    let span = (old.end() - old.offset) as usize;
+    assert!(crafted.len() <= span);
+    crafted.resize(span, 0);
+    r.fs.poke(&seg, old.offset as usize, &crafted);
+    r.kill();
+    let rep = r.open().expect("the start succeeds");
+    assert_eq!(rep.losses.len(), 1);
+    let l = &rep.losses[0];
+    assert_eq!(l.kind, LossKind::DataLost);
+    assert_eq!((l.first, l.last), (Some(41), Some(80)));
+    assert!(l.recorded);
+    assert!(r.w().fault().is_none());
+    let kept: Vec<u64> = r.positions().keys().copied().collect();
+    assert_eq!(kept, (1..=40).chain(81..=160).collect::<Vec<_>>());
+}
+
+#[test]
 fn corruption_below_the_mark_is_a_recorded_loss_and_later_batches_are_kept() {
     let mut r = Rig::new(WriterConfig {
         mark_sync: MarkSync::EveryCommit,
@@ -853,6 +923,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
             operator: None,
             emits: Selection::None,
             condition: None,
+            gate: None,
         })))]);
         r.drain();
     }
@@ -869,6 +940,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
         },
         latches: Vec::new(),
         reset: None,
+        gate: None,
     };
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("alarms", 12), None).unwrap();
     append(&r.fs, &dir(), STORE_ID, 0, T0, &state("broken", 2), None).unwrap();
@@ -902,6 +974,7 @@ fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
         operator: None,
         emits: Selection::None,
         condition: None,
+        gate: None,
     })))]);
     r.drain();
     r.advance(Duration::from_secs(301));
@@ -952,6 +1025,7 @@ fn a_routing_change_sealed_above_a_registry_files_through_names_its_consumer() {
         operator: None,
         emits: Selection::None,
         condition: None,
+        gate: None,
     })))]);
     r.drain();
     r.advance(Duration::from_secs(301));

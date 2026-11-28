@@ -40,6 +40,8 @@ provisional     model provisional
 gates           model gates
 gate-properties model gate_properties
 gate-edges      model gate_edges
+gate-seed       model gate_seed
+gate-reset      model gate_reset
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
@@ -56,14 +58,18 @@ log-pacing      log   pacing
 log-directories log   directories
 log-scan-differential log scan_differential
 log-body-check  log   body_check
+log-cursor-checkpoint log cursor_checkpoint
 kvik-windows    kvik  windows
-kvik-consumers  kvik  consumer_properties
+kvik-consumers  kvik  consumer_properties --rest
+kvik-consumers-gates kvik consumer_properties gate_deliveries_follow_the_model_
+kvik-gates-durable kvik gates_durable
 kvik-patterns   kvik  patterns
 kvik-differential kvik durable_differential --rest
 kvik-differential-small kvik durable_differential small_windows_decide_
 kvik-loss-open  kvik  durable_losses_open
 kvik-provisional kvik provisional
 kvik-restore-plan kvik restore_plan_model
+kvik-saved-points kvik saved_points
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 chunk-file-properties chunk file_properties
@@ -71,8 +77,12 @@ files-records   files records
 files-manifest  files manifest
 files-rebuild   files rebuild
 files-fuzz      files fuzz_inputs
+files-compaction files compaction_rule
 tree-properties tree properties
 tree-fuzz-inputs tree fuzz_inputs
+tree-refusals   tree refusals
+tree-set        tree set
+tree-write      tree  lib         write::tests::t1_t5_t6_t8_
 backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys
@@ -86,13 +96,19 @@ log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::
 kvik-units      kvik  lib         durable::by_id::tests::
 kvik-ingest     kvik  lib         durable::ingest::
+kvik-tree-reads kvik  lib         durable::tree::reads::
 kvik-fold       kvik  lib         durable::derived::tests::
 kvik-pmap       kvik  lib         durable::read::pmap::
 kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
 kvik-latest     kvik  lib         durable::read::latest::
 kvik-live       kvik  lib         durable::read::live::differential::
 kvik-fast       kvik  lib         durable::fast::tests::the_stream_says_
+kvik-saved      kvik  lib         durable::saved::tests::s1_
 kvik-seed       kvik  lib         durable::seed::tests::a_seeded_start_gives_what_the_start_from_the_whole_log_gives
+kvik-compact    kvik  lib         durable::compact::tests::every_input_position_lands_in_exactly_one_output_where_the_model_places_it
+kvik-gates-core kvik  lib         gates::differential::
+kvik-gates      kvik  lib         backend::gates::tests::the_model_backend_delivers_what_judge_computes_from_its_log
+kvik-gates-history kvik lib      durable::gates::tests::bounded_history_reads_
 '
 
 cd "$(dirname "$0")/.."

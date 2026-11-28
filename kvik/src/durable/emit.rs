@@ -43,6 +43,7 @@ impl Writer {
         // Decided and queued in call order under the decision lock; a full queue is waited for with no lock held,
         // and the call decided again.
         let mut provisional = None;
+        let mut marked: Vec<tree::dirty::Key> = Vec::new();
         let (mut d, call, mut plan, refreshes, queued) = loop {
             let mut d = lock(&self.decider);
             let call = self.next_call.fetch_add(1, Ordering::SeqCst);
@@ -64,6 +65,11 @@ impl Writer {
                 provisional = fast::facts_of(&self.fast, &plan.items, clock.wall)
                     .map(|f| (f, log.watch().durable()));
                 let items = std::mem::take(&mut plan.items);
+                // Design tree-memory section 11: with the tree off nothing is marked.
+                if self.tree.is_some() {
+                    marked = tree::dirty::keys_of(&items);
+                    self.dirty.begin(&marked);
+                }
                 #[cfg(test)]
                 pause::at(&self.dir, pause::Point::BeforeOffer);
                 if wait {
@@ -72,6 +78,9 @@ impl Writer {
                     log.try_submit(items)
                 }
             };
+            if r.is_err() {
+                self.dirty.settle(&std::mem::take(&mut marked), Ok(None));
+            }
             let e = match r {
                 Ok(p) => break (d, call, plan, refreshes, Some(p)),
                 Err(SubmitError::Busy(LogWait::QueueFull)) if wait => {
@@ -107,8 +116,24 @@ impl Writer {
         let mut ring = None;
         let tracked = match queued {
             Some(pending) => {
-                let (clocks, ids) = (self.clocks.clone(), refreshes);
-                let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
+                let (clocks, ids, dirty) = (self.clocks.clone(), refreshes, self.dirty.clone());
+                let keys = std::mem::take(&mut marked);
+                let c = Completion::new(
+                    pending,
+                    Box::new(move |r| {
+                        if r.is_ok() {
+                            clocks.refresh(&ids);
+                        }
+                        dirty.settle(
+                            &keys,
+                            match r {
+                                Ok(a) => Ok(Some(a.last)),
+                                Err(CommitError::OutcomeUnknown) => Err(()),
+                                Err(_) => Ok(None),
+                            },
+                        );
+                    }),
+                );
                 inflight.insert(call, c.clone());
                 if let Some((facts, floor)) = provisional.take() {
                     ring = Some(self.fast.publish(facts, floor, c.clone()));

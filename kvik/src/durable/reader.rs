@@ -34,7 +34,7 @@ use crate::error::{OpenError, QueryError};
 use crate::health::LossReport;
 use crate::read::ReaderState;
 use crate::time::Timestamp;
-use crate::types::ResetStamp;
+use crate::types::{PointCheck, ResetStamp, SavedPoint};
 
 pub(crate) use errors::{copy, open_error, query_error};
 
@@ -137,6 +137,11 @@ pub(crate) struct DurableReader {
     pub(crate) fanout_kick: Mutex<Option<std::task::Waker>>,
     /// The memory cap of its queries (Q-1063).
     memory: Arc<Accountant>,
+    /// The summary tree as last read for a cut (design 7.1b section 6).
+    tree: Mutex<super::tree::read::Cache>,
+    /// Reads take facts only, as the oracle of the tree's (invariant T7).
+    #[cfg(test)]
+    pub(crate) no_tree: AtomicBool,
     #[cfg(test)]
     lookups_made: AtomicU64,
     /// Lookups that would have passed their budget.
@@ -325,6 +330,9 @@ impl DurableReader {
             fanout_failed: AtomicBool::new(false),
             fanout_kick: Mutex::new(None),
             memory: Accountant::new(Sizes::of(DEFAULT_MEMORY)),
+            tree: Mutex::default(),
+            #[cfg(test)]
+            no_tree: AtomicBool::new(false),
         })
     }
 
@@ -337,6 +345,21 @@ impl DurableReader {
     /// The memory cap of its queries.
     pub(crate) fn memory(&self) -> &Arc<Accountant> {
         &self.memory
+    }
+
+    /// The summary tree at `v`'s cut, if one may serve it (design 7.1b section 6).
+    pub(crate) fn tree_at(&self, v: &View) -> Option<Arc<super::tree::read::TreeAt>> {
+        #[cfg(test)]
+        if self.no_tree.load(Ordering::Relaxed) {
+            return None;
+        }
+        super::tree::read::at_cut(&self.tree, &self.dir, &self.env, self.store_id, v.cut())
+    }
+
+    /// The tree's read counters: cuts served from a root, and parts found damaged.
+    #[cfg(test)]
+    pub(crate) fn tree_counts(&self) -> super::tree::read::Counts {
+        super::lock(&self.tree).counts()
     }
 
     /// The window clock now (spec §6 `now`).
@@ -676,6 +699,20 @@ impl DurableReader {
     /// Re-reads the mark, the manifest and new entries, and renews the lease when due.
     pub(crate) fn refresh(&self) -> Result<ReaderState, QueryError> {
         self.with_latest(|v| Ok(state_of(v)))
+    }
+
+    /// `Reader::check` under the cut of an ordinary refresh (`spec.md` §7 Readers, Reset stamp and saved points).
+    pub(crate) fn check_point(&self, point: SavedPoint) -> Result<PointCheck, QueryError> {
+        self.with_latest(|v| {
+            let st = state_of(v);
+            Ok(super::saved::check(
+                point,
+                st.generation,
+                st.stamp,
+                v.latest().entries(),
+                v.lost_ranges(),
+            ))
+        })
     }
 
     /// How many cuts the log reader holds: the current view's and those of views not yet released.

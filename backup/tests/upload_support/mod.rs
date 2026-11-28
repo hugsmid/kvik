@@ -26,7 +26,9 @@ use kvik_files::appender::{Appender, Opened, Settled};
 use kvik_files::catalogue::{Catalogue, Tier};
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
 use kvik_files::image;
-use kvik_files::rebuild::{Finality, LocalFile, LocalState, Place, Verifier, rebuild_manifest};
+use kvik_files::rebuild::{
+    Finality, LocalFile, LocalState, Place, Verdict, Verifier, rebuild_manifest,
+};
 use kvik_files::record::{Body, Record};
 use kvik_files::tier::CopyVerified;
 use kvik_log::fs::{Fs, MemFs, OpenMode};
@@ -711,8 +713,8 @@ pub fn run_idle(d: &mut Driver, now: &mut Duration) {
 pub struct AllVerify;
 
 impl Verifier for AllVerify {
-    fn verify(&self, _: &LocalFile, _: &[&LocalFile]) -> bool {
-        true
+    fn verify(&self, _: &[&LocalFile], _: &[&LocalFile]) -> Verdict {
+        Verdict::Holds
     }
 }
 
@@ -724,6 +726,7 @@ pub fn local_files(h: &Harness) -> Vec<LocalFile> {
             description: d.clone(),
             place: Place::Hot,
             verified: true,
+            layout: None,
         })
         .collect()
 }

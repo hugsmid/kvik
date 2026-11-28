@@ -575,3 +575,80 @@ fn a_progress_waker_is_woken_at_each_published_turn_and_at_the_stop_until_taken_
     assert!(woken() > before);
     assert_eq!(off.0.load(Ordering::SeqCst), 0);
 }
+
+/// A task of `steps` steps, each a device call of a piece, counting what it ran.
+struct Counter {
+    left: u32,
+    ran: Arc<Mutex<u32>>,
+}
+
+impl kvik_log::writer::share::Background for Counter {
+    fn next(&mut self) -> kvik_log::writer::share::Next {
+        if self.left == 0 {
+            kvik_log::writer::share::Next::Idle
+        } else {
+            kvik_log::writer::share::Next::Device(kvik_log::writer::share::PIECE)
+        }
+    }
+    fn step(&mut self) {
+        self.left -= 1;
+        *self.ran.lock().unwrap() += 1;
+    }
+}
+
+#[test]
+fn a_background_task_runs_between_creations_and_seals_and_every_call_still_lands() {
+    use kvik_log::writer::share::{ShareConfig, Task};
+    let fs = MemFs::new();
+    let dir = PathBuf::from("store");
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir, Some(&new_store())).unwrap();
+    let w = LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO, T0).unwrap();
+    let ran = Arc::new(Mutex::new(0));
+    let task = Task {
+        task: Box::new(Counter {
+            left: 200,
+            ran: ran.clone(),
+        }),
+        share: ShareConfig {
+            cpu_share: 1.0,
+            io_rate: 1 << 30,
+        },
+    };
+    let log = Log::start_with_task(w, Arc::new(SystemClock::default()), None, Some(task)).unwrap();
+    let mut acks = Vec::new();
+    for i in 0..300i64 {
+        acks.push((log.submit(vec![fact(1, i)]).unwrap().wait().unwrap(), 1));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while *ran.lock().unwrap() < 200 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let waits = log.maint_waits();
+    assert_eq!(*ran.lock().unwrap(), 200);
+    assert_eq!(waits.steps, 200);
+    assert!(!waits.seal.is_empty() && !waits.creation.is_empty());
+    assert_eq!(check_dense(acks), 300);
+    log.shutdown().unwrap();
+}
+
+#[test]
+fn a_task_whose_cpu_share_is_not_a_number_is_refused_at_start() {
+    use kvik_log::writer::share::{ShareConfig, Task};
+    let fs = MemFs::new();
+    let dir = PathBuf::from("store");
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir, Some(&new_store())).unwrap();
+    let w = LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO, T0).unwrap();
+    let task = Task {
+        task: Box::new(Counter {
+            left: 1,
+            ran: Arc::new(Mutex::new(0)),
+        }),
+        share: ShareConfig {
+            cpu_share: f64::NAN,
+            io_rate: 1 << 20,
+        },
+    };
+    let e =
+        Log::start_with_task(w, Arc::new(SystemClock::default()), None, Some(task)).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+}

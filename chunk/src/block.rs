@@ -612,4 +612,4 @@ fn decode(body: &[u8]) -> Result<Block, DecodeError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

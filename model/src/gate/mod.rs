@@ -4,7 +4,7 @@
 //! state at every instant. [`judge`] computes, from a history of log entries in position order, every
 //! transition of every gate with an identity that depends only on the log ([`TransitionId`]), so a
 //! replay after a restart finds the same transitions under the same ids. [`resume`] is the replay a
-//! consumer receives from its latches.
+//! consumer receives from its gate cursor and checkpoint.
 
 mod judge;
 mod pattern;
@@ -12,7 +12,7 @@ mod resume;
 
 pub use judge::{Judgement, judge};
 pub use pattern::{matches as pattern_matches, valid as pattern_valid};
-pub use resume::{Latches, ReplayBound, Resume, resume};
+pub use resume::{Frontier, GatePoint, ReplayBound, Resume, resume};
 
 use crate::summary::{Aggregate, Params};
 use crate::types::{Fact, Nanos, Position, SeriesId, Value};
@@ -27,7 +27,7 @@ pub enum Selector {
     /// One series, by id.
     Series(SeriesId),
     /// One instance per series a name pattern selects (spec §4 Funnel grammar), joining and leaving as
-    /// definitions commit; at most [`MAX_INSTANCES`] at a time (Q-1143).
+    /// definitions commit; at most [`MAX_INSTANCES`] at a time (Q-1143), and [`MAX_EACH_INSTANCES`] across a consumer.
     Each(String),
 }
 
@@ -134,6 +134,8 @@ pub const MAX_LEVELS: usize = 16;
 pub const MAX_MEMBERS: usize = 64;
 /// Most instances of one [`Selector::Each`] gate at a time.
 pub const MAX_INSTANCES: usize = 256;
+/// Most [`Selector::Each`] instances across one consumer's gates at a time, so its checkpoint fits a block (Q-2163).
+pub const MAX_EACH_INSTANCES: usize = 12_288;
 /// Longest hold, staleness limit, window width or cadence: ten years of 365 days.
 pub const MAX_DURATION: Nanos = 10 * 365 * crate::types::DAY;
 
@@ -365,6 +367,22 @@ pub enum Entry {
         /// Id.
         id: ConditionId,
     },
+    /// A reset point (spec §4 Resync), or the start of a new generation: every instance in force is seeded again at
+    /// it by the seed rule, with no transition, as if starting there (cond2 design §4.4 step 5; Q-2170).
+    Reset {
+        /// Position.
+        position: Position,
+        /// Commit time.
+        commit_time: Nanos,
+    },
+    /// Any other log entry: it moves the frontier only, so a timer's `at` is the last position of the whole log
+    /// before its instant (Q-1582).
+    Other {
+        /// Position.
+        position: Position,
+        /// Commit time.
+        commit_time: Nanos,
+    },
 }
 
 impl Entry {
@@ -374,7 +392,9 @@ impl Entry {
             Entry::Fact { fact, .. } => fact.position,
             Entry::Define { position, .. }
             | Entry::Watch { position, .. }
-            | Entry::Unwatch { position, .. } => *position,
+            | Entry::Unwatch { position, .. }
+            | Entry::Reset { position, .. }
+            | Entry::Other { position, .. } => *position,
         }
     }
 
@@ -384,7 +404,9 @@ impl Entry {
             Entry::Fact { commit_time, .. }
             | Entry::Define { commit_time, .. }
             | Entry::Watch { commit_time, .. }
-            | Entry::Unwatch { commit_time, .. } => *commit_time,
+            | Entry::Unwatch { commit_time, .. }
+            | Entry::Reset { commit_time, .. }
+            | Entry::Other { commit_time, .. } => *commit_time,
         }
     }
 }

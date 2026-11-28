@@ -22,3 +22,17 @@ path = "fuzz_targets/node.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "part"
+path = "fuzz_targets/part.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "root"
+path = "fuzz_targets/root.rs"
+test = false
+doc = false
+bench = false

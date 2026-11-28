@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calendar;
+pub mod compaction;
 pub mod condition;
 pub mod engine;
 pub mod gate;

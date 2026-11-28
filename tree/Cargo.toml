@@ -12,6 +12,8 @@ keywords = ["time-series", "storage", "embedded"]
 categories = ["database-implementations"]
 
 [dependencies]
+# File header, block framing, CRC32C and positions shared with the other kvik files (`format.md` A.1, A.2).
+kvik-log = { path = "../log" }
 num-bigint = "0.4"
 num-rational = { version = "0.4", default-features = false, features = ["std", "num-bigint"] }
 num-traits = "0.2"

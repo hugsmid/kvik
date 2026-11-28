@@ -31,10 +31,14 @@ kvik-model = { path = "../model" }
 # The backup and restore drivers (roadmap 8.1d, 8.3d) and the manifest they record in.
 kvik-backup = { path = "../backup" }
 kvik-files = { path = "../files" }
+# Compacted segments: the writer and positional reader compaction runs write and verify with (roadmap 6.2a2).
+kvik-chunk = { path = "../chunk" }
 # The backup sink trait and its types, re-exported unchanged.
 kvik-sink-api = { path = "../sinkapi" }
 # Summary nodes: the fold, merge and edge credit windows are evaluated with.
 kvik-tree = { path = "../tree" }
+# The per-fact digest of compaction's per-series checksum and the outputs' plaintext hash (Q-800).
+sha2 = { version = "0.11", default-features = false }
 thiserror = "2"
 # The warning of a segment size above the default for a store that reads files from a bucket (Q-970).
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
@@ -54,6 +58,11 @@ loom = "0.7.2"
 # The budgets S1 to S3 and S13 on a year of seals (roadmap 9.0e): `cargo bench -p kvik --bench read`.
 [[bench]]
 name = "read"
+harness = false
+
+# Ingest latency through `emit` (Q-2184): `cargo bench -p kvik --bench emit`.
+[[bench]]
+name = "emit"
 harness = false
 
 [lints]

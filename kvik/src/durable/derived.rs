@@ -285,6 +285,8 @@ pub(crate) struct Hook {
     /// Makes the registry file cover every entry up to the position given, the last entry taken being the second
     /// (Q-1001): whether it does.
     registry: OnceLock<RegistryCover>,
+    /// The summary tree's checkpoint job, stepped after the log's derived files.
+    tree: OnceLock<Arc<super::tree::Job>>,
 }
 
 /// See [`Hook::registry`].
@@ -365,6 +367,11 @@ impl Hook {
     pub(crate) fn registry(&self, cover: impl Fn(LogPos, LogPos) -> bool + Send + Sync + 'static) {
         let _ = self.registry.set(Box::new(cover));
     }
+
+    /// Gives the hook the summary tree's checkpoint job.
+    pub(crate) fn tree(&self, job: Arc<super::tree::Job>) {
+        let _ = self.tree.set(job);
+    }
 }
 
 impl SealHook for Hook {
@@ -384,6 +391,15 @@ impl SealHook for Hook {
 
     fn series_void(&self) -> bool {
         self.fold.broken()
+    }
+
+    fn step(
+        &self,
+        synced: LogPos,
+        now: std::time::Duration,
+        stopping: bool,
+    ) -> Option<std::time::Duration> {
+        self.tree.get()?.step(synced, now, stopping)
     }
 
     fn health(&self) -> Option<(u8, bool)> {
@@ -465,6 +481,7 @@ pub(crate) fn seeded_hook(
         fold: Arc::new(fold),
         parts: OnceLock::new(),
         registry: OnceLock::new(),
+        tree: OnceLock::new(),
     })
 }
 
@@ -487,13 +504,14 @@ fn of_fold(fold: SeriesFold, latch: &Arc<Latch>, recorded: &[LostRange]) -> Arc<
         fold: Arc::new(fold),
         parts: OnceLock::new(),
         registry: OnceLock::new(),
+        tree: OnceLock::new(),
     });
     settle(&hook, latch, recorded);
     hook
 }
 
 /// Whether a lost range in `found` begins at or below `through` and no lost range of the manifest holds it.
-fn lost_since(
+pub(crate) fn lost_since(
     found: &[crate::health::LossReport],
     recorded: &[LostRange],
     through: LogPos,

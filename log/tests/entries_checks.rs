@@ -494,6 +494,7 @@ fn routing_change_layout() {
             on: 3000.0,
             clear: 2500.0,
         }),
+        gate: None,
     };
     assert_eq!(b.entries, vec![Entry::Routing(Box::new(expected.clone()))]);
     let body = EntriesBlock {
@@ -510,7 +511,7 @@ fn routing_change_layout() {
         field_err(50)
     );
     assert_eq!(
-        decode_one(5, replace(routing_fields(), 51, vec![4])),
+        decode_one(5, replace(routing_fields(), 51, vec![6])),
         field_err(51)
     );
     assert_eq!(decode_one(5, remove(routing_fields(), 52)), presence(52));

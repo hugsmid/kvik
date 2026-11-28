@@ -15,6 +15,7 @@ use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig as LogReaderConfig};
 use proptest::prelude::*;
 
 use super::super::{PROBE, Probe, WHOLE};
+use super::losses::alike_without_identity;
 use crate::consume::{Condition, Funnel, Select, Start};
 use crate::durable::LOG_SKEW;
 use crate::durable::derived::SeriesFold;
@@ -524,6 +525,8 @@ pub(super) fn no_pointers(s: &str) -> String {
 /// What one start gives, in a comparable form, and whether it was seeded.
 pub(super) struct Seen {
     pub(super) out: Vec<String>,
+    /// Each loss report, by identity.
+    pub(super) loss_lines: Vec<String>,
     pub(super) seeded: bool,
     /// A loss the start's pass did not find was reported after it.
     pub(super) unrecorded: bool,
@@ -562,6 +565,7 @@ pub(super) fn observe(
     let unrecorded = losses
         .iter()
         .any(|l| l.kind == LossKind::DataLost && !l.recorded);
+    let loss_lines: Vec<String> = losses.iter().map(|l| format!("{l:?}")).collect();
     out.push(format!("losses {losses:?}"));
     // The log's description of an unlisted sealed segment runs in the background and may not have named it yet.
     let health = match store.health() {
@@ -660,6 +664,7 @@ pub(super) fn observe(
     SCAN_ORDERS.lock().unwrap().remove(dir);
     Seen {
         out,
+        loss_lines,
         seeded,
         unrecorded,
         probe,
@@ -721,7 +726,10 @@ pub(super) fn compare(
         if found_after && a.starts_with("losses ") {
             // A loss the scan grows downward keeps the identity and region it was found under while open (Q-200,
             // Q-1115).
-            prop_assert_eq!(without_identity(a), without_identity(b));
+            prop_assert!(
+                alike_without_identity(&whole.loss_lines, &seeded.loss_lines),
+                "{a}\n{b}"
+            );
             continue;
         }
         prop_assert_eq!(a, b);
@@ -736,29 +744,6 @@ pub(super) fn compare(
         below: order == ScanOrder::Background && gave == Some(GiveWay::Below),
         recoveries: seeded.probe.recoveries_naming > 0,
     })
-}
-
-/// `line` without each loss report's identity, segment and region size, which follow the region met first.
-fn without_identity(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    loop {
-        let cut = ["identity: Position {", "file_id: ", "bytes: "]
-            .iter()
-            .filter_map(|k| rest.find(k).map(|i| (i, *k)))
-            .min();
-        let Some((i, key)) = cut else { break };
-        out.push_str(&rest[..i]);
-        let tail = &rest[i + key.len()..];
-        let end = if key != "identity: Position {" {
-            tail.find(", ").map_or(tail.len(), |n| n + 2)
-        } else {
-            tail.find("}, ").map_or(tail.len(), |n| n + 3)
-        };
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Whether a line of [`observe`]'s output is promised alike while a loss below the seed is found after the open: the
