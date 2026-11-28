@@ -134,7 +134,7 @@ pub use backup::{
 };
 pub use config::{
     Backend, ConditionsConfig, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, ReplayMax,
-    StoreConfig, TierConfig, WINDOW_MEMORY_DESKTOP, WINDOW_MEMORY_MINIMAL,
+    StoreConfig, TierConfig, TreeConfig, WINDOW_MEMORY_DESKTOP, WINDOW_MEMORY_MINIMAL,
 };
 pub use consume::{
     Condition, ConditionState, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId,

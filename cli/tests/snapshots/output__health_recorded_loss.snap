@@ -15,5 +15,5 @@ log               open_segments                     2
 log               bytes                             134221952
 tier              cold                              not configured
 leases            count                             1
-lease             19000000000000001a00000000000000  epoch 2 renewals 1 created 2026-01-01T00:00:00Z
+lease             17000000000000001800000000000000  epoch 2 renewals 1 created 2026-01-01T00:00:00Z
 series_directory  state                             none

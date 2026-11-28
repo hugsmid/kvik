@@ -47,6 +47,8 @@ pub struct StoreConfig {
     pub tiers: TierConfig,
     /// Gates' resume (spec §6 Gates, Resume).
     pub conditions: ConditionsConfig,
+    /// The summary tree (experimental; default off).
+    pub tree: TreeConfig,
     /// Clock, file system, boot identity, tzdata and entropy.
     pub env: Env,
 }
@@ -100,6 +102,12 @@ impl StoreConfig {
     /// Sets the gates' resume configuration.
     pub fn conditions(mut self, conditions: ConditionsConfig) -> Self {
         self.conditions = conditions;
+        self
+    }
+
+    /// Sets the summary tree configuration.
+    pub fn tree(mut self, tree: TreeConfig) -> Self {
+        self.tree = tree;
         self
     }
 
@@ -212,6 +220,24 @@ impl Default for ConditionsConfig {
             replay_max: ReplayMax::default(),
             checkpoint_interval: Duration::from_secs(60),
         }
+    }
+}
+
+/// The summary tree over facts (design tree-memory section 11). Experimental: while on, a close or chart over a long
+/// backlog may use more memory than with it off, and turning it on for a store whose tree is far behind rebuilds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TreeConfig {
+    /// Build and checkpoint the tree (default off). Off, the writer marks nothing and writes nothing under `tree/`;
+    /// readers still use a tree an earlier run left while it is close enough to the cut.
+    pub enabled: bool,
+}
+
+impl TreeConfig {
+    /// Sets `enabled`.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 

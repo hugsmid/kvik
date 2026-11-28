@@ -18,6 +18,7 @@ use kvik_tree::set::{DAY, Policy, QUARTER};
 use kvik_tree::write::{Fact, Identity, Opening, TreeFiles, folded_levels, quarter_entries};
 
 use super::dirty::{Dirty, Key};
+use super::read::{STRETCH_MAX, past_stretch};
 use super::stretch::dirty_from_log;
 use crate::durable::index::{Stored, log_pos};
 use crate::durable::loss::Latch;
@@ -68,7 +69,24 @@ pub(crate) struct Job {
     readers: OnceLock<Readers>,
     marks: OnceLock<Watch>,
     interval: Duration,
+    stretch_max: u64,
     state: Mutex<State>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests: the `STRETCH_MAX` of a job a store opened on this thread starts with.
+    pub(crate) static STRETCH_MAX_AT_OPEN: std::cell::Cell<u64> = const { std::cell::Cell::new(STRETCH_MAX) };
+}
+
+#[cfg(not(test))]
+fn stretch_max() -> u64 {
+    STRETCH_MAX
+}
+
+#[cfg(test)]
+fn stretch_max() -> u64 {
+    STRETCH_MAX_AT_OPEN.get()
 }
 
 impl std::fmt::Debug for Job {
@@ -120,6 +138,7 @@ impl Job {
             readers: OnceLock::new(),
             marks: OnceLock::new(),
             interval: INTERVAL,
+            stretch_max: stretch_max(),
             state: Mutex::new(State::default()),
         }
     }
@@ -248,15 +267,18 @@ impl Job {
             wall: self.env.clock.wall().0,
             now,
         };
+        let far = |k: LogPos| past_stretch(synced, k, self.stretch_max);
         let (files, report) = TreeFiles::start(self.env.fs.clone(), &self.dir, self.id, at, |k| {
-            self.lost_below(k, &[])
+            self.lost_below(k, &[]) || far(k)
         })
         .map_err(|e| format!("tree start: {e}"))?;
         if report.discarded {
             st.answered = self.found_ranges();
         }
-        // Q-2181: a store with facts and no root covers nothing, so nothing below the mark needs marking.
-        if report.continued.is_some() || self.fresh {
+        // Q-2181: a store with facts and no root covers nothing, so nothing below the mark needs marking. Design
+        // tree-memory section 11: nor does a root discarded for a stretch past `STRETCH_MAX`, which is not read.
+        let stale = report.discarded && far(files.root().checkpoint);
+        if (report.continued.is_some() && !stale) || self.fresh {
             let s = dirty_from_log(&self.dir, &self.env, files.root().checkpoint, synced)
                 .map_err(|e| format!("tree start: {e}"))?;
             self.dirty.fill(&s.keys, &s.series);
